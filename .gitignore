@@ -1,0 +1,13 @@
+/target/
+/node_modules/
+/.pnpm-store/
+/.idea/
+/.vscode/
+/.claude/
+/.vfox/
+
+.DS_Store
+*.local
+*.log
+AGENTS.md
+CLAUDE.md

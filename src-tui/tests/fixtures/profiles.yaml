@@ -1,0 +1,8 @@
+current: dAbCdEfGhIj
+items:
+- uid: dAbCdEfGhIj
+  type: remote
+  name: example-subscription
+  file: dAbCdEfGhIj.yaml
+  url: https://example.com/sub
+  updated: 1700000000

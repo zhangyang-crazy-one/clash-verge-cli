@@ -1,0 +1,45 @@
+[package]
+name = "clash-verge-cli"
+version = "0.1.0"
+description = "Terminal-native proxy client for mihomo (clash meta)"
+authors = ["clash-verge-cli contributors"]
+license = "GPL-3.0-only"
+edition.workspace = true
+rust-version.workspace = true
+default-run = "clash-verge-cli"
+
+[[bin]]
+name = "clash-verge-cli"
+path = "src/main.rs"
+
+[dependencies]
+clash-verge-core = { path = "../crates/clash-verge-core" }
+
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "process"] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+color-eyre = { workspace = true }
+dirs = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "cookies", "gzip", "stream"] }
+tokio-stream = "0.1"
+url = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+
+[lints]
+workspace = true

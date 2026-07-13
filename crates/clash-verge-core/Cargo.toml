@@ -1,0 +1,26 @@
+[package]
+name = "clash-verge-core"
+version = "0.1.0"
+description = "Configuration compatibility layer used by clash-verge-cli"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aes-gcm = { version = "0.10.3", features = ["std"] }
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+getrandom = "0.4.3"
+log.workspace = true
+nanoid = "0.5"
+regex = "1.12.4"
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+smartstring.workspace = true
+sys-locale = "0.3.2"
+tokio.workspace = true
+
+[lints]
+workspace = true
