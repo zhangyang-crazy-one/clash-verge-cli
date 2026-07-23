@@ -155,6 +155,8 @@ impl IProfiles {
             items.push(item.to_owned());
         }
 
+        self.save_file().await?;
+
         Ok(())
     }
 
