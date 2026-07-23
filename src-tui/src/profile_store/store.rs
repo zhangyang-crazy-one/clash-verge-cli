@@ -61,6 +61,7 @@ impl ProfileStore {
     /// Append a new profile item and persist `profiles.yaml`.
     #[allow(dead_code)]
     pub async fn append(&mut self, mut item: PrfItem) -> anyhow::Result<()> {
+        ensure_profile_storage().await?;
         self.profiles
             .append_item(&mut item)
             .await
@@ -73,6 +74,7 @@ impl ProfileStore {
 
     /// Append enhance fragments then the remote item, and persist.
     pub async fn append_bundle(&mut self, bundle: RemoteProfileBundle) -> anyhow::Result<PrfItem> {
+        ensure_profile_storage().await?;
         for mut fragment in bundle.fragments {
             self.profiles
                 .append_item(&mut fragment)
@@ -123,6 +125,7 @@ impl ProfileStore {
         let mut bundle = from_url::update_with_fallback(url, merged.as_ref()).await?;
 
         // Rare path: an older remote without chain UIDs gets fragments on refresh.
+        ensure_profile_storage().await?;
         for mut fragment in bundle.fragments {
             self.profiles
                 .append_item(&mut fragment)
@@ -158,11 +161,24 @@ impl ProfileStore {
                 Err(err) => errors.push(format!("{uid}: {err}")),
             }
         }
-        if !errors.is_empty() && refreshed_current.is_empty() {
+        if !errors.is_empty() {
             anyhow::bail!("{}", errors.join("; "));
         }
         Ok(refreshed_current)
     }
+}
+
+async fn ensure_profile_storage() -> anyhow::Result<()> {
+    use clash_verge_core::utils::dirs;
+    let home = dirs::app_home_dir().context("app home dir not initialized")?;
+    tokio::fs::create_dir_all(&home)
+        .await
+        .with_context(|| format!("failed to create {}", home.display()))?;
+    let profiles = dirs::app_profiles_dir().context("profiles dir unavailable")?;
+    tokio::fs::create_dir_all(&profiles)
+        .await
+        .with_context(|| format!("failed to create {}", profiles.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

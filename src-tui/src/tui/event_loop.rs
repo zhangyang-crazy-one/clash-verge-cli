@@ -202,6 +202,23 @@ async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path
     }
 }
 
+async fn reload_remote_profile(
+    api: &crate::mihomo_api::MihomoApi,
+    item: &clash_verge_core::config::PrfItem,
+) -> Result<(), String> {
+    let file = item
+        .file
+        .as_deref()
+        .ok_or_else(|| "remote profile is missing file".to_string())?;
+    let path = clash_verge_core::utils::dirs::app_profiles_dir()
+        .map_err(|error| error.to_string())?
+        .join(file);
+    if !path.exists() {
+        return Err(format!("profile file not found: {}", path.display()));
+    }
+    reload_config_file(api, &path).await
+}
+
 async fn apply_chain_config(
     api: &crate::mihomo_api::MihomoApi,
     chain_nodes: &[String],
@@ -506,24 +523,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             match app.view {
                                                 View::Profiles => {
                                                     // Profile tab: switch profile
-                                                    if let Some(item) = app.profiles.get(app.selected_index)
-                                                        && let Some(ref uid) = item.uid {
+                                                    if let Some(item) = app.profiles.get(app.selected_index).filter(|item| item.uid.is_some()) {
                                                             let name = item.name.clone().unwrap_or_default();
                                                             let itype = item.itype.clone().unwrap_or_default();
                                                             app.status_msg = Some(format!("Switching to {name}..."));
                                                             let api = manager.api();
-                                                            let u = uid.clone();
                                                             let tx = action_tx.clone();
                                                             if itype == "remote" {
+                                                                let item = item.clone();
                                                                 tokio::spawn(async move {
-                                                                    let body = format!("{{\"path\":\"{u}\"}}");
-                                                                    let _ = api.client
-                                                                        .put("http://localhost/configs")
-                                                                        .header("Content-Type", "application/json")
-                                                                        .body(body)
-                                                                        .send()
-                                                                        .await;
-                                                                    let _ = tx.send(Action::ProxiesRefresh);
+                                                                    match reload_remote_profile(&api, &item).await {
+                                                                        Ok(()) => {
+                                                                            let _ = tx.send(Action::ProxiesRefresh);
+                                                                        }
+                                                                        Err(error) => {
+                                                                            let _ = tx.send(Action::CoreError(format!(
+                                                                                "profile reload: {error}"
+                                                                            )));
+                                                                        }
+                                                                    }
                                                                 });
                                                             } else {
                                                                 let item = item.clone();
@@ -892,21 +910,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     let m = manager.clone();
                                     tokio::spawn(async move { let _ = m.start().await; });
                                 }
-                                // Trigger config reload for the new profile
-                                if let Some(item) = app.profiles.get(last)
-                                    && let Some(ref uid) = item.uid
-                                {
+                                // Reload the imported profile yaml into the running core.
+                                if let Some(item) = app.profiles.get(last).cloned() {
                                     let api = manager.api();
-                                    let u = uid.clone();
                                     let tx = action_tx.clone();
                                     tokio::spawn(async move {
-                                        let body = format!("{{\"path\":\"{u}\"}}");
-                                        let _ = api.client
-                                            .put("http://localhost/configs")
-                                            .header("Content-Type", "application/json")
-                                            .body(body)
-                                            .send()
-                                            .await;
+                                        if let Err(error) = reload_remote_profile(&api, &item).await {
+                                            let _ = tx.send(Action::CoreError(format!(
+                                                "profile reload: {error}"
+                                            )));
+                                        }
                                         let _ = tx.send(Action::ProxiesRefresh);
                                     });
                                 }
@@ -1142,15 +1155,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             let tx = action_tx.clone();
                             let reload_uid = uid.clone();
                             tokio::spawn(async move {
-                                if !reload_uid.is_empty() {
-                                    let body = format!("{{\"path\":\"{reload_uid}\"}}");
-                                    let _ = api
-                                        .client
-                                        .put("http://localhost/configs?force=true")
-                                        .header("Content-Type", "application/json")
-                                        .body(body)
-                                        .send()
-                                        .await;
+                                if let Ok(store) = crate::profile_store::store::ProfileStore::load().await
+                                    && let Some(item) = store
+                                        .items()
+                                        .into_iter()
+                                        .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
+                                    && let Err(error) = reload_remote_profile(&api, &item).await
+                                {
+                                    let _ = tx.send(Action::CoreError(format!(
+                                        "profile reload: {error}"
+                                    )));
                                 }
                                 let _ = tx.send(Action::ProxiesRefresh);
                             });
