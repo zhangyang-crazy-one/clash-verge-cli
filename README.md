@@ -13,6 +13,16 @@ A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo).
 
 The current release target is Linux. System proxy integration uses GNOME/KDE tools, service management uses systemd, and process control uses Unix signals.
 
+## Mihomo core
+
+On `start` (TUI `s` or `clash-verge-cli start`), the CLI resolves mihomo as follows:
+
+1. Use a system `verge-mihomo` if present
+2. Otherwise auto-download **v1.19.29** into `$XDG_DATA_HOME/clash-verge-cli/mihomo`
+   (or `~/.local/share/clash-verge-cli/mihomo`) and keep that managed binary in sync
+
+No separate install step is required for normal use.
+
 ## Build
 
 Rust 1.95 or newer is required.
@@ -39,6 +49,9 @@ clash-verge-cli status --json
 clash-verge-cli start
 clash-verge-cli stop
 clash-verge-cli restart
+clash-verge-cli profile list
+clash-verge-cli profile import 'https://example.com/sub.yaml' --name my-sub
+clash-verge-cli profile update --all
 ```
 
 The TUI looks for an already running Clash Verge Rev/mihomo controller before starting its own process. It prefers `clash-verge.yaml` and retains `config.yaml` as a compatibility fallback.

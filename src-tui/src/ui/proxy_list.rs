@@ -30,9 +30,10 @@ pub fn draw(
                 node_count,
                 ..
             } => {
+                let display_name = crate::ui::terminal_text::display(name);
                 let mut spans = vec![
                     Span::styled(
-                        format!("+ {name}"),
+                        format!("+ {display_name}"),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(

@@ -1,16 +1,19 @@
-// Foundation module — `mihomo_binary_path`, `system_mihomo`, and
-// `ensure_executable` are wired up by Plan 02-03.
-#![allow(dead_code, unused_imports)]
+//! Resolve and auto-install the mihomo core binary.
 
+use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
-/// D-01: bundled binary path. Resolves to
+use anyhow::Context;
+use tokio::process::Command;
+
+/// Managed (auto-downloaded) mihomo stable version.
+pub const MIHOMO_VERSION: &str = "v1.19.29";
+
+/// D-01: managed binary path. Resolves to
 /// `$XDG_DATA_HOME/clash-verge-cli/mihomo` with a fallback to
 /// `~/.local/share/clash-verge-cli/mihomo` for systems without XDG.
-///
-/// Actual extraction happens in a later phase — this function only
-/// resolves the path the binary should live at.
 pub fn mihomo_binary_path() -> PathBuf {
     if let Some(data_dir) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(data_dir).join("clash-verge-cli").join("mihomo");
@@ -41,6 +44,74 @@ pub fn system_mihomo() -> Option<PathBuf> {
     None
 }
 
+/// Where the runnable mihomo binary came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MihomoBinarySource {
+    /// System `verge-mihomo`.
+    System,
+    /// Already present managed binary at the target version.
+    ManagedCached,
+    /// Freshly downloaded into the managed data directory.
+    Downloaded,
+}
+
+impl MihomoBinarySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::ManagedCached => "cached",
+            Self::Downloaded => "downloaded",
+        }
+    }
+}
+
+/// Result of resolving (and possibly installing) mihomo.
+#[derive(Debug, Clone)]
+pub struct ResolvedMihomo {
+    pub path: PathBuf,
+    pub source: MihomoBinarySource,
+    pub version: String,
+}
+
+/// Resolve a runnable mihomo binary, downloading the managed build when needed.
+///
+/// Preference order:
+/// 1. System `verge-mihomo` (left untouched)
+/// 2. Managed data-dir binary at [`MIHOMO_VERSION`] (download/upgrade as needed)
+pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
+    if let Some(system) = system_mihomo() {
+        let version = read_mihomo_version(&system)
+            .await?
+            .unwrap_or_else(|| "unknown".into());
+        return Ok(ResolvedMihomo {
+            path: system,
+            source: MihomoBinarySource::System,
+            version,
+        });
+    }
+
+    let managed = mihomo_binary_path();
+    if managed.exists()
+        && let Ok(Some(version)) = read_mihomo_version(&managed).await
+        && version_matches_target(&version)
+    {
+        ensure_executable(&managed).await?;
+        return Ok(ResolvedMihomo {
+            path: managed,
+            source: MihomoBinarySource::ManagedCached,
+            version,
+        });
+    }
+
+    download_managed_mihomo(&managed).await?;
+    ensure_executable(&managed).await?;
+    Ok(ResolvedMihomo {
+        path: managed,
+        source: MihomoBinarySource::Downloaded,
+        version: MIHOMO_VERSION.to_string(),
+    })
+}
+
 /// Set the executable bit on the binary. Idempotent — if the bits are
 /// already 0o755 we return success without touching the inode.
 pub async fn ensure_executable(path: &Path) -> std::io::Result<()> {
@@ -51,6 +122,112 @@ pub async fn ensure_executable(path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     tokio::fs::set_permissions(path, target).await
+}
+
+async fn download_managed_mihomo(dest: &Path) -> anyhow::Result<()> {
+    let asset = linux_asset_name().context("unsupported CPU architecture for auto-install")?;
+    let url = format!(
+        "https://github.com/MetaCubeX/mihomo/releases/download/{version}/{asset}-{version}.gz",
+        version = MIHOMO_VERSION,
+        asset = asset
+    );
+
+    tracing::info!(
+        target: "mihomo",
+        "downloading mihomo {MIHOMO_VERSION} → {}",
+        dest.display()
+    );
+
+    let client = reqwest::Client::builder()
+        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .context("failed to build download client")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to download mihomo from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("mihomo download returned error for {url}"))?;
+
+    let compressed = response
+        .bytes()
+        .await
+        .context("failed to read mihomo download body")?;
+
+    let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
+    let mut binary = Vec::new();
+    decoder
+        .read_to_end(&mut binary)
+        .context("failed to decompress mihomo gzip archive")?;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let tmp = dest.with_extension("download");
+    tokio::fs::write(&tmp, &binary)
+        .await
+        .with_context(|| format!("failed to write {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, dest)
+        .await
+        .with_context(|| format!("failed to install mihomo to {}", dest.display()))?;
+
+    tracing::info!(target: "mihomo", "installed mihomo {MIHOMO_VERSION}");
+    Ok(())
+}
+
+fn linux_asset_name() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some("mihomo-linux-amd64-v2"),
+        "aarch64" => Some("mihomo-linux-arm64"),
+        "arm" => Some("mihomo-linux-armv7"),
+        "riscv64" => Some("mihomo-linux-riscv64"),
+        "loongarch64" => Some("mihomo-linux-loong64"),
+        _ => None,
+    }
+}
+
+async fn read_mihomo_version(path: &Path) -> anyhow::Result<Option<String>> {
+    let output = Command::new(path)
+        .arg("-v")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("failed to execute {}", path.display()))?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{text}{err}");
+    Ok(extract_version_token(&combined))
+}
+
+fn extract_version_token(text: &str) -> Option<String> {
+    // Examples: "Mihomo Meta v1.19.29", "v1.19.29"
+    for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+        if trimmed.starts_with('v') && trimmed.contains('.') {
+            return Some(trimmed.to_string());
+        }
+        if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains('.') {
+            return Some(format!("v{trimmed}"));
+        }
+    }
+    None
+}
+
+fn version_matches_target(version: &str) -> bool {
+    let normalized = if version.starts_with('v') {
+        version.to_string()
+    } else {
+        format!("v{version}")
+    };
+    normalized == MIHOMO_VERSION
 }
 
 #[cfg(test)]
@@ -103,5 +280,21 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[test]
+    fn extracts_version_from_mihomo_output() {
+        assert_eq!(
+            extract_version_token("Mihomo Meta v1.19.29 linux amd64"),
+            Some("v1.19.29".into())
+        );
+        assert_eq!(extract_version_token("v1.19.29"), Some("v1.19.29".into()));
+        assert!(version_matches_target("v1.19.29"));
+        assert!(!version_matches_target("v1.19.25"));
+    }
+
+    #[test]
+    fn linux_asset_covers_common_arches() {
+        assert!(linux_asset_name().is_some() || !matches!(std::env::consts::ARCH, "x86_64" | "aarch64"));
     }
 }

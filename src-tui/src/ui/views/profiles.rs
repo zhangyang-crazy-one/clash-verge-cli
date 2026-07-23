@@ -31,7 +31,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .unwrap_or_else(|| app.tr("profiles.local").into());
         vec![
             Line::from(Span::styled(
-                name,
+                crate::ui::terminal_text::display(name),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )),
             Line::from(format!("{}: {kind}", app.tr("profiles.type"))),

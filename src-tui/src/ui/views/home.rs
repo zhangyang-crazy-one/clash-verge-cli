@@ -29,15 +29,16 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_core(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (label, color, detail) = match &app.core_state {
-        CoreState::Running => (
-            app.tr("status.running"),
-            Color::Green,
-            if area.width < 36 {
+        CoreState::Running => {
+            let detail = if let Some(version) = app.core_version.as_deref() {
+                version
+            } else if area.width < 36 {
                 app.tr("home.core_accepts")
             } else {
                 app.tr("home.core_accepting")
-            },
-        ),
+            };
+            (app.tr("status.running"), Color::Green, detail)
+        }
         CoreState::Starting => (app.tr("status.starting"), Color::Yellow, app.tr("home.core_waiting")),
         CoreState::Stopped => (
             app.tr("status.stopped"),
@@ -50,13 +51,21 @@ fn draw_core(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         CoreState::Error(message) => (app.tr("status.error"), Color::Red, message.as_str()),
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
     ];
+    if matches!(app.core_state, CoreState::Running)
+        && let Some(pid) = app.core_pid
+    {
+        lines.push(Line::from(Span::styled(
+            format!("pid {pid}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(app.tr("home.core"))),
         area,
@@ -69,7 +78,7 @@ fn draw_profile(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let kind = profile.itype.as_deref().unwrap_or(app.tr("common.unknown"));
         vec![
             Line::from(Span::styled(
-                name,
+                crate::ui::terminal_text::display(name),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
