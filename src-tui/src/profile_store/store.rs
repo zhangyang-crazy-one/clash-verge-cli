@@ -35,12 +35,7 @@ impl ProfileStore {
     /// All items including enhance fragments (for diagnostics / CLI).
     #[allow(dead_code)]
     pub fn all_items(&self) -> Vec<PrfItem> {
-        self.profiles
-            .get_items()
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect()
+        self.profiles.get_items().into_iter().flatten().cloned().collect()
     }
 
     /// Resolve the GUI's current profile UID into a stable TUI list index.
@@ -66,10 +61,7 @@ impl ProfileStore {
             .append_item(&mut item)
             .await
             .context("failed to append profile")?;
-        self.profiles
-            .save_file()
-            .await
-            .context("failed to save profiles.yaml")
+        self.profiles.save_file().await.context("failed to save profiles.yaml")
     }
 
     /// Append enhance fragments then the remote item, and persist.
@@ -101,25 +93,14 @@ impl ProfileStore {
     }
 
     /// Update a remote profile by UID. Returns whether it is the current profile.
-    pub async fn update_remote(
-        &mut self,
-        uid: &str,
-        option_override: Option<&PrfOption>,
-    ) -> anyhow::Result<bool> {
+    pub async fn update_remote(&mut self, uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
         let uid_key = SmartString::from(uid);
-        let existing = self
-            .profiles
-            .get_item(&uid_key)
-            .context("profile not found")?
-            .clone();
+        let existing = self.profiles.get_item(&uid_key).context("profile not found")?.clone();
 
         if existing.itype.as_deref() != Some("remote") {
             anyhow::bail!("profile {uid} is not a remote subscription");
         }
-        let url = existing
-            .url
-            .as_ref()
-            .context("remote profile is missing url")?;
+        let url = existing.url.as_ref().context("remote profile is missing url")?;
 
         let merged = PrfOption::merge(existing.option.as_ref(), option_override);
         let mut bundle = from_url::update_with_fallback(url, merged.as_ref()).await?;
@@ -191,10 +172,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_bundle_persists_profiles_yaml_and_body() {
-        let root = std::env::temp_dir().join(format!(
-            "clash-verge-cli-profile-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root = std::env::temp_dir().join(format!("clash-verge-cli-profile-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("profiles")).expect("temp profiles dir");
         dirs::set_app_home_dir(root.clone());
         assert_eq!(

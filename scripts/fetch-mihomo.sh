@@ -13,9 +13,9 @@ case "${ARCH}" in
   aarch64|arm64) ASSET="mihomo-linux-arm64" ;;
   armv7l|armhf) ASSET="mihomo-linux-armv7" ;;
   riscv64) ASSET="mihomo-linux-riscv64" ;;
-  loongarch64) ASSET="mihomo-linux-loong64" ;;
   *)
-    echo "unsupported architecture: ${ARCH}" >&2
+    echo "unsupported architecture for auto-fetch: ${ARCH}" >&2
+    echo "install a system verge-mihomo or place a binary at ${DEST}" >&2
     exit 1
     ;;
 esac

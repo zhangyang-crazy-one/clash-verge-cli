@@ -36,9 +36,7 @@ pub async fn fetch_subscription(
     ssrf::check_url_host(url, allowlist).map_err(|e| anyhow::anyhow!(e))?;
 
     let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
-    let accept_invalid = option
-        .and_then(|o| o.danger_accept_invalid_certs)
-        .unwrap_or(false);
+    let accept_invalid = option.and_then(|o| o.danger_accept_invalid_certs).unwrap_or(false);
     let user_agent = option
         .and_then(|o| o.user_agent.as_ref())
         .map(|s| s.to_string())
@@ -63,8 +61,9 @@ pub async fn fetch_subscription(
         }
         ProxyMode::Localhost => {
             let port = IClashTemp::new().await.get_mixed_port();
-            let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{port}"))
-                .context("invalid localhost proxy URL")?;
+            // Proxy::all covers both http and https subscription URLs through mixed-port.
+            let proxy =
+                reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).context("invalid localhost proxy URL")?;
             builder = builder.proxy(proxy);
         }
     }

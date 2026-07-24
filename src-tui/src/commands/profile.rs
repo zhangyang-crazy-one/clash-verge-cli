@@ -13,11 +13,7 @@ pub async fn list() -> anyhow::Result<()> {
     for item in items {
         let uid = item.uid.as_deref().unwrap_or("-");
         let name = item.name.as_deref().unwrap_or("(unnamed)");
-        let marker = if current.as_deref() == Some(uid) {
-            "*"
-        } else {
-            " "
-        };
+        let marker = if current.as_deref() == Some(uid) { "*" } else { " " };
         let url = item.url.as_deref().unwrap_or("");
         println!("{marker} {uid}\t{name}\t{url}");
     }

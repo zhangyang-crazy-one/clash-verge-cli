@@ -25,7 +25,10 @@ pub enum Action {
     UpdateProfile,
     ProfileImported,
     ProfileImportFailed(String),
-    ProfileUpdated { uid: String, is_current: bool },
+    ProfileUpdated {
+        uid: String,
+        is_current: bool,
+    },
     ProfileUpdateFailed(String),
 
     // Shell navigation
@@ -71,7 +74,10 @@ pub enum Action {
     RequestCloseConnection,
     ConfirmCloseConnection(String),
     ConnectionClosed(String),
-    CloseConnectionFailed { id: String, error: String },
+    CloseConnectionFailed {
+        id: String,
+        error: String,
+    },
 }
 
 const fn _assert_send_sync() {

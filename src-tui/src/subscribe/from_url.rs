@@ -105,10 +105,7 @@ pub async fn from_url(
 }
 
 /// GUI-style import retries: system proxy → clash (self) proxy → direct.
-pub async fn import_with_fallback(
-    url: &str,
-    name: Option<&str>,
-) -> anyhow::Result<RemoteProfileBundle> {
+pub async fn import_with_fallback(url: &str, name: Option<&str>) -> anyhow::Result<RemoteProfileBundle> {
     let attempts = [
         PrfOption {
             with_proxy: Some(true),
@@ -134,10 +131,7 @@ pub async fn import_with_fallback(
 }
 
 /// GUI-style update retries: current options → self_proxy → with_proxy.
-pub async fn update_with_fallback(
-    url: &str,
-    option: Option<&PrfOption>,
-) -> anyhow::Result<RemoteProfileBundle> {
+pub async fn update_with_fallback(url: &str, option: Option<&PrfOption>) -> anyhow::Result<RemoteProfileBundle> {
     let mut merged = PrfOption::merge(option, None).unwrap_or_default();
 
     if let Ok(bundle) = from_url(url, None, None, Some(&merged)).await {
@@ -225,7 +219,9 @@ fn parse_content_disposition_name(headers: &HashMap<String, String>) -> Option<s
     let filename = format!("{value:?}");
     let filename = filename.trim_matches('"');
     if let Some(encoded) = help::parse_str::<std::string::String>(filename, "filename*") {
-        let decoded = percent_encoding::percent_decode(encoded.as_bytes()).decode_utf8().ok()?;
+        let decoded = percent_encoding::percent_decode(encoded.as_bytes())
+            .decode_utf8()
+            .ok()?;
         return decoded.split("''").last().map(|s| s.to_string());
     }
     if let Some(plain) = help::parse_str::<std::string::String>(filename, "filename") {

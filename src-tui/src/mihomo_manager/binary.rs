@@ -80,9 +80,7 @@ pub struct ResolvedMihomo {
 /// 2. Managed data-dir binary at [`MIHOMO_VERSION`] (download/upgrade as needed)
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     if let Some(system) = system_mihomo() {
-        let version = read_mihomo_version(&system)
-            .await?
-            .unwrap_or_else(|| "unknown".into());
+        let version = read_mihomo_version(&system).await?.unwrap_or_else(|| "unknown".into());
         return Ok(ResolvedMihomo {
             path: system,
             source: MihomoBinarySource::System,
@@ -152,10 +150,7 @@ async fn download_managed_mihomo(dest: &Path) -> anyhow::Result<()> {
         .error_for_status()
         .with_context(|| format!("mihomo download returned error for {url}"))?;
 
-    let compressed = response
-        .bytes()
-        .await
-        .context("failed to read mihomo download body")?;
+    let compressed = response.bytes().await.context("failed to read mihomo download body")?;
 
     let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
     let mut binary = Vec::new();
@@ -187,7 +182,8 @@ fn linux_asset_name() -> Option<&'static str> {
         "aarch64" => Some("mihomo-linux-arm64"),
         "arm" => Some("mihomo-linux-armv7"),
         "riscv64" => Some("mihomo-linux-riscv64"),
-        "loongarch64" => Some("mihomo-linux-loong64"),
+        // MetaCubeX ships loongarch as abi1/abi2-specific assets; do not guess.
+        "loongarch64" => None,
         _ => None,
     }
 }
