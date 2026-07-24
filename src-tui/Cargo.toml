@@ -31,11 +31,14 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "cookies", "gzip", "stream"] }
+flate2 = "1"
 tokio-stream = "0.1"
 url = "2"
+percent-encoding = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 serde_yaml_ng = { workspace = true }
+smartstring = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

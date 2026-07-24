@@ -333,7 +333,7 @@ mod tests {
             );
 
             // Reply with a minimal mihomo /version body.
-            let body = r#"{"version":"Mihomo Meta v1.19.25"}"#;
+            let body = r#"{"version":"Mihomo Meta v1.19.29"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
@@ -347,7 +347,7 @@ mod tests {
 
         let api = MihomoApi::new(tmp_for_server, "secret123").expect("build");
         let v = api.version().await.expect("version should succeed");
-        assert_eq!(v.version, "Mihomo Meta v1.19.25");
+        assert_eq!(v.version, "Mihomo Meta v1.19.29");
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(&tmp);

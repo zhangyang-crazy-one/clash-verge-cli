@@ -1,3 +1,4 @@
+pub mod profile;
 pub mod restart;
 pub mod start;
 pub mod status;

@@ -19,6 +19,8 @@ use crate::app::{Action, CoreState};
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_manager::{binary, signal, watcher::spawn_watcher};
 
+use std::process::Stdio;
+
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RESTARTS_IN_WINDOW: usize = 3;
 
@@ -180,34 +182,36 @@ impl MihomoManager {
 
     /// D-13: spawn mihomo as a child process.
     ///
-    /// Tries `system_mihomo()` first, then falls back to the embedded
-    /// `mihomo_binary_path()`. Returns an error if neither binary is
-    /// available.
-    pub async fn start(&self) -> anyhow::Result<()> {
-        let binary = binary::system_mihomo()
-            .or_else(|| {
-                let p = binary::mihomo_binary_path();
-                p.exists().then_some(p)
-            })
-            .context("mihomo binary not found — install verge-mihomo or place it at the bundled path")?;
+    /// Prefers a system `verge-mihomo`. Otherwise auto-downloads the managed
+    /// mihomo build into the clash-verge-cli data directory.
+    ///
+    /// Returns details about which binary was used so the UI/CLI can report
+    /// install vs reuse clearly.
+    pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        let resolved = binary::resolve_or_install()
+            .await
+            .context("failed to resolve or auto-install mihomo core")?;
 
-        binary::ensure_executable(&binary).await?;
-
-        let mut command = Command::new(&binary);
+        let mut command = Command::new(&resolved.path);
         command.arg("-d").arg(&self.config_dir);
         if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
             && config_path.exists()
         {
             command.arg("-f").arg(config_path);
         }
+        // Keep mihomo I/O off the TTY. Without pipes, core logs overwrite the
+        // ratatui alternate screen (visible as garbled home-view output on start).
         let child = command
             .arg("-ext-ctl-unix")
             .arg(&self.socket_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(false)
             .spawn()
             .with_context(|| format!(
                 "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
-                binary.display(), binary.display()
+                resolved.path.display(), resolved.path.display()
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
@@ -226,14 +230,18 @@ impl MihomoManager {
         }
 
         if let Some(tx) = self.inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreStarted);
+            let _ = tx.send(Action::CoreStarted {
+                version: Some(resolved.version.clone()),
+                binary_path: Some(resolved.path.display().to_string()),
+                binary_source: Some(resolved.source.as_str().into()),
+            });
         }
 
         // Spawn watcher — takes ownership of the Child handle
         let inner = Arc::clone(&self.inner);
         spawn_watcher(child, inner);
 
-        Ok(())
+        Ok(resolved)
     }
 
     /// D-10: gracefully stop mihomo.
@@ -265,7 +273,7 @@ impl MihomoManager {
     }
 
     /// D-09 restart: stop + start, resetting the auto-restart counter.
-    pub async fn restart(&self) -> anyhow::Result<()> {
+    pub async fn restart(&self) -> anyhow::Result<binary::ResolvedMihomo> {
         self.reset_restart_history();
         // Ignore "not running" from stop
         let _ = self.stop().await;

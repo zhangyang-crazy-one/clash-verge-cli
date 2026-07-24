@@ -16,7 +16,10 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, profiles: &[PrfItem], selected_in
             let kind = profile.itype.as_deref().unwrap_or(tr(language, "common.unknown"));
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", index + 1), Style::default().fg(Color::DarkGray)),
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    crate::ui::terminal_text::display(name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!(" [{kind}]"), Style::default().fg(Color::DarkGray)),
             ]))
         })

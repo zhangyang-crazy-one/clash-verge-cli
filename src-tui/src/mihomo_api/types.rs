@@ -83,11 +83,11 @@ mod tests {
 
     #[test]
     fn test_version_deserialize() {
-        let raw = r#"{"version":"Mihomo Meta v1.19.25"}"#;
+        let raw = r#"{"version":"Mihomo Meta v1.19.29"}"#;
         let v: MihomoVersion = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => panic!("parse failed: {e}"),
         };
-        assert_eq!(v.version, "Mihomo Meta v1.19.25");
+        assert_eq!(v.version, "Mihomo Meta v1.19.29");
     }
 }

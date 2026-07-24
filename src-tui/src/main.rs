@@ -40,6 +40,15 @@ async fn main() -> anyhow::Result<()> {
             let code = commands::status::run(manager, json).await?;
             std::process::exit(code);
         }
+        Some(cli::Command::Profile { action }) => match action {
+            cli::ProfileCommand::List => commands::profile::list().await?,
+            cli::ProfileCommand::Import { url, name } => {
+                commands::profile::import(&url, name.as_deref()).await?;
+            }
+            cli::ProfileCommand::Update { uid, all } => {
+                commands::profile::update(uid.as_deref(), all).await?;
+            }
+        },
     }
 
     Ok(())
