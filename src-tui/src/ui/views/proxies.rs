@@ -10,7 +10,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let expanded_group = app.expanded_proxy_group.as_deref();
     let rows = proxy_display_rows(&app.proxy_groups, expanded_group);
     let left_title = expanded_group
-        .map(|group| format!("{} / {group} {}", app.tr("proxies.groups"), app.tr("proxies.nodes")))
+        .map(|group| {
+            format!(
+                "{} / {} {}",
+                app.tr("proxies.groups"),
+                crate::ui::terminal_text::display(group),
+                app.tr("proxies.nodes")
+            )
+        })
         .unwrap_or_else(|| app.tr("proxies.proxy_groups").to_string());
     let panes = crate::ui::split_view::draw(
         frame,

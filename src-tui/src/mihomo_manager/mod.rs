@@ -3,7 +3,7 @@
 //! - `manager` owns the struct and shared inner state
 //! - `signal` implements SIGTERM-then-SIGKILL graceful shutdown
 //! - `watcher` spawns the background task that monitors child exits
-//! - `binary` resolves the mihomo binary path on disk
+//! - `binary` resolves the mihomo binary path and auto-installs when missing
 
 // Foundation module — public surface wired up by Plan 02-03.
 #![allow(dead_code, unused_imports)]

@@ -25,4 +25,31 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage subscription profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommand,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ProfileCommand {
+    /// List remote subscription profiles
+    List,
+    /// Import a subscription URL
+    Import {
+        /// Subscription URL (http/https)
+        url: String,
+        /// Optional display name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Update one remote profile or all of them
+    Update {
+        /// Profile UID to update
+        uid: Option<String>,
+        /// Update every remote profile
+        #[arg(long)]
+        all: bool,
+    },
 }
