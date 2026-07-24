@@ -53,6 +53,19 @@ impl ProfileStore {
         self.profiles.get_current().cloned()
     }
 
+    /// Persist the GUI `current` profile UID (used when switching in the TUI).
+    pub async fn set_current(&mut self, uid: &str) -> anyhow::Result<()> {
+        let uid = SmartString::from(uid);
+        self.profiles.patch_config(&IProfiles {
+            current: Some(uid),
+            items: None,
+        });
+        self.profiles
+            .save_file()
+            .await
+            .context("failed to save profiles.yaml after set_current")
+    }
+
     /// Append a new profile item and persist `profiles.yaml`.
     #[allow(dead_code)]
     pub async fn append(&mut self, mut item: PrfItem) -> anyhow::Result<()> {

@@ -6,17 +6,18 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::App;
 
+pub const SETTINGS_ROW_COUNT: usize = 4;
+
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(3)])
+        .constraints([Constraint::Length(8), Constraint::Min(6)])
         .split(area);
-    let mode = app
-        .core_config
-        .0
-        .get("mode")
-        .and_then(|value| value.as_str())
-        .unwrap_or(app.tr("common.unknown"));
+    let mode = if app.clash_mode.is_empty() {
+        app.core_config.get_mode().unwrap_or_else(|| app.tr("common.unknown").into())
+    } else {
+        app.clash_mode.clone()
+    };
     let core = Paragraph::new(vec![
         Line::from(Span::styled(
             app.tr("settings.runtime_heading"),
@@ -33,38 +34,51 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.core_config.get_port()
         )),
         Line::from(format!("{}: {}", app.tr("settings.core_pid"), core_owner_label(app))),
-        Line::from(vec![
-            Span::raw(format!("{}: ", app.tr("settings.language"))),
-            Span::styled(
-                app.language.display_name(),
-                if app.focus == crate::app::Focus::Content {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                },
-            ),
-        ]),
-        Line::from(Span::styled(
-            app.tr("settings.change_language"),
-            Style::default().fg(Color::DarkGray),
-        )),
     ])
     .block(Block::bordered().title(app.tr("settings.runtime")));
     frame.render_widget(core, rows[0]);
 
+    let cursor = app.settings_selected_index.min(SETTINGS_ROW_COUNT - 1);
     let support = Paragraph::new(vec![
         Line::from(Span::styled(
             app.tr("settings.gui_config"),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         )),
-        Line::from(format!(
-            "{}: {} | TUN: {} | {}: {}",
-            app.tr("settings.system_proxy"),
-            enabled(app, app.gui_config.enable_system_proxy),
-            enabled(app, app.gui_config.enable_tun_mode),
-            app.tr("settings.dns_config"),
-            enabled(app, app.gui_config.enable_dns_settings)
-        )),
+        settings_row(
+            app,
+            0,
+            cursor,
+            format!(
+                "{}: {}",
+                app.tr("settings.language"),
+                app.language.display_name()
+            ),
+        ),
+        settings_row(
+            app,
+            1,
+            cursor,
+            format!(
+                "{}: {}",
+                app.tr("settings.system_proxy"),
+                enabled(app, app.gui_config.enable_system_proxy)
+            ),
+        ),
+        settings_row(
+            app,
+            2,
+            cursor,
+            format!(
+                "TUN: {}",
+                enabled(app, app.gui_config.enable_tun_mode)
+            ),
+        ),
+        settings_row(
+            app,
+            3,
+            cursor,
+            format!("{}: {mode}", app.tr("settings.mihomo_mode")),
+        ),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),
@@ -74,13 +88,24 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .unwrap_or(app.tr("settings.not_configured"))
         )),
         Line::from(Span::styled(
-            app.tr("settings.readonly_note"),
+            app.tr("settings.writable_hint"),
             Style::default().fg(Color::DarkGray),
         )),
     ])
     .block(Block::bordered().title(app.tr("settings.system")))
     .wrap(Wrap { trim: true });
     frame.render_widget(support, rows[1]);
+}
+
+fn settings_row(app: &App, index: usize, cursor: usize, text: String) -> Line<'static> {
+    let focused = app.focus == crate::app::Focus::Content && index == cursor;
+    let style = if focused {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let prefix = if focused { "> " } else { "  " };
+    Line::from(Span::styled(format!("{prefix}{text}"), style))
 }
 
 fn core_owner_label(app: &App) -> String {

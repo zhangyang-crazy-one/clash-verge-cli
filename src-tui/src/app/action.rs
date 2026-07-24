@@ -78,6 +78,15 @@ pub enum Action {
         id: String,
         error: String,
     },
+
+    /// Auto-update tick fired for a due remote profile.
+    AutoUpdateProfile(String),
+    CycleClashMode,
+    ModeChanged {
+        mode: String,
+        announce: bool,
+    },
+    ModeChangeFailed(String),
 }
 
 const fn _assert_send_sync() {

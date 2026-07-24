@@ -3,11 +3,13 @@ mod chain;
 mod cli;
 mod commands;
 mod config_dir;
+mod enhance;
 mod i18n;
 mod mihomo_api;
 mod mihomo_manager;
 mod profile_store;
 mod subscribe;
+mod sys_proxy;
 mod tui;
 mod ui;
 

@@ -105,17 +105,26 @@ fn draw_profile(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_system(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let mode = if app.chain_mode {
+    let selection = if app.chain_mode {
         app.tr("home.chain_enabled")
     } else {
         app.tr("home.direct_selection")
+    };
+    let mode = if app.clash_mode.is_empty() {
+        app.tr("common.unknown")
+    } else {
+        app.clash_mode.as_str()
     };
     let focus = match app.focus {
         crate::app::Focus::Menu => app.tr("home.menu_focus"),
         crate::app::Focus::Content => app.tr("home.content_focus"),
     };
     let lines = vec![
-        Line::from(Span::styled(mode, Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            format!("{}: {mode}", app.tr("home.mode")),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(Span::styled(selection, Style::default().fg(Color::DarkGray))),
         Line::from(Span::styled(focus, Style::default().fg(Color::DarkGray))),
     ];
     frame.render_widget(

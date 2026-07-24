@@ -144,6 +144,11 @@ pub struct App {
     // Chain proxy state
     pub chain_mode: bool,
     pub chain_nodes: Vec<String>,
+
+    /// Settings list cursor (language / system proxy / TUN / mode).
+    pub settings_selected_index: usize,
+    /// Last known clash mode from mihomo or saved config (tolerant string).
+    pub clash_mode: String,
 }
 
 impl App {
@@ -180,6 +185,8 @@ impl App {
             delay_map: HashMap::new(),
             chain_mode: false,
             chain_nodes: Vec::new(),
+            settings_selected_index: 0,
+            clash_mode: "rule".into(),
         }
     }
 
