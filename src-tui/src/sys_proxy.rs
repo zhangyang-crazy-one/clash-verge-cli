@@ -1,9 +1,12 @@
-// System proxy management: set/unset http_proxy/https_proxy env vars
-// and GNOME/KDE desktop environment proxy settings.
+//! System proxy management for desktop environments (GNOME/KDE).
+//!
+//! Intentionally does **not** mutate process environment variables: calling
+//! `std::env::set_var` from a multithreaded Tokio runtime is unsound when other
+//! tasks (e.g. reqwest) may read the environment concurrently.
 
 use std::process::Command;
 
-/// Toggle system proxy on. Sets environment variables + DE settings.
+/// Toggle system proxy on via desktop environment settings.
 pub fn set_system_proxy(host: &str, port: u16) -> std::io::Result<()> {
     let proxy_url = format!("http://{host}:{port}");
 
@@ -16,6 +19,12 @@ pub fn set_system_proxy(host: &str, port: u16) -> std::io::Result<()> {
         .output();
     let _ = Command::new("gsettings")
         .args(["set", "org.gnome.system.proxy.http", "port", &port.to_string()])
+        .output();
+    let _ = Command::new("gsettings")
+        .args(["set", "org.gnome.system.proxy.https", "host", host])
+        .output();
+    let _ = Command::new("gsettings")
+        .args(["set", "org.gnome.system.proxy.https", "port", &port.to_string()])
         .output();
 
     // KDE
@@ -41,21 +50,22 @@ pub fn set_system_proxy(host: &str, port: u16) -> std::io::Result<()> {
             &proxy_url,
         ])
         .output();
-
-    // Set env vars for current process tree
-    unsafe {
-        std::env::set_var("http_proxy", &proxy_url);
-        std::env::set_var("https_proxy", &proxy_url);
-        std::env::set_var("all_proxy", &proxy_url);
-        std::env::set_var("HTTP_PROXY", &proxy_url);
-        std::env::set_var("HTTPS_PROXY", &proxy_url);
-        std::env::set_var("ALL_PROXY", &proxy_url);
-    }
+    let _ = Command::new("kwriteconfig5")
+        .args([
+            "--file",
+            "kioslaverc",
+            "--group",
+            "Proxy Settings",
+            "--key",
+            "httpsProxy",
+            &proxy_url,
+        ])
+        .output();
 
     Ok(())
 }
 
-/// Toggle system proxy off. Unsets all proxy settings.
+/// Toggle system proxy off via desktop environment settings.
 pub fn unset_system_proxy() -> std::io::Result<()> {
     // GNOME
     let _ = Command::new("gsettings")
@@ -74,16 +84,6 @@ pub fn unset_system_proxy() -> std::io::Result<()> {
             "0",
         ])
         .output();
-
-    // Unset env vars
-    unsafe {
-        std::env::remove_var("http_proxy");
-        std::env::remove_var("https_proxy");
-        std::env::remove_var("all_proxy");
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
-        std::env::remove_var("ALL_PROXY");
-    }
 
     Ok(())
 }

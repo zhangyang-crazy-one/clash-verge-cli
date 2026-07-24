@@ -79,8 +79,8 @@ pub enum Action {
         error: String,
     },
 
-    /// Auto-update tick fired for a due remote profile.
-    AutoUpdateProfile(String),
+    /// Auto-update tick finished (clears in-flight guard).
+    AutoUpdateFinished,
     CycleClashMode,
     ModeChanged {
         mode: String,

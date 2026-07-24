@@ -103,11 +103,13 @@ pub async fn fetch_subscription(
 /// Strip URL userinfo into an Authorization header.
 ///
 /// Empty passwords still produce `Basic user:` (upstream NetworkManager behavior).
+/// Password-only userinfo (`:secret@host`) produces `Basic :secret`.
 fn prepare_request_url(url: &str) -> anyhow::Result<(Url, HeaderMap)> {
     let mut parsed = Url::parse(url).with_context(|| format!("invalid subscription URL: {url}"))?;
     let mut headers = HeaderMap::new();
 
-    if !parsed.username().is_empty() {
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if has_userinfo {
         let username = percent_encoding::percent_decode_str(parsed.username())
             .decode_utf8_lossy()
             .into_owned();
@@ -190,6 +192,16 @@ mod tests {
         assert!(url.password().is_none());
         let auth = headers.get(AUTHORIZATION).expect("auth").to_str().expect("str");
         let expected = general_purpose::STANDARD.encode("user:");
+        assert_eq!(auth, format!("Basic {expected}"));
+    }
+
+    #[test]
+    fn password_only_userinfo_emits_basic_auth() {
+        let (url, headers) = prepare_request_url("https://:secret@example.com/sub.yaml").expect("url");
+        assert!(url.username().is_empty());
+        assert!(url.password().is_none());
+        let auth = headers.get(AUTHORIZATION).expect("auth").to_str().expect("str");
+        let expected = general_purpose::STANDARD.encode(":secret");
         assert_eq!(auth, format!("Basic {expected}"));
     }
 
