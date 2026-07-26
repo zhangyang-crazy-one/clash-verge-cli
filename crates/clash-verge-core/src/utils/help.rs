@@ -55,14 +55,46 @@ pub async fn save_yaml<T: Serialize + Sync>(path: &PathBuf, data: &T, prefix: Op
     // Atomic replace avoids torn reads when another task reads mid-write.
     let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.yaml");
     let temporary_path = path.with_file_name(format!("{file_name}.tmp"));
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            tokio::fs::metadata(path).await.ok().map(|meta| meta.permissions())
+        } else {
+            // Prefer a restrictive default for new config/profile files.
+            Some(std::fs::Permissions::from_mode(0o600))
+        }
+    };
+
     tokio::fs::write(&temporary_path, yaml_str.as_bytes())
         .await
         .with_context(|| format!("failed to stage file \"{}\"", temporary_path.display()))?;
-    tokio::fs::rename(&temporary_path, path)
-        .await
-        .with_context(|| format!("failed to save file \"{}\"", path.display()))?;
+
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        tokio::fs::set_permissions(&temporary_path, permissions)
+            .await
+            .with_context(|| format!("failed to set permissions on \"{}\"", temporary_path.display()))?;
+    }
+
+    replace_file(&temporary_path, path).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     Ok(())
+}
+
+/// Replace `to` with `from`. On Unix this is an atomic rename; on Windows the
+/// destination is removed first because `rename` cannot overwrite.
+async fn replace_file(from: &PathBuf, to: &PathBuf) -> Result<()> {
+    #[cfg(windows)]
+    if tokio::fs::try_exists(to).await.unwrap_or(false) {
+        tokio::fs::remove_file(to)
+            .await
+            .with_context(|| format!("failed to remove existing file \"{}\"", to.display()))?;
+    }
+    tokio::fs::rename(from, to)
+        .await
+        .with_context(|| format!("failed to save file \"{}\"", to.display()))
 }
 
 const ALPHABET: [char; 62] = [

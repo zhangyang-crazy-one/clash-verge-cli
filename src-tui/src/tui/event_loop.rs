@@ -1,10 +1,14 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use serde_yaml_ng::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 use tokio_stream::StreamExt as _;
+
+/// Serializes writes to the shared runtime `clash.yaml` staging/rename path.
+static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use crate::app::{
     Action, App, CoreState, Focus, InputMode, Overlay, ProxyDisplayRow, View, first_selectable_proxy_group,
@@ -206,6 +210,7 @@ async fn reload_remote_profile(
     api: &crate::mihomo_api::MihomoApi,
     item: &clash_verge_core::config::PrfItem,
     enable_tun: bool,
+    core_running: bool,
 ) -> Result<(), String> {
     let file = item
         .file
@@ -231,7 +236,7 @@ async fn reload_remote_profile(
     let config = crate::enhance::enforce_control_plane(profile, control_plane);
 
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let previous = if path.exists() {
+    let previous = if core_running && path.exists() {
         Some(
             tokio::fs::read(&path)
                 .await
@@ -242,6 +247,11 @@ async fn reload_remote_profile(
     };
 
     write_runtime_config(config, enable_tun).await?;
+    if !core_running {
+        // Keep the newly selected runtime config for the next Start; do not API-reload
+        // (or roll it back) while no controller is available.
+        return Ok(());
+    }
     if let Err(error) = reload_config_file(api, &path).await {
         if let Some(previous) = previous {
             let _ = tokio::fs::write(&path, previous).await;
@@ -288,13 +298,39 @@ async fn write_runtime_config(
     mut config: serde_yaml_ng::Mapping,
     enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let temporary_path = path.with_extension("yaml.tui-runtime.tmp");
+    let temporary_path = path.with_extension(format!("yaml.tui-runtime.{}.tmp", uuid::Uuid::new_v4()));
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            tokio::fs::metadata(&path).await.ok().map(|meta| meta.permissions())
+        } else {
+            Some(std::fs::Permissions::from_mode(0o600))
+        }
+    };
+
     tokio::fs::write(&temporary_path, yaml)
         .await
         .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
+
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        tokio::fs::set_permissions(&temporary_path, permissions)
+            .await
+            .map_err(|error| format!("failed to set permissions on {}: {error}", temporary_path.display()))?;
+    }
+
+    #[cfg(windows)]
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
     tokio::fs::rename(&temporary_path, &path)
         .await
         .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
@@ -669,6 +705,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         let tx = action_tx.clone();
                                                         let enable_tun =
                                                             app.gui_config.enable_tun_mode.unwrap_or(false);
+                                                        let core_running = app.core_state == CoreState::Running;
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
@@ -676,9 +713,18 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                     uid.as_str(),
                                                                 )
                                                                 .await;
-                                                                match reload_remote_profile(&api, &item, enable_tun).await {
+                                                                match reload_remote_profile(
+                                                                    &api,
+                                                                    &item,
+                                                                    enable_tun,
+                                                                    core_running,
+                                                                )
+                                                                .await
+                                                                {
                                                                     Ok(()) => {
-                                                                        let _ = tx.send(Action::ProxiesRefresh);
+                                                                        if core_running {
+                                                                            let _ = tx.send(Action::ProxiesRefresh);
+                                                                        }
                                                                     }
                                                                     Err(error) => {
                                                                         let _ = tx.send(Action::CoreError(format!(
@@ -710,10 +756,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         match write_runtime_config(config, enable_tun).await
                                                                         {
                                                                             Ok(path) => {
-                                                                                let _ =
-                                                                                    reload_config_file(&api, &path).await;
-                                                                                restore_selected_nodes(&api, &item).await;
-                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                                if core_running {
+                                                                                    let _ = reload_config_file(&api, &path)
+                                                                                        .await;
+                                                                                    restore_selected_nodes(&api, &item)
+                                                                                        .await;
+                                                                                    let _ = tx.send(Action::ProxiesRefresh);
+                                                                                }
                                                                             }
                                                                             Err(error) => {
                                                                                 let _ = tx.send(Action::CoreError(
@@ -1204,26 +1253,34 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             if !app.profiles.is_empty() {
                                 let last = app.profiles.len().saturating_sub(1);
                                 app.selected_index = last;
-                                // Auto-start mihomo if not running, then switch
-                                if app.core_state != CoreState::Running {
-                                    let m = manager.clone();
-                                    tokio::spawn(async move { let _ = m.start().await; });
-                                }
-                                // Reload the imported profile yaml into the running core.
+                                // Write runtime config for the imported profile, then start if needed.
                                 if let Some(item) = app.profiles.get(last).cloned() {
                                     let api = manager.api();
                                     let tx = action_tx.clone();
                                     let enable_tun =
                                         app.gui_config.enable_tun_mode.unwrap_or(false);
+                                    let core_running = app.core_state == CoreState::Running;
+                                    let should_start = !core_running;
+                                    let manager = manager.clone();
                                     tokio::spawn(async move {
-                                        if let Err(error) =
-                                            reload_remote_profile(&api, &item, enable_tun).await
+                                        if let Err(error) = reload_remote_profile(
+                                            &api,
+                                            &item,
+                                            enable_tun,
+                                            core_running,
+                                        )
+                                        .await
                                         {
                                             let _ = tx.send(Action::CoreError(format!(
                                                 "profile reload: {error}"
                                             )));
+                                            return;
                                         }
-                                        let _ = tx.send(Action::ProxiesRefresh);
+                                        if should_start {
+                                            let _ = manager.start().await;
+                                        } else {
+                                            let _ = tx.send(Action::ProxiesRefresh);
+                                        }
                                     });
                                 }
                             }
@@ -1450,11 +1507,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                             app.profiles = store.items();
                         }
-                        if is_current && app.core_state == CoreState::Running {
+                        if is_current {
                             let api = manager.api();
                             let tx = action_tx.clone();
                             let reload_uid = uid.clone();
                             let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
+                            let core_running = app.core_state == CoreState::Running;
                             tokio::spawn(async move {
                                 if let Ok(store) =
                                     crate::profile_store::store::ProfileStore::snapshot().await
@@ -1462,14 +1520,22 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         .items()
                                         .into_iter()
                                         .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
-                                    && let Err(error) =
-                                        reload_remote_profile(&api, &item, enable_tun).await
                                 {
-                                    let _ = tx.send(Action::CoreError(format!(
-                                        "profile reload: {error}"
-                                    )));
+                                    if let Err(error) = reload_remote_profile(
+                                        &api,
+                                        &item,
+                                        enable_tun,
+                                        core_running,
+                                    )
+                                    .await
+                                    {
+                                        let _ = tx.send(Action::CoreError(format!(
+                                            "profile reload: {error}"
+                                        )));
+                                    } else if core_running {
+                                        let _ = tx.send(Action::ProxiesRefresh);
+                                    }
                                 }
-                                let _ = tx.send(Action::ProxiesRefresh);
                             });
                         }
                     }
