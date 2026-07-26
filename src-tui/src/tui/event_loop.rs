@@ -229,8 +229,27 @@ async fn reload_remote_profile(
     let app_config = clash_verge_core::config::IClashTemp::new().await.0;
     let control_plane = crate::enhance::snapshot_control_plane(&app_config);
     let config = crate::enhance::enforce_control_plane(profile, control_plane);
-    let path = write_runtime_config(config, enable_tun).await?;
-    reload_config_file(api, &path).await?;
+
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    let previous = if path.exists() {
+        Some(
+            tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    write_runtime_config(config, enable_tun).await?;
+    if let Err(error) = reload_config_file(api, &path).await {
+        if let Some(previous) = previous {
+            let _ = tokio::fs::write(&path, previous).await;
+            let _ = reload_config_file(api, &path).await;
+            return Err(format!("{error}; restored the previous config"));
+        }
+        return Err(error);
+    }
     restore_selected_nodes(api, item).await;
     Ok(())
 }
@@ -290,13 +309,20 @@ fn next_clash_mode(current: &str) -> &'static str {
     }
 }
 
-async fn apply_clash_mode(api: &crate::mihomo_api::MihomoApi, mode: &str) -> Result<String, String> {
-    api.patch_mode(mode).await.map_err(|error| error.to_string())?;
+async fn apply_clash_mode(
+    api: &crate::mihomo_api::MihomoApi,
+    mode: &str,
+    core_running: bool,
+) -> Result<String, String> {
+    // Always persist so the next core start picks up the mode even if mihomo is down.
     let mut clash = clash_verge_core::config::IClashTemp::new().await;
     let mut patch = serde_yaml_ng::Mapping::new();
     patch.insert("mode".into(), mode.into());
     clash.patch_config(&patch);
     clash.save_config().await.map_err(|error| error.to_string())?;
+    if core_running {
+        api.patch_mode(mode).await.map_err(|error| error.to_string())?;
+    }
     Ok(mode.to_string())
 }
 
@@ -393,7 +419,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
 
     // Load profiles on start
-    if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+    if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
         app.selected_index = store.selected_index();
         app.profiles = store.items();
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
@@ -646,11 +672,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                if let Ok(mut store) =
-                                                                    crate::profile_store::store::ProfileStore::load().await
-                                                                {
-                                                                    let _ = store.set_current(uid.as_str()).await;
-                                                                }
+                                                                let _ = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                    uid.as_str(),
+                                                                )
+                                                                .await;
                                                                 match reload_remote_profile(&api, &item, enable_tun).await {
                                                                     Ok(()) => {
                                                                         let _ = tx.send(Action::ProxiesRefresh);
@@ -665,11 +690,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         } else {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                if let Ok(mut store) =
-                                                                    crate::profile_store::store::ProfileStore::load().await
-                                                                {
-                                                                    let _ = store.set_current(uid.as_str()).await;
-                                                                }
+                                                                let _ = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                    uid.as_str(),
+                                                                )
+                                                                .await;
                                                                 let profiles_dir =
                                                                     clash_verge_core::utils::dirs::app_profiles_dir()
                                                                         .unwrap_or_default();
@@ -895,8 +919,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             let next = next_clash_mode(&app.clash_mode);
                                                             let api = manager.api();
                                                             let tx = action_tx.clone();
+                                                            let core_running = app.core_state == CoreState::Running;
                                                             tokio::spawn(async move {
-                                                                match apply_clash_mode(&api, next).await {
+                                                                match apply_clash_mode(&api, next, core_running).await {
                                                                     Ok(mode) => {
                                                                         let _ = tx.send(Action::ModeChanged {
                                                                             mode,
@@ -1003,36 +1028,31 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 .map(|u| u.to_string());
                                             let tx = action_tx.clone();
                                             tokio::spawn(async move {
-                                                match crate::profile_store::store::ProfileStore::load().await {
-                                                    Ok(mut store) => {
-                                                        let result = if let Some(uid) = selected_uid {
-                                                            store
-                                                                .update_remote(&uid, None)
-                                                                .await
-                                                                .map(|is_current| (uid, is_current))
-                                                        } else {
-                                                            store.update_all_remote().await.map(|currents| {
-                                                                let uid = currents
-                                                                    .first()
-                                                                    .map(|u| u.to_string())
-                                                                    .unwrap_or_default();
-                                                                let is_current = !currents.is_empty();
-                                                                (uid, is_current)
-                                                            })
-                                                        };
-                                                        match result {
-                                                            Ok((uid, is_current)) => {
-                                                                let _ = tx.send(Action::ProfileUpdated {
-                                                                    uid,
-                                                                    is_current,
-                                                                });
-                                                            }
-                                                            Err(error) => {
-                                                                let _ = tx.send(Action::ProfileUpdateFailed(
-                                                                    error.to_string(),
-                                                                ));
-                                                            }
-                                                        }
+                                                let result = if let Some(uid) = selected_uid {
+                                                    crate::profile_store::store::ProfileStore::update_remote_locked(
+                                                        &uid, None,
+                                                    )
+                                                    .await
+                                                    .map(|is_current| (uid, is_current))
+                                                } else {
+                                                    crate::profile_store::store::ProfileStore::update_all_remote_locked(
+                                                    )
+                                                    .await
+                                                    .map(|currents| {
+                                                        let uid = currents
+                                                            .first()
+                                                            .map(|u| u.to_string())
+                                                            .unwrap_or_default();
+                                                        let is_current = !currents.is_empty();
+                                                        (uid, is_current)
+                                                    })
+                                                };
+                                                match result {
+                                                    Ok((uid, is_current)) => {
+                                                        let _ = tx.send(Action::ProfileUpdated {
+                                                            uid,
+                                                            is_current,
+                                                        });
                                                     }
                                                     Err(error) => {
                                                         let _ = tx.send(Action::ProfileUpdateFailed(
@@ -1178,7 +1198,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::ProfileImported) => {
                         app.status_msg = Some("Profile imported successfully".into());
-                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                             app.profiles = store.items();
                             // Auto-select last (newly imported) profile
                             if !app.profiles.is_empty() {
@@ -1406,15 +1426,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ConfirmImport(url)) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::load().await {
-                                Ok(mut store) => match store.import_url(&url, None).await {
-                                    Ok(_) => {
-                                        let _ = tx.send(Action::ProfileImported);
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
-                                    }
-                                },
+                            match crate::profile_store::store::ProfileStore::import_url_locked(&url, None)
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = tx.send(Action::ProfileImported);
+                                }
                                 Err(e) => {
                                     let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
                                 }
@@ -1430,7 +1447,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         } else {
                             format!("Updated profile {uid}")
                         });
-                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                             app.profiles = store.items();
                         }
                         if is_current && app.core_state == CoreState::Running {
@@ -1439,7 +1456,8 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             let reload_uid = uid.clone();
                             let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
                             tokio::spawn(async move {
-                                if let Ok(store) = crate::profile_store::store::ProfileStore::load().await
+                                if let Ok(store) =
+                                    crate::profile_store::store::ProfileStore::snapshot().await
                                     && let Some(item) = store
                                         .items()
                                         .into_iter()
@@ -1462,8 +1480,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         let next = next_clash_mode(&app.clash_mode);
                         let api = manager.api();
                         let tx = action_tx.clone();
+                        let core_running = app.core_state == CoreState::Running;
                         tokio::spawn(async move {
-                            match apply_clash_mode(&api, next).await {
+                            match apply_clash_mode(&api, next, core_running).await {
                                 Ok(mode) => {
                                     let _ = tx.send(Action::ModeChanged {
                                         mode,
@@ -1525,18 +1544,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 auto_update_in_flight = true;
                 let tx = action_tx.clone();
                 tokio::spawn(async move {
-                    match crate::profile_store::store::ProfileStore::load().await {
-                        Ok(mut store) => {
-                            for uid in due {
-                                match store.update_remote(&uid, None).await {
-                                    Ok(is_current) => {
-                                        let _ = tx.send(Action::ProfileUpdated { uid, is_current });
-                                    }
-                                    Err(error) => {
-                                        let _ =
-                                            tx.send(Action::ProfileUpdateFailed(error.to_string()));
-                                    }
-                                }
+                    match crate::profile_store::store::ProfileStore::update_remotes_locked(&due).await {
+                        Ok((updated, failed)) => {
+                            for (uid, is_current) in updated {
+                                let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                            }
+                            for (_uid, error) in failed {
+                                let _ = tx.send(Action::ProfileUpdateFailed(error));
                             }
                         }
                         Err(error) => {

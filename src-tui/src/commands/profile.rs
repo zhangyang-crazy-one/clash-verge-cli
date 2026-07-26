@@ -3,7 +3,7 @@
 use crate::profile_store::store::ProfileStore;
 
 pub async fn list() -> anyhow::Result<()> {
-    let store = ProfileStore::load().await?;
+    let store = ProfileStore::snapshot().await?;
     let current = store.current_uid();
     let items = store.items();
     if items.is_empty() {
@@ -24,8 +24,7 @@ pub async fn import(url: &str, name: Option<&str>) -> anyhow::Result<()> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("subscription URL must start with http:// or https://");
     }
-    let mut store = ProfileStore::load().await?;
-    let item = store.import_url(url, name).await?;
+    let item = ProfileStore::import_url_locked(url, name).await?;
     let uid = item.uid.as_deref().unwrap_or("?");
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     println!("imported {uid} ({name})");
@@ -33,9 +32,8 @@ pub async fn import(url: &str, name: Option<&str>) -> anyhow::Result<()> {
 }
 
 pub async fn update(uid: Option<&str>, all: bool) -> anyhow::Result<()> {
-    let mut store = ProfileStore::load().await?;
     if all {
-        let currents = store.update_all_remote().await?;
+        let currents = ProfileStore::update_all_remote_locked().await?;
         println!("updated all remote profiles");
         if let Some(uid) = currents.first() {
             println!("current profile refreshed: {uid}");
@@ -44,7 +42,7 @@ pub async fn update(uid: Option<&str>, all: bool) -> anyhow::Result<()> {
     }
 
     let uid = uid.ok_or_else(|| anyhow::anyhow!("provide a profile uid or pass --all"))?;
-    let is_current = store.update_remote(uid, None).await?;
+    let is_current = ProfileStore::update_remote_locked(uid, None).await?;
     println!("updated {uid}");
     if is_current {
         println!("profile is current — restart or switch to reload the core config");

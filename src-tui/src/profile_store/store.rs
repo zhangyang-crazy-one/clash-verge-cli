@@ -1,10 +1,16 @@
 // Profile store — thin wrapper around IProfiles for TUI/CLI use.
 
+use std::sync::LazyLock;
+
 use anyhow::Context;
 use clash_verge_core::config::{IProfiles, PrfItem, PrfOption};
 use smartstring::alias::String as SmartString;
+use tokio::sync::Mutex;
 
 use crate::subscribe::from_url::{self, RemoteProfileBundle};
+
+/// Serializes all profiles.yaml load-modify-save sequences across TUI/CLI tasks.
+static PROFILE_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// In-memory view of the profile list. Re-reads from disk on each load.
 pub struct ProfileStore {
@@ -12,7 +18,60 @@ pub struct ProfileStore {
 }
 
 impl ProfileStore {
-    pub async fn load() -> anyhow::Result<Self> {
+    /// Read-only snapshot under the shared IO lock (avoids torn reads during a save).
+    pub async fn snapshot() -> anyhow::Result<Self> {
+        let _guard = PROFILE_IO.lock().await;
+        Self::load_unlocked().await
+    }
+
+    /// Persist `current` under the shared IO lock.
+    pub async fn set_current_locked(uid: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        store.set_current(uid).await
+    }
+
+    /// Import a subscription URL under the shared IO lock.
+    pub async fn import_url_locked(url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        store.import_url(url, name).await
+    }
+
+    /// Update one remote profile under the shared IO lock.
+    pub async fn update_remote_locked(uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        store.update_remote(uid, option_override).await
+    }
+
+    /// Update every remote profile under the shared IO lock.
+    pub async fn update_all_remote_locked() -> anyhow::Result<Vec<SmartString>> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        store.update_all_remote().await
+    }
+
+    /// Update a batch of remote UIDs under one lock (auto-update).
+    /// Continues after per-UID failures so one bad subscription does not block the rest.
+    pub async fn update_remotes_locked(
+        uids: &[String],
+    ) -> anyhow::Result<(Vec<(String, bool)>, Vec<(String, String)>)> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let mut updated = Vec::new();
+        let mut failed = Vec::new();
+        for uid in uids {
+            match store.update_remote(uid, None).await {
+                Ok(is_current) => updated.push((uid.clone(), is_current)),
+                Err(error) => failed.push((uid.clone(), error.to_string())),
+            }
+        }
+        Ok((updated, failed))
+    }
+
+    /// Unlocked load — callers that mutate must use the `*_locked` helpers.
+    async fn load_unlocked() -> anyhow::Result<Self> {
         let profiles = IProfiles::new().await;
         Ok(Self { profiles })
     }

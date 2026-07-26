@@ -52,7 +52,13 @@ pub async fn save_yaml<T: Serialize + Sync>(path: &PathBuf, data: &T, prefix: Op
         None => data_str,
     };
 
-    tokio::fs::write(path, yaml_str.as_bytes())
+    // Atomic replace avoids torn reads when another task reads mid-write.
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.yaml");
+    let temporary_path = path.with_file_name(format!("{file_name}.tmp"));
+    tokio::fs::write(&temporary_path, yaml_str.as_bytes())
+        .await
+        .with_context(|| format!("failed to stage file \"{}\"", temporary_path.display()))?;
+    tokio::fs::rename(&temporary_path, path)
         .await
         .with_context(|| format!("failed to save file \"{}\"", path.display()))?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
