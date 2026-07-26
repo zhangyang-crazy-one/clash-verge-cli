@@ -11,6 +11,7 @@ use smartstring::alias::String as SmartString;
 use url::Url;
 
 use super::fetch;
+use super::proxy_uri;
 
 /// Outcome of building a remote profile: the remote item plus any new
 /// enhance-chain fragments that must be appended before it.
@@ -59,8 +60,8 @@ pub async fn from_url(
         .map(SmartString::from)
         .unwrap_or_else(|| SmartString::from(filename.as_str()));
 
-    let data = result.body.trim_start_matches('\u{feff}');
-    validate_clash_yaml(data)?;
+    let raw_data = result.body.trim_start_matches('\u{feff}');
+    let data = resolve_subscription_body(raw_data)?;
 
     let mut fragments = Vec::new();
     ensure_chain_uid("merge", &mut merge, || PrfItem::from_merge(None), &mut fragments)?;
@@ -150,12 +151,56 @@ pub async fn update_with_fallback(url: &str, option: Option<&PrfOption>) -> anyh
 }
 
 /// Validate that body is Clash YAML containing proxies or proxy-providers.
+#[allow(dead_code)]
 pub fn validate_clash_yaml(data: &str) -> anyhow::Result<Mapping> {
     let yaml = serde_yaml_ng::from_str::<Mapping>(data).context("the remote profile data is invalid yaml")?;
     if !yaml.contains_key("proxies") && !yaml.contains_key("proxy-providers") {
         bail!("profile does not contain `proxies` or `proxy-providers`");
     }
     Ok(yaml)
+}
+
+/// Three-tier subscription body resolution:
+///
+/// 1. Direct Clash YAML (existing behaviour).
+/// 2. Base64-decode → Clash YAML (legacy subscription format).
+/// 3. Base64-decode → proxy URI list detection → generated Clash YAML,
+///    or raw text → proxy URI list (plaintext proxy URIs, no base64).
+///
+/// Returns a valid Clash YAML string on success.
+fn resolve_subscription_body(data: &str) -> anyhow::Result<String> {
+    // Tier 1: direct YAML
+    if is_valid_clash_yaml(data) {
+        return Ok(data.to_owned());
+    }
+
+    // Tier 2: base64-decode → YAML
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data.trim()).unwrap_or_default();
+    if let Ok(utf8) = String::from_utf8(decoded) {
+        if is_valid_clash_yaml(&utf8) {
+            return Ok(utf8);
+        }
+
+        // Tier 3: base64-decoded body is a proxy URI list
+        if proxy_uri::detect_proxy_uri_list(&utf8) {
+            let mapping = proxy_uri::parse_proxy_uri_list(&utf8)?;
+            return serde_yaml_ng::to_string(&mapping).context("failed to serialise generated proxy config");
+        }
+    }
+
+    // Tier 3b: raw body is a proxy URI list (no base64 wrapper)
+    if proxy_uri::detect_proxy_uri_list(data) {
+        let mapping = proxy_uri::parse_proxy_uri_list(data)?;
+        return serde_yaml_ng::to_string(&mapping).context("failed to serialise generated proxy config");
+    }
+
+    bail!("subscription returned unrecognized content (not YAML, base64-encoded YAML, or proxy URI list)")
+}
+
+fn is_valid_clash_yaml(data: &str) -> bool {
+    serde_yaml_ng::from_str::<Mapping>(data)
+        .map(|yaml| yaml.contains_key("proxies") || yaml.contains_key("proxy-providers"))
+        .unwrap_or(false)
 }
 
 pub fn parse_subscription_userinfo(headers: &HashMap<String, String>) -> Option<PrfExtra> {
