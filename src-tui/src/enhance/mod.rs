@@ -73,9 +73,7 @@ fn is_ipv4_shorthand_loopback(addr: &str) -> bool {
     match parts.as_slice() {
         [first, rest] => *first == 127 && *rest <= 0x00ff_ffff,
         [first, second, rest] => *first == 127 && *second <= 0xff && *rest <= 0xffff,
-        [first, second, third, fourth] => {
-            *first == 127 && *second <= 0xff && *third <= 0xff && *fourth <= 0xff
-        }
+        [first, second, third, fourth] => *first == 127 && *second <= 0xff && *third <= 0xff && *fourth <= 0xff,
         _ => false,
     }
 }
@@ -209,23 +207,15 @@ mod tests {
     #[test]
     fn lan_bind_address_preserves_custom_or_disabled() {
         let custom = ensure_lan_bind_address(mapping(r#"{allow-lan: true, bind-address: "192.168.1.2"}"#));
-        assert_eq!(
-            custom.get("bind-address").and_then(Value::as_str),
-            Some("192.168.1.2")
-        );
+        assert_eq!(custom.get("bind-address").and_then(Value::as_str), Some("192.168.1.2"));
 
         let disabled = ensure_lan_bind_address(mapping(r#"{allow-lan: false, bind-address: "127.0.0.1"}"#));
-        assert_eq!(
-            disabled.get("bind-address").and_then(Value::as_str),
-            Some("127.0.0.1")
-        );
+        assert_eq!(disabled.get("bind-address").and_then(Value::as_str), Some("127.0.0.1"));
     }
 
     #[test]
     fn control_plane_survives_manual_overrides() {
-        let app = mapping(
-            r#"{mixed-port: 7897, secret: "s", tun: {enable: true}, mode: rule, allow-lan: false}"#,
-        );
+        let app = mapping(r#"{mixed-port: 7897, secret: "s", tun: {enable: true}, mode: rule, allow-lan: false}"#);
         let snapshot = snapshot_control_plane(&app);
         let mut hijacked = app;
         hijacked.insert(Value::from("mixed-port"), Value::from(1));

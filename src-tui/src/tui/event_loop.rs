@@ -265,7 +265,10 @@ async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash
     }
 }
 
-async fn write_runtime_config(mut config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<std::path::PathBuf, String> {
+async fn write_runtime_config(
+    mut config: serde_yaml_ng::Mapping,
+    enable_tun: bool,
+) -> Result<std::path::PathBuf, String> {
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
@@ -287,19 +290,13 @@ fn next_clash_mode(current: &str) -> &'static str {
     }
 }
 
-async fn apply_clash_mode(
-    api: &crate::mihomo_api::MihomoApi,
-    mode: &str,
-) -> Result<String, String> {
+async fn apply_clash_mode(api: &crate::mihomo_api::MihomoApi, mode: &str) -> Result<String, String> {
     api.patch_mode(mode).await.map_err(|error| error.to_string())?;
     let mut clash = clash_verge_core::config::IClashTemp::new().await;
     let mut patch = serde_yaml_ng::Mapping::new();
     patch.insert("mode".into(), mode.into());
     clash.patch_config(&patch);
-    clash
-        .save_config()
-        .await
-        .map_err(|error| error.to_string())?;
+    clash.save_config().await.map_err(|error| error.to_string())?;
     Ok(mode.to_string())
 }
 
@@ -393,10 +390,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.gui_config = clash_verge_core::config::IVerge::new().await;
     app.language = Language::from_config(app.gui_config.language.as_deref());
     app.core_config = clash_verge_core::config::IClashTemp::new().await;
-    app.clash_mode = app
-        .core_config
-        .get_mode()
-        .unwrap_or_else(|| "rule".into());
+    app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
 
     // Load profiles on start
     if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {

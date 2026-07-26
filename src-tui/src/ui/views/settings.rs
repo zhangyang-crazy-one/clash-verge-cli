@@ -14,7 +14,9 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Length(8), Constraint::Min(6)])
         .split(area);
     let mode = if app.clash_mode.is_empty() {
-        app.core_config.get_mode().unwrap_or_else(|| app.tr("common.unknown").into())
+        app.core_config
+            .get_mode()
+            .unwrap_or_else(|| app.tr("common.unknown").into())
     } else {
         app.clash_mode.clone()
     };
@@ -48,11 +50,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app,
             0,
             cursor,
-            format!(
-                "{}: {}",
-                app.tr("settings.language"),
-                app.language.display_name()
-            ),
+            format!("{}: {}", app.tr("settings.language"), app.language.display_name()),
         ),
         settings_row(
             app,
@@ -68,17 +66,9 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app,
             2,
             cursor,
-            format!(
-                "TUN: {}",
-                enabled(app, app.gui_config.enable_tun_mode)
-            ),
+            format!("TUN: {}", enabled(app, app.gui_config.enable_tun_mode)),
         ),
-        settings_row(
-            app,
-            3,
-            cursor,
-            format!("{}: {mode}", app.tr("settings.mihomo_mode")),
-        ),
+        settings_row(app, 3, cursor, format!("{}: {mode}", app.tr("settings.mihomo_mode"))),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),

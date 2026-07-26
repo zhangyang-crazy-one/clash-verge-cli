@@ -117,8 +117,7 @@ fn prepare_request_url(url: &str) -> anyhow::Result<(Url, HeaderMap)> {
             .decode_utf8_lossy()
             .into_owned();
         let encoded = general_purpose::STANDARD.encode(format!("{username}:{password}"));
-        let value = HeaderValue::from_str(&format!("Basic {encoded}"))
-            .context("invalid Basic Auth header value")?;
+        let value = HeaderValue::from_str(&format!("Basic {encoded}")).context("invalid Basic Auth header value")?;
         headers.insert(AUTHORIZATION, value);
     }
 
@@ -131,9 +130,7 @@ fn context_fetch_error(err: reqwest::Error, url: &str) -> anyhow::Error {
     let legacy_tls = is_legacy_tls_protocol_error(&err);
     let err = anyhow::Error::new(err).context(format!("failed to fetch URL: {url}"));
     if legacy_tls {
-        err.context(
-            "Subscription server uses legacy TLS; only TLS 1.2/1.3 is supported. TLS 1.0/1.1 is insecure",
-        )
+        err.context("Subscription server uses legacy TLS; only TLS 1.2/1.3 is supported. TLS 1.0/1.1 is insecure")
     } else {
         err
     }

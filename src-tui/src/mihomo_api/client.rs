@@ -174,8 +174,7 @@ impl MihomoApi {
         }
 
         // Tolerant: accept non-standard payloads as long as `mode` is present.
-        let value: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))?;
         value
             .get("mode")
             .and_then(|m| m.as_str())
