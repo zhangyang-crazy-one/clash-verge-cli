@@ -224,14 +224,11 @@ async fn reload_remote_profile(
     let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
 
-    // Keep app-owned control-plane keys from the current clash config, then overlay
-    // the subscription body and re-apply TUN / LAN / fake-ip-range6 guards.
-    let mut config = clash_verge_core::config::IClashTemp::new().await.0;
-    let control_plane = crate::enhance::snapshot_control_plane(&config);
-    for (key, value) in profile {
-        config.insert(key, value);
-    }
-    config = crate::enhance::enforce_control_plane(config, control_plane);
+    // Rebuild from the subscription body so omitted top-level keys (proxies, rules, …)
+    // from a previous profile do not linger. Only app-owned control-plane keys are kept.
+    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    let control_plane = crate::enhance::snapshot_control_plane(&app_config);
+    let config = crate::enhance::enforce_control_plane(profile, control_plane);
     let path = write_runtime_config(config, enable_tun).await?;
     reload_config_file(api, &path).await?;
     restore_selected_nodes(api, item).await;
@@ -853,7 +850,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                             "{}: {error}",
                                                                             app.tr("settings.save_failed")
                                                                         ));
-                                                                    } else {
+                                                                    } else if app.core_state == CoreState::Running {
                                                                         app.status_msg = Some(
                                                                             if enabled {
                                                                                 app.tr("settings.tun_on")
@@ -880,6 +877,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                                 let _ = tx.send(Action::ProxiesRefresh);
                                                                             }
                                                                         });
+                                                                    } else {
+                                                                        // Core is stopped: persist only; apply on next start.
+                                                                        app.status_msg = Some(
+                                                                            if enabled {
+                                                                                app.tr("settings.tun_saved_on")
+                                                                            } else {
+                                                                                app.tr("settings.tun_saved_off")
+                                                                            }
+                                                                            .into(),
+                                                                        );
                                                                     }
                                                                 }
                                                                 Err(error) => {

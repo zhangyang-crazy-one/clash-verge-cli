@@ -246,6 +246,35 @@ mod tests {
     }
 
     #[test]
+    fn profile_reload_drops_stale_non_control_plane_keys() {
+        // Simulate rebuild: start from a providers-only profile, keep only control plane
+        // from a previous proxies-based runtime.
+        let previous_runtime = mapping(
+            r#"{
+mixed-port: 7897,
+secret: "s",
+mode: rule,
+proxies: [{name: old, type: ss}],
+proxy-groups: [{name: PROXY, type: select, proxies: [old]}],
+rules: [MATCH,PROXY]
+}"#,
+        );
+        let new_profile = mapping(
+            r#"{
+proxy-providers: {sub: {type: http, url: https://example.com/p.yaml}},
+proxy-groups: [{name: PROXY, type: select, use: [sub]}],
+rules: [MATCH,PROXY]
+}"#,
+        );
+        let snapshot = snapshot_control_plane(&previous_runtime);
+        let result = enforce_control_plane(new_profile, snapshot);
+        assert!(result.get("proxies").is_none(), "stale proxies must not linger");
+        assert!(result.get("proxy-providers").is_some());
+        assert_eq!(result.get("mixed-port").and_then(Value::as_u64), Some(7897));
+        assert_eq!(result.get("secret").and_then(Value::as_str), Some("s"));
+    }
+
+    #[test]
     fn fake_ip_range6_added_when_needed() {
         let mut dns = mapping(r#"{ipv6: true, enhanced-mode: fake-ip}"#);
         ensure_fake_ip_range6(&mut dns);
