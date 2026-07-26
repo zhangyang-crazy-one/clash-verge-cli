@@ -32,6 +32,49 @@ pub async fn graceful_stop(child_pid: u32, child: &mut tokio::process::Child) ->
     }
 }
 
+/// Graceful shutdown when we only have the PID (the Child handle was moved
+/// to the watcher). Signals the process directly and polls liveness via
+/// kill(pid, None) until the process exits or the timeout expires, then
+/// falls back to SIGKILL.
+pub async fn graceful_stop_by_pid(pid: u32) -> anyhow::Result<()> {
+    let nix_pid = Pid::from_raw(pid as i32);
+    kill(nix_pid, Signal::SIGTERM)?;
+
+    let start = std::time::Instant::now();
+    loop {
+        // kill(pid, None) is a no-signal check — ESRCH means the process is gone.
+        match kill(nix_pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::anyhow!("error checking pid {pid} after SIGTERM: {e}"));
+            }
+            Ok(_) => {}
+        }
+        if start.elapsed() >= GRACEFUL_TIMEOUT {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    tracing::warn!("mihomo (pid {pid}) did not exit in 5s, sending SIGKILL");
+    kill(nix_pid, Signal::SIGKILL)?;
+
+    // Poll until reaped.
+    for _ in 0..50 {
+        match kill(nix_pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "error checking pid {pid} after SIGKILL: {e}"
+                ));
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+
+    anyhow::bail!("failed to kill mihomo pid {pid} after SIGKILL");
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {

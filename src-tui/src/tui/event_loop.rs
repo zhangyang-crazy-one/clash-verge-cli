@@ -342,6 +342,18 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         // If no controller is available, the user can press s to start one.
     });
 
+    // Catch Ctrl-C — send Quit through the channel so stop() runs on the
+    // normal exit path and TerminalGuard::drop restores the terminal.
+    let manager_for_signal = manager.clone();
+    let quit_tx = action_tx.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("SIGINT received, stopping mihomo");
+        let _ = manager_for_signal.stop().await;
+        let _ = quit_tx.send(Action::Quit);
+    });
+
+    let mut should_quit = false;
     loop {
         tokio::select! {
             maybe_event = events.next() => {
@@ -414,7 +426,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     }
                                 } else if let Some(action) = input::map_key(key, key_context(&app)) {
                                     match action {
-                                        Action::Quit => break,
+                                        Action::Quit => {
+                                            should_quit = true;
+                                            break;
+                                        }
                                         Action::StartCore => {
                                             app.core_state = CoreState::Starting;
                                             app.status_msg = Some(app.tr("home.starting_core").into());
@@ -1201,6 +1216,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // Clean shutdown: stop mihomo on the normal exit path so the spawned
+    // future isn't cancelled by the select loop dropping.
+    if should_quit {
+        let _ = manager.stop().await;
     }
 
     Ok(())

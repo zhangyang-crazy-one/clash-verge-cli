@@ -255,6 +255,10 @@ impl MihomoManager {
             (Some(pid), Some(child)) => {
                 signal::graceful_stop(pid, child).await?;
             }
+            (Some(pid), None) => {
+                // Child handle was moved to the watcher — kill by PID directly.
+                signal::graceful_stop_by_pid(pid).await?;
+            }
             _ => { /* already stopped — idempotent */ }
         }
 
