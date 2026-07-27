@@ -31,6 +31,21 @@ impl ProfileStore {
         store.set_current(uid).await
     }
 
+    /// Restore `previous` only when `current` is still `expected` (failed switch owned it).
+    ///
+    /// Prevents a late-failing concurrent switch from overwriting a successful one.
+    pub async fn restore_current_if_matches(expected: &str, previous: Option<&str>) -> anyhow::Result<()> {
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        if store.current_uid().as_deref() != Some(expected) {
+            return Ok(());
+        }
+        store.set_current(previous).await
+    }
+
     /// Import a subscription URL under the shared IO lock.
     pub async fn import_url_locked(url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
         let _guard = PROFILE_IO.lock().await;

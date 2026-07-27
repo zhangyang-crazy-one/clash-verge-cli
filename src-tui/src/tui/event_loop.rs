@@ -241,21 +241,29 @@ async fn reload_remote_profile(
 
 /// Write TUN-enabled runtime config and apply it under one IO lock.
 ///
-/// Owned cores restart (stop-by-pid now works when the Child sits in the watcher);
-/// attached cores API-reload the written file.
+/// Re-reads `clash.yaml` inside the lock so a concurrent profile/mode commit is not
+/// overwritten by a stale pre-spawn snapshot. Owned cores restart (stop-by-pid works
+/// when the Child sits in the watcher); attached cores API-reload the written file.
 async fn apply_tun_runtime(
     manager: &crate::mihomo_manager::manager::MihomoManager,
     owns_core: bool,
-    config: serde_yaml_ng::Mapping,
     enable_tun: bool,
 ) -> Result<(), String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
     let path = write_runtime_config_unlocked(config, enable_tun).await?;
     if owns_core {
         manager.restart().await.map(|_| ()).map_err(|error| error.to_string())
     } else {
         reload_config_file(&manager.api(), &path).await
     }
+}
+
+/// Persist TUN flag into a freshly loaded runtime config (core stopped path).
+async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
+    write_runtime_config_unlocked(config, enable_tun).await
 }
 
 async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash_verge_core::config::PrfItem) {
@@ -378,16 +386,26 @@ async fn apply_clash_mode(
 ) -> Result<String, String> {
     // Serialize with runtime commits so a stale IClashTemp snapshot cannot
     // overwrite a concurrent profile/TUN write to clash.yaml.
-    {
+    let previous_mode = {
         let _guard = RUNTIME_CONFIG_IO.lock().await;
         let mut clash = clash_verge_core::config::IClashTemp::new().await;
+        let previous = clash.get_mode().unwrap_or_else(|| "rule".into());
         let mut patch = serde_yaml_ng::Mapping::new();
         patch.insert("mode".into(), mode.into());
         clash.patch_config(&patch);
         clash.save_config().await.map_err(|error| error.to_string())?;
-    }
-    if core_running {
-        api.patch_mode(mode).await.map_err(|error| error.to_string())?;
+        previous
+    };
+    if core_running && let Err(error) = api.patch_mode(mode).await {
+        // Keep disk aligned with the failed API update so the next Start does
+        // not silently adopt a mode the UI reported as failed.
+        let _guard = RUNTIME_CONFIG_IO.lock().await;
+        let mut clash = clash_verge_core::config::IClashTemp::new().await;
+        let mut patch = serde_yaml_ng::Mapping::new();
+        patch.insert("mode".into(), previous_mode.into());
+        clash.patch_config(&patch);
+        let _ = clash.save_config().await;
+        return Err(error.to_string());
     }
     Ok(mode.to_string())
 }
@@ -766,12 +784,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         }
                                                                     }
                                                                     Err(error) => {
-                                                                        if let Some(previous) = previous_uid.as_deref() {
-                                                                            let _ = crate::profile_store::store::ProfileStore::set_current_locked(
-                                                                                previous,
-                                                                            )
-                                                                            .await;
-                                                                        }
+                                                                        let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                            uid.as_str(),
+                                                                            previous_uid.as_deref(),
+                                                                        )
+                                                                        .await;
                                                                         let _ = tx.send(Action::CoreError(format!(
                                                                             "profile reload: {error}"
                                                                         )));
@@ -826,14 +843,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                                 }
                                                                             }
                                                                             Err(error) => {
-                                                                                if let Some(previous) =
-                                                                                    previous_uid.as_deref()
-                                                                                {
-                                                                                    let _ = crate::profile_store::store::ProfileStore::set_current_locked(
-                                                                                        previous,
-                                                                                    )
-                                                                                    .await;
-                                                                                }
+                                                                                let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                                    uid.as_str(),
+                                                                                    previous_uid.as_deref(),
+                                                                                )
+                                                                                .await;
                                                                                 let _ = tx.send(Action::CoreError(
                                                                                     format!("config write: {error}"),
                                                                                 ));
@@ -841,12 +855,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         }
                                                                     }
                                                                     Err(e) => {
-                                                                        if let Some(previous) = previous_uid.as_deref() {
-                                                                            let _ = crate::profile_store::store::ProfileStore::set_current_locked(
-                                                                                previous,
-                                                                            )
-                                                                            .await;
-                                                                        }
+                                                                        let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                            uid.as_str(),
+                                                                            previous_uid.as_deref(),
+                                                                        )
+                                                                        .await;
                                                                         let _ = tx
                                                                             .send(Action::CoreError(format!("chain: {e}")));
                                                                     }
@@ -992,10 +1005,6 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             match updated.save_file().await {
                                                                 Ok(()) => {
                                                                     app.gui_config = updated;
-                                                                    let config =
-                                                                        clash_verge_core::config::IClashTemp::new()
-                                                                            .await
-                                                                            .0;
                                                                     if app.core_state == CoreState::Running {
                                                                         app.status_msg = Some(
                                                                             if enabled {
@@ -1012,10 +1021,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         let m = manager.clone();
                                                                         let tx = action_tx.clone();
                                                                         tokio::spawn(async move {
-                                                                            if let Err(error) = apply_tun_runtime(
-                                                                                &m, owns_core, config, enabled,
-                                                                            )
-                                                                            .await
+                                                                            if let Err(error) =
+                                                                                apply_tun_runtime(&m, owns_core, enabled)
+                                                                                    .await
                                                                             {
                                                                                 let _ = tx.send(Action::CoreError(
                                                                                     error,
@@ -1025,7 +1033,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                             }
                                                                         });
                                                                     } else if let Err(error) =
-                                                                        write_runtime_config(config, enabled).await
+                                                                        write_tun_runtime(enabled).await
                                                                     {
                                                                         app.status_msg = Some(format!(
                                                                             "{}: {error}",
