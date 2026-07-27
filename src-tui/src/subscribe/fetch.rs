@@ -40,10 +40,10 @@ pub async fn fetch_subscription(
 
     let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
     let accept_invalid = option.and_then(|o| o.danger_accept_invalid_certs).unwrap_or(false);
-    let user_agent = option
-        .and_then(|o| o.user_agent.as_ref())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")));
+    let user_agent = match option.and_then(|o| o.user_agent.as_ref()) {
+        Some(custom) if !custom.trim().is_empty() => custom.to_string(),
+        _ => super::client_meta::default_subscription_user_agent().await,
+    };
 
     let mode = proxy_mode_from_option(option);
     let mut builder = reqwest::Client::builder()
