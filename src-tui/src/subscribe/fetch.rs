@@ -1,10 +1,13 @@
-// Async reqwest fetch for subscription URLs with cookies, gzip, and SSRF protection.
+//! Async reqwest fetch for subscription URLs with cookies, gzip, and SSRF protection.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose};
 use clash_verge_core::config::{IClashTemp, PrfOption};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use url::Url;
 
 use super::ssrf;
 
@@ -69,12 +72,14 @@ pub async fn fetch_subscription(
     }
 
     let client = builder.build().context("failed to build reqwest client")?;
+    let (request_url, auth_headers) = prepare_request_url(url)?;
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch URL: {url}"))?
+    let response = match client.get(request_url).headers(auth_headers).send().await {
+        Ok(resp) => resp,
+        Err(err) => return Err(context_fetch_error(err, url)),
+    };
+
+    let response = response
         .error_for_status()
         .with_context(|| format!("subscription request failed: {url}"))?;
 
@@ -93,6 +98,47 @@ pub async fn fetch_subscription(
         headers,
         final_url,
     })
+}
+
+/// Strip URL userinfo into an Authorization header.
+///
+/// Empty passwords still produce `Basic user:` (upstream NetworkManager behavior).
+/// Password-only userinfo (`:secret@host`) produces `Basic :secret`.
+fn prepare_request_url(url: &str) -> anyhow::Result<(Url, HeaderMap)> {
+    let mut parsed = Url::parse(url).with_context(|| format!("invalid subscription URL: {url}"))?;
+    let mut headers = HeaderMap::new();
+
+    let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+    if has_userinfo {
+        let username = percent_encoding::percent_decode_str(parsed.username())
+            .decode_utf8_lossy()
+            .into_owned();
+        let password = percent_encoding::percent_decode_str(parsed.password().unwrap_or_default())
+            .decode_utf8_lossy()
+            .into_owned();
+        let encoded = general_purpose::STANDARD.encode(format!("{username}:{password}"));
+        let value = HeaderValue::from_str(&format!("Basic {encoded}")).context("invalid Basic Auth header value")?;
+        headers.insert(AUTHORIZATION, value);
+    }
+
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    Ok((parsed, headers))
+}
+
+fn context_fetch_error(err: reqwest::Error, url: &str) -> anyhow::Error {
+    let legacy_tls = is_legacy_tls_protocol_error(&err);
+    let err = anyhow::Error::new(err).context(format!("failed to fetch URL: {url}"));
+    if legacy_tls {
+        err.context("Subscription server uses legacy TLS; only TLS 1.2/1.3 is supported. TLS 1.0/1.1 is insecure")
+    } else {
+        err
+    }
+}
+
+fn is_legacy_tls_protocol_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let detail = format!("{err:#?}").to_ascii_lowercase();
+    detail.contains("protocolversion") || detail.contains("protocol version")
 }
 
 pub fn proxy_mode_from_option(option: Option<&PrfOption>) -> ProxyMode {
@@ -134,5 +180,32 @@ mod tests {
     #[test]
     fn proxy_mode_defaults_to_direct() {
         assert_eq!(proxy_mode_from_option(None), ProxyMode::None);
+    }
+
+    #[test]
+    fn empty_password_still_emits_basic_auth() {
+        let (url, headers) = prepare_request_url("https://user:@example.com/sub.yaml").expect("url");
+        assert!(url.username().is_empty());
+        assert!(url.password().is_none());
+        let auth = headers.get(AUTHORIZATION).expect("auth").to_str().expect("str");
+        let expected = general_purpose::STANDARD.encode("user:");
+        assert_eq!(auth, format!("Basic {expected}"));
+    }
+
+    #[test]
+    fn password_only_userinfo_emits_basic_auth() {
+        let (url, headers) = prepare_request_url("https://:secret@example.com/sub.yaml").expect("url");
+        assert!(url.username().is_empty());
+        assert!(url.password().is_none());
+        let auth = headers.get(AUTHORIZATION).expect("auth").to_str().expect("str");
+        let expected = general_purpose::STANDARD.encode(":secret");
+        assert_eq!(auth, format!("Basic {expected}"));
+    }
+
+    #[test]
+    fn no_userinfo_skips_authorization() {
+        let (url, headers) = prepare_request_url("https://example.com/sub.yaml").expect("url");
+        assert_eq!(url.as_str(), "https://example.com/sub.yaml");
+        assert!(!headers.contains_key(AUTHORIZATION));
     }
 }

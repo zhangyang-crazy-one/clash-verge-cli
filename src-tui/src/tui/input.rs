@@ -65,6 +65,9 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         }
         KeyCode::Char('s') if context.view == View::Home => Some(Action::StartCore),
         KeyCode::Char('r') if context.view == View::Home => Some(Action::RestartCore),
+        KeyCode::Char('m') if context.view == View::Home || context.view == View::Settings => {
+            Some(Action::CycleClashMode)
+        }
         KeyCode::Esc => Some(Action::DismissOverlay),
 
         // View navigation

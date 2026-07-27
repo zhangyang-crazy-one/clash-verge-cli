@@ -1,26 +1,42 @@
-// System proxy management: set/unset http_proxy/https_proxy env vars
-// and GNOME/KDE desktop environment proxy settings.
+//! System proxy management for desktop environments (GNOME/KDE).
+//!
+//! Intentionally does **not** mutate process environment variables: calling
+//! `std::env::set_var` from a multithreaded Tokio runtime is unsound when other
+//! tasks (e.g. reqwest) may read the environment concurrently.
 
 use std::process::Command;
 
-/// Toggle system proxy on. Sets environment variables + DE settings.
-pub fn set_system_proxy(host: &str, port: u16) -> std::io::Result<()> {
-    let proxy_url = format!("http://{host}:{port}");
+fn run(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
 
-    // GNOME gsettings
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy", "mode", "manual"])
-        .output();
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.http", "host", host])
-        .output();
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy.http", "port", &port.to_string()])
-        .output();
+fn apply_gnome(host: &str, port: u16) -> bool {
+    let port = port.to_string();
+    run("gsettings", &["set", "org.gnome.system.proxy", "mode", "manual"])
+        && run("gsettings", &["set", "org.gnome.system.proxy.http", "host", host])
+        && run(
+            "gsettings",
+            &["set", "org.gnome.system.proxy.http", "port", port.as_str()],
+        )
+        && run("gsettings", &["set", "org.gnome.system.proxy.https", "host", host])
+        && run(
+            "gsettings",
+            &["set", "org.gnome.system.proxy.https", "port", port.as_str()],
+        )
+}
 
-    // KDE
-    let _ = Command::new("kwriteconfig5")
-        .args([
+fn clear_gnome() -> bool {
+    run("gsettings", &["set", "org.gnome.system.proxy", "mode", "none"])
+}
+
+fn apply_kde(proxy_url: &str) -> bool {
+    run(
+        "kwriteconfig5",
+        &[
             "--file",
             "kioslaverc",
             "--group",
@@ -28,43 +44,36 @@ pub fn set_system_proxy(host: &str, port: u16) -> std::io::Result<()> {
             "--key",
             "ProxyType",
             "1",
-        ])
-        .output();
-    let _ = Command::new("kwriteconfig5")
-        .args([
+        ],
+    ) && run(
+        "kwriteconfig5",
+        &[
             "--file",
             "kioslaverc",
             "--group",
             "Proxy Settings",
             "--key",
             "httpProxy",
-            &proxy_url,
-        ])
-        .output();
-
-    // Set env vars for current process tree
-    unsafe {
-        std::env::set_var("http_proxy", &proxy_url);
-        std::env::set_var("https_proxy", &proxy_url);
-        std::env::set_var("all_proxy", &proxy_url);
-        std::env::set_var("HTTP_PROXY", &proxy_url);
-        std::env::set_var("HTTPS_PROXY", &proxy_url);
-        std::env::set_var("ALL_PROXY", &proxy_url);
-    }
-
-    Ok(())
+            proxy_url,
+        ],
+    ) && run(
+        "kwriteconfig5",
+        &[
+            "--file",
+            "kioslaverc",
+            "--group",
+            "Proxy Settings",
+            "--key",
+            "httpsProxy",
+            proxy_url,
+        ],
+    )
 }
 
-/// Toggle system proxy off. Unsets all proxy settings.
-pub fn unset_system_proxy() -> std::io::Result<()> {
-    // GNOME
-    let _ = Command::new("gsettings")
-        .args(["set", "org.gnome.system.proxy", "mode", "none"])
-        .output();
-
-    // KDE
-    let _ = Command::new("kwriteconfig5")
-        .args([
+fn clear_kde() -> bool {
+    run(
+        "kwriteconfig5",
+        &[
             "--file",
             "kioslaverc",
             "--group",
@@ -72,18 +81,27 @@ pub fn unset_system_proxy() -> std::io::Result<()> {
             "--key",
             "ProxyType",
             "0",
-        ])
-        .output();
+        ],
+    )
+}
 
-    // Unset env vars
-    unsafe {
-        std::env::remove_var("http_proxy");
-        std::env::remove_var("https_proxy");
-        std::env::remove_var("all_proxy");
-        std::env::remove_var("HTTP_PROXY");
-        std::env::remove_var("HTTPS_PROXY");
-        std::env::remove_var("ALL_PROXY");
+/// Toggle system proxy on via desktop environment settings.
+pub fn set_system_proxy(host: &str, port: u16) -> anyhow::Result<()> {
+    let proxy_url = format!("http://{host}:{port}");
+    let gnome_ok = apply_gnome(host, port);
+    let kde_ok = apply_kde(&proxy_url);
+    if gnome_ok || kde_ok {
+        return Ok(());
     }
+    anyhow::bail!("no desktop proxy backend available (tried gsettings and kwriteconfig5)");
+}
 
-    Ok(())
+/// Toggle system proxy off via desktop environment settings.
+pub fn unset_system_proxy() -> anyhow::Result<()> {
+    let gnome_ok = clear_gnome();
+    let kde_ok = clear_kde();
+    if gnome_ok || kde_ok {
+        return Ok(());
+    }
+    anyhow::bail!("no desktop proxy backend available (tried gsettings and kwriteconfig5)");
 }

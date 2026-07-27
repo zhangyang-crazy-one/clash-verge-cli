@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 use smartstring::alias::String;
 use std::collections::HashSet;
+use std::path::{Component, Path};
 use std::sync::OnceLock;
 use tokio::fs;
 
@@ -125,6 +126,10 @@ impl IProfiles {
             bail!("the uid should not be null");
         }
 
+        if let Some(file) = &item.file {
+            Self::validate_profile_file(file)?;
+        }
+
         // save the file data
         // move the field value after save
         if let Some(file_data) = item.file_data.take() {
@@ -162,6 +167,10 @@ impl IProfiles {
 
     /// update the item value
     pub async fn patch_item(&mut self, uid: &String, item: &PrfItem) -> Result<()> {
+        if let Some(file) = &item.file {
+            Self::validate_profile_file(file)?;
+        }
+
         let mut items = self.items.take().unwrap_or_default();
 
         for each in items.iter_mut() {
@@ -203,6 +212,22 @@ impl IProfiles {
         bail!("failed to find the profile item \"uid:{uid}\"")
     }
 
+    fn validate_profile_file(file: &str) -> Result<()> {
+        let mut components = Path::new(file).components();
+        if file.is_empty()
+            || file.contains('/')
+            || file.contains('\\')
+            || !matches!(
+                (components.next(), components.next()),
+                (Some(Component::Normal(_)), None)
+            )
+        {
+            bail!("profile file must be a single filename");
+        }
+
+        Ok(())
+    }
+
     /// be used to update the remote item
     /// only patch `updated` `extra` `file_data`
     pub async fn update_item(&mut self, uid: &String, item: &mut PrfItem) -> Result<()> {
@@ -228,6 +253,7 @@ impl IProfiles {
                         let file =
                             file.unwrap_or_else(|| item.file.take().unwrap_or_else(|| format!("{}.yaml", uid).into()));
 
+                        Self::validate_profile_file(file.as_str())?;
                         each.file = Some(file.clone());
 
                         let path = dirs::app_profiles_dir()?.join(file.as_str());

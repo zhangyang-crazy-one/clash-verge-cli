@@ -1,10 +1,14 @@
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use serde_yaml_ng::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 use tokio_stream::StreamExt as _;
+
+/// Serializes writes to the shared runtime `clash.yaml` staging/rename path.
+static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use crate::app::{
     Action, App, CoreState, Focus, InputMode, Overlay, ProxyDisplayRow, View, first_selectable_proxy_group,
@@ -205,70 +209,255 @@ async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path
 async fn reload_remote_profile(
     api: &crate::mihomo_api::MihomoApi,
     item: &clash_verge_core::config::PrfItem,
+    enable_tun: bool,
+    core_running: bool,
 ) -> Result<(), String> {
     let file = item
         .file
         .as_deref()
         .ok_or_else(|| "remote profile is missing file".to_string())?;
-    let path = clash_verge_core::utils::dirs::app_profiles_dir()
+    let profile_path = clash_verge_core::utils::dirs::app_profiles_dir()
         .map_err(|error| error.to_string())?
         .join(file);
-    if !path.exists() {
-        return Err(format!("profile file not found: {}", path.display()));
+    if !profile_path.exists() {
+        return Err(format!("profile file not found: {}", profile_path.display()));
     }
-    reload_config_file(api, &path).await
+
+    let raw = tokio::fs::read_to_string(&profile_path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", profile_path.display()))?;
+    let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
+        .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
+
+    // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
+    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
+        let control_plane = crate::enhance::snapshot_control_plane(&app_config);
+        Ok(crate::enhance::enforce_control_plane(profile, control_plane))
+    })
+    .await?;
+    Ok(())
+}
+
+/// Write TUN-enabled runtime config and apply it under one IO lock.
+///
+/// Re-reads `clash.yaml` inside the lock so a concurrent profile/mode commit is not
+/// overwritten by a stale pre-spawn snapshot. Owned cores restart (stop-by-pid works
+/// when the Child sits in the watcher); attached cores API-reload the written file.
+async fn apply_tun_runtime(
+    manager: &crate::mihomo_manager::manager::MihomoManager,
+    owns_core: bool,
+    enable_tun: bool,
+) -> Result<(), String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
+    let path = write_runtime_config_unlocked(config, enable_tun).await?;
+    if owns_core {
+        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())
+    } else {
+        reload_config_file(&manager.api(), &path).await
+    }
+}
+
+/// Persist TUN flag into a freshly loaded runtime config (core stopped path).
+async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
+    write_runtime_config_unlocked(config, enable_tun).await
+}
+
+async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash_verge_core::config::PrfItem) {
+    let Some(selected) = item.selected.as_ref() else {
+        return;
+    };
+    for entry in selected {
+        let Some(group) = entry.name.as_deref() else {
+            continue;
+        };
+        let Some(node) = entry.now.as_deref() else {
+            continue;
+        };
+        if let Err(error) = api.select_proxy(group, node).await {
+            tracing::debug!(target: "profile", "restore selected {group}/{node}: {error}");
+        }
+    }
+}
+
+/// Write runtime config under the shared IO lock (no reload).
+async fn write_runtime_config(config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    write_runtime_config_unlocked(config, enable_tun).await
+}
+
+/// Backup → build (from a fresh on-disk snapshot) → write → reload/rollback.
+///
+/// `build` receives the latest `clash.yaml` mapping while `RUNTIME_CONFIG_IO` is held,
+/// so concurrent mode/TUN commits are not overwritten by a stale pre-lock snapshot.
+async fn commit_runtime_config<F>(
+    api: &crate::mihomo_api::MihomoApi,
+    enable_tun: bool,
+    core_running: bool,
+    restore_item: Option<&clash_verge_core::config::PrfItem>,
+    build: F,
+) -> Result<std::path::PathBuf, String>
+where
+    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
+{
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    let config = build(app_config)?;
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    let previous = if core_running && path.exists() {
+        Some(
+            tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    write_runtime_config_unlocked(config, enable_tun).await?;
+    if !core_running {
+        // Keep the newly selected runtime config for the next Start; do not API-reload
+        // (or roll it back) while no controller is available.
+        return Ok(path);
+    }
+    if let Err(error) = reload_config_file(api, &path).await {
+        if let Some(previous) = previous {
+            let _ = tokio::fs::write(&path, previous).await;
+            let _ = reload_config_file(api, &path).await;
+            return Err(format!("{error}; restored the previous config"));
+        }
+        return Err(error);
+    }
+    if let Some(item) = restore_item {
+        restore_selected_nodes(api, item).await;
+    }
+    Ok(path)
+}
+
+async fn write_runtime_config_unlocked(
+    mut config: serde_yaml_ng::Mapping,
+    enable_tun: bool,
+) -> Result<std::path::PathBuf, String> {
+    config = crate::enhance::prepare_runtime_config(config, enable_tun);
+    let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    let temporary_path = path.with_extension(format!("yaml.tui-runtime.{}.tmp", uuid::Uuid::new_v4()));
+
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt;
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            tokio::fs::metadata(&path).await.ok().map(|meta| meta.permissions())
+        } else {
+            Some(std::fs::Permissions::from_mode(0o600))
+        }
+    };
+
+    tokio::fs::write(&temporary_path, yaml)
+        .await
+        .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
+
+    #[cfg(unix)]
+    if let Some(permissions) = permissions {
+        tokio::fs::set_permissions(&temporary_path, permissions)
+            .await
+            .map_err(|error| format!("failed to set permissions on {}: {error}", temporary_path.display()))?;
+    }
+
+    #[cfg(windows)]
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
+    }
+    tokio::fs::rename(&temporary_path, &path)
+        .await
+        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn next_clash_mode(current: &str) -> &'static str {
+    match current.to_ascii_lowercase().as_str() {
+        "global" => "direct",
+        "direct" => "rule",
+        _ => "global",
+    }
+}
+
+async fn apply_clash_mode(
+    api: &crate::mihomo_api::MihomoApi,
+    mode: &str,
+    core_running: bool,
+) -> Result<String, String> {
+    // Serialize with runtime commits so a stale IClashTemp snapshot cannot
+    // overwrite a concurrent profile/TUN write to clash.yaml.
+    let previous_mode = {
+        let _guard = RUNTIME_CONFIG_IO.lock().await;
+        let mut clash = clash_verge_core::config::IClashTemp::new().await;
+        let previous = clash.get_mode().unwrap_or_else(|| "rule".into());
+        let mut patch = serde_yaml_ng::Mapping::new();
+        patch.insert("mode".into(), mode.into());
+        clash.patch_config(&patch);
+        clash.save_config().await.map_err(|error| error.to_string())?;
+        previous
+    };
+    if core_running && let Err(error) = api.patch_mode(mode).await {
+        // Keep disk aligned with the failed API update so the next Start does
+        // not silently adopt a mode the UI reported as failed.
+        let _guard = RUNTIME_CONFIG_IO.lock().await;
+        let mut clash = clash_verge_core::config::IClashTemp::new().await;
+        let mut patch = serde_yaml_ng::Mapping::new();
+        patch.insert("mode".into(), previous_mode.into());
+        clash.patch_config(&patch);
+        let _ = clash.save_config().await;
+        return Err(error.to_string());
+    }
+    Ok(mode.to_string())
 }
 
 async fn apply_chain_config(
     api: &crate::mihomo_api::MihomoApi,
     chain_nodes: &[String],
+    enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
-    let mut config = clash_verge_core::config::IClashTemp::new().await.0;
-    let entries = config
-        .get("proxies")
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| "active config has no proxies list".to_string())?;
-    let mut proxies = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            entry
-                .as_mapping()
-                .cloned()
-                .ok_or_else(|| format!("proxies[{index}] is not a mapping"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    crate::chain::build_chain_config(chain_nodes, &mut proxies).map_err(|error| error.to_string())?;
-    config.insert(
-        "proxies".into(),
-        Value::Sequence(proxies.into_iter().map(Value::Mapping).collect()),
-    );
-    let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
+    // Sidecar backup for diagnostics; the commit path also keeps an in-memory rollback copy.
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let original = tokio::fs::read(&path)
-        .await
-        .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
-    let backup_path = path.with_extension("yaml.tui-chain-backup");
-    tokio::fs::write(&backup_path, &original)
-        .await
-        .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
-
-    let temporary_path = path.with_extension("yaml.tui-chain.tmp");
-    tokio::fs::write(&temporary_path, yaml)
-        .await
-        .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
-    tokio::fs::rename(&temporary_path, &path)
-        .await
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
-
-    if let Err(error) = reload_config_file(api, &path).await {
-        let _ = tokio::fs::write(&path, original).await;
-        let _ = reload_config_file(api, &path).await;
-        return Err(format!("{error}; restored the previous config"));
+    if path.exists() {
+        let original = tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
+        let backup_path = path.with_extension("yaml.tui-chain-backup");
+        tokio::fs::write(&backup_path, &original)
+            .await
+            .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
     }
 
-    Ok(backup_path)
+    commit_runtime_config(api, enable_tun, true, None, |mut config| {
+        let entries = config
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| "active config has no proxies list".to_string())?;
+        let mut proxies = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                entry
+                    .as_mapping()
+                    .cloned()
+                    .ok_or_else(|| format!("proxies[{index}] is not a mapping"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        crate::chain::build_chain_config(chain_nodes, &mut proxies).map_err(|error| error.to_string())?;
+        config.insert(
+            "proxies".into(),
+            Value::Sequence(proxies.into_iter().map(Value::Mapping).collect()),
+        );
+        Ok(config)
+    })
+    .await
 }
 
 /// Find the (group_name, node_name) at a flat index in proxy groups.
@@ -315,9 +504,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.gui_config = clash_verge_core::config::IVerge::new().await;
     app.language = Language::from_config(app.gui_config.language.as_deref());
     app.core_config = clash_verge_core::config::IClashTemp::new().await;
+    app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
 
     // Load profiles on start
-    if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+    if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
         app.selected_index = store.selected_index();
         app.profiles = store.items();
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
@@ -326,6 +516,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut render_tick = time::interval(Duration::from_millis(100));
     let mut runtime_refresh_tick = time::interval(Duration::from_secs(1));
+    let mut auto_update_tick = time::interval(Duration::from_secs(30));
+    auto_update_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut auto_update_in_flight = false;
     let mut rendered_view = app.view;
 
     // Try connecting to existing mihomo (may be running from GUI)
@@ -420,7 +613,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             app.status_msg = Some(app.tr("home.starting_core").into());
                                             let m = manager.clone();
                                             let tx = action_tx.clone();
+                                            let enable_tun =
+                                                app.gui_config.enable_tun_mode.unwrap_or(false);
                                             tokio::spawn(async move {
+                                                let config =
+                                                    clash_verge_core::config::IClashTemp::new().await.0;
+                                                if let Err(error) =
+                                                    write_runtime_config(config, enable_tun).await
+                                                {
+                                                    let _ = tx.send(Action::CoreError(error));
+                                                    return;
+                                                }
                                                 if let Err(error) = m.start().await {
                                                     let _ = tx.send(Action::CoreError(error.to_string()));
                                                 }
@@ -436,7 +639,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             app.status_msg = Some(app.tr("home.starting_core").into());
                                             let m = manager.clone();
                                             let tx = action_tx.clone();
+                                            let enable_tun =
+                                                app.gui_config.enable_tun_mode.unwrap_or(false);
                                             tokio::spawn(async move {
+                                                let config =
+                                                    clash_verge_core::config::IClashTemp::new().await.0;
+                                                if let Err(error) =
+                                                    write_runtime_config(config, enable_tun).await
+                                                {
+                                                    let _ = tx.send(Action::CoreError(error));
+                                                    return;
+                                                }
                                                 if let Err(error) = m.restart().await {
                                                     let _ = tx.send(Action::CoreError(error.to_string()));
                                                 }
@@ -476,6 +689,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 }
                                                 View::Connections => move_connection_selection(&mut app, true),
                                                 View::Logs => move_log_selection(&mut app, true),
+                                                View::Settings => {
+                                                    app.settings_selected_index =
+                                                        (app.settings_selected_index + 1)
+                                                            % crate::ui::views::settings::SETTINGS_ROW_COUNT;
+                                                }
                                                 _ => {}
                                             }
                                             }
@@ -511,6 +729,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 }
                                                 View::Connections => move_connection_selection(&mut app, false),
                                                 View::Logs => move_log_selection(&mut app, false),
+                                                View::Settings => {
+                                                    let count = crate::ui::views::settings::SETTINGS_ROW_COUNT;
+                                                    app.settings_selected_index =
+                                                        (app.settings_selected_index + count - 1) % count;
+                                                }
                                                 _ => {}
                                             }
                                             }
@@ -523,55 +746,125 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             match app.view {
                                                 View::Profiles => {
                                                     // Profile tab: switch profile
-                                                    if let Some(item) = app.profiles.get(app.selected_index).filter(|item| item.uid.is_some()) {
-                                                            let name = item.name.clone().unwrap_or_default();
-                                                            let itype = item.itype.clone().unwrap_or_default();
-                                                            app.status_msg = Some(format!("Switching to {name}..."));
-                                                            let api = manager.api();
-                                                            let tx = action_tx.clone();
-                                                            if itype == "remote" {
-                                                                let item = item.clone();
-                                                                tokio::spawn(async move {
-                                                                    match reload_remote_profile(&api, &item).await {
-                                                                        Ok(()) => {
+                                                    if let Some(item) =
+                                                        app.profiles.get(app.selected_index).filter(|item| item.uid.is_some())
+                                                    {
+                                                        let name = item.name.clone().unwrap_or_default();
+                                                        let itype = item.itype.clone().unwrap_or_default();
+                                                        let uid = item.uid.clone().expect("filtered uid");
+                                                        app.status_msg = Some(format!("Switching to {name}..."));
+                                                        let api = manager.api();
+                                                        let tx = action_tx.clone();
+                                                        let enable_tun =
+                                                            app.gui_config.enable_tun_mode.unwrap_or(false);
+                                                        let core_running = app.core_state == CoreState::Running;
+                                                        if itype == "remote" {
+                                                            let item = item.clone();
+                                                            tokio::spawn(async move {
+                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
+                                                                    uid.as_str(),
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(previous) => previous,
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::CoreError(format!(
+                                                                            "profile switch: {error}"
+                                                                        )));
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                match reload_remote_profile(
+                                                                    &api,
+                                                                    &item,
+                                                                    enable_tun,
+                                                                    core_running,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(()) => {
+                                                                        if core_running {
                                                                             let _ = tx.send(Action::ProxiesRefresh);
                                                                         }
-                                                                        Err(error) => {
-                                                                            let _ = tx.send(Action::CoreError(format!(
-                                                                                "profile reload: {error}"
-                                                                            )));
-                                                                        }
                                                                     }
-                                                                });
-                                                            } else {
-                                                                let item = item.clone();
-                                                                tokio::spawn(async move {
-                                                                    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()
+                                                                    Err(error) => {
+                                                                        let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                            uid.as_str(),
+                                                                            previous_uid.as_deref(),
+                                                                        )
+                                                                        .await;
+                                                                        let _ = tx.send(Action::CoreError(format!(
+                                                                            "profile reload: {error}"
+                                                                        )));
+                                                                    }
+                                                                }
+                                                            });
+                                                        } else {
+                                                            let item = item.clone();
+                                                            tokio::spawn(async move {
+                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
+                                                                    uid.as_str(),
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(previous) => previous,
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::CoreError(format!(
+                                                                            "profile switch: {error}"
+                                                                        )));
+                                                                        return;
+                                                                    }
+                                                                };
+                                                                let profiles_dir =
+                                                                    clash_verge_core::utils::dirs::app_profiles_dir()
                                                                         .unwrap_or_default();
-                                                                    match crate::chain::resolve_chain(&item, &profiles_dir).await {
-                                                                        Ok(chain) => {
-                                                                            let mut config = clash_verge_core::config::IClashTemp::new().await.0;
-                                                                            crate::chain::apply_chain_to_config(&mut config, &chain);
-                                                                            if let Ok(yaml) = serde_yaml_ng::to_string(&config)
-                                                                                && let Ok(path) = clash_verge_core::utils::dirs::clash_path()
-                                                                            {
-                                                                                let _ = tokio::fs::write(&path, &yaml).await;
-                                                                                let _ = api.client
-                                                                                    .put("http://localhost/configs?force=true")
-                                                                                    .header("Content-Type", "application/json")
-                                                                                    .body("{}")
-                                                                                    .send()
-                                                                                    .await;
+                                                                match crate::chain::resolve_chain(&item, &profiles_dir).await
+                                                                {
+                                                                    Ok(chain) => {
+                                                                        match commit_runtime_config(
+                                                                            &api,
+                                                                            enable_tun,
+                                                                            core_running,
+                                                                            Some(&item),
+                                                                            |mut config| {
+                                                                                crate::chain::apply_chain_to_config(
+                                                                                    &mut config, &chain,
+                                                                                );
+                                                                                Ok(config)
+                                                                            },
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            Ok(_) => {
+                                                                                if core_running {
+                                                                                    let _ = tx.send(Action::ProxiesRefresh);
+                                                                                }
                                                                             }
-                                                                            let _ = tx.send(Action::ProxiesRefresh);
-                                                                        }
-                                                                        Err(e) => {
-                                                                            let _ = tx.send(Action::CoreError(format!("chain: {e}")));
+                                                                            Err(error) => {
+                                                                                let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                                    uid.as_str(),
+                                                                                    previous_uid.as_deref(),
+                                                                                )
+                                                                                .await;
+                                                                                let _ = tx.send(Action::CoreError(
+                                                                                    format!("config write: {error}"),
+                                                                                ));
+                                                                            }
                                                                         }
                                                                     }
-                                                                });
-                                                            }
+                                                                    Err(e) => {
+                                                                        let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                            uid.as_str(),
+                                                                            previous_uid.as_deref(),
+                                                                        )
+                                                                        .await;
+                                                                        let _ = tx
+                                                                            .send(Action::CoreError(format!("chain: {e}")));
+                                                                    }
+                                                                }
+                                                            });
                                                         }
+                                                    }
                                                 }
                                                 View::Proxies => {
                                                     let selected_row = proxy_display_rows(
@@ -628,24 +921,161 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 }
                                                 View::Connections => begin_connection_close(&mut app),
                                                 View::Settings => {
-                                                    let next_language = app.language.next();
-                                                    let mut updated_config = app.gui_config.clone();
-                                                    updated_config.language = Some(next_language.config_code().into());
-                                                    match updated_config.save_file().await {
-                                                        Ok(()) => {
-                                                            app.gui_config = updated_config;
-                                                            app.language = next_language;
-                                                            app.status_msg = Some(format!(
-                                                                "{}: {}",
-                                                                app.tr("settings.language_saved"),
-                                                                next_language.display_name()
-                                                            ));
+                                                    match app.settings_selected_index {
+                                                        0 => {
+                                                            let next_language = app.language.next();
+                                                            let mut updated_config = app.gui_config.clone();
+                                                            updated_config.language =
+                                                                Some(next_language.config_code().into());
+                                                            match updated_config.save_file().await {
+                                                                Ok(()) => {
+                                                                    app.gui_config = updated_config;
+                                                                    app.language = next_language;
+                                                                    app.status_msg = Some(format!(
+                                                                        "{}: {}",
+                                                                        app.tr("settings.language_saved"),
+                                                                        next_language.display_name()
+                                                                    ));
+                                                                }
+                                                                Err(error) => {
+                                                                    app.status_msg = Some(format!(
+                                                                        "{}: {error}",
+                                                                        app.tr("settings.language_save_failed")
+                                                                    ));
+                                                                }
+                                                            }
                                                         }
-                                                        Err(error) => {
-                                                            app.status_msg = Some(format!(
-                                                                "{}: {error}",
-                                                                app.tr("settings.language_save_failed")
-                                                            ));
+                                                        1 => {
+                                                            let enabled = !app
+                                                                .gui_config
+                                                                .enable_system_proxy
+                                                                .unwrap_or(false);
+                                                            let previous = app.gui_config.clone();
+                                                            let mut updated = previous.clone();
+                                                            updated.enable_system_proxy = Some(enabled);
+                                                            match updated.save_file().await {
+                                                                Ok(()) => {
+                                                                    let host = updated
+                                                                        .proxy_host
+                                                                        .as_deref()
+                                                                        .unwrap_or("127.0.0.1");
+                                                                    let port = app.core_config.get_mixed_port();
+                                                                    let apply_result = if enabled {
+                                                                        crate::sys_proxy::set_system_proxy(host, port)
+                                                                    } else {
+                                                                        crate::sys_proxy::unset_system_proxy()
+                                                                    };
+                                                                    match apply_result {
+                                                                        Ok(()) => {
+                                                                            app.gui_config = updated;
+                                                                            app.status_msg = Some(
+                                                                                if enabled {
+                                                                                    app.tr("settings.sysproxy_on")
+                                                                                } else {
+                                                                                    app.tr("settings.sysproxy_off")
+                                                                                }
+                                                                                .into(),
+                                                                            );
+                                                                        }
+                                                                        Err(error) => {
+                                                                            let _ = previous.save_file().await;
+                                                                            app.gui_config = previous;
+                                                                            app.status_msg = Some(format!(
+                                                                                "{}: {error}",
+                                                                                app.tr("settings.save_failed")
+                                                                            ));
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(error) => {
+                                                                    app.status_msg = Some(format!(
+                                                                        "{}: {error}",
+                                                                        app.tr("settings.save_failed")
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        2 => {
+                                                            let enabled =
+                                                                !app.gui_config.enable_tun_mode.unwrap_or(false);
+                                                            let mut updated = app.gui_config.clone();
+                                                            updated.enable_tun_mode = Some(enabled);
+                                                            match updated.save_file().await {
+                                                                Ok(()) => {
+                                                                    app.gui_config = updated;
+                                                                    if app.core_state == CoreState::Running {
+                                                                        app.status_msg = Some(
+                                                                            if enabled {
+                                                                                app.tr("settings.tun_on")
+                                                                            } else {
+                                                                                app.tr("settings.tun_off")
+                                                                            }
+                                                                            .into(),
+                                                                        );
+                                                                        let owns_core = manager.pid().is_some();
+                                                                        if owns_core {
+                                                                            app.core_state = CoreState::Starting;
+                                                                        }
+                                                                        let m = manager.clone();
+                                                                        let tx = action_tx.clone();
+                                                                        tokio::spawn(async move {
+                                                                            if let Err(error) =
+                                                                                apply_tun_runtime(&m, owns_core, enabled)
+                                                                                    .await
+                                                                            {
+                                                                                let _ = tx.send(Action::CoreError(
+                                                                                    error,
+                                                                                ));
+                                                                            } else if !owns_core {
+                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                            }
+                                                                        });
+                                                                    } else if let Err(error) =
+                                                                        write_tun_runtime(enabled).await
+                                                                    {
+                                                                        app.status_msg = Some(format!(
+                                                                            "{}: {error}",
+                                                                            app.tr("settings.save_failed")
+                                                                        ));
+                                                                    } else {
+                                                                        // Core is stopped: persist only; apply on next start.
+                                                                        app.status_msg = Some(
+                                                                            if enabled {
+                                                                                app.tr("settings.tun_saved_on")
+                                                                            } else {
+                                                                                app.tr("settings.tun_saved_off")
+                                                                            }
+                                                                            .into(),
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(error) => {
+                                                                    app.status_msg = Some(format!(
+                                                                        "{}: {error}",
+                                                                        app.tr("settings.save_failed")
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                        _ => {
+                                                            let next = next_clash_mode(&app.clash_mode);
+                                                            let api = manager.api();
+                                                            let tx = action_tx.clone();
+                                                            let core_running = app.core_state == CoreState::Running;
+                                                            tokio::spawn(async move {
+                                                                match apply_clash_mode(&api, next, core_running).await {
+                                                                    Ok(mode) => {
+                                                                        let _ = tx.send(Action::ModeChanged {
+                                                                            mode,
+                                                                            announce: true,
+                                                                        });
+                                                                    }
+                                                                    Err(error) => {
+                                                                        let _ =
+                                                                            tx.send(Action::ModeChangeFailed(error));
+                                                                    }
+                                                                }
+                                                            });
                                                         }
                                                     }
                                                 }
@@ -740,36 +1170,31 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 .map(|u| u.to_string());
                                             let tx = action_tx.clone();
                                             tokio::spawn(async move {
-                                                match crate::profile_store::store::ProfileStore::load().await {
-                                                    Ok(mut store) => {
-                                                        let result = if let Some(uid) = selected_uid {
-                                                            store
-                                                                .update_remote(&uid, None)
-                                                                .await
-                                                                .map(|is_current| (uid, is_current))
-                                                        } else {
-                                                            store.update_all_remote().await.map(|currents| {
-                                                                let uid = currents
-                                                                    .first()
-                                                                    .map(|u| u.to_string())
-                                                                    .unwrap_or_default();
-                                                                let is_current = !currents.is_empty();
-                                                                (uid, is_current)
-                                                            })
-                                                        };
-                                                        match result {
-                                                            Ok((uid, is_current)) => {
-                                                                let _ = tx.send(Action::ProfileUpdated {
-                                                                    uid,
-                                                                    is_current,
-                                                                });
-                                                            }
-                                                            Err(error) => {
-                                                                let _ = tx.send(Action::ProfileUpdateFailed(
-                                                                    error.to_string(),
-                                                                ));
-                                                            }
-                                                        }
+                                                let result = if let Some(uid) = selected_uid {
+                                                    crate::profile_store::store::ProfileStore::update_remote_locked(
+                                                        &uid, None,
+                                                    )
+                                                    .await
+                                                    .map(|is_current| (uid, is_current))
+                                                } else {
+                                                    crate::profile_store::store::ProfileStore::update_all_remote_locked(
+                                                    )
+                                                    .await
+                                                    .map(|currents| {
+                                                        let uid = currents
+                                                            .first()
+                                                            .map(|u| u.to_string())
+                                                            .unwrap_or_default();
+                                                        let is_current = !currents.is_empty();
+                                                        (uid, is_current)
+                                                    })
+                                                };
+                                                match result {
+                                                    Ok((uid, is_current)) => {
+                                                        let _ = tx.send(Action::ProfileUpdated {
+                                                            uid,
+                                                            is_current,
+                                                        });
                                                     }
                                                     Err(error) => {
                                                         let _ = tx.send(Action::ProfileUpdateFailed(
@@ -792,11 +1217,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         Action::ApplyChain => {
                                             if app.chain_nodes.len() >= 2 {
                                                 let nodes = app.chain_nodes.clone();
+                                                let enable_tun =
+                                                    app.gui_config.enable_tun_mode.unwrap_or(false);
                                                 let api = manager.api();
                                                 let tx = action_tx.clone();
                                                 app.status_msg = Some("Applying chain...".into());
                                                 tokio::spawn(async move {
-                                                    match apply_chain_config(&api, &nodes).await {
+                                                    match apply_chain_config(&api, &nodes, enable_tun).await {
                                                         Ok(_) => {
                                                             let _ = tx.send(Action::ChainApplied(nodes));
                                                             let _ = tx.send(Action::ProxiesRefresh);
@@ -813,6 +1240,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         Action::ClearChain => {
                                             app.chain_nodes.clear();
                                             app.status_msg = Some("Chain cleared".into());
+                                        }
+                                        Action::CycleClashMode => {
+                                            let _ = action_tx.send(Action::CycleClashMode);
                                         }
                                         _ => {}
                                     }
@@ -885,6 +1315,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         let _ = action_tx.send(Action::TrafficRefresh);
                         let _ = action_tx.send(Action::ConnectionsRefresh);
                         let _ = action_tx.send(Action::LogsRefresh);
+
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            if let Ok(mode) = api.get_mode().await {
+                                let _ = tx.send(Action::ModeChanged {
+                                    mode,
+                                    announce: false,
+                                });
+                            }
+                        });
                     }
                     Some(Action::CoreExited(0)) => {
                         app.core_state = CoreState::Stopped;
@@ -899,28 +1340,40 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::ProfileImported) => {
                         app.status_msg = Some("Profile imported successfully".into());
-                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                             app.profiles = store.items();
                             // Auto-select last (newly imported) profile
                             if !app.profiles.is_empty() {
                                 let last = app.profiles.len().saturating_sub(1);
                                 app.selected_index = last;
-                                // Auto-start mihomo if not running, then switch
-                                if app.core_state != CoreState::Running {
-                                    let m = manager.clone();
-                                    tokio::spawn(async move { let _ = m.start().await; });
-                                }
-                                // Reload the imported profile yaml into the running core.
+                                // Write runtime config for the imported profile, then start if needed.
                                 if let Some(item) = app.profiles.get(last).cloned() {
                                     let api = manager.api();
                                     let tx = action_tx.clone();
+                                    let enable_tun =
+                                        app.gui_config.enable_tun_mode.unwrap_or(false);
+                                    let core_running = app.core_state == CoreState::Running;
+                                    let should_start = !core_running;
+                                    let manager = manager.clone();
                                     tokio::spawn(async move {
-                                        if let Err(error) = reload_remote_profile(&api, &item).await {
+                                        if let Err(error) = reload_remote_profile(
+                                            &api,
+                                            &item,
+                                            enable_tun,
+                                            core_running,
+                                        )
+                                        .await
+                                        {
                                             let _ = tx.send(Action::CoreError(format!(
                                                 "profile reload: {error}"
                                             )));
+                                            return;
                                         }
-                                        let _ = tx.send(Action::ProxiesRefresh);
+                                        if should_start {
+                                            let _ = manager.start().await;
+                                        } else {
+                                            let _ = tx.send(Action::ProxiesRefresh);
+                                        }
                                     });
                                 }
                             }
@@ -1123,15 +1576,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ConfirmImport(url)) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::load().await {
-                                Ok(mut store) => match store.import_url(&url, None).await {
-                                    Ok(_) => {
-                                        let _ = tx.send(Action::ProfileImported);
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
-                                    }
-                                },
+                            match crate::profile_store::store::ProfileStore::import_url_locked(&url, None)
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = tx.send(Action::ProfileImported);
+                                }
                                 Err(e) => {
                                     let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
                                 }
@@ -1147,31 +1597,75 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         } else {
                             format!("Updated profile {uid}")
                         });
-                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
+                        if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                             app.profiles = store.items();
                         }
-                        if is_current && app.core_state == CoreState::Running {
+                        if is_current {
                             let api = manager.api();
                             let tx = action_tx.clone();
                             let reload_uid = uid.clone();
+                            let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
+                            let core_running = app.core_state == CoreState::Running;
                             tokio::spawn(async move {
-                                if let Ok(store) = crate::profile_store::store::ProfileStore::load().await
+                                if let Ok(store) =
+                                    crate::profile_store::store::ProfileStore::snapshot().await
                                     && let Some(item) = store
                                         .items()
                                         .into_iter()
                                         .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
-                                    && let Err(error) = reload_remote_profile(&api, &item).await
                                 {
-                                    let _ = tx.send(Action::CoreError(format!(
-                                        "profile reload: {error}"
-                                    )));
+                                    if let Err(error) = reload_remote_profile(
+                                        &api,
+                                        &item,
+                                        enable_tun,
+                                        core_running,
+                                    )
+                                    .await
+                                    {
+                                        let _ = tx.send(Action::CoreError(format!(
+                                            "profile reload: {error}"
+                                        )));
+                                    } else if core_running {
+                                        let _ = tx.send(Action::ProxiesRefresh);
+                                    }
                                 }
-                                let _ = tx.send(Action::ProxiesRefresh);
                             });
                         }
                     }
                     Some(Action::ProfileUpdateFailed(error)) => {
                         app.status_msg = Some(format!("Update failed: {error}"));
+                    }
+                    Some(Action::CycleClashMode) => {
+                        let next = next_clash_mode(&app.clash_mode);
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        let core_running = app.core_state == CoreState::Running;
+                        tokio::spawn(async move {
+                            match apply_clash_mode(&api, next, core_running).await {
+                                Ok(mode) => {
+                                    let _ = tx.send(Action::ModeChanged {
+                                        mode,
+                                        announce: true,
+                                    });
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::ModeChangeFailed(error));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::ModeChanged { mode, announce }) => {
+                        app.clash_mode = mode.clone();
+                        app.core_config = clash_verge_core::config::IClashTemp::new().await;
+                        if announce {
+                            app.status_msg = Some(format!("{}: {mode}", app.tr("settings.mode_set")));
+                        }
+                    }
+                    Some(Action::ModeChangeFailed(error)) => {
+                        app.status_msg = Some(format!("{}: {error}", app.tr("common.failed")));
+                    }
+                    Some(Action::AutoUpdateFinished) => {
+                        auto_update_in_flight = false;
                     }
                     None => break,
                     _ => {}
@@ -1199,6 +1693,31 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     _ => {}
                 }
+            }
+
+            _ = auto_update_tick.tick(), if !auto_update_in_flight => {
+                let due = crate::subscribe::timer::due_remote_uids(&app.profiles);
+                if due.is_empty() {
+                    continue;
+                }
+                auto_update_in_flight = true;
+                let tx = action_tx.clone();
+                tokio::spawn(async move {
+                    match crate::profile_store::store::ProfileStore::update_remotes_locked(&due).await {
+                        Ok((updated, failed)) => {
+                            for (uid, is_current) in updated {
+                                let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                            }
+                            for (_uid, error) in failed {
+                                let _ = tx.send(Action::ProfileUpdateFailed(error));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Action::ProfileUpdateFailed(error.to_string()));
+                        }
+                    }
+                    let _ = tx.send(Action::AutoUpdateFinished);
+                });
             }
         }
     }

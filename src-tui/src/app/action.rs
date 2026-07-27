@@ -78,6 +78,15 @@ pub enum Action {
         id: String,
         error: String,
     },
+
+    /// Auto-update tick finished (clears in-flight guard).
+    AutoUpdateFinished,
+    CycleClashMode,
+    ModeChanged {
+        mode: String,
+        announce: bool,
+    },
+    ModeChangeFailed(String),
 }
 
 const fn _assert_send_sync() {

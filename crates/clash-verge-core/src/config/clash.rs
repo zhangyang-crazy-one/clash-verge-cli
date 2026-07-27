@@ -159,6 +159,14 @@ impl IClashTemp {
         }
     }
 
+    /// Tolerant read of the saved proxy mode (avoids strict BaseConfig parsing).
+    pub fn get_mode(&self) -> Option<String> {
+        self.0.get("mode").and_then(|value| match value {
+            Value::String(val_str) => Some(val_str.clone()),
+            _ => None,
+        })
+    }
+
     #[cfg(not(target_os = "windows"))]
     pub fn guard_redir_port(config: &Mapping) -> u16 {
         let mut port = config
@@ -379,6 +387,7 @@ pub struct IClashDNS {
     pub default_nameserver: Option<Vec<String>>,
     pub enhanced_mode: Option<String>,
     pub fake_ip_range: Option<String>,
+    pub fake_ip_range6: Option<String>,
     pub use_hosts: Option<bool>,
     pub fake_ip_filter: Option<Vec<String>>,
     pub nameserver: Option<Vec<String>>,

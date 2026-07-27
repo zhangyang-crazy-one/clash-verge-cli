@@ -135,6 +135,53 @@ impl MihomoApi {
         })
     }
 
+    /// `PATCH /configs` — set clash mode (`rule` / `global` / `direct`).
+    pub async fn patch_mode(&self, mode: &str) -> Result<(), MihomoError> {
+        let resp = self
+            .client
+            .patch("http://localhost/configs")
+            .json(&serde_json::json!({ "mode": mode }))
+            .send()
+            .await
+            .map_err(|e| self.map_http_err(e))?;
+
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            })
+        }
+    }
+
+    /// Read clash mode from mihomo `/configs`, falling back to tolerant parse of `mode` only.
+    pub async fn get_mode(&self) -> Result<String, MihomoError> {
+        let resp = self
+            .client
+            .get("http://localhost/configs")
+            .send()
+            .await
+            .map_err(|e| self.map_http_err(e))?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        // Tolerant: accept non-standard payloads as long as `mode` is present.
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))?;
+        value
+            .get("mode")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| MihomoError::Parse("configs response missing mode".into()))
+    }
+
     /// `GET /proxies/:name/delay?timeout=N&url=U` — test delay for a node.
     pub async fn delay_test(&self, name: &str, test_url: &str, timeout_ms: u64) -> Result<ProxyDelay, MihomoError> {
         let url = delay_test_url(name, test_url, timeout_ms)?;

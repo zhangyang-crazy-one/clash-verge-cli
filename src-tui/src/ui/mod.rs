@@ -190,6 +190,7 @@ mod tests {
         app.gui_config.enable_dns_settings = Some(false);
         app.gui_config.proxy_host = Some("127.0.0.1".into());
         app.core_config.0.insert("mode".into(), "global".into());
+        app.clash_mode = "global".into();
         app.proxy_groups.insert(
             "Auto".to_string(),
             ProxyGroup {
@@ -357,11 +358,12 @@ mod tests {
 
         app.view = View::Settings;
         let (settings, _) = render(&app, 120, 32);
-        assert!(settings.contains("GUI config (read-only)"));
-        assert!(settings.contains("System proxy: on | TUN: off | DNS config: off"));
+        assert!(settings.contains("Writable settings"));
+        assert!(settings.contains("System proxy: on"));
+        assert!(settings.contains("TUN: off"));
         assert!(settings.contains("Mihomo mode: global"));
         assert!(settings.contains("Core PID: 4242"));
-        assert!(settings.contains("Writes for system proxy"));
+        assert!(settings.contains("Enter toggles the highlighted setting"));
     }
 
     #[test]
