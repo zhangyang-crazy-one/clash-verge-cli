@@ -4,7 +4,7 @@ use anyhow::Context;
 use clash_verge_core::config::{IProfiles, PrfItem, PrfOption};
 use smartstring::alias::String as SmartString;
 
-use crate::subscribe::from_url::{self, RemoteProfileBundle};
+use crate::subscribe::from_url;
 
 /// In-memory view of the profile list. Re-reads from disk on each load.
 pub struct ProfileStore {
@@ -64,36 +64,16 @@ impl ProfileStore {
         self.profiles.save_file().await.context("failed to save profiles.yaml")
     }
 
-    /// Append enhance fragments then the remote item, and persist.
-    pub async fn append_bundle(&mut self, bundle: RemoteProfileBundle) -> anyhow::Result<PrfItem> {
-        ensure_profile_storage().await?;
-        for mut fragment in bundle.fragments {
-            self.profiles
-                .append_item(&mut fragment)
-                .await
-                .context("failed to append profile fragment")?;
-        }
-        let mut item = bundle.item;
-        let saved = item.clone();
-        self.profiles
-            .append_item(&mut item)
-            .await
-            .context("failed to append remote profile")?;
-        self.profiles
-            .save_file()
-            .await
-            .context("failed to save profiles.yaml")?;
-        Ok(saved)
-    }
-
-    /// Import a subscription URL with GUI-style proxy fallbacks.
+    /// Import a subscription URL.
     pub async fn import_url(&mut self, url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
-        let bundle = from_url::import_with_fallback(url, name).await?;
-        self.append_bundle(bundle).await
+        let name = name.unwrap_or(url);
+        let item = from_url::from_url(url, name).await?;
+        self.append(item.clone()).await?;
+        Ok(item)
     }
 
     /// Update a remote profile by UID. Returns whether it is the current profile.
-    pub async fn update_remote(&mut self, uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
+    pub async fn update_remote(&mut self, uid: &str, _option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
         let uid_key = SmartString::from(uid);
         let existing = self.profiles.get_item(&uid_key).context("profile not found")?.clone();
 
@@ -102,21 +82,12 @@ impl ProfileStore {
         }
         let url = existing.url.as_ref().context("remote profile is missing url")?;
 
-        let merged = PrfOption::merge(existing.option.as_ref(), option_override);
-        let mut bundle = from_url::update_with_fallback(url, merged.as_ref()).await?;
-
-        // Rare path: an older remote without chain UIDs gets fragments on refresh.
-        ensure_profile_storage().await?;
-        for mut fragment in bundle.fragments {
-            self.profiles
-                .append_item(&mut fragment)
-                .await
-                .context("failed to append profile fragment during update")?;
-        }
+        let mut item = from_url::from_url(url, url).await?;
+        item.uid = Some(uid_key.clone());
 
         let is_current = self.profiles.get_current().map(|c| c.as_str()) == Some(uid);
         self.profiles
-            .update_item(&uid_key, &mut bundle.item)
+            .update_item(&uid_key, &mut item)
             .await
             .context("failed to update remote profile")?;
         Ok(is_current)
@@ -168,43 +139,26 @@ mod tests {
     use clash_verge_core::utils::dirs;
 
     use super::*;
-    use crate::subscribe::from_url::RemoteProfileBundle;
 
     #[tokio::test]
-    async fn append_bundle_persists_profiles_yaml_and_body() {
+    #[ignore = "requires a real subscription URL via SUB_TEST_URL env var"]
+    async fn import_url_persists_profiles_yaml_and_body() {
+        let url = std::env::var("SUB_TEST_URL").expect("SUB_TEST_URL env var not set");
         let root = std::env::temp_dir().join(format!("clash-verge-cli-profile-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("profiles")).expect("temp profiles dir");
         dirs::set_app_home_dir(root.clone());
-        assert_eq!(
-            dirs::app_home_dir().expect("home"),
-            root,
-            "test requires exclusive app home dir; another test may have claimed OnceLock"
-        );
 
         let mut store = ProfileStore {
             profiles: IProfiles::default(),
         };
-        let uid = "Rpersist01ab";
-        let file_name = format!("{uid}.yaml");
-        let bundle = RemoteProfileBundle {
-            item: PrfItem {
-                uid: Some(uid.into()),
-                itype: Some("remote".into()),
-                name: Some("persist-demo".into()),
-                file: Some(file_name.clone().into()),
-                url: Some("https://example.com/sub.yaml".into()),
-                file_data: Some("proxies: []\n".into()),
-                ..Default::default()
-            },
-            fragments: vec![PrfItem::from_merge(None).expect("merge fragment")],
-        };
-
-        store.append_bundle(bundle).await.expect("append_bundle");
+        let item = store.import_url(&url, Some("test-profile")).await.expect("import_url");
+        assert!(item.uid.is_some());
+        assert_eq!(item.itype.as_deref(), Some("remote"));
 
         let profiles_yaml = std::fs::read_to_string(root.join("profiles.yaml")).expect("profiles.yaml");
-        assert!(profiles_yaml.contains(uid));
-        assert!(profiles_yaml.contains("persist-demo"));
-        let body = std::fs::read_to_string(root.join("profiles").join(&file_name)).expect("body");
+        assert!(profiles_yaml.contains("test-profile"));
+        let file = item.file.as_ref().unwrap();
+        let body = std::fs::read_to_string(root.join("profiles").join(file.as_str())).expect("body");
         assert!(body.contains("proxies:"));
         let _ = std::fs::remove_dir_all(&root);
     }

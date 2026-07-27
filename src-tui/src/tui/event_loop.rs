@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
-use serde_yaml_ng::Value;
+use serde_yaml_ng::{Mapping, Value};
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_stream::StreamExt as _;
@@ -44,6 +44,44 @@ fn close_confirmation_is_current(app: &App, id: &str) -> bool {
     app.pending_connection_close.as_deref() == Some(id)
         && app.selected_connection_id.as_deref() == Some(id)
         && app.overlay == Some(Overlay::CloseConfirmation)
+}
+
+/// Merge a subscription profile's YAML content into the base Mihomo config
+/// template and write the result to `clash-verge.yaml`.
+///
+/// Subscription endpoints return a Clash config fragment (proxies,
+/// proxy-groups, rules, etc.) without the required base fields (port,
+/// mode, log-level). This function joins them together so Mihomo can
+/// load the result as a complete configuration.
+async fn build_active_config(item: &clash_verge_core::config::PrfItem) -> Result<std::path::PathBuf, String> {
+    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|e| format!("profiles dir: {e}"))?;
+
+    let file = item
+        .file
+        .as_ref()
+        .ok_or_else(|| "profile has no file field".to_string())?;
+    let profile_path = profiles_dir.join(file.as_str());
+
+    let base = clash_verge_core::config::IClashTemp::template().0;
+    let mut merged = base.clone();
+
+    let profile_yaml = tokio::fs::read_to_string(&profile_path)
+        .await
+        .map_err(|e| format!("failed to read profile {}: {e}", profile_path.display()))?;
+    let profile_map: Mapping = serde_yaml_ng::from_str(&profile_yaml)
+        .map_err(|e| format!("invalid YAML in profile {}: {e}", profile_path.display()))?;
+
+    for key in ["proxies", "proxy-groups", "rules", "rule-providers", "proxy-providers"] {
+        crate::chain::apply_merge(&mut merged, &profile_map, key);
+    }
+
+    let output = serde_yaml_ng::to_string(&merged).map_err(|e| format!("failed to serialize merged config: {e}"))?;
+    let clash_path = clash_verge_core::utils::dirs::clash_path().map_err(|e| format!("clash path: {e}"))?;
+    tokio::fs::write(&clash_path, output)
+        .await
+        .map_err(|e| format!("failed to write {}: {e}", clash_path.display()))?;
+
+    Ok(clash_path)
 }
 
 fn connection_matches_filter(connection: &crate::mihomo_api::types::ConnectionInfo, query: &str) -> bool {
@@ -202,21 +240,19 @@ async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path
     }
 }
 
-async fn reload_remote_profile(
-    api: &crate::mihomo_api::MihomoApi,
-    item: &clash_verge_core::config::PrfItem,
-) -> Result<(), String> {
-    let file = item
-        .file
-        .as_deref()
-        .ok_or_else(|| "remote profile is missing file".to_string())?;
-    let path = clash_verge_core::utils::dirs::app_profiles_dir()
-        .map_err(|error| error.to_string())?
-        .join(file);
-    if !path.exists() {
-        return Err(format!("profile file not found: {}", path.display()));
+/// Poll GET /version with exponential backoff until mihomo responds.
+/// Gives up after ~6 seconds (10 attempts, max 3.2 s per wait).
+async fn wait_for_mihomo_ready(api: &crate::mihomo_api::MihomoApi) {
+    for attempt in 0..10 {
+        match api.version().await {
+            Ok(_) => return,
+            Err(_) => {
+                let ms = 100 * 2u64.pow(attempt.min(5)); // 100,200,400,800,1600,3200...
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            }
+        }
     }
-    reload_config_file(api, &path).await
+    // Timeout — the user sees a loading state and can press r to manually refresh.
 }
 
 async fn apply_chain_config(
@@ -333,11 +369,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let tx = action_tx.clone();
     tokio::spawn(async move {
         if api.version().await.is_ok() {
-            let _ = tx.send(Action::CoreStarted {
-                version: None,
-                binary_path: None,
-                binary_source: None,
-            });
+            let _ = tx.send(Action::CoreStarted);
         }
         // If no controller is available, the user can press s to start one.
     });
@@ -431,31 +463,18 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             break;
                                         }
                                         Action::StartCore => {
-                                            app.core_state = CoreState::Starting;
-                                            app.status_msg = Some(app.tr("home.starting_core").into());
                                             let m = manager.clone();
-                                            let tx = action_tx.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(error) = m.start().await {
-                                                    let _ = tx.send(Action::CoreError(error.to_string()));
-                                                }
-                                                // On success, manager emits CoreStarted with launch details.
-                                            });
+                                            tokio::spawn(async move { let _ = m.start().await; });
+                                            app.core_state = CoreState::Starting;
                                         }
                                         Action::StopCore => {
                                             let m = manager.clone();
                                             tokio::spawn(async move { let _ = m.stop().await; });
                                         }
                                         Action::RestartCore => {
-                                            app.core_state = CoreState::Starting;
-                                            app.status_msg = Some(app.tr("home.starting_core").into());
                                             let m = manager.clone();
-                                            let tx = action_tx.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(error) = m.restart().await {
-                                                    let _ = tx.send(Action::CoreError(error.to_string()));
-                                                }
-                                            });
+                                            tokio::spawn(async move { let _ = m.restart().await; });
+                                            app.core_state = CoreState::Starting;
                                         }
                                         Action::StartImport => {
                                             app.input_mode = InputMode::Importing(String::new());
@@ -538,7 +557,8 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             match app.view {
                                                 View::Profiles => {
                                                     // Profile tab: switch profile
-                                                    if let Some(item) = app.profiles.get(app.selected_index).filter(|item| item.uid.is_some()) {
+                                                    if let Some(item) = app.profiles.get(app.selected_index)
+                                                        && item.uid.is_some() {
                                                             let name = item.name.clone().unwrap_or_default();
                                                             let itype = item.itype.clone().unwrap_or_default();
                                                             app.status_msg = Some(format!("Switching to {name}..."));
@@ -547,16 +567,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             if itype == "remote" {
                                                                 let item = item.clone();
                                                                 tokio::spawn(async move {
-                                                                    match reload_remote_profile(&api, &item).await {
-                                                                        Ok(()) => {
-                                                                            let _ = tx.send(Action::ProxiesRefresh);
+                                                                    match build_active_config(&item).await {
+                                                                        Ok(config_path) => {
+                                                                            if let Err(e) = reload_config_file(&api, &config_path).await {
+                                                                                let _ = tx.send(Action::CoreError(e));
+                                                                            }
                                                                         }
-                                                                        Err(error) => {
-                                                                            let _ = tx.send(Action::CoreError(format!(
-                                                                                "profile reload: {error}"
-                                                                            )));
+                                                                        Err(e) => {
+                                                                            let _ = tx.send(Action::CoreError(e));
                                                                         }
                                                                     }
+                                                                    let _ = tx.send(Action::ProxiesRefresh);
                                                                 });
                                                             } else {
                                                                 let item = item.clone();
@@ -748,51 +769,6 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::UpdateProfile => {
                                             app.status_msg = Some("Updating subscriptions...".into());
-                                            let selected_uid = app
-                                                .profiles
-                                                .get(app.selected_index)
-                                                .and_then(|item| item.uid.clone())
-                                                .map(|u| u.to_string());
-                                            let tx = action_tx.clone();
-                                            tokio::spawn(async move {
-                                                match crate::profile_store::store::ProfileStore::load().await {
-                                                    Ok(mut store) => {
-                                                        let result = if let Some(uid) = selected_uid {
-                                                            store
-                                                                .update_remote(&uid, None)
-                                                                .await
-                                                                .map(|is_current| (uid, is_current))
-                                                        } else {
-                                                            store.update_all_remote().await.map(|currents| {
-                                                                let uid = currents
-                                                                    .first()
-                                                                    .map(|u| u.to_string())
-                                                                    .unwrap_or_default();
-                                                                let is_current = !currents.is_empty();
-                                                                (uid, is_current)
-                                                            })
-                                                        };
-                                                        match result {
-                                                            Ok((uid, is_current)) => {
-                                                                let _ = tx.send(Action::ProfileUpdated {
-                                                                    uid,
-                                                                    is_current,
-                                                                });
-                                                            }
-                                                            Err(error) => {
-                                                                let _ = tx.send(Action::ProfileUpdateFailed(
-                                                                    error.to_string(),
-                                                                ));
-                                                            }
-                                                        }
-                                                    }
-                                                    Err(error) => {
-                                                        let _ = tx.send(Action::ProfileUpdateFailed(
-                                                            error.to_string(),
-                                                        ));
-                                                    }
-                                                }
-                                            });
                                         }
                                         Action::ToggleChainMode => {
                                             app.chain_mode = !app.chain_mode;
@@ -842,64 +818,21 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
 
             action = action_rx.recv() => {
                 match action {
-                    Some(Action::CoreStarted {
-                        version,
-                        binary_path,
-                        binary_source,
-                    }) => {
+                    Some(Action::CoreStarted) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
-                        if let Some(version) = version.clone() {
-                            app.core_version = Some(version);
-                        } else if app.core_version.is_none() {
-                            // Attached to an existing controller — ask the API for version.
-                            let api = manager.api();
-                            let tx = action_tx.clone();
-                            tokio::spawn(async move {
-                                if let Ok(v) = api.version().await {
-                                    let _ = tx.send(Action::CoreStarted {
-                                        version: Some(v.version),
-                                        binary_path: None,
-                                        binary_source: None,
-                                    });
-                                }
-                            });
-                        }
-
-                        let pid = app.core_pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                        app.status_msg = Some(match binary_source.as_deref() {
-                            Some("downloaded") => format!(
-                                "{} · {} · {} · pid {pid}",
-                                app.tr("home.core_started"),
-                                version.as_deref().unwrap_or("mihomo"),
-                                app.tr("home.core_downloaded"),
-                            ),
-                            Some("cached") => format!(
-                                "{} · {} · {} · pid {pid}",
-                                app.tr("home.core_started"),
-                                version.as_deref().unwrap_or("mihomo"),
-                                app.tr("home.core_cached"),
-                            ),
-                            Some("system") => format!(
-                                "{} · {} · {} · pid {pid}",
-                                app.tr("home.core_started"),
-                                version.as_deref().unwrap_or("mihomo"),
-                                app.tr("home.core_system"),
-                            ),
-                            _ if version.is_some() => format!(
-                                "{} · {} · pid {pid}",
-                                app.tr("home.core_started"),
-                                version.as_deref().unwrap_or("mihomo"),
-                            ),
-                            _ => app.tr("home.core_attached").into(),
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            // Poll /version until the mihomo API is actually
+                            // responsive — spawning the process doesn't mean
+                            // it's ready to serve proxied requests yet.
+                            wait_for_mihomo_ready(&api).await;
+                            let _ = tx.send(Action::ProxiesRefresh);
+                            let _ = tx.send(Action::TrafficRefresh);
+                            let _ = tx.send(Action::ConnectionsRefresh);
+                            let _ = tx.send(Action::LogsRefresh);
                         });
-                        if let Some(path) = binary_path {
-                            tracing::info!(target: "mihomo", "core binary: {path}");
-                        }
-                        let _ = action_tx.send(Action::ProxiesRefresh);
-                        let _ = action_tx.send(Action::TrafficRefresh);
-                        let _ = action_tx.send(Action::ConnectionsRefresh);
-                        let _ = action_tx.send(Action::LogsRefresh);
                     }
                     Some(Action::CoreExited(0)) => {
                         app.core_state = CoreState::Stopped;
@@ -907,10 +840,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.clear_runtime_caches();
                     }
                     Some(Action::CoreError(msg)) => {
-                        app.core_state = CoreState::Error(msg.clone());
+                        app.core_state = CoreState::Error(msg);
                         app.core_pid = None;
-                        app.status_msg = Some(format!("{}: {msg}", app.tr("status.error")));
-                        app.clear_runtime_caches();
+                        // Don't clear runtime caches — proxy_groups, traffic,
+                        // connections, and logs are the last-known-good state.
+                        // A single API failure (e.g. reload timeout) shouldn't
+                        // discard what the user already sees. CoreExited, which
+                        // means the process really died, is the signal to clear.
                     }
                     Some(Action::ProfileImported) => {
                         app.status_msg = Some("Profile imported successfully".into());
@@ -920,22 +856,41 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             if !app.profiles.is_empty() {
                                 let last = app.profiles.len().saturating_sub(1);
                                 app.selected_index = last;
-                                // Auto-start mihomo if not running, then switch
-                                if app.core_state != CoreState::Running {
-                                    let m = manager.clone();
-                                    tokio::spawn(async move { let _ = m.start().await; });
-                                }
-                                // Reload the imported profile yaml into the running core.
-                                if let Some(item) = app.profiles.get(last).cloned() {
+
+                                // Build the active config and then either
+                                // hot-reload (if mihomo is already running) or
+                                // start mihomo (so it reads the fresh config).
+                                // The two operations must be serial: config
+                                // must be on disk before mihomo reads it.
+                                if let Some(item) = app.profiles.get(last) {
+                                    let item = item.clone();
                                     let api = manager.api();
+                                    let m = manager.clone();
                                     let tx = action_tx.clone();
+                                    let core_was_running = app.core_state == CoreState::Running;
+
                                     tokio::spawn(async move {
-                                        if let Err(error) = reload_remote_profile(&api, &item).await {
-                                            let _ = tx.send(Action::CoreError(format!(
-                                                "profile reload: {error}"
-                                            )));
+                                        match build_active_config(&item).await {
+                                            Ok(config_path) => {
+                                                if core_was_running {
+                                                    // Core already up: hot-reload via API
+                                                    if let Err(e) = reload_config_file(&api, &config_path).await {
+                                                        let _ = tx.send(Action::CoreError(e));
+                                                    }
+                                                    let _ = tx.send(Action::ProxiesRefresh);
+                                                } else {
+                                                    // Core not up: start mihomo now that config is on disk.
+                                                    // CoreStarted → ProxiesRefresh is guaranteed by the
+                                                    // readiness gate in the CoreStarted handler.
+                                                    if let Err(e) = m.start().await {
+                                                        let _ = tx.send(Action::CoreError(e.to_string()));
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tx.send(Action::CoreError(e));
+                                            }
                                         }
-                                        let _ = tx.send(Action::ProxiesRefresh);
                                     });
                                 }
                             }
@@ -1138,15 +1093,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ConfirmImport(url)) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::load().await {
-                                Ok(mut store) => match store.import_url(&url, None).await {
-                                    Ok(_) => {
-                                        let _ = tx.send(Action::ProfileImported);
+                            match crate::subscribe::from_url::from_url(&url, &url).await {
+                                Ok(item) => {
+                                    if let Ok(mut store) = crate::profile_store::store::ProfileStore::load().await {
+                                        let _ = store.append(item).await;
                                     }
-                                    Err(e) => {
-                                        let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
-                                    }
-                                },
+                                    let _ = tx.send(Action::ProfileImported);
+                                }
                                 Err(e) => {
                                     let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
                                 }
@@ -1155,38 +1108,6 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::ProfileImportFailed(error)) => {
                         app.status_msg = Some(format!("Import failed: {error}"));
-                    }
-                    Some(Action::ProfileUpdated { uid, is_current }) => {
-                        app.status_msg = Some(if uid.is_empty() {
-                            "Subscriptions updated".into()
-                        } else {
-                            format!("Updated profile {uid}")
-                        });
-                        if let Ok(store) = crate::profile_store::store::ProfileStore::load().await {
-                            app.profiles = store.items();
-                        }
-                        if is_current && app.core_state == CoreState::Running {
-                            let api = manager.api();
-                            let tx = action_tx.clone();
-                            let reload_uid = uid.clone();
-                            tokio::spawn(async move {
-                                if let Ok(store) = crate::profile_store::store::ProfileStore::load().await
-                                    && let Some(item) = store
-                                        .items()
-                                        .into_iter()
-                                        .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
-                                    && let Err(error) = reload_remote_profile(&api, &item).await
-                                {
-                                    let _ = tx.send(Action::CoreError(format!(
-                                        "profile reload: {error}"
-                                    )));
-                                }
-                                let _ = tx.send(Action::ProxiesRefresh);
-                            });
-                        }
-                    }
-                    Some(Action::ProfileUpdateFailed(error)) => {
-                        app.status_msg = Some(format!("Update failed: {error}"));
                     }
                     None => break,
                     _ => {}

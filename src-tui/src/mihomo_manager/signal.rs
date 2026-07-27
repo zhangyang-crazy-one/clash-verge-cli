@@ -64,9 +64,7 @@ pub async fn graceful_stop_by_pid(pid: u32) -> anyhow::Result<()> {
         match kill(nix_pid, None) {
             Err(nix::errno::Errno::ESRCH) => return Ok(()),
             Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "error checking pid {pid} after SIGKILL: {e}"
-                ));
+                return Err(anyhow::anyhow!("error checking pid {pid} after SIGKILL: {e}"));
             }
             Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }

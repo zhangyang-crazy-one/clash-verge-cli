@@ -230,11 +230,7 @@ impl MihomoManager {
         }
 
         if let Some(tx) = self.inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreStarted {
-                version: Some(resolved.version.clone()),
-                binary_path: Some(resolved.path.display().to_string()),
-                binary_source: Some(resolved.source.as_str().into()),
-            });
+            let _ = tx.send(Action::CoreStarted);
         }
 
         // Spawn watcher — takes ownership of the Child handle
@@ -256,7 +252,6 @@ impl MihomoManager {
                 signal::graceful_stop(pid, child).await?;
             }
             (Some(pid), None) => {
-                // Child handle was moved to the watcher — kill by PID directly.
                 signal::graceful_stop_by_pid(pid).await?;
             }
             _ => { /* already stopped — idempotent */ }
