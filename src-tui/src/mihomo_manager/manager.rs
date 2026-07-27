@@ -247,6 +247,10 @@ impl MihomoManager {
     /// D-10: gracefully stop mihomo.
     ///
     /// Returns Ok(()) even if no child was running (idempotent).
+    ///
+    /// `start()` moves the `Child` into the exit watcher, so `inner.child` is
+    /// usually `None` while `inner.pid` is set. Prefer the Child wait path when
+    /// available; otherwise signal and poll by PID so restart cannot leak a core.
     pub async fn stop(&self) -> anyhow::Result<()> {
         let pid = { *self.inner.pid.lock() };
         let mut child_opt = self.inner.child.lock().take();
@@ -254,6 +258,9 @@ impl MihomoManager {
         match (pid, child_opt.as_mut()) {
             (Some(pid), Some(child)) => {
                 signal::graceful_stop(pid, child).await?;
+            }
+            (Some(pid), None) => {
+                signal::graceful_stop_by_pid(pid).await?;
             }
             _ => { /* already stopped — idempotent */ }
         }

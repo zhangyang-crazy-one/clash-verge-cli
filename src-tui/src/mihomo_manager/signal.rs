@@ -32,6 +32,46 @@ pub async fn graceful_stop(child_pid: u32, child: &mut tokio::process::Child) ->
     }
 }
 
+/// Stop a process we own by PID when the `Child` handle was moved into the watcher.
+///
+/// Polls `kill(pid, None)` for liveness after SIGTERM, then escalates to SIGKILL.
+pub async fn graceful_stop_by_pid(child_pid: u32) -> Result<()> {
+    let pid = Pid::from_raw(child_pid as i32);
+    match kill(pid, Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+
+    let deadline = tokio::time::Instant::now() + GRACEFUL_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        match kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+
+    tracing::warn!("mihomo pid {child_pid} did not exit in 5s, sending SIGKILL");
+    match kill(pid, Signal::SIGKILL) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Reap until gone (or give up after a short window).
+    let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < kill_deadline {
+        match kill(pid, None) {
+            Err(nix::errno::Errno::ESRCH) => return Ok(()),
+            Err(error) => {
+                return Err(anyhow::anyhow!("error checking pid {child_pid} after SIGKILL: {error}"));
+            }
+            Ok(()) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
