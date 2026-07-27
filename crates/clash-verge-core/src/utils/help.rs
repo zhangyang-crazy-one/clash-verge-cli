@@ -53,8 +53,10 @@ pub async fn save_yaml<T: Serialize + Sync>(path: &PathBuf, data: &T, prefix: Op
     };
 
     // Atomic replace avoids torn reads when another task reads mid-write.
+    // Unique staging name avoids concurrent writers clobbering the same .tmp.
     let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("config.yaml");
-    let temporary_path = path.with_file_name(format!("{file_name}.tmp"));
+    let staging_id = nanoid!(8, &ALPHABET);
+    let temporary_path = path.with_file_name(format!("{file_name}.{staging_id}.tmp"));
 
     #[cfg(unix)]
     let permissions = {

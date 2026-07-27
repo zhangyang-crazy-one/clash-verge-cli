@@ -235,32 +235,7 @@ async fn reload_remote_profile(
     let control_plane = crate::enhance::snapshot_control_plane(&app_config);
     let config = crate::enhance::enforce_control_plane(profile, control_plane);
 
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let previous = if core_running && path.exists() {
-        Some(
-            tokio::fs::read(&path)
-                .await
-                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    write_runtime_config(config, enable_tun).await?;
-    if !core_running {
-        // Keep the newly selected runtime config for the next Start; do not API-reload
-        // (or roll it back) while no controller is available.
-        return Ok(());
-    }
-    if let Err(error) = reload_config_file(api, &path).await {
-        if let Some(previous) = previous {
-            let _ = tokio::fs::write(&path, previous).await;
-            let _ = reload_config_file(api, &path).await;
-            return Err(format!("{error}; restored the previous config"));
-        }
-        return Err(error);
-    }
-    restore_selected_nodes(api, item).await;
+    commit_runtime_config(api, config, enable_tun, core_running, Some(item)).await?;
     Ok(())
 }
 
@@ -294,11 +269,56 @@ async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash
     }
 }
 
-async fn write_runtime_config(
+/// Write runtime config under the shared IO lock (no reload).
+async fn write_runtime_config(config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    write_runtime_config_unlocked(config, enable_tun).await
+}
+
+/// Backup → write → reload/rollback as one critical section.
+async fn commit_runtime_config(
+    api: &crate::mihomo_api::MihomoApi,
+    config: serde_yaml_ng::Mapping,
+    enable_tun: bool,
+    core_running: bool,
+    restore_item: Option<&clash_verge_core::config::PrfItem>,
+) -> Result<std::path::PathBuf, String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    let previous = if core_running && path.exists() {
+        Some(
+            tokio::fs::read(&path)
+                .await
+                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    write_runtime_config_unlocked(config, enable_tun).await?;
+    if !core_running {
+        // Keep the newly selected runtime config for the next Start; do not API-reload
+        // (or roll it back) while no controller is available.
+        return Ok(path);
+    }
+    if let Err(error) = reload_config_file(api, &path).await {
+        if let Some(previous) = previous {
+            let _ = tokio::fs::write(&path, previous).await;
+            let _ = reload_config_file(api, &path).await;
+            return Err(format!("{error}; restored the previous config"));
+        }
+        return Err(error);
+    }
+    if let Some(item) = restore_item {
+        restore_selected_nodes(api, item).await;
+    }
+    Ok(path)
+}
+
+async fn write_runtime_config_unlocked(
     mut config: serde_yaml_ng::Mapping,
     enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
@@ -388,24 +408,20 @@ async fn apply_chain_config(
         "proxies".into(),
         Value::Sequence(proxies.into_iter().map(Value::Mapping).collect()),
     );
+
+    // Sidecar backup for diagnostics; the commit path also keeps an in-memory rollback copy.
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let original = tokio::fs::read(&path)
-        .await
-        .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
-    let backup_path = path.with_extension("yaml.tui-chain-backup");
-    tokio::fs::write(&backup_path, &original)
-        .await
-        .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
-
-    write_runtime_config(config, enable_tun).await?;
-
-    if let Err(error) = reload_config_file(api, &path).await {
-        let _ = tokio::fs::write(&path, original).await;
-        let _ = reload_config_file(api, &path).await;
-        return Err(format!("{error}; restored the previous config"));
+    if path.exists() {
+        let original = tokio::fs::read(&path)
+            .await
+            .map_err(|error| format!("failed to back up {}: {error}", path.display()))?;
+        let backup_path = path.with_extension("yaml.tui-chain-backup");
+        tokio::fs::write(&backup_path, &original)
+            .await
+            .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
     }
 
-    Ok(backup_path)
+    commit_runtime_config(api, config, enable_tun, true, None).await
 }
 
 /// Find the (group_name, node_name) at a flat index in proxy groups.
@@ -709,10 +725,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                let _ = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                if let Err(error) = crate::profile_store::store::ProfileStore::set_current_locked(
                                                                     uid.as_str(),
                                                                 )
-                                                                .await;
+                                                                .await
+                                                                {
+                                                                    let _ = tx.send(Action::CoreError(format!(
+                                                                        "profile switch: {error}"
+                                                                    )));
+                                                                    return;
+                                                                }
                                                                 match reload_remote_profile(
                                                                     &api,
                                                                     &item,
@@ -736,10 +758,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         } else {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                let _ = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                if let Err(error) = crate::profile_store::store::ProfileStore::set_current_locked(
                                                                     uid.as_str(),
                                                                 )
-                                                                .await;
+                                                                .await
+                                                                {
+                                                                    let _ = tx.send(Action::CoreError(format!(
+                                                                        "profile switch: {error}"
+                                                                    )));
+                                                                    return;
+                                                                }
                                                                 let profiles_dir =
                                                                     clash_verge_core::utils::dirs::app_profiles_dir()
                                                                         .unwrap_or_default();
@@ -753,14 +781,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         crate::chain::apply_chain_to_config(
                                                                             &mut config, &chain,
                                                                         );
-                                                                        match write_runtime_config(config, enable_tun).await
+                                                                        match commit_runtime_config(
+                                                                            &api,
+                                                                            config,
+                                                                            enable_tun,
+                                                                            core_running,
+                                                                            Some(&item),
+                                                                        )
+                                                                        .await
                                                                         {
-                                                                            Ok(path) => {
+                                                                            Ok(_) => {
                                                                                 if core_running {
-                                                                                    let _ = reload_config_file(&api, &path)
-                                                                                        .await;
-                                                                                    restore_selected_nodes(&api, &item)
-                                                                                        .await;
                                                                                     let _ = tx.send(Action::ProxiesRefresh);
                                                                                 }
                                                                             }
@@ -864,30 +895,41 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 .gui_config
                                                                 .enable_system_proxy
                                                                 .unwrap_or(false);
-                                                            let mut updated = app.gui_config.clone();
+                                                            let previous = app.gui_config.clone();
+                                                            let mut updated = previous.clone();
                                                             updated.enable_system_proxy = Some(enabled);
                                                             match updated.save_file().await {
                                                                 Ok(()) => {
-                                                                    app.gui_config = updated;
-                                                                    let host = app
-                                                                        .gui_config
+                                                                    let host = updated
                                                                         .proxy_host
                                                                         .as_deref()
                                                                         .unwrap_or("127.0.0.1");
                                                                     let port = app.core_config.get_mixed_port();
-                                                                    if enabled {
-                                                                        let _ = crate::sys_proxy::set_system_proxy(
-                                                                            host, port,
-                                                                        );
-                                                                        app.status_msg = Some(
-                                                                            app.tr("settings.sysproxy_on").into(),
-                                                                        );
+                                                                    let apply_result = if enabled {
+                                                                        crate::sys_proxy::set_system_proxy(host, port)
                                                                     } else {
-                                                                        let _ =
-                                                                            crate::sys_proxy::unset_system_proxy();
-                                                                        app.status_msg = Some(
-                                                                            app.tr("settings.sysproxy_off").into(),
-                                                                        );
+                                                                        crate::sys_proxy::unset_system_proxy()
+                                                                    };
+                                                                    match apply_result {
+                                                                        Ok(()) => {
+                                                                            app.gui_config = updated;
+                                                                            app.status_msg = Some(
+                                                                                if enabled {
+                                                                                    app.tr("settings.sysproxy_on")
+                                                                                } else {
+                                                                                    app.tr("settings.sysproxy_off")
+                                                                                }
+                                                                                .into(),
+                                                                            );
+                                                                        }
+                                                                        Err(error) => {
+                                                                            let _ = previous.save_file().await;
+                                                                            app.gui_config = previous;
+                                                                            app.status_msg = Some(format!(
+                                                                                "{}: {error}",
+                                                                                app.tr("settings.save_failed")
+                                                                            ));
+                                                                        }
                                                                     }
                                                                 }
                                                                 Err(error) => {
