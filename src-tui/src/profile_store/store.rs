@@ -24,11 +24,16 @@ impl ProfileStore {
         Self::load_unlocked().await
     }
 
-    /// Persist `current` under the shared IO lock.
-    pub async fn set_current_locked(uid: &str) -> anyhow::Result<()> {
+    /// Atomically capture the previous `current` UID and install `uid`.
+    ///
+    /// Returns the previous UID (if any) from the same critical section that writes
+    /// the new one, so concurrent switches cannot both snapshot the same predecessor.
+    pub async fn replace_current_locked(uid: &str) -> anyhow::Result<Option<String>> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        store.set_current(uid).await
+        let previous = store.current_uid().map(|current| current.to_string());
+        store.set_current(uid).await?;
+        Ok(previous)
     }
 
     /// Restore `previous` only when `current` is still `expected` (failed switch owned it).

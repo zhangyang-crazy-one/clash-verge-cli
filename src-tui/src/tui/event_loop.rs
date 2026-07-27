@@ -229,13 +229,12 @@ async fn reload_remote_profile(
     let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
 
-    // Rebuild from the subscription body so omitted top-level keys (proxies, rules, …)
-    // from a previous profile do not linger. Only app-owned control-plane keys are kept.
-    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
-    let control_plane = crate::enhance::snapshot_control_plane(&app_config);
-    let config = crate::enhance::enforce_control_plane(profile, control_plane);
-
-    commit_runtime_config(api, config, enable_tun, core_running, Some(item)).await?;
+    // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
+    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
+        let control_plane = crate::enhance::snapshot_control_plane(&app_config);
+        Ok(crate::enhance::enforce_control_plane(profile, control_plane))
+    })
+    .await?;
     Ok(())
 }
 
@@ -289,15 +288,23 @@ async fn write_runtime_config(config: serde_yaml_ng::Mapping, enable_tun: bool) 
     write_runtime_config_unlocked(config, enable_tun).await
 }
 
-/// Backup → write → reload/rollback as one critical section.
-async fn commit_runtime_config(
+/// Backup → build (from a fresh on-disk snapshot) → write → reload/rollback.
+///
+/// `build` receives the latest `clash.yaml` mapping while `RUNTIME_CONFIG_IO` is held,
+/// so concurrent mode/TUN commits are not overwritten by a stale pre-lock snapshot.
+async fn commit_runtime_config<F>(
     api: &crate::mihomo_api::MihomoApi,
-    config: serde_yaml_ng::Mapping,
     enable_tun: bool,
     core_running: bool,
     restore_item: Option<&clash_verge_core::config::PrfItem>,
-) -> Result<std::path::PathBuf, String> {
+    build: F,
+) -> Result<std::path::PathBuf, String>
+where
+    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
+{
     let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    let config = build(app_config)?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
     let previous = if core_running && path.exists() {
         Some(
@@ -415,28 +422,6 @@ async fn apply_chain_config(
     chain_nodes: &[String],
     enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
-    let mut config = clash_verge_core::config::IClashTemp::new().await.0;
-    let entries = config
-        .get("proxies")
-        .and_then(Value::as_sequence)
-        .ok_or_else(|| "active config has no proxies list".to_string())?;
-    let mut proxies = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            entry
-                .as_mapping()
-                .cloned()
-                .ok_or_else(|| format!("proxies[{index}] is not a mapping"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    crate::chain::build_chain_config(chain_nodes, &mut proxies).map_err(|error| error.to_string())?;
-    config.insert(
-        "proxies".into(),
-        Value::Sequence(proxies.into_iter().map(Value::Mapping).collect()),
-    );
-
     // Sidecar backup for diagnostics; the commit path also keeps an in-memory rollback copy.
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
     if path.exists() {
@@ -449,7 +434,30 @@ async fn apply_chain_config(
             .map_err(|error| format!("failed to write {}: {error}", backup_path.display()))?;
     }
 
-    commit_runtime_config(api, config, enable_tun, true, None).await
+    commit_runtime_config(api, enable_tun, true, None, |mut config| {
+        let entries = config
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| "active config has no proxies list".to_string())?;
+        let mut proxies = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                entry
+                    .as_mapping()
+                    .cloned()
+                    .ok_or_else(|| format!("proxies[{index}] is not a mapping"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        crate::chain::build_chain_config(chain_nodes, &mut proxies).map_err(|error| error.to_string())?;
+        config.insert(
+            "proxies".into(),
+            Value::Sequence(proxies.into_iter().map(Value::Mapping).collect()),
+        );
+        Ok(config)
+    })
+    .await
 }
 
 /// Find the (group_name, node_name) at a flat index in proxy groups.
@@ -753,23 +761,19 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                let previous_uid =
-                                                                    crate::profile_store::store::ProfileStore::snapshot()
-                                                                        .await
-                                                                        .ok()
-                                                                        .and_then(|store| {
-                                                                            store.current_uid().map(|uid| uid.to_string())
-                                                                        });
-                                                                if let Err(error) = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
                                                                     uid.as_str(),
                                                                 )
                                                                 .await
                                                                 {
-                                                                    let _ = tx.send(Action::CoreError(format!(
-                                                                        "profile switch: {error}"
-                                                                    )));
-                                                                    return;
-                                                                }
+                                                                    Ok(previous) => previous,
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::CoreError(format!(
+                                                                            "profile switch: {error}"
+                                                                        )));
+                                                                        return;
+                                                                    }
+                                                                };
                                                                 match reload_remote_profile(
                                                                     &api,
                                                                     &item,
@@ -798,42 +802,36 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         } else {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                let previous_uid =
-                                                                    crate::profile_store::store::ProfileStore::snapshot()
-                                                                        .await
-                                                                        .ok()
-                                                                        .and_then(|store| {
-                                                                            store.current_uid().map(|uid| uid.to_string())
-                                                                        });
-                                                                if let Err(error) = crate::profile_store::store::ProfileStore::set_current_locked(
+                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
                                                                     uid.as_str(),
                                                                 )
                                                                 .await
                                                                 {
-                                                                    let _ = tx.send(Action::CoreError(format!(
-                                                                        "profile switch: {error}"
-                                                                    )));
-                                                                    return;
-                                                                }
+                                                                    Ok(previous) => previous,
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::CoreError(format!(
+                                                                            "profile switch: {error}"
+                                                                        )));
+                                                                        return;
+                                                                    }
+                                                                };
                                                                 let profiles_dir =
                                                                     clash_verge_core::utils::dirs::app_profiles_dir()
                                                                         .unwrap_or_default();
                                                                 match crate::chain::resolve_chain(&item, &profiles_dir).await
                                                                 {
                                                                     Ok(chain) => {
-                                                                        let mut config =
-                                                                            clash_verge_core::config::IClashTemp::new()
-                                                                                .await
-                                                                                .0;
-                                                                        crate::chain::apply_chain_to_config(
-                                                                            &mut config, &chain,
-                                                                        );
                                                                         match commit_runtime_config(
                                                                             &api,
-                                                                            config,
                                                                             enable_tun,
                                                                             core_running,
                                                                             Some(&item),
+                                                                            |mut config| {
+                                                                                crate::chain::apply_chain_to_config(
+                                                                                    &mut config, &chain,
+                                                                                );
+                                                                                Ok(config)
+                                                                            },
                                                                         )
                                                                         .await
                                                                         {
