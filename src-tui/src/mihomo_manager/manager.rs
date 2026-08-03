@@ -32,10 +32,15 @@ pub struct ManagerInner {
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
+    /// Captured config so the watcher can auto-restart without holding a
+    /// reference back to `MihomoManager`.
+    config_dir: PathBuf,
+    socket_path: PathBuf,
+    secret: String,
 }
 
 impl ManagerInner {
-    pub const fn new() -> Self {
+    pub fn new(config_dir: PathBuf, socket_path: PathBuf, secret: String) -> Self {
         Self {
             state: Mutex::new(CoreState::Stopped),
             child: Mutex::new(None),
@@ -43,6 +48,9 @@ impl ManagerInner {
             started_at: Mutex::new(None),
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
+            config_dir,
+            socket_path,
+            secret,
         }
     }
 
@@ -71,10 +79,73 @@ impl ManagerInner {
         self.restart_history.lock().clear();
     }
 
-    /// Stub for Plan 03. Returns `Ok(())` so the watcher can call it
-    /// before the actual spawn logic lands.
-    #[allow(clippy::unused_async, dead_code)]
+    /// Attempt to restart mihomo from the watcher after a crash.
+    ///
+    /// Resolves the binary (reusing cached managed or system path), spawns
+    /// the child, and wires up a new watcher.  Called by `spawn_watcher`
+    /// from within its exit callback, so the caller must ensure this does
+    /// not block the watcher's own `wait()` loop.
     pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
+        let resolved = binary::resolve_or_install()
+            .await
+            .context("auto-restart: failed to resolve mihomo binary")?;
+
+        let mut command = Command::new(&resolved.path);
+        command.arg("-d").arg(&self.config_dir);
+        if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
+            && config_path.exists()
+        {
+            command.arg("-f").arg(config_path);
+        }
+        let child = command
+            .arg("-ext-ctl-unix")
+            .arg(&self.socket_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(false)
+            .spawn()
+            .with_context(|| format!(
+                "auto-restart: failed to spawn mihomo from '{}'",
+                resolved.path.display()
+            ))?;
+
+        let pid = child.id().expect("child must have PID after spawn");
+
+        {
+            let mut state = self.state.lock();
+            *state = CoreState::Running;
+        }
+        *self.pid.lock() = Some(pid);
+        *self.started_at.lock() = Some(Utc::now());
+
+        tracing::info!(
+            target: "mihomo",
+            "auto-restarted mihomo {} pid={pid}",
+            resolved.version
+        );
+
+        if let Some(tx) = self.action_tx.lock().as_ref() {
+            let _ = tx.send(Action::CoreStarted {
+                version: Some(resolved.version),
+                binary_path: Some(resolved.path.display().to_string()),
+                binary_source: Some(resolved.source.as_str().into()),
+            });
+        }
+
+        // Spawn a new watcher for the restarted child.
+        spawn_watcher(child, Arc::new(Self {
+            config_dir: self.config_dir.clone(),
+            socket_path: self.socket_path.clone(),
+            secret: self.secret.clone(),
+            state: Mutex::new(CoreState::Running),
+            child: Mutex::new(None),
+            action_tx: Mutex::new(self.action_tx.lock().clone()),
+            started_at: Mutex::new(Some(Utc::now())),
+            restart_history: Mutex::new(VecDeque::new()),
+            pid: Mutex::new(None),
+        }));
+
         Ok(())
     }
 }
@@ -97,8 +168,13 @@ impl MihomoManager {
     /// is usable for the common case.
     pub fn new(config_dir: PathBuf) -> Self {
         let socket_path = default_socket_path();
+        let inner = ManagerInner::new(
+            config_dir.clone(),
+            socket_path.clone(),
+            String::new(),
+        );
         Self {
-            inner: Arc::new(ManagerInner::new()),
+            inner: Arc::new(inner),
             config_dir,
             socket_path,
             secret: String::new(),
