@@ -280,6 +280,7 @@ fn delay_test_url(name: &str, test_url: &str, timeout_ms: u64) -> Result<reqwest
 
 /// Helper trait for building a client from anything path-like.
 impl MihomoApi {
+    #[allow(dead_code)]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }

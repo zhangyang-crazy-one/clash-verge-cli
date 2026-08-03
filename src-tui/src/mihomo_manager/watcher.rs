@@ -1,7 +1,4 @@
 // Foundation module — `spawn_watcher` is wired up by Plan 02-03.
-// `dead_code` allow covers the function and helper. `unused_trait_names`
-// is suppressed because `BufReader` only needs the trait anonymously.
-#![allow(dead_code, unused_imports)]
 
 use std::sync::Arc;
 

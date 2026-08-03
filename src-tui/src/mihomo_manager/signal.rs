@@ -1,5 +1,4 @@
 // Foundation module — `graceful_stop` is wired up by Plan 02-03.
-#![allow(dead_code, unused_imports)]
 
 use std::time::Duration;
 

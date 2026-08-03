@@ -1,7 +1,5 @@
 // Foundation module — public surface is wired up by Plan 02-03 (CLI
-// dispatch + start/stop wiring). The `dead_code` allow covers fields
-// and methods that are intentionally unused at the end of Plan 02-01.
-#![allow(dead_code)]
+// dispatch + start/stop wiring).
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
