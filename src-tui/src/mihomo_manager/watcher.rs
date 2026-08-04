@@ -20,12 +20,7 @@ use crate::mihomo_manager::manager::ManagerInner;
 /// `ManagerInner::try_auto_restart` after a small backoff. Otherwise
 /// the manager state is transitioned to `Error` and a
 /// `Action::CoreError` is sent.
-pub fn spawn_watcher(
-    child: Child,
-    inner: Arc<ManagerInner>,
-    config_dir: &Path,
-    socket_path: &Path,
-) -> JoinHandle<()> {
+pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, socket_path: &Path) -> JoinHandle<()> {
     // The auto-restart path outlives this function, so own the paths.
     let config_dir = config_dir.to_path_buf();
     let socket_path = socket_path.to_path_buf();
@@ -66,10 +61,7 @@ pub fn spawn_watcher(
         if inner.should_auto_restart() {
             inner.record_restart();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if let Err(e) =
-                ManagerInner::try_auto_restart(Arc::clone(&inner), &config_dir, &socket_path)
-                    .await
-            {
+            if let Err(e) = ManagerInner::try_auto_restart(Arc::clone(&inner), &config_dir, &socket_path).await {
                 tracing::error!("auto-restart failed: {e}");
                 let msg = format!("exited {exit_code} (restart failed)");
                 *inner.state.lock() = CoreState::Error(msg.clone());
