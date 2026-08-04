@@ -133,17 +133,19 @@ impl ManagerInner {
             });
         }
 
-        // Spawn a new watcher for the restarted child.
-        spawn_watcher(child, Arc::new(Self {
+        // Spawn a new watcher that shares the same config, action channel,
+        // and restart history. The old watcher already cleared pid/child
+        // to None; we reset to the new pid here so restart and stop work.
+        spawn_watcher(child, Arc::new(ManagerInner {
+            pid: Mutex::new(Some(pid)),
+            started_at: Mutex::new(Some(Utc::now())),
+            state: Mutex::new(CoreState::Running),
+            action_tx: Mutex::new(self.action_tx.lock().clone()),
+            child: Mutex::new(None),
             config_dir: self.config_dir.clone(),
             socket_path: self.socket_path.clone(),
             secret: self.secret.clone(),
-            state: Mutex::new(CoreState::Running),
-            child: Mutex::new(None),
-            action_tx: Mutex::new(self.action_tx.lock().clone()),
-            started_at: Mutex::new(Some(Utc::now())),
-            restart_history: Mutex::new(VecDeque::new()),
-            pid: Mutex::new(None),
+            restart_history: Mutex::new(self.restart_history.lock().clone()),
         }));
 
         Ok(())
