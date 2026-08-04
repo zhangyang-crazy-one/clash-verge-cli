@@ -79,19 +79,17 @@ impl ManagerInner {
         self.restart_history.lock().clear();
     }
 
-    /// Attempt to restart mihomo from the watcher after a crash.
-    ///
-    /// Resolves the binary (reusing cached managed or system path), spawns
-    /// the child, and wires up a new watcher.  Called by `spawn_watcher`
-    /// from within its exit callback, so the caller must ensure this does
-    /// not block the watcher's own `wait()` loop.
-    pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
-        let resolved = binary::resolve_or_install()
-            .await
-            .context("auto-restart: failed to resolve mihomo binary")?;
-
+    /// Spawn a mihomo child from a resolved binary, wire up the watcher,
+    /// and update the inner state.  Used by both `start` (initial launch)
+    /// and `try_auto_restart` (crash recovery).
+    fn spawn_and_watch(
+        resolved: &binary::ResolvedMihomo,
+        config_dir: &PathBuf,
+        socket_path: &PathBuf,
+        inner: Arc<ManagerInner>,
+    ) -> anyhow::Result<()> {
         let mut command = Command::new(&resolved.path);
-        command.arg("-d").arg(&self.config_dir);
+        command.arg("-d").arg(config_dir);
         if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
             && config_path.exists()
         {
@@ -99,56 +97,68 @@ impl ManagerInner {
         }
         let child = command
             .arg("-ext-ctl-unix")
-            .arg(&self.socket_path)
+            .arg(socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false)
             .spawn()
             .with_context(|| format!(
-                "auto-restart: failed to spawn mihomo from '{}'",
-                resolved.path.display()
+                "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
+                resolved.path.display(), resolved.path.display()
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
 
-        {
-            let mut state = self.state.lock();
-            *state = CoreState::Running;
-        }
-        *self.pid.lock() = Some(pid);
-        *self.started_at.lock() = Some(Utc::now());
+        *inner.state.lock() = CoreState::Running;
+        *inner.pid.lock() = Some(pid);
+        *inner.started_at.lock() = Some(Utc::now());
 
-        tracing::info!(
-            target: "mihomo",
-            "auto-restarted mihomo {} pid={pid}",
-            resolved.version
-        );
-
-        if let Some(tx) = self.action_tx.lock().as_ref() {
+        if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
-                version: Some(resolved.version),
+                version: Some(resolved.version.clone()),
                 binary_path: Some(resolved.path.display().to_string()),
                 binary_source: Some(resolved.source.as_str().into()),
             });
         }
 
-        // Spawn a new watcher that shares the same config, action channel,
-        // and restart history. The old watcher already cleared pid/child
-        // to None; we reset to the new pid here so restart and stop work.
-        spawn_watcher(child, Arc::new(ManagerInner {
-            pid: Mutex::new(Some(pid)),
-            started_at: Mutex::new(Some(Utc::now())),
-            state: Mutex::new(CoreState::Running),
-            action_tx: Mutex::new(self.action_tx.lock().clone()),
-            child: Mutex::new(None),
-            config_dir: self.config_dir.clone(),
-            socket_path: self.socket_path.clone(),
-            secret: self.secret.clone(),
-            restart_history: Mutex::new(self.restart_history.lock().clone()),
-        }));
-
+        spawn_watcher(child, inner);
         Ok(())
+    }
+
+    /// Attempt to restart mihomo from the watcher after a crash.
+    ///
+    /// Resolves the binary (reusing cached managed or system path) and
+    /// delegates to [`spawn_and_watch`] so the spawn pipeline is shared
+    /// with [`MihomoManager::start`].
+    pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
+        let resolved = binary::resolve_or_install()
+            .await
+            .context("auto-restart: failed to resolve mihomo binary")?;
+
+        tracing::info!(
+            target: "mihomo",
+            "auto-restarting mihomo {}",
+            resolved.version
+        );
+
+        Self::spawn_and_watch(
+            &resolved,
+            &self.config_dir,
+            &self.socket_path,
+            Arc::new(Self {
+                pid: Mutex::new(None),
+                started_at: Mutex::new(None),
+                state: Mutex::new(CoreState::Stopped),
+                action_tx: Mutex::new(self.action_tx.lock().clone()),
+                child: Mutex::new(None),
+                config_dir: self.config_dir.clone(),
+                socket_path: self.socket_path.clone(),
+                secret: self.secret.clone(),
+                restart_history: Mutex::new(self.restart_history.lock().clone()),
+            }),
+        )
+        .context("auto-restart: failed to spawn mihomo")
     }
 }
 
@@ -268,54 +278,13 @@ impl MihomoManager {
             .await
             .context("failed to resolve or auto-install mihomo core")?;
 
-        let mut command = Command::new(&resolved.path);
-        command.arg("-d").arg(&self.config_dir);
-        if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
-            && config_path.exists()
-        {
-            command.arg("-f").arg(config_path);
-        }
-        // Keep mihomo I/O off the TTY. Without pipes, core logs overwrite the
-        // ratatui alternate screen (visible as garbled home-view output on start).
-        let child = command
-            .arg("-ext-ctl-unix")
-            .arg(&self.socket_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false)
-            .spawn()
-            .with_context(|| format!(
-                "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
-                resolved.path.display(), resolved.path.display()
-            ))?;
-
-        let pid = child.id().expect("child must have PID after spawn");
-
-        {
-            let mut state = self.inner.state.lock();
-            *state = CoreState::Starting;
-        }
-        *self.inner.pid.lock() = Some(pid);
-        *self.inner.started_at.lock() = Some(Utc::now());
-
-        // Reset state to Running; the watcher will detect crashes
-        {
-            let mut state = self.inner.state.lock();
-            *state = CoreState::Running;
-        }
-
-        if let Some(tx) = self.inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreStarted {
-                version: Some(resolved.version.clone()),
-                binary_path: Some(resolved.path.display().to_string()),
-                binary_source: Some(resolved.source.as_str().into()),
-            });
-        }
-
-        // Spawn watcher — takes ownership of the Child handle
-        let inner = Arc::clone(&self.inner);
-        spawn_watcher(child, inner);
+        ManagerInner::spawn_and_watch(
+            &resolved,
+            &self.config_dir,
+            &self.socket_path,
+            Arc::clone(&self.inner),
+        )
+        .context("failed to spawn mihomo")?;
 
         Ok(resolved)
     }
