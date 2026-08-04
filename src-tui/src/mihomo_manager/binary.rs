@@ -27,9 +27,7 @@ static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
 pub async fn latest_mihomo_version() -> &'static str {
     LATEST_VERSION
         .get_or_init(|| async {
-            if let Some(tag) = crate::subscribe::client_meta::fetch_latest_release_tag(MIHOMO_REPO)
-                .await
-            {
+            if let Some(tag) = crate::subscribe::client_meta::fetch_latest_release_tag(MIHOMO_REPO).await {
                 tracing::info!(target: "mihomo", "latest mihomo release from GitHub: {tag}");
                 return tag;
             }

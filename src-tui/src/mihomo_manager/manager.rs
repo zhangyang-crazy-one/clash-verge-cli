@@ -155,8 +155,7 @@ impl ManagerInner {
             resolved.version
         );
 
-        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner)
-            .context("auto-restart: failed to spawn mihomo")
+        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner).context("auto-restart: failed to spawn mihomo")
     }
 }
 
@@ -242,12 +241,7 @@ impl MihomoManager {
     }
 
     pub async fn try_auto_restart(&self) -> anyhow::Result<()> {
-        ManagerInner::try_auto_restart(
-            Arc::clone(&self.inner),
-            &self.config_dir,
-            &self.socket_path,
-        )
-        .await
+        ManagerInner::try_auto_restart(Arc::clone(&self.inner), &self.config_dir, &self.socket_path).await
     }
 
     pub fn set_secret(&mut self, secret: String) {
@@ -277,13 +271,8 @@ impl MihomoManager {
             .await
             .context("failed to resolve or auto-install mihomo core")?;
 
-        ManagerInner::spawn_and_watch(
-            &resolved,
-            &self.config_dir,
-            &self.socket_path,
-            Arc::clone(&self.inner),
-        )
-        .context("failed to spawn mihomo")?;
+        ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
+            .context("failed to spawn mihomo")?;
 
         Ok(resolved)
     }
@@ -297,7 +286,9 @@ impl MihomoManager {
     pub async fn stop(&self) -> anyhow::Result<()> {
         // Set a flag so the watcher knows this was intentional and skips
         // auto-restart.  The flag is cleared by the next successful start.
-        self.inner.expected_exit.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .expected_exit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let pid = { *self.inner.pid.lock() };
 
         if let Some(pid) = pid {

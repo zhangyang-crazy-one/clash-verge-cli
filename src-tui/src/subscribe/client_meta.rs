@@ -59,11 +59,11 @@ pub(crate) async fn fetch_latest_release_tag(owner_repo: &str) -> Option<String>
 pub async fn clash_verge_compat_version() -> &'static str {
     COMPAT_VERSION
         .get_or_init(|| async {
-            if let Some(tag) = fetch_latest_release_tag(CLASH_VERGE_REPO).await {
-                if let Some(version) = normalize_version(&tag) {
-                    tracing::info!(target: "subscribe", "subscription UA version from GitHub: {version}");
-                    return version;
-                }
+            if let Some(tag) = fetch_latest_release_tag(CLASH_VERGE_REPO).await
+                && let Some(version) = normalize_version(&tag)
+            {
+                tracing::info!(target: "subscribe", "subscription UA version from GitHub: {version}");
+                return version;
             }
             if let Some(version) = detect_installed_clash_verge_version() {
                 tracing::info!(target: "subscribe", "subscription UA version from local package: {version}");
