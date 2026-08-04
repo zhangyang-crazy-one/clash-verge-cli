@@ -4,7 +4,6 @@ use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::Context;
 use tokio::process::Command;
@@ -14,8 +13,7 @@ use tokio::sync::OnceCell;
 /// when GitHub API is unreachable.
 pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.29";
 
-const GITHUB_LATEST_RELEASE: &str =
-    "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest";
+const MIHOMO_REPO: &str = "MetaCubeX/mihomo";
 
 static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
 
@@ -24,7 +22,9 @@ static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
 pub async fn latest_mihomo_version() -> &'static str {
     LATEST_VERSION
         .get_or_init(|| async {
-            if let Some(tag) = fetch_latest_mihomo_tag().await {
+            if let Some(tag) = crate::subscribe::client_meta::fetch_latest_release_tag(MIHOMO_REPO)
+                .await
+            {
                 tracing::info!(target: "mihomo", "latest mihomo release from GitHub: {tag}");
                 return tag;
             }
@@ -36,37 +36,6 @@ pub async fn latest_mihomo_version() -> &'static str {
         })
         .await
         .as_str()
-}
-
-async fn fetch_latest_mihomo_tag() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(3))
-        .no_proxy()
-        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
-
-    let response = client
-        .get(GITHUB_LATEST_RELEASE)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let payload: serde_json::Value = response.json().await.ok()?;
-    let tag = payload.get("tag_name")?.as_str()?;
-    // Accept only well-formed version tags like "v1.19.29".
-    let tag = tag.trim();
-    if tag.starts_with('v') && tag[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        Some(tag.to_string())
-    } else {
-        None
-    }
 }
 
 /// D-01: managed binary path. Resolves to

@@ -1,14 +1,13 @@
 //! Client identity for subscription providers.
 //!
 //! Airports commonly whitelist GUI-style User-Agents such as `clash-verge/v2.5.x`.
-//! Sending `clash-verge-cli/0.1.0` can yield placeholder nodes like “client too old”.
+//! Sending `clash-verge-cli/0.1.0` can yield placeholder nodes like "client too old".
 //!
 //! Version resolution order:
 //! 1. Latest GitHub release of `clash-verge-rev/clash-verge-rev`
 //! 2. Local GUI package version (`rpm` / `dpkg-query`, never launching the binary)
 //! 3. Compile-time fallback
 
-use std::process::Command;
 use std::time::Duration;
 
 use tokio::sync::OnceCell;
@@ -16,17 +15,55 @@ use tokio::sync::OnceCell;
 /// Fallback when GitHub and local package lookup both fail.
 const FALLBACK_CLASH_VERGE_VERSION: &str = "2.5.2";
 
-const GITHUB_LATEST_RELEASE: &str = "https://api.github.com/repos/clash-verge-rev/clash-verge-rev/releases/latest";
+const CLASH_VERGE_REPO: &str = "clash-verge-rev/clash-verge-rev";
 
 static COMPAT_VERSION: OnceCell<String> = OnceCell::const_new();
+
+/// Shared: query the GitHub releases API for `owner/repo` and return the
+/// `tag_name` stripped of a leading `v`/`V`.
+///
+/// Times out after 5 s (3 s connect).  Returns `None` on any failure.
+pub(crate) async fn fetch_latest_release_tag(owner_repo: &str) -> Option<String> {
+    let url = format!("https://api.github.com/repos/{owner_repo}/releases/latest");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(3))
+        .no_proxy()
+        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .ok()?;
+
+    let response = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let payload: serde_json::Value = response.json().await.ok()?;
+    let tag = payload.get("tag_name")?.as_str()?;
+    // Accept only well-formed version tags like "v2.5.2" or "v1.19.29".
+    let tag = tag.trim();
+    if tag.starts_with('v') && tag[1..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        Some(tag.to_string())
+    } else {
+        None
+    }
+}
 
 /// Semantic version used for GUI-compatible subscription User-Agent.
 pub async fn clash_verge_compat_version() -> &'static str {
     COMPAT_VERSION
         .get_or_init(|| async {
-            if let Some(version) = fetch_latest_clash_verge_version().await {
-                tracing::info!(target: "subscribe", "subscription UA version from GitHub: {version}");
-                return version;
+            if let Some(tag) = fetch_latest_release_tag(CLASH_VERGE_REPO).await {
+                if let Some(version) = normalize_version(&tag) {
+                    tracing::info!(target: "subscribe", "subscription UA version from GitHub: {version}");
+                    return version;
+                }
             }
             if let Some(version) = detect_installed_clash_verge_version() {
                 tracing::info!(target: "subscribe", "subscription UA version from local package: {version}");
@@ -47,31 +84,6 @@ pub async fn default_subscription_user_agent() -> String {
     format!("clash-verge/v{}", clash_verge_compat_version().await)
 }
 
-async fn fetch_latest_clash_verge_version() -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(3))
-        .no_proxy()
-        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .ok()?;
-
-    let response = client
-        .get(GITHUB_LATEST_RELEASE)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-
-    let payload: serde_json::Value = response.json().await.ok()?;
-    let tag = payload.get("tag_name")?.as_str()?;
-    normalize_version(tag.trim_start_matches(['v', 'V']))
-}
-
 /// Read the installed GUI package version without launching the binary
 /// (`clash-verge --version` starts the app).
 fn detect_installed_clash_verge_version() -> Option<String> {
@@ -86,7 +98,7 @@ fn detect_installed_clash_verge_version() -> Option<String> {
 
 fn version_from_command(argv: &[&str]) -> Option<String> {
     let (program, args) = argv.split_first()?;
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = std::process::Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -95,7 +107,7 @@ fn version_from_command(argv: &[&str]) -> Option<String> {
 }
 
 /// Accept `v2.5.2`, `2.5.1`, `2.5.1-1`, `2.5.3+dfsg` → bare semver.
-fn normalize_version(raw: &str) -> Option<String> {
+pub(crate) fn normalize_version(raw: &str) -> Option<String> {
     let main = raw
         .trim()
         .trim_start_matches(['v', 'V'])
