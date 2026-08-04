@@ -21,7 +21,8 @@ pub async fn graceful_stop(child_pid: u32, child: &mut tokio::process::Child) ->
     kill(pid, Signal::SIGTERM)?;
 
     match tokio::time::timeout(GRACEFUL_TIMEOUT, child.wait()).await {
-        Ok(_) => Ok(()),
+        Ok(Ok(_status)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("error waiting for mihomo after SIGTERM: {e}")),
         Err(_) => {
             tracing::warn!("mihomo did not exit in 5s, sending SIGKILL");
             child.kill().await?;

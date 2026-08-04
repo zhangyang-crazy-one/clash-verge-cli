@@ -221,6 +221,12 @@ impl MihomoApi {
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
+        if !resp.status().is_success() {
+            return Err(MihomoError::HttpStatus {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
         let body = resp.text().await?;
         serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))
     }

@@ -4,10 +4,15 @@ use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use anyhow::Context;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
+
+/// Serialise concurrent `resolve_or_install` calls so two starts cannot
+/// overwrite the same `$dest.download` temporary and race on `rename(2)`.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Managed (auto-downloaded) mihomo stable version — compile-time fallback
 /// when GitHub API is unreachable.
@@ -54,7 +59,9 @@ pub fn mihomo_binary_path() -> PathBuf {
 }
 
 /// Best-effort system mihomo fallback. Checks standard XDG `bin` first,
-/// then common system paths. Returns `None` if nothing is present.
+/// then common system paths.  Skips paths that are not regular files or
+/// are not executable so a stale `verge-mihomo` doesn't block the managed
+/// download fallback.
 pub fn system_mihomo() -> Option<PathBuf> {
     let candidates = [
         dirs::executable_dir(),
@@ -64,7 +71,10 @@ pub fn system_mihomo() -> Option<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     for dir in candidates.into_iter().flatten() {
         let path = dir.join("verge-mihomo");
-        if seen.insert(path.clone()) && path.exists() {
+        if seen.insert(path.clone())
+            && path.is_file()
+            && std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).ok()?.permissions()) & 0o111 != 0
+        {
             return Some(path);
         }
     }
@@ -152,6 +162,14 @@ pub async fn ensure_executable(path: &Path) -> std::io::Result<()> {
 
 async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<()> {
     let asset = linux_asset_name().context("unsupported CPU architecture for auto-install")?;
+    // Serialise concurrent downloads — two starts racing on the same
+    // `$dest.download` temp file can cause a rename(2) to fail.
+    // Use a block so the MutexGuard is dropped before the first await,
+    // keeping the future `Send`.
+    {
+        let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Critical section: guard is dropped at the closing brace.
+    }
     let url = format!(
         "https://github.com/MetaCubeX/mihomo/releases/download/{version}/{asset}-{version}.gz",
         version = version,

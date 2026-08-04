@@ -4,6 +4,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -32,6 +33,9 @@ pub struct ManagerInner {
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
+    /// Set by `stop()` so the watcher knows this exit was intentional and
+    /// should NOT trigger an auto-restart.
+    pub expected_exit: AtomicBool,
     /// Captured config so the watcher can auto-restart without holding a
     /// reference back to `MihomoManager`.
     config_dir: PathBuf,
@@ -48,6 +52,7 @@ impl ManagerInner {
             started_at: Mutex::new(None),
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
+            expected_exit: AtomicBool::new(false),
             config_dir,
             socket_path,
             secret,
@@ -56,11 +61,15 @@ impl ManagerInner {
 
     /// D-09: 3-in-60s policy. Returns `true` if another auto-restart is
     /// permitted right now, `false` if the cap has been hit.
+    ///
+    /// This is a pure predicate: expired entries are pruned but the check
+    /// is read-only for external callers.
     pub fn should_auto_restart(&self) -> bool {
         let now = Utc::now();
         let window_start = now - chrono::Duration::seconds(60);
 
         let mut history = self.restart_history.lock();
+        // Prune expired entries, then check the cap.
         while let Some(front) = history.front() {
             if *front < window_start {
                 history.pop_front();
@@ -113,6 +122,7 @@ impl ManagerInner {
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
         *inner.started_at.lock() = Some(Utc::now());
+        inner.expected_exit.store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
@@ -152,6 +162,7 @@ impl ManagerInner {
                 state: Mutex::new(CoreState::Stopped),
                 action_tx: Mutex::new(self.action_tx.lock().clone()),
                 child: Mutex::new(None),
+                expected_exit: AtomicBool::new(false),
                 config_dir: self.config_dir.clone(),
                 socket_path: self.socket_path.clone(),
                 secret: self.secret.clone(),
@@ -297,6 +308,9 @@ impl MihomoManager {
     /// usually `None` while `inner.pid` is set. Prefer the Child wait path when
     /// available; otherwise signal and poll by PID so restart cannot leak a core.
     pub async fn stop(&self) -> anyhow::Result<()> {
+        // Set a flag so the watcher knows this was intentional and skips
+        // auto-restart.  The flag is cleared by the next successful start.
+        self.inner.expected_exit.store(true, std::sync::atomic::Ordering::SeqCst);
         let pid = { *self.inner.pid.lock() };
         let mut child_opt = self.inner.child.lock().take();
 
