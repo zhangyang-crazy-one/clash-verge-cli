@@ -81,6 +81,9 @@ pub struct IVerge {
     /// clash tun mode
     pub enable_tun_mode: Option<bool>,
 
+    /// probe the selected node and force-refresh the subscription when it dies
+    pub probe_enabled: Option<bool>,
+
     /// can the app auto startup
     pub enable_auto_launch: Option<bool>,
 

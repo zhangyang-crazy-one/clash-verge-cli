@@ -128,6 +128,9 @@ pub enum Action {
         name: String,
         error: String,
     },
+
+    // Probe loop (dead-node detection → forced refresh / rollback notices).
+    ProbeNotice(String),
 }
 
 const fn _assert_send_sync() {

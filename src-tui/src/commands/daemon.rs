@@ -46,9 +46,12 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                 let sched = scheduler.clone();
                 let api = manager.api();
                 let handle = tokio::spawn(async move {
-                    let outcome = {
+                    let (outcome, probe) = {
                         let mut scheduler = sched.lock().await;
-                        scheduler.tick().await
+                        (
+                            scheduler.tick().await,
+                            scheduler.probe(&api, enable_tun, true).await,
+                        )
                     };
                     for (uid, is_current) in outcome.updated {
                         tracing::info!(target: "auto_update", "refreshed {uid} (current={is_current})");
@@ -68,6 +71,18 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                     }
                     if let Some(error) = outcome.errored {
                         tracing::error!(target: "auto_update", "auto-update batch failed: {error}");
+                    }
+                    if probe.forced_refresh {
+                        if probe.rolled_back {
+                            tracing::warn!(target: "probe", "selected node vanished — refresh rolled back");
+                        } else if probe.may_be_down {
+                            tracing::error!(target: "probe", "subscription may be down after forced refresh");
+                        } else {
+                            tracing::info!(target: "probe", "node recovered — subscription refreshed");
+                        }
+                    }
+                    if let Some(error) = probe.error {
+                        tracing::warn!(target: "probe", "probe error: {error}");
                     }
                 });
                 in_flight = Some(handle);

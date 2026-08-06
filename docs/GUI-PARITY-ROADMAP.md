@@ -15,6 +15,11 @@ Tray, global hotkeys, and lightweight window mode are explicitly out of scope.
   (`subscribe::scheduler`), with CLI `profile import --update-interval
   <minutes>` / `--no-auto-update`, failure cooldown, and periodic
   `profiles.yaml` re-snapshot.
+  - **Probe recovery**: the scheduler probes the current exit node every 30 s;
+    3 consecutive failures force a subscription refresh (bypassing the
+    interval), and a refresh that would lose the selected node name is
+    rolled back to preserve the user's fixed exit (`probe_enabled` in
+    verge.yaml, default on).
 - **Phase 3 — System integration**: system proxy (GNOME/KDE), clash mode
   cycle, TUN via runtime config, `service install|uninstall|status` CLI.
 - **Phase 4 — Proxies / Rules / observability**: proxies view, rules +

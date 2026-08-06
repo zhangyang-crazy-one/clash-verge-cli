@@ -587,12 +587,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             match app.view {
                                                 View::Profiles => {
                                                     // Profile tab: switch profile
-                                                    if let Some(item) =
-                                                        app.profiles.get(app.selected_index).filter(|item| item.uid.is_some())
+                                                    if let Some(item) = app.profiles.get(app.selected_index)
+                                                        && let Some(uid) = item.uid.clone()
                                                     {
                                                         let name = item.name.clone().unwrap_or_default();
                                                         let itype = item.itype.clone().unwrap_or_default();
-                                                        let uid = item.uid.clone().expect("filtered uid");
                                                         app.status_msg = Some(format!("Switching to {name}..."));
                                                         let api = manager.api();
                                                         let tx = action_tx.clone();
@@ -1667,6 +1666,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ModeChangeFailed(error)) => {
                         app.status_msg = Some(format!("{}: {error}", app.tr("common.failed")));
                     }
+                    Some(Action::ProbeNotice(message)) => {
+                        app.status_msg = Some(message);
+                    }
                     Some(Action::AutoUpdateFinished) => {
                         auto_update_in_flight = false;
                     }
@@ -1702,10 +1704,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 auto_update_in_flight = true;
                 let scheduler = auto_update_scheduler.clone();
                 let tx = action_tx.clone();
+                let api = manager.api();
+                let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
+                let core_running = app.core_state == CoreState::Running;
                 tokio::spawn(async move {
-                    let outcome = {
+                    let (outcome, probe) = {
                         let mut scheduler = scheduler.lock().await;
-                        scheduler.tick().await
+                        (
+                            scheduler.tick().await,
+                            scheduler.probe(&api, enable_tun, core_running).await,
+                        )
                     };
                     for (uid, is_current) in outcome.updated {
                         let _ = tx.send(Action::ProfileUpdated { uid, is_current });
@@ -1715,6 +1723,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     if let Some(error) = outcome.errored {
                         let _ = tx.send(Action::ProfileUpdateFailed(error));
+                    }
+                    if probe.forced_refresh {
+                        let notice = if probe.rolled_back {
+                            "probe: selected node vanished — refresh rolled back".to_string()
+                        } else if probe.may_be_down {
+                            "probe: subscription may be down".to_string()
+                        } else {
+                            "probe: node recovered — subscription refreshed".to_string()
+                        };
+                        let _ = tx.send(Action::ProbeNotice(notice));
                     }
                     let _ = tx.send(Action::AutoUpdateFinished);
                 });
@@ -1784,10 +1802,16 @@ mod tests {
     fn ndjson_parser_buffers_partial_records_and_preserves_order() {
         let mut buffer = Vec::new();
 
-        let initial = drain_ndjson::<TrafficData>(&mut buffer, br#"{"up":1,"down":2}"#).expect("partial record");
+        let initial = match drain_ndjson::<TrafficData>(&mut buffer, br#"{"up":1,"down":2}"#) {
+            Ok(records) => records,
+            Err(error) => panic!("partial record: {error}"),
+        };
         assert!(initial.is_empty());
 
-        let entries = drain_ndjson::<TrafficData>(&mut buffer, b"\n{\"up\":3,\"down\":4}\n").expect("complete records");
+        let entries = match drain_ndjson::<TrafficData>(&mut buffer, b"\n{\"up\":3,\"down\":4}\n") {
+            Ok(records) => records,
+            Err(error) => panic!("complete records: {error}"),
+        };
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].up, 1);
         assert_eq!(entries[1].down, 4);
@@ -1796,8 +1820,10 @@ mod tests {
     #[test]
     fn ndjson_parser_ignores_blank_lines() {
         let mut buffer = Vec::new();
-        let entries = drain_ndjson::<LogEntry>(&mut buffer, b"\n {\"type\":\"info\",\"payload\":\"ready\"}\n\n")
-            .expect("valid log record");
+        let entries = match drain_ndjson::<LogEntry>(&mut buffer, b"\n {\"type\":\"info\",\"payload\":\"ready\"}\n\n") {
+            Ok(records) => records,
+            Err(error) => panic!("valid log record: {error}"),
+        };
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].level, "info");

@@ -105,6 +105,18 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Restore a profile's `updated` timestamp (probe rollback path).
+    pub async fn restore_updated_locked(uid: &str, updated: usize) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let patch = PrfItem {
+            updated: Some(updated),
+            ..Default::default()
+        };
+        store.profiles.patch_item(&uid.into(), &patch).await?;
+        Ok(())
+    }
+
     /// Rename a profile by UID under the shared IO lock.
     pub async fn rename_locked(uid: &str, new_name: &str) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
@@ -298,11 +310,17 @@ mod tests {
     #[tokio::test]
     async fn append_bundle_persists_profiles_yaml_and_body() {
         let root = std::env::temp_dir().join(format!("clash-verge-cli-profile-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(root.join("profiles")).expect("temp profiles dir");
+        match std::fs::create_dir_all(root.join("profiles")) {
+            Ok(()) => {}
+            Err(error) => panic!("create temp profiles dir: {error}"),
+        }
         dirs::set_app_home_dir(root.clone());
+        let home = match dirs::app_home_dir() {
+            Ok(home) => home,
+            Err(error) => panic!("app home dir: {error}"),
+        };
         assert_eq!(
-            dirs::app_home_dir().expect("home"),
-            root,
+            home, root,
             "test requires exclusive app home dir; another test may have claimed OnceLock"
         );
 
@@ -321,15 +339,27 @@ mod tests {
                 file_data: Some("proxies: []\n".into()),
                 ..Default::default()
             },
-            fragments: vec![PrfItem::from_merge(None).expect("merge fragment")],
+            fragments: vec![match PrfItem::from_merge(None) {
+                Ok(item) => item,
+                Err(error) => panic!("merge fragment: {error}"),
+            }],
         };
 
-        store.append_bundle(bundle).await.expect("append_bundle");
+        match store.append_bundle(bundle).await {
+            Ok(_) => {}
+            Err(error) => panic!("append_bundle: {error}"),
+        }
 
-        let profiles_yaml = std::fs::read_to_string(root.join("profiles.yaml")).expect("profiles.yaml");
+        let profiles_yaml = match std::fs::read_to_string(root.join("profiles.yaml")) {
+            Ok(text) => text,
+            Err(error) => panic!("read profiles.yaml: {error}"),
+        };
         assert!(profiles_yaml.contains(uid));
         assert!(profiles_yaml.contains("persist-demo"));
-        let body = std::fs::read_to_string(root.join("profiles").join(&file_name)).expect("body");
+        let body = match std::fs::read_to_string(root.join("profiles").join(&file_name)) {
+            Ok(text) => text,
+            Err(error) => panic!("read profile body: {error}"),
+        };
         assert!(body.contains("proxies:"));
         let _ = std::fs::remove_dir_all(&root);
     }
