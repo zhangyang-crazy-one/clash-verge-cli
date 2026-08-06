@@ -112,6 +112,22 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             frame.render_widget(popup, area);
         }
         Overlay::Filter => {}
+        Overlay::CloseAllConnectionsConfirmation => {
+            let popup = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "Close ALL connections?",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
+                Line::from("This will terminate every active connection."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter = confirm | Esc/q = cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(Block::bordered().title("Close All"));
+            frame.render_widget(popup, area);
+        }
     }
 }
 
@@ -265,7 +281,7 @@ mod tests {
             (View::Proxies, "Groups / Auto Nodes"),
             (View::Profiles, "Profile Detail"),
             (View::Connections, "Connection Detail"),
-            (View::Rules, "Limited provider support"),
+            (View::Rules, "Rule Providers"),
             (View::Logs, "ERROR"),
             (View::Unlock, "Limited support"),
             (View::Settings, "Runtime Settings"),
@@ -350,7 +366,7 @@ mod tests {
 
         app.view = View::Rules;
         let (rules, _) = render(&app, 120, 32);
-        assert!(rules.contains("Limited provider support"));
+        assert!(rules.contains("Rule Providers"));
 
         app.view = View::Unlock;
         let (unlock, _) = render(&app, 120, 32);

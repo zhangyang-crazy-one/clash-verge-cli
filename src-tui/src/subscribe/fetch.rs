@@ -153,6 +153,20 @@ pub fn proxy_mode_from_option(option: Option<&PrfOption>) -> ProxyMode {
     }
 }
 
+/// Strip query parameters and userinfo from a URL for safe display.
+pub fn redact_url(raw: &str) -> String {
+    let parsed = match Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return raw.to_string(),
+    };
+    let scheme = parsed.scheme();
+    let host = parsed.host_str().unwrap_or("");
+    let port = parsed.port().map_or_else(String::new, |p| format!(":{p}"));
+    let path = parsed.path();
+    // Keep the scheme://host:port/path, drop query and fragment.
+    format!("{scheme}://{host}{port}{path}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +221,25 @@ mod tests {
         let (url, headers) = prepare_request_url("https://example.com/sub.yaml").expect("url");
         assert_eq!(url.as_str(), "https://example.com/sub.yaml");
         assert!(!headers.contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn redact_url_strips_query_and_userinfo() {
+        let redacted = redact_url("https://user:pass@example.com/sub?token=abc&flag=1");
+        assert_eq!(redacted, "https://example.com/sub");
+    }
+
+    #[test]
+    fn redact_url_keeps_port() {
+        let redacted = redact_url("http://example.com:8080/path?a=1");
+        assert_eq!(redacted, "http://example.com:8080/path");
+    }
+
+    #[test]
+    fn redact_url_plain_unchanged() {
+        assert_eq!(
+            redact_url("https://example.com/sub.yaml"),
+            "https://example.com/sub.yaml"
+        );
     }
 }

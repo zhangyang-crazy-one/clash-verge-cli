@@ -1,11 +1,11 @@
 pub mod action;
 pub mod state;
 
-pub use action::Action;
+pub use action::{Action, EditorTarget};
 pub use state::CoreState;
 
 use crate::i18n::Language;
-use crate::mihomo_api::types::{ConnectionInfo, LogEntry, ProxyGroup, TrafficData};
+use crate::mihomo_api::types::{ConnectionInfo, LogEntry, ProxyGroup, Rule, RuleProvider, TrafficData};
 use clash_verge_core::config::{IClashTemp, IVerge, PrfItem};
 use std::collections::HashMap;
 
@@ -88,6 +88,7 @@ pub enum Overlay {
     Help,
     Filter,
     CloseConfirmation,
+    CloseAllConnectionsConfirmation,
 }
 
 #[derive(Debug, Default)]
@@ -149,6 +150,17 @@ pub struct App {
     pub settings_selected_index: usize,
     /// Last known clash mode from mihomo or saved config (tolerant string).
     pub clash_mode: String,
+
+    // Rules state
+    pub rules: Vec<Rule>,
+    pub rule_providers: Vec<RuleProvider>,
+    pub rules_loading: bool,
+    pub rules_error: Option<String>,
+    pub rule_providers_loading: bool,
+    pub rule_providers_error: Option<String>,
+    /// Tab between Rules and Providers panels.
+    pub rules_focus_providers: bool,
+    pub rules_selected_index: usize,
 }
 
 impl App {
@@ -187,6 +199,14 @@ impl App {
             chain_nodes: Vec::new(),
             settings_selected_index: 0,
             clash_mode: "rule".into(),
+            rules: Vec::new(),
+            rule_providers: Vec::new(),
+            rules_loading: false,
+            rules_error: None,
+            rule_providers_loading: false,
+            rule_providers_error: None,
+            rules_focus_providers: false,
+            rules_selected_index: 0,
         }
     }
 

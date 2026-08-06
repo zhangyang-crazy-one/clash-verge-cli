@@ -76,6 +76,42 @@ pub struct LogEntry {
     pub payload: String,
 }
 
+/// A single rule from `GET /rules`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    pub payload: String,
+    pub proxy: String,
+    #[serde(default)]
+    pub size: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RulesResponse {
+    pub rules: Vec<Rule>,
+}
+
+/// A rule provider from `GET /providers/rules`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleProvider {
+    pub name: String,
+    pub behavior: String,
+    #[serde(rename = "ruleCount")]
+    pub rule_count: u64,
+    #[serde(rename = "vehicleType")]
+    pub vehicle_type: String,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(rename = "type")]
+    pub provider_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleProvidersResponse {
+    pub providers: std::collections::HashMap<String, RuleProvider>,
+}
+
 #[cfg(test)]
 #[allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 mod tests {

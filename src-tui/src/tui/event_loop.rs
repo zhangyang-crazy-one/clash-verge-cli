@@ -1,21 +1,21 @@
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use serde_yaml_ng::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time;
 use tokio_stream::StreamExt as _;
 
-/// Serializes writes to the shared runtime `clash.yaml` staging/rename path.
-static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 use crate::app::{
-    Action, App, CoreState, Focus, InputMode, Overlay, ProxyDisplayRow, View, first_selectable_proxy_group,
-    proxy_display_rows,
+    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, View,
+    first_selectable_proxy_group, proxy_display_rows,
 };
 use crate::i18n::Language;
 use crate::mihomo_api::types::{LogEntry, TrafficData};
+use crate::runtime_config::{
+    RUNTIME_CONFIG_IO, commit_runtime_config, reload_config_file, reload_remote_profile, write_runtime_config,
+    write_runtime_config_unlocked,
+};
 use crate::tui::{TerminalGuard, input};
 
 fn key_context(app: &App) -> input::KeyContext<'_> {
@@ -169,7 +169,7 @@ async fn receive_log_stream(
     api: crate::mihomo_api::client::MihomoApi,
     tx: mpsc::UnboundedSender<Action>,
 ) -> Result<(), String> {
-    let response = api.stream_logs().await.map_err(|error| error.to_string())?;
+    let response = api.stream_logs("info").await.map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
 
@@ -183,59 +183,6 @@ async fn receive_log_stream(
     }
 
     Err("Mihomo log stream closed".into())
-}
-
-async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {
-    let config_path = path
-        .to_str()
-        .ok_or_else(|| format!("config path is not valid UTF-8: {}", path.display()))?;
-    let response = api
-        .client
-        .put("http://localhost/configs?force=true")
-        .json(&serde_json::json!({ "path": config_path, "payload": "" }))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(format!("Mihomo rejected config reload ({status}): {body}"))
-    }
-}
-
-async fn reload_remote_profile(
-    api: &crate::mihomo_api::MihomoApi,
-    item: &clash_verge_core::config::PrfItem,
-    enable_tun: bool,
-    core_running: bool,
-) -> Result<(), String> {
-    let file = item
-        .file
-        .as_deref()
-        .ok_or_else(|| "remote profile is missing file".to_string())?;
-    let profile_path = clash_verge_core::utils::dirs::app_profiles_dir()
-        .map_err(|error| error.to_string())?
-        .join(file);
-    if !profile_path.exists() {
-        return Err(format!("profile file not found: {}", profile_path.display()));
-    }
-
-    let raw = tokio::fs::read_to_string(&profile_path)
-        .await
-        .map_err(|error| format!("failed to read {}: {error}", profile_path.display()))?;
-    let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
-        .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
-
-    // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
-    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
-        let control_plane = crate::enhance::snapshot_control_plane(&app_config);
-        Ok(crate::enhance::enforce_control_plane(profile, control_plane))
-    })
-    .await?;
-    Ok(())
 }
 
 /// Write TUN-enabled runtime config and apply it under one IO lock.
@@ -263,119 +210,6 @@ async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, Strin
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let config = clash_verge_core::config::IClashTemp::new().await.0;
     write_runtime_config_unlocked(config, enable_tun).await
-}
-
-async fn restore_selected_nodes(api: &crate::mihomo_api::MihomoApi, item: &clash_verge_core::config::PrfItem) {
-    let Some(selected) = item.selected.as_ref() else {
-        return;
-    };
-    for entry in selected {
-        let Some(group) = entry.name.as_deref() else {
-            continue;
-        };
-        let Some(node) = entry.now.as_deref() else {
-            continue;
-        };
-        if let Err(error) = api.select_proxy(group, node).await {
-            tracing::debug!(target: "profile", "restore selected {group}/{node}: {error}");
-        }
-    }
-}
-
-/// Write runtime config under the shared IO lock (no reload).
-async fn write_runtime_config(config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<std::path::PathBuf, String> {
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    write_runtime_config_unlocked(config, enable_tun).await
-}
-
-/// Backup → build (from a fresh on-disk snapshot) → write → reload/rollback.
-///
-/// `build` receives the latest `clash.yaml` mapping while `RUNTIME_CONFIG_IO` is held,
-/// so concurrent mode/TUN commits are not overwritten by a stale pre-lock snapshot.
-async fn commit_runtime_config<F>(
-    api: &crate::mihomo_api::MihomoApi,
-    enable_tun: bool,
-    core_running: bool,
-    restore_item: Option<&clash_verge_core::config::PrfItem>,
-    build: F,
-) -> Result<std::path::PathBuf, String>
-where
-    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
-{
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let app_config = clash_verge_core::config::IClashTemp::new().await.0;
-    let config = build(app_config)?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let previous = if core_running && path.exists() {
-        Some(
-            tokio::fs::read(&path)
-                .await
-                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    write_runtime_config_unlocked(config, enable_tun).await?;
-    if !core_running {
-        // Keep the newly selected runtime config for the next Start; do not API-reload
-        // (or roll it back) while no controller is available.
-        return Ok(path);
-    }
-    if let Err(error) = reload_config_file(api, &path).await {
-        if let Some(previous) = previous {
-            let _ = tokio::fs::write(&path, previous).await;
-            let _ = reload_config_file(api, &path).await;
-            return Err(format!("{error}; restored the previous config"));
-        }
-        return Err(error);
-    }
-    if let Some(item) = restore_item {
-        restore_selected_nodes(api, item).await;
-    }
-    Ok(path)
-}
-
-async fn write_runtime_config_unlocked(
-    mut config: serde_yaml_ng::Mapping,
-    enable_tun: bool,
-) -> Result<std::path::PathBuf, String> {
-    config = crate::enhance::prepare_runtime_config(config, enable_tun);
-    let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let temporary_path = path.with_extension(format!("yaml.tui-runtime.{}.tmp", uuid::Uuid::new_v4()));
-
-    #[cfg(unix)]
-    let permissions = {
-        use std::os::unix::fs::PermissionsExt;
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            tokio::fs::metadata(&path).await.ok().map(|meta| meta.permissions())
-        } else {
-            Some(std::fs::Permissions::from_mode(0o600))
-        }
-    };
-
-    tokio::fs::write(&temporary_path, yaml)
-        .await
-        .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
-
-    #[cfg(unix)]
-    if let Some(permissions) = permissions {
-        tokio::fs::set_permissions(&temporary_path, permissions)
-            .await
-            .map_err(|error| format!("failed to set permissions on {}: {error}", temporary_path.display()))?;
-    }
-
-    #[cfg(windows)]
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
-    }
-    tokio::fs::rename(&temporary_path, &path)
-        .await
-        .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
-    Ok(path)
 }
 
 fn next_clash_mode(current: &str) -> &'static str {
@@ -519,6 +353,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let mut auto_update_tick = time::interval(Duration::from_secs(30));
     auto_update_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_in_flight = false;
+    // Re-read profiles.yaml every 5 min so external interval edits (GUI/user)
+    // take effect without restarting the TUI.
+    let mut profiles_refresh_tick = time::interval(Duration::from_secs(300));
+    profiles_refresh_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let auto_update_scheduler = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::subscribe::scheduler::AutoUpdateScheduler::new(),
+    ));
     let mut rendered_view = app.view;
 
     // Try connecting to existing mihomo (may be running from GUI)
@@ -920,6 +761,30 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                     }
                                                 }
                                                 View::Connections => begin_connection_close(&mut app),
+                                                View::Rules => {
+                                                    // Activate on rules view: update selected rule provider.
+                                                    if app.rules_focus_providers
+                                                        && let Some(provider) = app.rule_providers.get(app.rules_selected_index)
+                                                    {
+                                                        let name = provider.name.clone();
+                                                        app.status_msg = Some(format!("Updating rule provider {name}..."));
+                                                        let api = manager.api();
+                                                        let tx = action_tx.clone();
+                                                        tokio::spawn(async move {
+                                                            match api.update_rule_provider(&name).await {
+                                                                Ok(()) => {
+                                                                    let _ = tx.send(Action::RuleProviderUpdated(name));
+                                                                }
+                                                                Err(error) => {
+                                                                    let _ = tx.send(Action::RuleProviderUpdateFailed {
+                                                                        name,
+                                                                        error: error.to_string(),
+                                                                    });
+                                                                }
+                                                            }
+                                                        });
+                                                    }
+                                                }
                                                 View::Settings => {
                                                     match app.settings_selected_index {
                                                         0 => {
@@ -1112,11 +977,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 View::Logs => {
                                                     let _ = action_tx.send(Action::LogsRefresh);
                                                 }
+                                                View::Rules => {
+                                                    if app.rules.is_empty() {
+                                                        let _ = action_tx.send(Action::RulesRefresh);
+                                                    }
+                                                    if app.rule_providers.is_empty() {
+                                                        let _ = action_tx.send(Action::RuleProvidersRefresh);
+                                                    }
+                                                }
                                                 _ => {}
                                             }
                                         }
                                         Action::CycleFocus => {
-                                            app.focus = app.focus.cycle();
+                                            // On Rules view, cycle between Rules ↔ Providers panels.
+                                            if app.view == View::Rules && app.focus == Focus::Content {
+                                                app.rules_focus_providers = !app.rules_focus_providers;
+                                                app.rules_selected_index = 0;
+                                            } else {
+                                                app.focus = app.focus.cycle();
+                                            }
                                         }
                                         Action::FocusMenu => {
                                             app.focus = Focus::Menu;
@@ -1140,6 +1019,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::RequestCloseConnection => {
                                             begin_connection_close(&mut app);
+                                        }
+                                        Action::RequestCloseAllConnections => {
+                                            app.overlay = Some(Overlay::CloseAllConnectionsConfirmation);
+                                            app.status_msg =
+                                                Some("Close ALL connections? Press Enter to confirm".into());
+                                            app.focus = Focus::Content;
                                         }
                                         Action::ConfirmCloseConnection(id) => {
                                             if close_confirmation_is_current(&app, &id) {
@@ -1243,6 +1128,45 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::CycleClashMode => {
                                             let _ = action_tx.send(Action::CycleClashMode);
+                                        }
+                                        Action::OpenEditor(target) => {
+                                            let config_path = match target {
+                                                EditorTarget::Verge => {
+                                                    clash_verge_core::utils::dirs::verge_path().ok()
+                                                }
+                                                EditorTarget::Dns => None,
+                                            };
+                                            if let Some(path) = config_path {
+                                                let snapshot = crate::editor::snapshot(&path).ok();
+                                                let edit_result = crate::editor::edit_file_blocking(&mut guard, &path);
+                                                match edit_result {
+                                                    Ok(()) => {
+                                                        match crate::editor::validate_yaml(&path) {
+                                                            Ok(()) => {
+                                                                app.gui_config = clash_verge_core::config::IVerge::new().await;
+                                                                app.language = Language::from_config(app.gui_config.language.as_deref());
+                                                                // Reload DNS enable from the (possibly edited) verge config.
+                                                                if let EditorTarget::Dns = target {
+                                                                    // DNS editing not yet wired as a separate file.
+                                                                }
+                                                                app.status_msg = Some("Config saved and validated".into());
+                                                            }
+                                                            Err(e) => {
+                                                                if let Some(data) = snapshot {
+                                                                    let _ = crate::editor::restore_snapshot(&path, &data);
+                                                                }
+                                                                app.gui_config = clash_verge_core::config::IVerge::new().await;
+                                                                app.status_msg = Some(format!("Invalid YAML, restored: {e}"));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        app.status_msg = Some(format!("Editor error: {e}"));
+                                                    }
+                                                }
+                                            } else {
+                                                app.status_msg = Some("Config file path not available".into());
+                                            }
                                         }
                                         _ => {}
                                     }
@@ -1573,10 +1497,95 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::CloseConnectionFailed { id, error }) => {
                         app.runtime_errors.connections = Some(format!("Could not close {id}: {error}"));
                     }
+                    Some(Action::ConfirmCloseAllConnections)
+                        if app.overlay == Some(Overlay::CloseAllConnectionsConfirmation) =>
+                    {
+                        app.overlay = None;
+                        app.status_msg = Some("Closing all connections...".into());
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.close_all_connections().await {
+                                Ok(()) => {
+                                    let _ = tx.send(Action::AllConnectionsClosed);
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::CloseAllConnectionsFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::AllConnectionsClosed) => {
+                        app.status_msg = Some("All connections closed".into());
+                        let _ = action_tx.send(Action::ConnectionsRefresh);
+                    }
+                    Some(Action::CloseAllConnectionsFailed(error)) => {
+                        app.status_msg = Some(format!("Close all failed: {error}"));
+                    }
+                    Some(Action::RulesRefresh) if !app.rules_loading => {
+                        app.rules_loading = true;
+                        app.rules_error = None;
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.get_rules().await {
+                                Ok(resp) => {
+                                    let _ = tx.send(Action::RulesFetched(resp.rules));
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::RulesFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::RulesFetched(rules)) => {
+                        app.rules_loading = false;
+                        app.rules = rules;
+                        app.rules_selected_index = app.rules_selected_index.min(app.rules.len().saturating_sub(1));
+                    }
+                    Some(Action::RulesFailed(error)) => {
+                        app.rules_loading = false;
+                        app.rules_error = Some(error);
+                    }
+                    Some(Action::RuleProvidersRefresh) if !app.rule_providers_loading => {
+                        app.rule_providers_loading = true;
+                        app.rule_providers_error = None;
+                        let api = manager.api();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            match api.get_rule_providers().await {
+                                Ok(resp) => {
+                                    let providers: Vec<_> = resp.providers.into_values().collect();
+                                    let _ = tx.send(Action::RuleProvidersFetched(providers));
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Action::RuleProvidersFailed(error.to_string()));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::RuleProvidersFetched(providers)) => {
+                        app.rule_providers_loading = false;
+                        app.rule_providers = providers;
+                        app.rules_selected_index = app.rules_selected_index.min(app.rule_providers.len().saturating_sub(1));
+                    }
+                    Some(Action::RuleProvidersFailed(error)) => {
+                        app.rule_providers_loading = false;
+                        app.rule_providers_error = Some(error);
+                    }
+                    Some(Action::RuleProviderUpdated(name)) => {
+                        app.status_msg = Some(format!("Rule provider updated: {name}"));
+                        let _ = action_tx.send(Action::RuleProvidersRefresh);
+                    }
+                    Some(Action::RuleProviderUpdateFailed { name, error }) => {
+                        app.status_msg = Some(format!("Failed to update {name}: {error}"));
+                    }
                     Some(Action::ConfirmImport(url)) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::import_url_locked(&url, None)
+                            match crate::profile_store::store::ProfileStore::import_url_locked(
+                                &url, None, None,
+                            )
                                 .await
                             {
                                 Ok(_) => {
@@ -1607,26 +1616,20 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
                             let core_running = app.core_state == CoreState::Running;
                             tokio::spawn(async move {
-                                if let Ok(store) =
-                                    crate::profile_store::store::ProfileStore::snapshot().await
-                                    && let Some(item) = store
-                                        .items()
-                                        .into_iter()
-                                        .find(|item| item.uid.as_deref() == Some(reload_uid.as_str()))
+                                match crate::subscribe::scheduler::reload_current_profile(
+                                    &api, &reload_uid, enable_tun, core_running,
+                                )
+                                .await
                                 {
-                                    if let Err(error) = reload_remote_profile(
-                                        &api,
-                                        &item,
-                                        enable_tun,
-                                        core_running,
-                                    )
-                                    .await
-                                    {
+                                    Ok(()) => {
+                                        if core_running {
+                                            let _ = tx.send(Action::ProxiesRefresh);
+                                        }
+                                    }
+                                    Err(error) => {
                                         let _ = tx.send(Action::CoreError(format!(
                                             "profile reload: {error}"
                                         )));
-                                    } else if core_running {
-                                        let _ = tx.send(Action::ProxiesRefresh);
                                     }
                                 }
                             });
@@ -1696,28 +1699,33 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             }
 
             _ = auto_update_tick.tick(), if !auto_update_in_flight => {
-                let due = crate::subscribe::timer::due_remote_uids(&app.profiles);
-                if due.is_empty() {
-                    continue;
-                }
                 auto_update_in_flight = true;
+                let scheduler = auto_update_scheduler.clone();
                 let tx = action_tx.clone();
                 tokio::spawn(async move {
-                    match crate::profile_store::store::ProfileStore::update_remotes_locked(&due).await {
-                        Ok((updated, failed)) => {
-                            for (uid, is_current) in updated {
-                                let _ = tx.send(Action::ProfileUpdated { uid, is_current });
-                            }
-                            for (_uid, error) in failed {
-                                let _ = tx.send(Action::ProfileUpdateFailed(error));
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(Action::ProfileUpdateFailed(error.to_string()));
-                        }
+                    let outcome = {
+                        let mut scheduler = scheduler.lock().await;
+                        scheduler.tick().await
+                    };
+                    for (uid, is_current) in outcome.updated {
+                        let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                    }
+                    for (_uid, error) in outcome.failed {
+                        let _ = tx.send(Action::ProfileUpdateFailed(error));
+                    }
+                    if let Some(error) = outcome.errored {
+                        let _ = tx.send(Action::ProfileUpdateFailed(error));
                     }
                     let _ = tx.send(Action::AutoUpdateFinished);
                 });
+            }
+
+            _ = profiles_refresh_tick.tick() => {
+                // Re-read profiles.yaml so external interval edits (GUI/user)
+                // take effect without restarting the TUI.
+                if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
+                    app.profiles = store.items();
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::app::{Action, Focus, Overlay, View};
+use crate::app::{Action, EditorTarget, Focus, Overlay, View};
 use crate::i18n::Language;
 
 /// The state that determines both key dispatch and the commands visible in the shell.
@@ -52,6 +52,7 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             (Overlay::CloseConfirmation, KeyCode::Enter) => context
                 .pending_connection_close
                 .map(|id| Action::ConfirmCloseConnection(id.to_string())),
+            (Overlay::CloseAllConnectionsConfirmation, KeyCode::Enter) => Some(Action::ConfirmCloseAllConnections),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -97,6 +98,9 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Char('d') if context.view == View::Connections && context.focus == Focus::Content => {
             Some(Action::RequestCloseConnection)
         }
+        KeyCode::Char('D') if context.view == View::Connections && context.focus == Focus::Content => {
+            Some(Action::RequestCloseAllConnections)
+        }
 
         // Delay test
         KeyCode::Char('T') if context.view == View::Proxies && event.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -108,6 +112,18 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Char('c') if context.view == View::Proxies => Some(Action::ToggleChainMode),
         KeyCode::Char('a') if context.view == View::Proxies => Some(Action::ApplyChain),
         KeyCode::Char('x') if context.view == View::Proxies => Some(Action::ClearChain),
+
+        // Rules
+        KeyCode::Char('r') if context.view == View::Rules => Some(Action::RulesRefresh),
+        KeyCode::Char('u') if context.view == View::Rules && context.focus == Focus::Content => {
+            // Update the selected rule provider.
+            None // handled by event loop's Activate/Update on Rules
+        }
+
+        // Settings editor
+        KeyCode::Char('e') if context.view == View::Settings && context.focus == Focus::Content => {
+            Some(Action::OpenEditor(EditorTarget::Verge))
+        }
 
         _ => None,
     }

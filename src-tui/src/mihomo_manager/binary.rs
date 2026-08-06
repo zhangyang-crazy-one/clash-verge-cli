@@ -10,15 +10,15 @@ use anyhow::Context;
 use tokio::process::Command;
 use tokio::sync::OnceCell;
 
-/// Serialise concurrent `resolve_or_install` calls so two starts cannot
-/// overwrite the same `$dest.download` temporary and race on `rename(2)`.
-static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
-
 /// Managed (auto-downloaded) mihomo stable version — compile-time fallback
 /// when GitHub API is unreachable.
 pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.29";
 
 const MIHOMO_REPO: &str = "MetaCubeX/mihomo";
+
+/// Serialise concurrent `resolve_or_install` calls so two starts cannot
+/// overwrite the same `$dest.download` temporary and race on `rename(2)`.
+static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
 
 static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
 

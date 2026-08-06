@@ -3,21 +3,18 @@ use std::io::stdout;
 
 pub struct TerminalGuard {
     terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    suspended: bool,
 }
 
 impl TerminalGuard {
     pub fn new() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            stdout(),
-            crossterm::terminal::EnterAlternateScreen,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-            crossterm::cursor::MoveTo(0, 0),
-            crossterm::cursor::Hide
-        )?;
+        enable()?;
         let backend = ratatui::backend::CrosstermBackend::new(stdout());
         let terminal = ratatui::Terminal::new(backend)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            suspended: false,
+        })
     }
 
     /// Clear stale cells and reset Ratatui's diff buffers before a full repaint.
@@ -38,10 +35,54 @@ impl TerminalGuard {
     ) -> &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>> {
         &mut self.terminal
     }
+
+    /// Disable raw mode and leave the alternate screen so an external editor
+    /// can take over the terminal. Idempotent.
+    pub fn suspend(&mut self) -> Result<()> {
+        if self.suspended {
+            return Ok(());
+        }
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        )?;
+        crossterm::terminal::disable_raw_mode()?;
+        self.suspended = true;
+        Ok(())
+    }
+
+    /// Re-enter raw mode and alternate screen after an editor exits.
+    /// Idempotent.
+    pub fn resume(&mut self) -> Result<()> {
+        if !self.suspended {
+            return Ok(());
+        }
+        enable()?;
+        let backend = ratatui::backend::CrosstermBackend::new(stdout());
+        self.terminal = ratatui::Terminal::new(backend)?;
+        self.suspended = false;
+        Ok(())
+    }
+}
+
+fn enable() -> Result<()> {
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(
+        stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        crossterm::cursor::MoveTo(0, 0),
+        crossterm::cursor::Hide
+    )?;
+    Ok(())
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.suspended {
+            return;
+        }
         let _ = crossterm::execute!(
             self.terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,

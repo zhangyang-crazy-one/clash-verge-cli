@@ -52,10 +52,14 @@ impl ProfileStore {
     }
 
     /// Import a subscription URL under the shared IO lock.
-    pub async fn import_url_locked(url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
+    pub async fn import_url_locked(
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        store.import_url(url, name).await
+        store.import_url(url, name, option).await
     }
 
     /// Update one remote profile under the shared IO lock.
@@ -88,6 +92,30 @@ impl ProfileStore {
             }
         }
         Ok((updated, failed))
+    }
+
+    /// Delete a profile by UID under the shared IO lock.
+    /// Also removes associated chain fragment files.
+    pub async fn delete_locked(uid: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let uid_key = smartstring::alias::String::from(uid);
+        let was_current = store.profiles.delete_item(&uid_key).await?;
+        let _ = was_current;
+        Ok(())
+    }
+
+    /// Rename a profile by UID under the shared IO lock.
+    pub async fn rename_locked(uid: &str, new_name: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let uid_key = smartstring::alias::String::from(uid);
+        let patch = PrfItem {
+            name: Some(smartstring::alias::String::from(new_name)),
+            ..Default::default()
+        };
+        store.profiles.patch_item(&uid_key, &patch).await?;
+        Ok(())
     }
 
     /// Unlocked load — callers that mutate must use the `*_locked` helpers.
@@ -179,8 +207,13 @@ impl ProfileStore {
     }
 
     /// Import a subscription URL with GUI-style proxy fallbacks.
-    pub async fn import_url(&mut self, url: &str, name: Option<&str>) -> anyhow::Result<PrfItem> {
-        let bundle = from_url::import_with_fallback(url, name).await?;
+    pub async fn import_url(
+        &mut self,
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
+        let bundle = from_url::import_with_fallback(url, name, option).await?;
         self.append_bundle(bundle).await
     }
 

@@ -14,7 +14,11 @@ pub struct Cli {
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
     /// Start the mihomo core (non-interactive)
-    Start,
+    Start {
+        /// Run in foreground, blocking until SIGTERM (for systemd)
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Stop the mihomo core
     Stop,
     /// Restart the mihomo core
@@ -30,11 +34,16 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
+    /// Manage systemd daemon service
+    Service {
+        #[command(subcommand)]
+        action: ServiceCommand,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ProfileCommand {
-    /// List remote subscription profiles
+    /// List subscription profiles
     List,
     /// Import a subscription URL
     Import {
@@ -43,6 +52,12 @@ pub enum ProfileCommand {
         /// Optional display name
         #[arg(long)]
         name: Option<String>,
+        /// Auto-refresh interval in minutes (persisted as `option.update_interval`)
+        #[arg(long, value_name = "MINUTES")]
+        update_interval: Option<u64>,
+        /// Disable automatic refresh for this profile
+        #[arg(long)]
+        no_auto_update: bool,
     },
     /// Update one remote profile or all of them
     Update {
@@ -51,5 +66,27 @@ pub enum ProfileCommand {
         /// Update every remote profile
         #[arg(long)]
         all: bool,
+    },
+    /// Delete a profile by UID (including its chain fragments)
+    Delete { uid: String },
+    /// Rename a profile
+    Rename { uid: String, new_name: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ServiceCommand {
+    /// Install the systemd service unit
+    Install {
+        /// Also start the service immediately
+        #[arg(long)]
+        now: bool,
+    },
+    /// Stop and remove the systemd service unit
+    Uninstall,
+    /// Show service active/enabled status
+    Status {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 }

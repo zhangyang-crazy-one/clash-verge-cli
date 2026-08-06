@@ -1,5 +1,7 @@
 use crate::mihomo_api::error::MihomoError;
-use crate::mihomo_api::types::{ConnectionsData, MihomoVersion, ProxyData, ProxyDelay, SelectProxyRequest};
+use crate::mihomo_api::types::{
+    ConnectionsData, MihomoVersion, ProxyData, ProxyDelay, RuleProvidersResponse, RulesResponse, SelectProxyRequest,
+};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -249,9 +251,81 @@ impl MihomoApi {
         }
     }
 
+    /// `DELETE /connections` — close all active connections.
+    pub async fn close_all_connections(&self) -> Result<(), MihomoError> {
+        let resp = self
+            .client
+            .delete("http://localhost/connections")
+            .send()
+            .await
+            .map_err(|e| self.map_http_err(e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            })
+        }
+    }
+
     /// Open Mihomo's newline-delimited real-time log stream.
-    pub async fn stream_logs(&self) -> Result<reqwest::Response, MihomoError> {
-        self.stream_endpoint("/logs?level=info").await
+    pub async fn stream_logs(&self, level: &str) -> Result<reqwest::Response, MihomoError> {
+        self.stream_endpoint(&format!("/logs?level={level}")).await
+    }
+
+    /// `GET /rules` — fetch all rules.
+    pub async fn get_rules(&self) -> Result<RulesResponse, MihomoError> {
+        let resp = self
+            .client
+            .get("http://localhost/rules")
+            .send()
+            .await
+            .map_err(|e| self.map_http_err(e))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
+    /// `GET /providers/rules` — fetch all rule providers.
+    pub async fn get_rule_providers(&self) -> Result<RuleProvidersResponse, MihomoError> {
+        let resp = self
+            .client
+            .get("http://localhost/providers/rules")
+            .send()
+            .await
+            .map_err(|e| self.map_http_err(e))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
+    /// `PUT /providers/rules/:name` — update a rule provider.
+    pub async fn update_rule_provider(&self, name: &str) -> Result<(), MihomoError> {
+        let path = format!("http://localhost/providers/rules/{name}");
+        let resp = self.client.put(&path).send().await.map_err(|e| self.map_http_err(e))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            })
+        }
     }
 
     async fn stream_endpoint(&self, endpoint: &str) -> Result<reqwest::Response, MihomoError> {

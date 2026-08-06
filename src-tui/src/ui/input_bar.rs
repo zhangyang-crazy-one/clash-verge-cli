@@ -39,6 +39,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 frame.render_widget(Paragraph::new(line), area);
                 return;
             }
+            Overlay::CloseAllConnectionsConfirmation => {
+                let line = Line::from(vec![
+                    Span::styled("Close ALL connections? ", Style::default().fg(Color::Red)),
+                    Span::styled("Enter = confirm | Esc/q = cancel", Style::default().fg(Color::DarkGray)),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+                return;
+            }
             Overlay::Help => {}
         }
     }

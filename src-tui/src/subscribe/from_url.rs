@@ -104,8 +104,17 @@ pub async fn from_url(
     Ok(RemoteProfileBundle { item, fragments })
 }
 
-/// GUI-style import retries: system proxy → clash (self) proxy → direct.
-pub async fn import_with_fallback(url: &str, name: Option<&str>) -> anyhow::Result<RemoteProfileBundle> {
+/// Merge a caller's interval/auto-update overrides into a fallback attempt,
+/// keeping the attempt's proxy strategy.
+fn merge_import_option(base: &PrfOption, user: Option<&PrfOption>) -> PrfOption {
+    PrfOption::merge(Some(base), user).unwrap_or_else(|| base.clone())
+}
+
+pub async fn import_with_fallback(
+    url: &str,
+    name: Option<&str>,
+    user: Option<&PrfOption>,
+) -> anyhow::Result<RemoteProfileBundle> {
     let attempts = [
         PrfOption {
             with_proxy: Some(true),
@@ -121,8 +130,9 @@ pub async fn import_with_fallback(url: &str, name: Option<&str>) -> anyhow::Resu
     ];
 
     let mut last_err = None;
-    for opt in &attempts {
-        match from_url(url, name, None, Some(opt)).await {
+    for base in &attempts {
+        let merged = merge_import_option(base, user);
+        match from_url(url, name, None, Some(&merged)).await {
             Ok(bundle) => return Ok(bundle),
             Err(err) => last_err = Some(err),
         }
@@ -254,7 +264,10 @@ mod tests {
 
     #[test]
     fn fix_dirty_url_moves_ampersand_query() {
-        let fixed = fix_dirty_url("https://example.com/path&token=abc&flag=1").unwrap();
+        let fixed = match fix_dirty_url("https://example.com/path&token=abc&flag=1") {
+            Ok(url) => url,
+            Err(error) => panic!("dirty url with ampersand query is fixable: {error}"),
+        };
         assert_eq!(fixed.path(), "/path");
         assert!(fixed.query().unwrap().contains("token=abc"));
     }
@@ -266,7 +279,10 @@ mod tests {
             "subscription-userinfo".into(),
             "upload=1; download=2; total=3; expire=4".into(),
         );
-        let extra = parse_subscription_userinfo(&headers).unwrap();
+        let extra = match parse_subscription_userinfo(&headers) {
+            Some(extra) => extra,
+            None => panic!("subscription-userinfo header present"),
+        };
         assert_eq!(extra.upload, 1);
         assert_eq!(extra.download, 2);
         assert_eq!(extra.total, 3);
@@ -277,7 +293,10 @@ mod tests {
             "x-amz-meta-subscription-userinfo".into(),
             "upload=10; download=20; total=30; expire=40".into(),
         );
-        let extra = parse_subscription_userinfo(&headers).unwrap();
+        let extra = match parse_subscription_userinfo(&headers) {
+            Some(extra) => extra,
+            None => panic!("x-amz-meta-subscription-userinfo header present"),
+        };
         assert_eq!(extra.upload, 10);
     }
 
@@ -289,5 +308,33 @@ mod tests {
             ..Default::default()
         };
         assert!(!allow_auto_update_enabled(Some(&disabled)));
+    }
+
+    #[test]
+    fn import_option_merge_keeps_strategy_and_takes_user_flags() {
+        let base = PrfOption {
+            with_proxy: Some(true),
+            self_proxy: Some(false),
+            ..Default::default()
+        };
+        // CLI `--update-interval 15 --no-auto-update`.
+        let user = PrfOption {
+            update_interval: Some(15),
+            allow_auto_update: Some(false),
+            ..Default::default()
+        };
+
+        let merged = merge_import_option(&base, Some(&user));
+        // The attempt's proxy strategy survives...
+        assert_eq!(merged.with_proxy, Some(true));
+        assert_eq!(merged.self_proxy, Some(false));
+        // ...while the caller's flags win.
+        assert_eq!(merged.update_interval, Some(15));
+        assert_eq!(merged.allow_auto_update, Some(false));
+
+        // Without user flags the attempt stands alone.
+        let bare = merge_import_option(&base, None);
+        assert_eq!(bare.update_interval, None);
+        assert_eq!(bare.allow_auto_update, None);
     }
 }

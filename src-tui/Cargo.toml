@@ -39,6 +39,7 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 serde_yaml_ng = { workspace = true }
 smartstring = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 serde = { workspace = true }

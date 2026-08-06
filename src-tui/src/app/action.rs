@@ -1,5 +1,13 @@
 use super::View;
-use crate::mihomo_api::types::{ConnectionInfo, LogEntry, TrafficData};
+use crate::mihomo_api::types::{ConnectionInfo, LogEntry, Rule, RuleProvider, TrafficData};
+
+/// What config file to open in `$EDITOR`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorTarget {
+    Verge,
+    #[allow(dead_code)]
+    Dns,
+}
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -79,6 +87,12 @@ pub enum Action {
         error: String,
     },
 
+    /// Close all connections via `DELETE /connections`.
+    RequestCloseAllConnections,
+    ConfirmCloseAllConnections,
+    AllConnectionsClosed,
+    CloseAllConnectionsFailed(String),
+
     /// Auto-update tick finished (clears in-flight guard).
     AutoUpdateFinished,
     CycleClashMode,
@@ -87,6 +101,33 @@ pub enum Action {
         announce: bool,
     },
     ModeChangeFailed(String),
+
+    // Settings editor via $EDITOR
+    /// Open the given config target in the user's editor.
+    OpenEditor(EditorTarget),
+    /// Editor session finished. `ok` is false if YAML validation failed and
+    /// the pre-edit snapshot was restored.
+    #[allow(dead_code)]
+    EditorFinished {
+        target: EditorTarget,
+        ok: bool,
+    },
+    /// Reload settings from disk after an editor session.
+    #[allow(dead_code)]
+    ReloadSettings,
+
+    // Rules
+    RulesRefresh,
+    RulesFetched(Vec<Rule>),
+    RulesFailed(String),
+    RuleProvidersRefresh,
+    RuleProvidersFetched(Vec<RuleProvider>),
+    RuleProvidersFailed(String),
+    RuleProviderUpdated(String),
+    RuleProviderUpdateFailed {
+        name: String,
+        error: String,
+    },
 }
 
 const fn _assert_send_sync() {

@@ -1,5 +1,8 @@
+pub mod daemon;
+pub mod log_cleanup;
 pub mod profile;
 pub mod restart;
+pub mod service;
 pub mod start;
 pub mod status;
 pub mod stop;
