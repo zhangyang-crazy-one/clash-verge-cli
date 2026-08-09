@@ -57,6 +57,11 @@ pub enum Action {
     NodeDelayAll,
     DelayResult(String, Option<u64>),
     DelayFailed(String, String),
+    /// Batch-only result events. Kept distinct from the single-node
+    /// `DelayResult`/`DelayFailed` so a single-node `t` result can never
+    /// advance or clear the active batch progress/guard.
+    BatchDelayResult(String, Option<u64>),
+    BatchDelayFailed(String, String),
 
     // Chain proxy
     ToggleChainMode,

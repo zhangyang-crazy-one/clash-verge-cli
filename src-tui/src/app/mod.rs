@@ -150,6 +150,9 @@ pub struct App {
     pub expanded_proxy_group: Option<String>,
     pub node_selected_index: usize,
     pub delay_map: HashMap<String, Option<u64>>,
+    /// Progress of the active batch delay test: (completed, total).
+    /// `None` while no batch is running (also used to reject duplicate starts).
+    pub batch_delay: Option<(usize, usize)>,
     // Chain proxy state
     pub chain_mode: bool,
     pub chain_nodes: Vec<String>,
@@ -212,6 +215,7 @@ impl App {
             expanded_proxy_group: None,
             node_selected_index: 0,
             delay_map: HashMap::new(),
+            batch_delay: None,
             chain_mode: false,
             chain_nodes: Vec::new(),
             settings_selected_index: 0,

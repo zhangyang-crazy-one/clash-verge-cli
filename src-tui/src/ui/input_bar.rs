@@ -74,6 +74,12 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             if matches!(app.view, View::Connections | View::Logs) {
                 spans.push(Span::styled(" | / filter", Style::default().fg(Color::DarkGray)));
             }
+            if let Some((done, total)) = app.batch_delay {
+                spans.push(Span::styled(
+                    format!(" | {} {done}/{total}", app.tr("proxies.batch_delay")),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             spans.push(Span::styled(
                 app.tr("input.help_quit"),
                 Style::default().fg(Color::DarkGray),

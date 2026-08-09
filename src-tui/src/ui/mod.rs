@@ -413,6 +413,17 @@ mod tests {
     }
 
     #[test]
+    fn batch_delay_progress_renders_in_the_proxies_view() {
+        let mut app = representative_app();
+        app.view = View::Proxies;
+        app.batch_delay = Some((2, 5));
+
+        let (rendered, rows) = render(&app, 120, 32);
+        assert!(rendered.contains("Batch delay test: 2/5"));
+        assert!(rows.iter().any(|row| row.contains("2/5")));
+    }
+
+    #[test]
     fn filter_help_and_focus_states_render_visible_commands() {
         let mut app = representative_app();
         app.view = View::Connections;

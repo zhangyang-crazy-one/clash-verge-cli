@@ -299,6 +299,26 @@ mod tests {
     }
 
     #[test]
+    fn batch_delay_shortcut_maps_on_the_proxy_view() {
+        let proxies = base(View::Proxies);
+        // Shift+T is the one-key batch delay test.
+        assert!(matches!(
+            map_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), proxies),
+            Some(Action::NodeDelayAll)
+        ));
+        // Plain t keeps the single-node delay test.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('t')), proxies),
+            Some(Action::NodeDelayTest)
+        ));
+        // The batch shortcut only exists on the Proxies view.
+        assert!(!matches!(
+            map_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), base(View::Home)),
+            Some(Action::NodeDelayAll)
+        ));
+    }
+
+    #[test]
     fn context_hints_follow_the_active_focus_region() {
         assert_eq!(
             context_hint(View::Connections, Focus::Menu, Language::English),
@@ -307,6 +327,10 @@ mod tests {
         assert_eq!(
             context_hint(View::Connections, Focus::Content, Language::English),
             "Enter/d close | / filter"
+        );
+        assert_eq!(
+            context_hint(View::Proxies, Focus::Content, Language::English),
+            "Enter group/node | t delay | T all | c chain"
         );
     }
 
