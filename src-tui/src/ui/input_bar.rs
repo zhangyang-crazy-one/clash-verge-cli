@@ -47,6 +47,16 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 frame.render_widget(Paragraph::new(line), area);
                 return;
             }
+            Overlay::PasswordInput => {
+                let masked: String = "•".repeat(app.password_buffer.len());
+                let line = Line::from(vec![
+                    Span::styled("sudo 密码: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(masked, Style::default().fg(Color::White)),
+                    Span::styled(" | Enter 确认 | Esc/q 取消", Style::default().fg(Color::DarkGray)),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+                return;
+            }
             Overlay::Help => {}
         }
     }

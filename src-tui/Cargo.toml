@@ -17,7 +17,15 @@ clash-verge-core = { path = "../crates/clash-verge-core" }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "signal", "fs", "process"] }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "signal",
+  "fs",
+  "process",
+] }
 clap = { workspace = true }
 anyhow = { workspace = true }
 color-eyre = { workspace = true }
@@ -29,8 +37,18 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-nix = { version = "0.31", default-features = false, features = ["signal", "process"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "cookies", "gzip", "stream"] }
+nix = { version = "0.31", default-features = false, features = [
+  "signal",
+  "process",
+  "term",
+] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  "rustls",
+  "cookies",
+  "gzip",
+  "stream",
+] }
 flate2 = "1"
 tokio-stream = "0.1"
 url = "2"

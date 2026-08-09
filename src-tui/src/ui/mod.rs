@@ -128,6 +128,24 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             .block(Block::bordered().title("Close All"));
             frame.render_widget(popup, area);
         }
+        Overlay::PasswordInput => {
+            let prompt = app.password_prompt.as_deref().unwrap_or("sudo").to_string();
+            let masked: String = "•".repeat(app.password_buffer.len());
+            let popup = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    prompt,
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("密码: {masked}")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter = 确认 | Esc/q = 取消",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .block(Block::bordered().title("管理员权限"));
+            frame.render_widget(popup, area);
+        }
     }
 }
 

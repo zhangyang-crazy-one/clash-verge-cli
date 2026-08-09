@@ -22,7 +22,35 @@ use clap::Parser as _;
 async fn main() -> anyhow::Result<()> {
     color_eyre::install().map_err(|e| anyhow::anyhow!("color-eyre install failed: {e}"))?;
 
+    // sudo -A executes the askpass program with a prompt argument and keeps
+    // SUDO_ASKPASS pointing at us. Detect that BEFORE clap parsing (the
+    // prompt argument is not a valid subcommand) and run the popup.
+    if std::env::var("SUDO_ASKPASS").ok().as_deref()
+        == std::env::current_exe()
+            .ok()
+            .as_deref()
+            .map(|p| p.to_str().unwrap_or_default())
+    {
+        commands::askpass::run()?;
+        return Ok(());
+    }
     let cli = cli::Cli::parse();
+    // sudo -A executes the askpass program with NO arguments; it keeps the
+    // SUDO_ASKPASS variable pointing at us. Detect that and run the popup
+    // before any config resolution (bare environment, maybe no config dir).
+    if std::env::var("SUDO_ASKPASS").ok().as_deref()
+        == std::env::current_exe()
+            .ok()
+            .as_deref()
+            .map(|p| p.to_str().unwrap_or_default())
+    {
+        commands::askpass::run()?;
+        return Ok(());
+    }
+    if matches!(cli.command, Some(cli::Command::Askpass)) {
+        commands::askpass::run()?;
+        return Ok(());
+    }
     let config_dir = config_dir::resolve(cli.config_dir)?;
     clash_verge_core::utils::dirs::set_app_home_dir(config_dir.clone());
 
@@ -32,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => tui::run(config_dir).await?,
+        Some(cli::Command::Askpass) => unreachable!("askpass handled before config resolution"),
         Some(cli::Command::Start { foreground }) => {
             if foreground {
                 commands::daemon::run(config_dir).await?;
@@ -89,6 +118,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(cli::Command::Tun { action }) => match action {
+            cli::TunCommand::Setup => commands::tun::setup().await?,
+            cli::TunCommand::Status => commands::tun::status().await?,
+        },
     }
 
     Ok(())

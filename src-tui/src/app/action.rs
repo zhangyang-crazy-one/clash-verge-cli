@@ -131,6 +131,20 @@ pub enum Action {
 
     // Probe loop (dead-node detection → forced refresh / rollback notices).
     ProbeNotice(String),
+    /// Read-only report of the resolved binary's TUN capability state
+    /// (refresh after setup / start / startup probe).
+    TunCapabilityState(bool),
+    /// TUN capability was applied (explicit one-time sudo); settings shows
+    /// (privileged).
+    TunPrivilegeApplied,
+    /// Password popup input (hidden buffer, `•` masked).
+    PasswordChar(char),
+    PasswordBackspace,
+    PasswordSubmit,
+    PasswordCancel,
+    /// The user chose the explicit Settings → TUN setup action and the
+    /// resolved binary needs capabilities; open the popup.
+    TunSetupRequested(std::path::PathBuf),
 }
 
 const fn _assert_send_sync() {

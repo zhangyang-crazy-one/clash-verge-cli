@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::app::App;
 
-pub const SETTINGS_ROW_COUNT: usize = 4;
+pub const SETTINGS_ROW_COUNT: usize = 5;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
@@ -66,9 +66,31 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app,
             2,
             cursor,
-            format!("TUN: {}", enabled(app, app.gui_config.enable_tun_mode)),
+            format!(
+                "TUN: {}{}",
+                enabled(app, app.gui_config.enable_tun_mode),
+                if app.tun_privileged {
+                    format!(" ({})", app.tr("settings.tun_capable"))
+                } else {
+                    String::new()
+                }
+            ),
         ),
-        settings_row(app, 3, cursor, format!("{}: {mode}", app.tr("settings.mihomo_mode"))),
+        settings_row(
+            app,
+            3,
+            cursor,
+            format!(
+                "{}: {}",
+                app.tr("settings.tun_setup"),
+                if app.tun_privileged {
+                    app.tr("settings.tun_capable")
+                } else {
+                    app.tr("settings.tun_missing")
+                }
+            ),
+        ),
+        settings_row(app, 4, cursor, format!("{}: {mode}", app.tr("settings.mihomo_mode"))),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),
@@ -79,6 +101,10 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::from(Span::styled(
             app.tr("settings.writable_hint"),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
+            "TUN setup = the only action that asks for sudo; start/toggle never prompt.",
             Style::default().fg(Color::DarkGray),
         )),
     ])

@@ -1,12 +1,51 @@
 //! systemd service management: install/uninstall/status for clash-verge-cli daemon.
+//!
+//! Each install/uninstall runs the whole transaction under exactly ONE
+//! `sudo -A` boundary (the CLI's own self-rendered askpass), regardless of
+//! sudo timestamp caching. Commands inside the transaction are fixed argv
+//! built from quoted constants — no shell interpolation of user input.
 
 use std::process::Command;
 
 const SERVICE_NAME: &str = "clash-verge-cli";
 const SERVICE_PATH: &str = "/etc/systemd/system/clash-verge-cli.service";
 
+/// Escape a path for a systemd unit `ExecStart=` value. systemd splits the
+/// command line on unescaped whitespace, expands `%` specifiers and `$VAR`
+/// environment references, and interprets a small set of escape sequences.
+/// To refer to the exact file:
+///
+/// - whitespace becomes the documented `\s` (space) / `\t` (tab) / `\n`
+///   (newline) escapes — a bare backslash-space is NOT a valid systemd
+///   escape and makes ExecStart fail to parse
+/// - quotes are backslash-escaped (`\"`, `\'`); a literal backslash is `\\`
+/// - a literal `%` is `%%` (suppresses specifier expansion such as `%i`)
+/// - a literal `$` is `$$` (suppresses `$VAR` / `${VAR}` expansion)
+///
+/// (systemd does not run commands through a shell, so no shell
+/// metacharacters need handling beyond these.)
+fn systemd_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for c in value.chars() {
+        match c {
+            ' ' => out.push_str("\\s"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '"' => out.push_str("\\\""),
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Generate systemd unit file content.
 /// The binary runs in foreground mode so systemd can track the PID properly.
+/// `binary_path` and `config_dir` are systemd-escaped so units keep working
+/// for paths containing spaces, `%`, quotes or backslashes.
 pub fn unit_content(binary_path: &str, config_dir: &str) -> String {
     format!(
         r#"[Unit]
@@ -16,7 +55,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={binary_path} start --foreground --config-dir {config_dir}
+ExecStart={} start --foreground --config-dir {}
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5
@@ -24,12 +63,88 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-"#
+"#,
+        systemd_escape(binary_path),
+        systemd_escape(config_dir)
     )
 }
 
-/// Install systemd service (requires root).
+/// Single-quote a value for `sh -c` (safe argv even with spaces/quotes).
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build the one-shot install transaction script. `set -eu` aborts on the
+/// first failing step; `echo` markers identify the failing step in stderr.
+pub fn build_install_script(tmp_unit: &str, service_path: &str, service_name: &str, start_now: bool) -> String {
+    let mut script = String::new();
+    script.push_str("set -eu\n");
+    script.push_str("echo 'clash-verge-cli: copying unit'\n");
+    script.push_str(&format!("cp -- {} {}\n", sh_quote(tmp_unit), sh_quote(service_path)));
+    script.push_str("echo 'clash-verge-cli: reloading systemd'\n");
+    script.push_str("systemctl daemon-reload\n");
+    script.push_str("echo 'clash-verge-cli: enabling service'\n");
+    script.push_str(&format!("systemctl enable {}\n", sh_quote(service_name)));
+    if start_now {
+        script.push_str("echo 'clash-verge-cli: starting service'\n");
+        script.push_str(&format!("systemctl start {}\n", sh_quote(service_name)));
+    }
+    script
+}
+
+/// Build the one-shot uninstall transaction script. `stop`/`disable` may
+/// fail when the service is not running/registered, so they are tolerant;
+/// removing the unit and reloading systemd complete the transaction.
+pub fn build_uninstall_script(service_path: &str, service_name: &str) -> String {
+    let mut script = String::new();
+    script.push_str("set -u\n");
+    script.push_str("echo 'clash-verge-cli: stopping service'\n");
+    script.push_str(&format!("systemctl stop {} || true\n", sh_quote(service_name)));
+    script.push_str("echo 'clash-verge-cli: disabling service'\n");
+    script.push_str(&format!("systemctl disable {} || true\n", sh_quote(service_name)));
+    script.push_str("echo 'clash-verge-cli: removing unit'\n");
+    script.push_str(&format!("rm -f {}\n", sh_quote(service_path)));
+    script.push_str("echo 'clash-verge-cli: reloading systemd'\n");
+    script.push_str("systemctl daemon-reload || true\n");
+    script
+}
+
+/// Run one privileged transaction under a single sudo authentication
+/// boundary: `sudo -A sh -c <script>` with `SUDO_ASKPASS` pointing at this
+/// binary's hidden `askpass` subcommand (works over SSH without DISPLAY).
+fn run_sudo_transaction(script: &str) -> std::io::Result<()> {
+    let askpass = std::env::current_exe().unwrap_or_default();
+    let output = Command::new("sudo")
+        .arg("-A")
+        .env("SUDO_ASKPASS", &askpass)
+        .args(["sh", "-c", script])
+        .output()
+        .map_err(|error| std::io::Error::other(format!("cannot run sudo (is sudo installed?): {error}")))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "sudo transaction failed: {} {}",
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Install systemd service (requires root). The whole transaction (copy
+/// unit, daemon-reload, enable, optional start) runs under one sudo call.
 pub fn install_service(binary_path: &str, config_dir: &str, start_now: bool) -> std::io::Result<()> {
+    install_service_with(binary_path, config_dir, start_now, &mut run_sudo_transaction)
+}
+
+/// Install with an injectable transaction executor (test boundary).
+fn install_service_with(
+    binary_path: &str,
+    config_dir: &str,
+    start_now: bool,
+    executor: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let unit = unit_content(binary_path, config_dir);
     // Write to a temp dir under /tmp with a unique name — avoids the
     // well-known /tmp/clash-verge-cli.service symlink race.
@@ -37,42 +152,30 @@ pub fn install_service(binary_path: &str, config_dir: &str, start_now: bool) -> 
     let tmp_path = dir.path().join("clash-verge-cli.service");
     std::fs::write(&tmp_path, unit)?;
 
-    let status = Command::new("sudo")
-        .args(["cp", &tmp_path.to_string_lossy(), SERVICE_PATH])
-        .status()?;
-    if !status.success() {
-        return Err(std::io::Error::other("sudo cp failed — need root privileges"));
-    }
+    let script = build_install_script(&tmp_path.to_string_lossy(), SERVICE_PATH, SERVICE_NAME, start_now);
+    // Exactly one sudo authentication boundary for the whole transaction.
+    executor(&script)?;
     // Temp dir is cleaned up when `dir` is dropped.
 
-    let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
-    let _ = Command::new("sudo")
-        .args(["systemctl", "enable", SERVICE_NAME])
-        .status();
-
     if start_now {
-        let _ = Command::new("sudo").args(["systemctl", "start", SERVICE_NAME]).status();
         println!("service installed and started");
     } else {
         println!("service installed (not started)");
     }
-
     Ok(())
 }
 
-/// Uninstall systemd service.
+/// Uninstall systemd service. One sudo call for the whole transaction.
 pub fn uninstall_service() -> std::io::Result<()> {
-    let _ = Command::new("sudo").args(["systemctl", "stop", SERVICE_NAME]).status();
-    let _ = Command::new("sudo")
-        .args(["systemctl", "disable", SERVICE_NAME])
-        .status();
-    let status = Command::new("sudo").args(["rm", "-f", SERVICE_PATH]).status()?;
-    if !status.success() {
-        return Err(std::io::Error::other("sudo rm failed — need root privileges"));
-    }
-    let _ = Command::new("sudo").args(["systemctl", "daemon-reload"]).status();
-    println!("service uninstalled");
+    uninstall_service_with(&mut run_sudo_transaction)
+}
 
+/// Uninstall with an injectable transaction executor (test boundary).
+fn uninstall_service_with(executor: &mut dyn FnMut(&str) -> std::io::Result<()>) -> std::io::Result<()> {
+    let script = build_uninstall_script(SERVICE_PATH, SERVICE_NAME);
+    // Exactly one sudo authentication boundary for the whole transaction.
+    executor(&script)?;
+    println!("service uninstalled");
     Ok(())
 }
 
@@ -91,5 +194,174 @@ pub fn service_enabled_state() -> String {
     match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Err(_) => "unknown".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_script_runs_all_steps_in_one_transaction() {
+        let script = build_install_script("/tmp/tmpX/clash-verge-cli.service", SERVICE_PATH, SERVICE_NAME, true);
+        let cp_idx = script.find("cp -- ").expect("cp step");
+        let reload_idx = script.find("systemctl daemon-reload").expect("daemon-reload step");
+        let enable_idx = script.find("systemctl enable 'clash-verge-cli'").expect("enable step");
+        let start_idx = script.find("systemctl start 'clash-verge-cli'").expect("start step");
+        assert!(cp_idx < reload_idx && reload_idx < enable_idx && enable_idx < start_idx);
+        // Exactly one `sh -c`-style transaction body: no second sudo.
+        assert!(!script.contains("sudo"), "script must not self-elevate: {script}");
+        // Unit path is single-quoted (safe argv).
+        assert!(script.contains(&format!("cp -- {}", sh_quote("/tmp/tmpX/clash-verge-cli.service"))));
+    }
+
+    #[test]
+    fn install_script_omits_start_when_not_requested() {
+        let script = build_install_script("/tmp/u.service", SERVICE_PATH, SERVICE_NAME, false);
+        assert!(script.contains("systemctl enable 'clash-verge-cli'"));
+        assert!(!script.contains("systemctl start"));
+    }
+
+    #[test]
+    fn uninstall_script_covers_stop_disable_remove_reload_in_order() {
+        let script = build_uninstall_script(SERVICE_PATH, SERVICE_NAME);
+        let stop_idx = script.find("systemctl stop 'clash-verge-cli'").expect("stop step");
+        let disable_idx = script
+            .find("systemctl disable 'clash-verge-cli'")
+            .expect("disable step");
+        let rm_idx = script
+            .find("rm -f '/etc/systemd/system/clash-verge-cli.service'")
+            .expect("rm step");
+        let reload_idx = script.find("systemctl daemon-reload").expect("reload step");
+        assert!(stop_idx < disable_idx && disable_idx < rm_idx && rm_idx < reload_idx);
+        assert!(!script.contains("sudo"), "script must not self-elevate: {script}");
+    }
+
+    #[test]
+    fn sh_quote_handles_spaces_quotes_and_single_quotes() {
+        assert_eq!(sh_quote("/tmp/a b"), "'/tmp/a b'");
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn install_transaction_invokes_executor_exactly_once() {
+        let mut calls: Vec<String> = Vec::new();
+        let result = install_service_with(
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            true,
+            &mut |script: &str| {
+                calls.push(script.to_string());
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "install must succeed with a recording executor");
+        assert_eq!(calls.len(), 1, "install must run exactly one sudo transaction");
+        let script = &calls[0];
+        assert!(script.contains("cp -- "), "{script}");
+        assert!(script.contains("systemctl enable 'clash-verge-cli'"), "{script}");
+        assert!(script.contains("systemctl start 'clash-verge-cli'"), "{script}");
+    }
+
+    #[test]
+    fn uninstall_transaction_invokes_executor_exactly_once() {
+        let mut calls: Vec<String> = Vec::new();
+        let result = uninstall_service_with(&mut |script: &str| {
+            calls.push(script.to_string());
+            Ok(())
+        });
+        assert!(result.is_ok(), "uninstall must succeed with a recording executor");
+        assert_eq!(calls.len(), 1, "uninstall must run exactly one sudo transaction");
+        assert!(
+            calls[0].contains("rm -f '/etc/systemd/system/clash-verge-cli.service'"),
+            "{}",
+            calls[0]
+        );
+    }
+
+    #[test]
+    fn transaction_failure_is_propagated() {
+        let mut calls = 0;
+        let result = install_service_with(
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            false,
+            &mut |_script: &str| {
+                calls += 1;
+                Err(std::io::Error::other("systemctl enable failed"))
+            },
+        );
+        assert!(result.is_err(), "a failing transaction step must surface");
+        assert_eq!(calls, 1, "the single boundary is still one call");
+    }
+
+    #[test]
+    fn unit_content_contains_exec_start_with_both_paths() {
+        let unit = unit_content("/usr/bin/clash-verge-cli", "/home/u/.config/clash-verge-cli");
+        assert!(unit.contains(
+            "ExecStart=/usr/bin/clash-verge-cli start --foreground --config-dir /home/u/.config/clash-verge-cli"
+        ));
+    }
+
+    #[test]
+    fn systemd_escape_leaves_plain_paths_untouched() {
+        assert_eq!(systemd_escape("/usr/bin/clash-verge-cli"), "/usr/bin/clash-verge-cli");
+        assert_eq!(
+            systemd_escape("/home/u/.config/clash-verge-cli"),
+            "/home/u/.config/clash-verge-cli"
+        );
+    }
+
+    #[test]
+    fn systemd_escape_handles_spaces_percent_quotes_and_backslash() {
+        // Whitespace becomes systemd's `\s` escape, NOT a bare backslash-
+        // space (which is not a valid systemd escape and fails ExecStart).
+        assert_eq!(
+            systemd_escape("/opt/my apps/clash verge"),
+            "/opt/my\\sapps/clash\\sverge"
+        );
+        // `%%` is systemd's documented literal-percent escape (specifier
+        // expansion), NOT backslash-percent.
+        assert_eq!(systemd_escape("/cfg/100%dir"), "/cfg/100%%dir");
+        assert_eq!(systemd_escape("/a\"b'c\\d"), "/a\\\"b\\'c\\\\d");
+        // Tab/newline become systemd's documented `\t` / `\n` escapes.
+        assert_eq!(systemd_escape("/tab\tpath"), "/tab\\tpath");
+        assert_eq!(systemd_escape("/line\npath"), "/line\\npath");
+    }
+
+    #[test]
+    fn systemd_escape_doubles_literal_dollar_signs() {
+        // `$VAR` / `${VAR}` are expanded by systemd; `$$` yields a literal
+        // `$` so a path containing one survives unchanged.
+        assert_eq!(systemd_escape("/var/$USER/cfg"), "/var/$$USER/cfg");
+        assert_eq!(systemd_escape("/a${x}b"), "/a$${x}b");
+        assert_eq!(systemd_escape("/plain"), "/plain");
+    }
+
+    #[test]
+    fn unit_content_escapes_special_path_characters_in_exec_start() {
+        let unit = unit_content("/opt/my apps/clash-verge-cli", "/home/u/.config/100% clash");
+        assert!(unit.contains(
+            "ExecStart=/opt/my\\sapps/clash-verge-cli start --foreground --config-dir /home/u/.config/100%%\\sclash"
+        ));
+    }
+
+    #[test]
+    fn unit_content_escapes_dollar_in_exec_start_but_keeps_mainpid_variable() {
+        // The binary/config paths must not be subject to `$VAR` expansion,
+        // while the template's own `$MAINPID` reference stays intact.
+        let unit = unit_content("/usr/bin/clash-verge-cli", "/tmp/$cfg");
+        assert!(unit.contains("--config-dir /tmp/$$cfg"));
+        assert!(unit.contains("$MAINPID"));
+        assert!(!unit.contains("/tmp/$cfg"), "raw $cfg must not survive escaping");
+    }
+
+    #[test]
+    fn unit_content_never_contains_a_raw_percent_in_exec_start() {
+        // `%` starts a systemd specifier; the `%%` escape keeps the value
+        // literal and the $MAINPID variable intact.
+        let unit = unit_content("/usr/bin/clash-verge-cli", "/tmp/100%");
+        assert!(unit.contains("--config-dir /tmp/100%%"));
+        assert!(unit.contains("$MAINPID"));
     }
 }

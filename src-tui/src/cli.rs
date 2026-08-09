@@ -39,6 +39,14 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceCommand,
     },
+    /// Manage TUN privileges for the resolved mihomo binary
+    Tun {
+        #[command(subcommand)]
+        action: TunCommand,
+    },
+    /// Internal: sudo askpass helper (SUDO_ASKPASS target).
+    #[command(hide = true)]
+    Askpass,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -71,6 +79,15 @@ pub enum ProfileCommand {
     Delete { uid: String },
     /// Rename a profile
     Rename { uid: String, new_name: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum TunCommand {
+    /// Grant TUN capabilities to the mihomo binary (one-time sudo; the only
+    /// explicit privilege operation)
+    Setup,
+    /// Show the TUN capability state of the resolved mihomo binary
+    Status,
 }
 
 #[derive(clap::Subcommand, Debug)]
