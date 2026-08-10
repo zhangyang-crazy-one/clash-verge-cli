@@ -53,9 +53,8 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
                 .pending_connection_close
                 .map(|id| Action::ConfirmCloseConnection(id.to_string())),
             (Overlay::CloseAllConnectionsConfirmation, KeyCode::Enter) => Some(Action::ConfirmCloseAllConnections),
-            // `q` cancels the password popup (the popup UI advertises q to
-            // cancel); it must NOT be appended to the password buffer.
-            (Overlay::PasswordInput, KeyCode::Char('q')) => Some(Action::PasswordCancel),
+            // The password is opaque UTF-8 data: every printable character
+            // (including `q`) enters the buffer. Esc is the only cancel key.
             (Overlay::PasswordInput, KeyCode::Char(c)) => Some(Action::PasswordChar(c)),
             (Overlay::PasswordInput, KeyCode::Backspace) => Some(Action::PasswordBackspace),
             (Overlay::PasswordInput, KeyCode::Enter) => Some(Action::PasswordSubmit),
@@ -344,11 +343,21 @@ mod tests {
     }
 
     #[test]
-    fn q_cancels_the_password_popup_instead_of_entering_q() {
-        // Regression: the popup UI advertises `q` as cancel, but the generic
-        // char arm used to append 'q' to the (hidden) password buffer.
+    fn q_enters_the_password_buffer_like_any_printable_char() {
+        // Regression: `q` used to cancel the popup, which destroyed valid
+        // passwords containing q. The password is opaque data — only Esc
+        // cancels now.
         assert!(matches!(
             map_key(event(KeyCode::Char('q')), password_context()),
+            Some(Action::PasswordChar('q'))
+        ));
+    }
+
+    #[test]
+    fn esc_is_the_only_password_cancel_key() {
+        // Esc cancels; q must never map to PasswordCancel.
+        assert!(matches!(
+            map_key(event(KeyCode::Esc), password_context()),
             Some(Action::PasswordCancel)
         ));
     }

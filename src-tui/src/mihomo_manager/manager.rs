@@ -2,6 +2,7 @@
 // dispatch + start/stop wiring).
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -104,7 +105,7 @@ impl ManagerInner {
         // TUN disabled → no capability needed. If the config cannot be read
         // we assume TUN is off and let mihomo fail on its own if it is not.
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
-        preflight_tun_capability(resolved, tun_enabled)?;
+        preflight_tun_capability(&resolved.path, tun_enabled)?;
 
         *inner.resolved_binary.lock() = Some(resolved.path.clone());
         let mut command = Command::new(&resolved.path);
@@ -194,7 +195,7 @@ impl MihomoManager {
     /// standard values from D-01/D-02 so a manager built without arguments
     /// is usable for the common case.
     pub fn new(config_dir: PathBuf) -> Self {
-        let socket_path = default_socket_path();
+        let socket_path = clash_verge_core::utils::dirs::standalone_socket_path();
         let inner = ManagerInner::new();
         Self {
             inner: Arc::new(inner),
@@ -282,6 +283,19 @@ impl MihomoManager {
             .expect("MihomoApi construction failed — secret may contain invalid header characters")
     }
 
+    /// D1: resolve the next mihomo binary and run the read-only TUN
+    /// capability preflight BEFORE any lifecycle change. Shared by `start`
+    /// and the pre-stop phase of `restart`; failure here must leave the
+    /// currently running core untouched. Never invokes sudo/setcap.
+    async fn resolve_and_preflight() -> anyhow::Result<binary::ResolvedMihomo> {
+        let resolved = binary::resolve_or_install()
+            .await
+            .context("failed to resolve or auto-install mihomo core")?;
+        let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
+        preflight_tun_capability(&resolved.path, tun_enabled)?;
+        Ok(resolved)
+    }
+
     /// D-13: spawn mihomo as a child process.
     ///
     /// Prefers a system `verge-mihomo`. Otherwise auto-downloads the managed
@@ -290,9 +304,7 @@ impl MihomoManager {
     /// Returns details about which binary was used so the UI/CLI can report
     /// install vs reuse clearly.
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
-        let resolved = binary::resolve_or_install()
-            .await
-            .context("failed to resolve or auto-install mihomo core")?;
+        let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
 
         ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
             .await
@@ -333,12 +345,51 @@ impl MihomoManager {
         Ok(())
     }
 
-    /// D-09 restart: stop + start, resetting the auto-restart counter.
+    /// D-09 restart: validate the replacement core BEFORE stopping the
+    /// running one (see [`orchestrate_restart`]).
+    ///
+    /// Ordering: resolve the binary, run the read-only TUN capability
+    /// preflight, and only then stop the old core and spawn the SAME
+    /// resolved binary — resolve happens exactly once. A resolve or
+    /// capability failure (e.g. a replaced binary that lost its file
+    /// capability) returns explicit `tun setup` guidance and leaves the
+    /// currently running core untouched. No sudo/setcap here.
     pub async fn restart(&self) -> anyhow::Result<binary::ResolvedMihomo> {
         self.reset_restart_history();
-        // Ignore "not running" from stop
-        let _ = self.stop().await;
-        self.start().await
+        orchestrate_restart(
+            || async {
+                binary::resolve_or_install()
+                    .await
+                    .context("failed to resolve or auto-install mihomo core")
+            },
+            |resolved| {
+                // Own the path so the future does not borrow the closure
+                // argument across an await point.
+                let path = resolved.path.clone();
+                async move {
+                    let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
+                    preflight_tun_capability(&path, tun_enabled).context(
+                        "TUN capability preflight failed — run `clash-verge-cli tun setup` for the \
+resolved binary; the running core was left untouched",
+                    )
+                }
+            },
+            || async move { self.stop().await },
+            |resolved| {
+                let (resolved, config_dir, socket_path, inner) = (
+                    resolved.clone(),
+                    self.config_dir.clone(),
+                    self.socket_path.clone(),
+                    Arc::clone(&self.inner),
+                );
+                async move {
+                    ManagerInner::spawn_and_watch(&resolved, &config_dir, &socket_path, inner)
+                        .await
+                        .context("failed to spawn mihomo")
+                }
+            },
+        )
+        .await
     }
 
     /// Return CoreStatus with live version info if mihomo is running.
@@ -389,11 +440,45 @@ pub async fn runtime_tun_enabled() -> anyhow::Result<bool> {
 /// never performs sudo/setcap. Runs after binary resolution and before
 /// every spawn, so a replaced/upgraded binary loses its capability into
 /// this same failure path instead of silently degrading.
-fn preflight_tun_capability(resolved: &binary::ResolvedMihomo, tun_enabled: bool) -> anyhow::Result<()> {
+fn preflight_tun_capability(path: &Path, tun_enabled: bool) -> anyhow::Result<()> {
     if tun_enabled {
-        crate::commands::privilege::require_tun_capability(&resolved.path)?;
+        crate::commands::privilege::require_tun_capability(path)?;
     }
     Ok(())
+}
+
+/// Restart orchestration with injectable steps, so the exact ordering and
+/// short-circuit behavior can be tested with zero processes, network, or
+/// lifecycle side effects. Contract:
+///
+/// 1. `resolve` — produce the replacement binary; failure aborts here and
+///    the currently running core is never touched.
+/// 2. `preflight` — read-only TUN capability check on that binary; failure
+///    aborts here, again leaving the running core untouched.
+/// 3. `stop` — only runs after 1+2 pass. Its error is tolerated: a
+///    "not running" stop must not block the replacement spawn (historical
+///    restart behavior).
+/// 4. `spawn` — receives the SAME binary produced by `resolve`; the binary
+///    is never resolved a second time.
+///
+/// Returns the resolved binary on success.
+async fn orchestrate_restart<ResolveFut, PreflightFut, StopFut, SpawnFut>(
+    resolve: impl FnOnce() -> ResolveFut,
+    preflight: impl FnOnce(&binary::ResolvedMihomo) -> PreflightFut,
+    stop: impl FnOnce() -> StopFut,
+    spawn: impl FnOnce(&binary::ResolvedMihomo) -> SpawnFut,
+) -> anyhow::Result<binary::ResolvedMihomo>
+where
+    ResolveFut: Future<Output = anyhow::Result<binary::ResolvedMihomo>>,
+    PreflightFut: Future<Output = anyhow::Result<()>>,
+    StopFut: Future<Output = anyhow::Result<()>>,
+    SpawnFut: Future<Output = anyhow::Result<()>>,
+{
+    let resolved = resolve().await?;
+    preflight(&resolved).await?;
+    let _ = stop().await;
+    spawn(&resolved).await?;
+    Ok(resolved)
 }
 
 /// Public status snapshot returned by `MihomoManager::status()`.
@@ -405,16 +490,6 @@ pub struct CoreStatus {
     pub version: Option<String>,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
-}
-
-fn default_socket_path() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime)
-            .join("clash-verge")
-            .join("external-controller.sock")
-    } else {
-        PathBuf::from("/tmp/clash-verge/external-controller.sock")
-    }
 }
 
 #[cfg(test)]
@@ -467,7 +542,7 @@ mod tests {
             version: "v0.0.0".into(),
         };
         // TUN off → spawn allowed regardless of file capabilities.
-        assert!(preflight_tun_capability(&resolved, false).is_ok());
+        assert!(preflight_tun_capability(&resolved.path, false).is_ok());
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -483,9 +558,9 @@ mod tests {
         // Root bypasses the check; non-root (the normal CI/user case) must
         // get an actionable error naming the binary and the setup command.
         if crate::commands::privilege::running_as_root() {
-            assert!(preflight_tun_capability(&resolved, true).is_ok());
+            assert!(preflight_tun_capability(&resolved.path, true).is_ok());
         } else {
-            let error = preflight_tun_capability(&resolved, true)
+            let error = preflight_tun_capability(&resolved.path, true)
                 .expect_err("uncapped TUN-enabled spawn must fail before spawn")
                 .to_string();
             assert!(error.contains("tun setup"), "{error}");
@@ -505,11 +580,217 @@ mod tests {
             version: "v9.9.9".into(),
         };
         if !crate::commands::privilege::running_as_root() {
-            let error = preflight_tun_capability(&resolved, true)
+            let error = preflight_tun_capability(&resolved.path, true)
                 .expect_err("replaced uncapped binary must fail")
                 .to_string();
             assert!(error.contains(&tmp.display().to_string()), "{error}");
         }
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ── restart orchestration seam: pure ordering tests, no process / ──────
+    // ── network / lifecycle side effects (never call start/stop/restart) ───
+
+    fn fake_resolved(path: &str) -> binary::ResolvedMihomo {
+        binary::ResolvedMihomo {
+            path: PathBuf::from(path),
+            source: binary::MihomoBinarySource::System,
+            version: "v1.2.3".into(),
+        }
+    }
+
+    /// Stand-in for the `stop` step: records the event and succeeds.
+    fn record_ok(
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        event: &'static str,
+    ) -> impl FnOnce() -> std::future::Ready<anyhow::Result<()>> {
+        let events = Arc::clone(events);
+        move || {
+            events.lock().push(event);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Stand-in for the `preflight` step: records the event and succeeds.
+    fn record_ok_preflight(
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        event: &'static str,
+    ) -> impl FnOnce(&binary::ResolvedMihomo) -> std::future::Ready<anyhow::Result<()>> {
+        let events = Arc::clone(events);
+        move |_resolved| {
+            events.lock().push(event);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// Stand-in for the `spawn` step: records the event and the binary path
+    /// it received, then succeeds.
+    fn record_ok_spawn(
+        events: &Arc<Mutex<Vec<&'static str>>>,
+        spawned: &Arc<Mutex<Option<PathBuf>>>,
+    ) -> impl FnOnce(&binary::ResolvedMihomo) -> std::future::Ready<anyhow::Result<()>> {
+        let events = Arc::clone(events);
+        let spawned = Arc::clone(spawned);
+        move |resolved| {
+            events.lock().push("spawn");
+            *spawned.lock() = Some(resolved.path.clone());
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_sequence_is_resolve_preflight_stop_then_spawn() {
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let spawned: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let resolved = fake_resolved("/fake/verge-mihomo");
+
+        let result = orchestrate_restart(
+            {
+                let events = Arc::clone(&events);
+                let resolved = resolved.clone();
+                move || {
+                    events.lock().push("resolve");
+                    async move { Ok(resolved) }
+                }
+            },
+            record_ok_preflight(&events, "preflight"),
+            record_ok(&events, "stop"),
+            record_ok_spawn(&events, &spawned),
+        )
+        .await;
+
+        result.expect("success path must resolve");
+        assert_eq!(*events.lock(), ["resolve", "preflight", "stop", "spawn"]);
+        // resolve ran exactly once and spawn reused that same binary.
+        assert_eq!(*spawned.lock(), Some(PathBuf::from("/fake/verge-mihomo")));
+    }
+
+    #[tokio::test]
+    async fn restart_resolve_failure_short_circuits_before_stop() {
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let spawned: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+
+        let result = orchestrate_restart(
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events.lock().push("resolve");
+                    std::future::ready(Err(anyhow::anyhow!("no binary available")))
+                }
+            },
+            record_ok_preflight(&events, "preflight"),
+            record_ok(&events, "stop"),
+            record_ok_spawn(&events, &spawned),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock(),
+            ["resolve"],
+            "resolve failure must short-circuit before preflight/stop/spawn"
+        );
+        assert!(spawned.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_preflight_failure_keeps_old_core_running() {
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let spawned: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let resolved = fake_resolved("/fake/verge-mihomo");
+
+        let result = orchestrate_restart(
+            {
+                let events = Arc::clone(&events);
+                let resolved = resolved.clone();
+                move || {
+                    events.lock().push("resolve");
+                    async move { Ok(resolved) }
+                }
+            },
+            {
+                let events = Arc::clone(&events);
+                move |_resolved| {
+                    events.lock().push("preflight");
+                    std::future::ready(Err(anyhow::anyhow!("TUN is enabled but the binary lacks capabilities")))
+                }
+            },
+            record_ok(&events, "stop"),
+            record_ok_spawn(&events, &spawned),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock(),
+            ["resolve", "preflight"],
+            "capability failure must never stop the running core"
+        );
+        assert!(spawned.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_tolerates_stop_failure_and_still_spawns() {
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let spawned: Arc<Mutex<Option<PathBuf>>> = Arc::new(Mutex::new(None));
+        let resolved = fake_resolved("/fake/verge-mihomo");
+
+        let result = orchestrate_restart(
+            {
+                let events = Arc::clone(&events);
+                let resolved = resolved.clone();
+                move || {
+                    events.lock().push("resolve");
+                    async move { Ok(resolved) }
+                }
+            },
+            record_ok_preflight(&events, "preflight"),
+            {
+                let events = Arc::clone(&events);
+                move || {
+                    events.lock().push("stop");
+                    std::future::ready(Err(anyhow::anyhow!("stop failed")))
+                }
+            },
+            record_ok_spawn(&events, &spawned),
+        )
+        .await;
+
+        result.expect("stop failure is tolerated and must not block the spawn");
+        assert_eq!(*events.lock(), ["resolve", "preflight", "stop", "spawn"]);
+    }
+
+    #[tokio::test]
+    async fn restart_spawn_failure_propagates_after_stop() {
+        let events: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolved = fake_resolved("/fake/verge-mihomo");
+
+        let result = orchestrate_restart(
+            {
+                let events = Arc::clone(&events);
+                let resolved = resolved.clone();
+                move || {
+                    events.lock().push("resolve");
+                    async move { Ok(resolved) }
+                }
+            },
+            record_ok_preflight(&events, "preflight"),
+            record_ok(&events, "stop"),
+            {
+                let events = Arc::clone(&events);
+                move |_resolved| {
+                    events.lock().push("spawn");
+                    std::future::ready(Err(anyhow::anyhow!("spawn failed")))
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock(),
+            ["resolve", "preflight", "stop", "spawn"],
+            "spawn failure comes only after the old core was stopped"
+        );
     }
 }

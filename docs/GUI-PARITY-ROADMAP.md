@@ -3,6 +3,11 @@
 Phased plan to reach Clash Verge Rev GUI feature parity in `clash-verge-cli`.
 Tray, global hotkeys, and lightweight window mode are explicitly out of scope.
 
+> **Standalone by design.** The CLI owns its data directory
+> (`~/.local/share/clash-verge-cli`), its mihomo core, and its controller
+> socket. It never reads the GUI's configuration at runtime; an existing GUI
+> profile set is imported once via `profile migrate --from <gui-dir>`.
+
 ## Done
 
 - **Phase 1 — Subscriptions**: remote import/update (TUI `i`/`u` + `profile
@@ -22,6 +27,11 @@ Tray, global hotkeys, and lightweight window mode are explicitly out of scope.
     verge.yaml, default on).
 - **Phase 3 — System integration**: system proxy (GNOME/KDE), clash mode
   cycle, TUN via runtime config, `service install|uninstall|status` CLI.
+  - **TUN privilege**: one-time `setcap` (`cap_net_admin,cap_net_raw+eip`)
+    via a self-rendered bordered askpass popup (`sudo -A` + `SUDO_ASKPASS`,
+    works over SSH with no DISPLAY); password-free toggles afterwards, no
+    root service or daemon.
+
 - **Phase 4 — Proxies / Rules / observability**: proxies view, rules +
   rule-provider panels with provider update, close connection /
   close-all-connections, live traffic/connection/log streams. Log level is

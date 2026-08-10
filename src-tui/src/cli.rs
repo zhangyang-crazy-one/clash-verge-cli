@@ -79,6 +79,16 @@ pub enum ProfileCommand {
     Delete { uid: String },
     /// Rename a profile
     Rename { uid: String, new_name: String },
+    /// One-shot import of a Clash Verge GUI profile set (subscriptions,
+    /// chain fragments, settings) into the standalone directory
+    Migrate {
+        /// Source GUI config directory (e.g. ~/.local/share/io.github.clash-verge-rev.clash-verge-rev)
+        #[arg(long, value_name = "DIR")]
+        from: std::path::PathBuf,
+        /// Overwrite an existing standalone profile set
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

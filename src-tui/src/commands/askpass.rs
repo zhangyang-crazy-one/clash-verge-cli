@@ -149,7 +149,10 @@ fn terminal_size(fd: i32) -> (u16, u16) {
 fn truncate(text: &str, max: usize) -> String {
     let mut out: String = text.chars().take(max).collect();
     if text.chars().count() > max && max > 1 {
-        out.truncate(max - 1);
+        // pop() removes a whole char, so the cut is always on a UTF-8
+        // boundary — a byte-index truncate would panic in the middle of a
+        // multibyte char.
+        out.pop();
         out.push('…');
     }
     out
@@ -208,5 +211,26 @@ mod tests {
         );
         assert_eq!(pad("ab", 6), "ab    ");
         assert_eq!(pad("abcdefgh", 6), "abcde…");
+    }
+
+    #[test]
+    fn truncate_is_utf8_boundary_safe_for_multibyte_prompts() {
+        // Regression: the old byte-index truncate(max - 1) panicked when
+        // max - 1 landed inside a multibyte character.
+        let prompt = "你你你你你"; // 5 chars × 3 bytes each
+        assert_eq!(truncate(prompt, 4), "你你你…");
+        assert_eq!(truncate(prompt, 5), "你你你你你");
+        assert_eq!(truncate(prompt, 2), "你…");
+        // Mixed multibyte + ASCII prompt.
+        assert_eq!(truncate("密码 prompt 很长", 6), "密码 pr…");
+    }
+
+    #[test]
+    fn truncate_small_widths_never_panic() {
+        // Width-1 returns the leading char; width-0 returns an empty string.
+        assert_eq!(truncate("你你", 1), "你");
+        assert_eq!(truncate("你你", 0), "");
+        assert_eq!(truncate("", 4), "");
+        assert_eq!(truncate("你", 4), "你");
     }
 }

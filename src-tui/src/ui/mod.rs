@@ -139,7 +139,7 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Line::from(format!("密码: {masked}")),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter = 确认 | Esc/q = 取消",
+                    "Enter = 确认 | Esc = 取消",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])

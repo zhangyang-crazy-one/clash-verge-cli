@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::sync::OnceLock;
 use std::{fs, path::PathBuf};
 
-pub static APP_ID: &str = "io.github.clash-verge-rev.clash-verge-rev";
+pub static APP_ID: &str = "clash-verge-cli";
 pub static BACKUP_DIR: &str = "clash-verge-rev-backup";
 
 pub static APP_HOME_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -71,6 +71,17 @@ pub fn profiles_path() -> Result<PathBuf> {
     Ok(app_home_dir()?.join(PROFILE_YAML))
 }
 
+/// The CLI's own mihomo controller socket. Standalone by design — never
+/// resolves to a GUI path.
+pub fn standalone_socket_path() -> PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime)
+            .join("clash-verge-cli")
+            .join("external-controller.sock")
+    } else {
+        PathBuf::from("/tmp/clash-verge-cli").join("external-controller.sock")
+    }
+}
 pub fn path_to_str(path: &PathBuf) -> Result<&str> {
     let path_str = path
         .as_os_str()

@@ -101,6 +101,9 @@ async fn main() -> anyhow::Result<()> {
             cli::ProfileCommand::Rename { uid, new_name } => {
                 commands::profile::rename(&uid, &new_name).await?;
             }
+            cli::ProfileCommand::Migrate { from, force } => {
+                commands::profile::migrate(&from, force).await?;
+            }
         },
         Some(cli::Command::Service { action }) => {
             let bin = std::env::current_exe()?;
