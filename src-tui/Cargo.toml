@@ -1,6 +1,6 @@
 [package]
 name = "clash-verge-cli"
-version = "0.1.0"
+version = "0.0.1"
 description = "Terminal-native proxy client for mihomo (clash meta)"
 authors = ["clash-verge-cli contributors"]
 license = "GPL-3.0-only"
