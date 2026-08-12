@@ -27,6 +27,25 @@ pub enum Action {
     // Profile management
     StartImport,
     ConfirmImport(String),
+    /// The SSRF safety check found a blocked host during import; the user must
+    /// explicitly trust it before that URL may be imported.
+    ImportNeedsTrust {
+        url: String,
+        host: String,
+    },
+    /// The SSRF safety check found a blocked host during a manual profile
+    /// refresh; the user must explicitly trust it before the update retries.
+    /// Carries the profile uid so confirming persists the trust into that
+    /// profile's stored option.
+    UpdateNeedsTrust {
+        uid: String,
+        host: String,
+    },
+    /// User pressed `y` on the trust prompt: retry only that import with the
+    /// host in `trusted_hosts` (reads `app.pending_trust`).
+    ConfirmTrustImport,
+    /// User pressed `n`/Esc on the trust prompt: cancel. No trust is saved.
+    CancelTrustImport,
     MoveNext,
     MovePrevious,
     Activate,
@@ -139,9 +158,30 @@ pub enum Action {
     /// Read-only report of the resolved binary's TUN capability state
     /// (refresh after setup / start / startup probe).
     TunCapabilityState(bool),
-    /// TUN capability was applied (explicit one-time sudo); settings shows
-    /// (privileged).
-    TunPrivilegeApplied,
+    /// TUN setup transaction finished. `resume_start` is `Some(enable_tun)`
+    /// when a pending core start (offered from the core-start prompt) should
+    /// resume now that the capability/DNS rule are installed, `None` for the
+    /// explicit Settings → TUN setup action.
+    TunSetupSucceeded {
+        resume_start: Option<bool>,
+    },
+    /// The TUN-enabled core-start preflight found a missing file capability
+    /// or DNS polkit rule; open the TUI-native confirm dialog.
+    TunSetupPrompt {
+        binary: std::path::PathBuf,
+        enable_tun: bool,
+    },
+    /// User pressed `y` on the core-start setup confirm: open the password
+    /// popup; the same one-time transaction runs and the start resumes.
+    ConfirmTunSetup,
+    /// User pressed `n`/Esc/q on the core-start setup confirm: dismiss and
+    /// start anyway (preserving the passive warning behavior).
+    SkipTunSetupStart,
+    /// Resume the pending core start (post-setup success or after the user
+    /// chose to start without setup).
+    ResumeCoreStart {
+        enable_tun: bool,
+    },
     /// Password popup input (hidden buffer, `•` masked).
     PasswordChar(char),
     PasswordBackspace,
@@ -183,6 +223,16 @@ mod tests {
         let _ = Action::CoreExited(137);
         let _ = Action::CoreError("boom".to_string());
         let _ = Action::Quit;
+        let _ = Action::TunSetupSucceeded {
+            resume_start: Some(true),
+        };
+        let _ = Action::TunSetupPrompt {
+            binary: std::path::PathBuf::from("/fake/mihomo"),
+            enable_tun: true,
+        };
+        let _ = Action::ConfirmTunSetup;
+        let _ = Action::SkipTunSetupStart;
+        let _ = Action::ResumeCoreStart { enable_tun: true };
     }
 
     fn assert_send_sync<T: Send + Sync>() {}

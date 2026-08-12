@@ -22,7 +22,18 @@ pub async fn setup() -> anyhow::Result<()> {
     if applied {
         println!("TUN capabilities applied ({}).", crate::commands::privilege::TUN_CAPS);
     } else {
-        println!("TUN capabilities already present — nothing to do.");
+        println!("TUN capabilities and DNS polkit rule already present — nothing to do.");
+    }
+    // The one-time transaction also installs the systemd-resolved DNS polkit
+    // rule (when the resolve1 policy exists), so a later TUN start triggers
+    // zero polkit dialogs.
+    match (
+        crate::commands::privilege::resolved_policy_present(),
+        crate::commands::privilege::resolve1_rule_installed(),
+    ) {
+        (false, _) => println!("No systemd-resolved polkit policy found — DNS polkit rule skipped."),
+        (true, true) => println!("DNS polkit rule installed — TUN start needs no polkit dialogs."),
+        (true, false) => println!("DNS polkit rule MISSING — check the error above; TUN start may prompt."),
     }
     Ok(())
 }
@@ -46,11 +57,28 @@ pub async fn status() -> anyhow::Result<()> {
             "non-root"
         }
     );
+    let policy = crate::commands::privilege::resolved_policy_present();
+    let rule = crate::commands::privilege::resolve1_rule_installed();
+    println!(
+        "resolve1 policy: {}",
+        if policy {
+            "present"
+        } else {
+            "absent (no systemd-resolved)"
+        }
+    );
+    println!("DNS polkit rule:  {}", if rule { "installed" } else { "missing" });
     if !privileged && !root {
         println!(
             "hint: run `{}` to grant {}",
             crate::commands::privilege::TUN_SETUP_COMMAND,
             crate::commands::privilege::TUN_CAPS
+        );
+    }
+    if policy && !rule && !root {
+        println!(
+            "hint: run `{}` to install the DNS polkit rule (avoids polkit dialogs on TUN start)",
+            crate::commands::privilege::TUN_SETUP_COMMAND
         );
     }
     Ok(())

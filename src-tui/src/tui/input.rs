@@ -59,6 +59,26 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             (Overlay::PasswordInput, KeyCode::Backspace) => Some(Action::PasswordBackspace),
             (Overlay::PasswordInput, KeyCode::Enter) => Some(Action::PasswordSubmit),
             (Overlay::PasswordInput, KeyCode::Esc) => Some(Action::PasswordCancel),
+            // Trust confirmation is an explicit opt-in: only `y` retries the
+            // import with the host in `trusted_hosts`; `n`/Esc cancel without
+            // saving any trust. `q` still dismisses via the generic fallback.
+            (Overlay::TrustConfirmation, KeyCode::Char('y')) | (Overlay::TrustConfirmation, KeyCode::Char('Y')) => {
+                Some(Action::ConfirmTrustImport)
+            }
+            (Overlay::TrustConfirmation, KeyCode::Char('n')) | (Overlay::TrustConfirmation, KeyCode::Char('N')) => {
+                Some(Action::CancelTrustImport)
+            }
+            (Overlay::TrustConfirmation, KeyCode::Esc) => Some(Action::CancelTrustImport),
+            // Core-start TUN setup confirm is an explicit opt-in: `y` opens
+            // the existing password popup (setup then resumes the pending
+            // start); `n`/Esc/`q` dismiss and start anyway — the app never
+            // falls through to a system polkit dialog.
+            (Overlay::TunSetupConfirmation, KeyCode::Char('y'))
+            | (Overlay::TunSetupConfirmation, KeyCode::Char('Y')) => Some(Action::ConfirmTunSetup),
+            (Overlay::TunSetupConfirmation, KeyCode::Char('n'))
+            | (Overlay::TunSetupConfirmation, KeyCode::Char('N'))
+            | (Overlay::TunSetupConfirmation, KeyCode::Esc)
+            | (Overlay::TunSetupConfirmation, KeyCode::Char('q')) => Some(Action::SkipTunSetupStart),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -339,6 +359,114 @@ mod tests {
             focus: Focus::Content,
             overlay: Some(Overlay::PasswordInput),
             pending_connection_close: None,
+        }
+    }
+
+    fn trust_context() -> KeyContext<'static> {
+        KeyContext {
+            view: View::Profiles,
+            focus: Focus::Content,
+            overlay: Some(Overlay::TrustConfirmation),
+            pending_connection_close: None,
+        }
+    }
+
+    fn tun_setup_confirm_context() -> KeyContext<'static> {
+        KeyContext {
+            view: View::Home,
+            focus: Focus::Content,
+            overlay: Some(Overlay::TunSetupConfirmation),
+            pending_connection_close: None,
+        }
+    }
+
+    #[test]
+    fn tun_setup_confirm_y_opens_setup_and_n_escalates() {
+        // `y` opens the password popup (setup then resumes the start); `n`,
+        // `N`, Esc, and `q` all skip the setup and start anyway — no key may
+        // fall through to the generic dismiss that would strand the pending
+        // start.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('y')), tun_setup_confirm_context()),
+            Some(Action::ConfirmTunSetup)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('Y')), tun_setup_confirm_context()),
+            Some(Action::ConfirmTunSetup)
+        ));
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(
+                matches!(
+                    map_key(event(code), tun_setup_confirm_context()),
+                    Some(Action::SkipTunSetupStart)
+                ),
+                "key {code:?} must skip setup and start anyway"
+            );
+        }
+    }
+
+    #[test]
+    fn tun_setup_confirm_does_not_swallow_other_keys_as_confirmation() {
+        // No other key may confirm the setup: accidental keystrokes must not
+        // open the password popup or skip the start.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Backspace,
+            KeyCode::Char('1'),
+        ] {
+            assert!(
+                map_key(event(code), tun_setup_confirm_context()).is_none(),
+                "key {code:?} must not confirm or skip the setup"
+            );
+        }
+    }
+
+    #[test]
+    fn trust_prompt_requires_explicit_y_and_n_escalates() {
+        // Only `y` retries the import; `n` and Esc cancel. `q` falls through
+        // to the generic dismiss (which also drops the pending trust).
+        assert!(matches!(
+            map_key(event(KeyCode::Char('y')), trust_context()),
+            Some(Action::ConfirmTrustImport)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('Y')), trust_context()),
+            Some(Action::ConfirmTrustImport)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('n')), trust_context()),
+            Some(Action::CancelTrustImport)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('N')), trust_context()),
+            Some(Action::CancelTrustImport)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Esc), trust_context()),
+            Some(Action::CancelTrustImport)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('q')), trust_context()),
+            Some(Action::DismissOverlay)
+        ));
+    }
+
+    #[test]
+    fn trust_prompt_does_not_swallow_other_keys_as_confirmation() {
+        // No other key may confirm the trust: accidental keystrokes must not
+        // retry the import or save an exception.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                map_key(event(code), trust_context()).is_none(),
+                "key {code:?} must not confirm trust"
+            );
         }
     }
 

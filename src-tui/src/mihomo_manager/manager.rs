@@ -443,6 +443,14 @@ pub async fn runtime_tun_enabled() -> anyhow::Result<bool> {
 fn preflight_tun_capability(path: &Path, tun_enabled: bool) -> anyhow::Result<()> {
     if tun_enabled {
         crate::commands::privilege::require_tun_capability(path)?;
+        // Read-only DNS-rule check for the daemon/restart spawn paths: a
+        // missing systemd-resolved polkit rule means this start will trigger
+        // polkit dialogs. Logged as a warning so the operator is told to run
+        // TUN setup instead of polkit dialogs being the first notice. Never
+        // blocks the spawn (the capability above is the hard gate).
+        if crate::commands::privilege::resolve1_rule_needed(true) {
+            tracing::warn!("{}", crate::commands::privilege::missing_resolve1_rule_warning());
+        }
     }
     Ok(())
 }

@@ -1,15 +1,17 @@
+pub mod dialog;
 pub mod input_bar;
 pub mod profile_list;
 pub mod proxy_list;
 pub mod split_view;
 pub mod status_bar;
 pub mod terminal_text;
+pub mod theme;
 pub mod views;
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::app::{App, Focus, Overlay, View};
 
@@ -21,10 +23,9 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     status_bar::draw(frame, shell[0], app);
 
-    let nav_width = if shell[1].width < 120 { 18 } else { 24 };
     let main = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(nav_width), Constraint::Min(0)])
+        .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
         .split(shell[1]);
 
     draw_navigation(frame, main[0], app);
@@ -33,27 +34,32 @@ pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     draw_overlay(frame, app);
 }
 
+/// Nav column width: longest localized view label + 6, covering the block
+/// borders (2), the `> ` highlight symbol (2), and the `1 ` number prefix (2),
+/// clamped to a usable band regardless of locale.
+fn nav_width(app: &App) -> u16 {
+    let longest = View::ALL
+        .iter()
+        .map(|view| Line::from(view.localized_label(app.language)).width())
+        .max()
+        .unwrap_or(0);
+    (longest + 6).clamp(17, 26) as u16
+}
+
 fn draw_navigation(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     let selected = View::ALL.iter().position(|view| *view == app.view).unwrap_or_default();
+    let menu_focused = app.focus == Focus::Menu;
     let items = View::ALL.iter().enumerate().map(|(index, view)| {
         ListItem::new(Line::from(vec![
-            Span::styled(format!("{} ", index + 1), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ", index + 1), Style::new().fg(theme::dim())),
             Span::raw(view.localized_label(app.language)),
         ]))
     });
-    let highlight = if app.focus == Focus::Menu {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    };
-    let mut state = ListState::default().with_selected(Some(selected));
     let list = List::new(items)
-        .block(Block::bordered().title(app.tr("menu")))
-        .highlight_style(highlight)
+        .block(theme::panel_block(app.tr("menu"), menu_focused))
+        .highlight_style(theme::highlight(menu_focused))
         .highlight_symbol("> ");
+    let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -65,107 +71,140 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-    let area = centered_rect(70, 50, frame.area());
-    frame.render_widget(Clear, area);
     match overlay {
         Overlay::Help => {
-            let text = vec![
-                Line::from(Span::styled(
-                    app.tr("help.global"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
+            let content = vec![
+                Line::from(Span::styled(app.tr("help.global"), theme::bold(theme::accent()))),
                 Line::from(app.tr("help.global_commands")),
                 Line::from(app.tr("help.global_commands_more")),
                 Line::from(""),
-                Line::from(Span::styled(
-                    app.tr("help.current_view"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )),
+                Line::from(Span::styled(app.tr("help.current_view"), theme::bold(theme::accent()))),
                 Line::from(crate::tui::input::context_hint(app.view, app.focus, app.language)),
                 Line::from(""),
-                Line::from(Span::styled(app.tr("help.close"), Style::default().fg(Color::DarkGray))),
+                Line::from(Span::styled(app.tr("help.close"), Style::new().fg(theme::dim()))),
             ];
-            let popup = Paragraph::new(text)
-                .block(Block::bordered().title(app.tr("help")))
-                .alignment(Alignment::Left)
-                .wrap(Wrap { trim: true });
-            frame.render_widget(popup, area);
+            dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Info, app.tr("help"), content);
         }
         Overlay::CloseConfirmation => {
             let target = app
                 .pending_connection_close
                 .as_deref()
                 .unwrap_or(app.tr("common.unknown"));
-            let popup = Paragraph::new(vec![
+            let content = vec![
                 Line::from(Span::styled(
                     app.tr("dialog.confirm_close"),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    theme::bold(theme::danger()),
                 )),
                 Line::from(format!("{}: {target}", app.tr("dialog.target"))),
                 Line::from(""),
                 Line::from(Span::styled(
                     app.tr("input.confirm_cancel").trim_start_matches(" | "),
-                    Style::default().fg(Color::DarkGray),
+                    Style::new().fg(theme::dim()),
                 )),
-            ])
-            .block(Block::bordered().title(app.tr("input.close")));
-            frame.render_widget(popup, area);
+            ];
+            dialog::draw_dialog(
+                frame,
+                frame.area(),
+                dialog::DialogKind::Danger,
+                app.tr("input.close"),
+                content,
+            );
         }
         Overlay::Filter => {}
+        Overlay::TrustConfirmation => {
+            let is_update = app.pending_trust.as_ref().is_some_and(|pending| pending.uid.is_some());
+            let host = app
+                .pending_trust
+                .as_ref()
+                .map(|pending| pending.host.as_str())
+                .unwrap_or(app.tr("common.unknown"));
+            let title = app.tr(if is_update {
+                "dialog.trust_update_title"
+            } else {
+                "dialog.trust_title"
+            });
+            let warning = app.tr(if is_update {
+                "dialog.trust_update_warning"
+            } else {
+                "dialog.trust_warning"
+            });
+            let confirm = app.tr(if is_update {
+                "dialog.trust_update_confirm"
+            } else {
+                "dialog.trust_confirm"
+            });
+            let dialog_title = app.tr(if is_update {
+                "dialog.trust_update"
+            } else {
+                "dialog.trust"
+            });
+            let content = vec![
+                Line::from(Span::styled(title, theme::bold(theme::danger()))),
+                Line::from(format!("{}: {host}", app.tr("dialog.target"))),
+                Line::from(""),
+                Line::from(Span::styled(warning, Style::new().fg(theme::warn()))),
+                Line::from(""),
+                Line::from(Span::styled(confirm, Style::new().fg(theme::dim()))),
+            ];
+            dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Warn, dialog_title, content);
+        }
         Overlay::CloseAllConnectionsConfirmation => {
-            let popup = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "Close ALL connections?",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                )),
+            let content = vec![
+                Line::from(Span::styled("Close ALL connections?", theme::bold(theme::danger()))),
                 Line::from("This will terminate every active connection."),
                 Line::from(""),
                 Line::from(Span::styled(
                     "Enter = confirm | Esc/q = cancel",
-                    Style::default().fg(Color::DarkGray),
+                    Style::new().fg(theme::dim()),
                 )),
-            ])
-            .block(Block::bordered().title("Close All"));
-            frame.render_widget(popup, area);
+            ];
+            dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Danger, "Close All", content);
         }
-        Overlay::PasswordInput => {
-            let prompt = app.password_prompt.as_deref().unwrap_or("sudo").to_string();
-            let masked: String = "•".repeat(app.password_buffer.len());
-            let popup = Paragraph::new(vec![
+        Overlay::TunSetupConfirmation => {
+            let content = vec![
                 Line::from(Span::styled(
-                    prompt,
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    app.tr("dialog.tun_setup_title"),
+                    theme::bold(theme::warn()),
                 )),
-                Line::from(format!("密码: {masked}")),
+                Line::from(app.tr("dialog.tun_setup_warning")),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter = 确认 | Esc = 取消",
-                    Style::default().fg(Color::DarkGray),
+                    app.tr("dialog.tun_setup_confirm"),
+                    Style::new().fg(theme::dim()),
                 )),
-            ])
-            .block(Block::bordered().title("管理员权限"));
-            frame.render_widget(popup, area);
+            ];
+            dialog::draw_dialog(
+                frame,
+                frame.area(),
+                dialog::DialogKind::Warn,
+                app.tr("dialog.tun_setup"),
+                content,
+            );
+        }
+        Overlay::PasswordInput => {
+            let prompt = app.password_prompt.as_deref().unwrap_or("sudo");
+            let masked = dialog::mask_password(app.password_buffer.len());
+            let content = vec![
+                Line::from(Span::styled(prompt, theme::bold(theme::warn()))),
+                Line::from(vec![
+                    Span::styled(app.tr("dialog.password.prompt"), theme::bold(theme::text())),
+                    Span::styled(masked, Style::new().fg(theme::text())),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled(
+                    app.tr("dialog.password.hint"),
+                    Style::new().fg(theme::dim()),
+                )),
+            ];
+            dialog::draw_dialog(
+                frame,
+                frame.area(),
+                dialog::DialogKind::Password,
+                app.tr("dialog.password.title"),
+                content,
+            );
         }
     }
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height) / 2),
-            Constraint::Percentage(height),
-            Constraint::Percentage((100 - height) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - width) / 2),
-            Constraint::Percentage(width),
-            Constraint::Percentage((100 - width) / 2),
-        ])
-        .split(vertical[1])[1]
 }
 
 #[cfg(test)]
@@ -259,6 +298,19 @@ mod tests {
             },
         ];
         app
+    }
+
+    #[test]
+    fn nav_width_covers_borders_highlight_and_number_prefix() {
+        let mut app = App::new();
+        app.language = crate::i18n::Language::English;
+        // "Connections" (11 cells) + 6 (borders 2 + "> " 2 + "1 " 2) = 17;
+        // the longest selected row never truncates.
+        assert_eq!(nav_width(&app), 17);
+
+        app.language = crate::i18n::Language::SimplifiedChinese;
+        // CJK labels are 4 cells wide; the 17 minimum applies.
+        assert_eq!(nav_width(&app), 17);
     }
 
     #[test]
@@ -452,5 +504,86 @@ mod tests {
         app.view = View::Logs;
         let (logs, _) = render(&app, 120, 32);
         assert!(logs.contains("/ filter"));
+    }
+
+    #[test]
+    fn trust_confirmation_renders_host_warning_and_explicit_choice() {
+        let mut app = representative_app();
+        app.view = View::Profiles;
+        app.pending_trust = Some(crate::app::TrustPending {
+            url: "http://192.168.1.1/sub".to_string(),
+            host: "192.168.1.1".to_string(),
+            uid: None,
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+
+        let (rendered, _) = render(&app, 120, 32);
+        assert!(rendered.contains("Trust Host"));
+        assert!(rendered.contains("192.168.1.1"));
+        assert!(rendered.contains("SSRF"));
+        assert!(rendered.contains("y = trust & import"));
+        assert!(rendered.contains("no trust saved"));
+    }
+
+    #[test]
+    fn trust_update_confirmation_renders_update_wording() {
+        // The refresh trust prompt (pending.uid set) must use the update wording
+        // instead of the import wording while sharing the same overlay.
+        let mut app = representative_app();
+        app.view = View::Profiles;
+        app.pending_trust = Some(crate::app::TrustPending {
+            url: "http://192.168.1.1/sub".to_string(),
+            host: "192.168.1.1".to_string(),
+            uid: Some("R7iHvBBicAOz".to_string()),
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+
+        let (rendered, _) = render(&app, 120, 32);
+        assert!(rendered.contains("Trust & Update"));
+        assert!(rendered.contains("192.168.1.1"));
+        assert!(rendered.contains("SSRF"));
+        assert!(rendered.contains("y = trust & update"));
+        assert!(
+            !rendered.contains("y = trust & import"),
+            "update prompt must not use import wording"
+        );
+
+        // Chinese locale mirrors the same split.
+        app.language = crate::i18n::Language::SimplifiedChinese;
+        let (zh, _) = render(&app, 120, 32);
+        // CJK double-width glyphs split across buffer cells: strip the empty
+        // continuation cells before searching for contiguous phrases.
+        let zh_clean: String = zh.chars().filter(|c| !c.is_whitespace() && *c != '\0').collect();
+        assert!(zh_clean.contains("信任并更新"));
+        assert!(!zh_clean.contains("信任并导入"));
+    }
+
+    #[test]
+    fn tun_setup_confirmation_renders_warning_and_choice() {
+        let mut app = representative_app();
+        app.view = View::Home;
+        app.overlay = Some(Overlay::TunSetupConfirmation);
+
+        let (rendered, _) = render(&app, 120, 32);
+        assert!(rendered.contains("TUN Setup"));
+        assert!(rendered.contains("TUN needs one-time setup"));
+        assert!(rendered.contains("polkit"));
+        assert!(rendered.contains("y = setup now"));
+        assert!(rendered.contains("start without setup"));
+    }
+
+    #[test]
+    fn profiles_view_shows_import_feedback_status() {
+        // Import success/failure must be visible on the initiating view.
+        let mut app = representative_app();
+        app.view = View::Profiles;
+        app.status_msg = Some("Import failed: SSRF blocked".to_string());
+
+        let (rendered, rows) = render(&app, 120, 32);
+        assert!(rendered.contains("Import failed: SSRF blocked"));
+        assert!(
+            rows.iter().any(|row| row.contains("Import failed")),
+            "import feedback must appear as a visible row on Profiles"
+        );
     }
 }
