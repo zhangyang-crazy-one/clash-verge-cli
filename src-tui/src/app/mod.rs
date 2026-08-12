@@ -91,12 +91,62 @@ pub enum Overlay {
     CloseAllConnectionsConfirmation,
     /// Bordered password popup for one-time TUN capability setup.
     PasswordInput,
+    /// SSRF safety check blocked the imported URL host; explicit `y` required
+    /// before retrying that import with the host in `trusted_hosts`.
+    TrustConfirmation,
+    /// Core start with TUN enabled needs the one-time setup (file capability
+    /// and/or the systemd-resolved DNS polkit rule); explicit `y` opens the
+    /// password popup, `n`/Esc/q starts without setup.
+    TunSetupConfirmation,
 }
 
-/// Context for the explicit TUN setup action waiting on password input.
+/// Pending SSRF trust confirmation for a subscription import or refresh.
+///
+/// `host` is the bare host that the safety check rejected; only this host is
+/// offered for `trusted_hosts`. No profile data is written until the user
+/// confirms via `y`.
+///
+/// `uid` is `None` for the import flow and `Some(profile uid)` for a manual
+/// refresh of an existing profile: the update flow must carry the uid so that
+/// confirming persists the trusted host into that profile's stored option.
+#[derive(Debug, Clone)]
+pub struct TrustPending {
+    pub url: String,
+    pub host: String,
+    /// Profile uid for the refresh flow (`None` = import flow).
+    pub uid: Option<String>,
+}
+
+/// Why the core-start setup confirm was offered. Decides what `n`/Esc/q
+/// means on the dialog: dismissing a capability-missing prompt must cancel
+/// the start (the spawn preflight would hard-fail anyway), while dismissing
+/// a missing-DNS-rule prompt may start without setup (that path works, it
+/// just triggers system polkit dialogs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunSetupReason {
+    /// The resolved binary lacks the TUN file capability (and the process
+    /// is not root): hard gate — setup is required before the core can run
+    /// with TUN enabled.
+    MissingCapability,
+    /// Capability is fine; only the systemd-resolved DNS polkit rule is
+    /// missing: soft gate — the core can still start, it will just show
+    /// system auth dialogs until the rule is installed.
+    MissingDnsRule,
+}
+
+/// Context for a TUN setup waiting on password input (or the inline confirm
+/// dialog on core start).
 #[derive(Debug, Clone)]
 pub struct TunPending {
     pub binary: std::path::PathBuf,
+    /// Resume a pending core start after the transaction succeeds:
+    /// `Some(enable_tun)` when the setup was offered from the core-start
+    /// prompt, `None` for the explicit Settings → TUN setup action (nothing
+    /// to resume).
+    pub resume_start: Option<bool>,
+    /// Which gate prompted the setup; only meaningful for the core-start
+    /// confirm (the explicit Settings flow has nothing to skip).
+    pub reason: TunSetupReason,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +182,9 @@ pub struct App {
     pub view: View,
     pub focus: Focus,
     pub overlay: Option<Overlay>,
+    /// Subscription URL or profile refresh waiting on an explicit SSRF trust
+    /// confirmation (import when `uid` is `None`, manual update otherwise).
+    pub pending_trust: Option<TrustPending>,
     pub filter: Option<String>,
     pub traffic: Option<TrafficData>,
     pub connections: Vec<ConnectionInfo>,
@@ -199,6 +252,7 @@ impl App {
             view: View::Home,
             focus: Focus::Menu,
             overlay: None,
+            pending_trust: None,
             filter: None,
             traffic: None,
             connections: Vec::new(),
@@ -249,6 +303,22 @@ impl App {
 
     pub fn tr(&self, key: &'static str) -> &'static str {
         crate::i18n::tr(self.language, key)
+    }
+
+    /// Choice hint for the core-start TUN setup confirm dialog: the two
+    /// cases differ in what `n`/Esc/q does. Missing capability → dismissing
+    /// cancels the start; only the DNS rule missing → dismissing starts
+    /// without setup.
+    pub fn tun_setup_confirm_hint(&self) -> &'static str {
+        if self
+            .pending_tun
+            .as_ref()
+            .is_some_and(|pending| pending.reason == TunSetupReason::MissingCapability)
+        {
+            self.tr("dialog.tun_setup_confirm_hard")
+        } else {
+            self.tr("dialog.tun_setup_confirm")
+        }
     }
 }
 
