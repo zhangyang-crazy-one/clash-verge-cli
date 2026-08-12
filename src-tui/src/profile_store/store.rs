@@ -117,6 +117,33 @@ impl ProfileStore {
         Ok(())
     }
 
+    /// Persist a trusted host into a remote profile's stored `option.trusted_hosts`.
+    ///
+    /// Merges with any entries the profile already trusts (deduplicated via
+    /// `from_url::merge_trusted_host`), then saves `profiles.yaml`. The saved
+    /// option is what the next `update_remote` fetch re-reads into its SSRF
+    /// allowlist, so a manual refresh that was blocked becomes refreshable
+    /// without an explicit option override.
+    pub async fn add_trusted_host_locked(uid: &str, host: &str) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let uid_key = SmartString::from(uid);
+        let existing = store.profiles.get_item(&uid_key).context("profile not found")?.clone();
+        if existing.itype.as_deref() != Some("remote") {
+            anyhow::bail!("profile {uid} is not a remote subscription");
+        }
+        let mut option = existing.option.clone().unwrap_or_default();
+        let merged = from_url::merge_trusted_host(option.trusted_hosts.as_deref(), host)
+            .ok_or_else(|| anyhow::anyhow!("trusted host does not normalize: {host}"))?;
+        option.trusted_hosts = Some(merged.into_iter().map(SmartString::from).collect());
+        let patch = PrfItem {
+            option: Some(option),
+            ..Default::default()
+        };
+        store.profiles.patch_item(&uid_key, &patch).await?;
+        Ok(())
+    }
+
     /// Rename a profile by UID under the shared IO lock.
     pub async fn rename_locked(uid: &str, new_name: &str) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
@@ -300,29 +327,47 @@ async fn ensure_profile_storage() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use clash_verge_core::config::{IProfiles, PrfItem};
     use clash_verge_core::utils::dirs;
 
     use super::*;
     use crate::subscribe::from_url::RemoteProfileBundle;
 
+    /// Serializes tests that claim the process-global `APP_HOME_DIR` OnceLock.
+    /// Disk-backed tests run one at a time and share one root so the OnceLock
+    /// can only ever be claimed once per process. Async-aware because the guard
+    /// is held across `await` points for the whole test body.
+    pub(crate) static TEST_APP_HOME_DIR_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// The single test app-home root shared by every disk-backed test.
+    pub(crate) fn test_app_home_root() -> std::path::PathBuf {
+        std::env::temp_dir().join("clash-verge-cli-tui-tests")
+    }
+
+    /// Claim the global app home dir for this test. Returns a guard that must
+    /// be held (in scope) until the test finishes so no other disk-backed test
+    /// can run while this one is using the shared root.
+    pub(crate) async fn claim_test_app_home(root: std::path::PathBuf) -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = TEST_APP_HOME_DIR_LOCK.lock().await;
+        let _ = std::fs::create_dir_all(root.join("profiles"));
+        dirs::set_app_home_dir(root);
+        guard
+    }
+
+    /// In-memory store for disk-backed tests that must seed a profile without
+    /// hitting the network (the `profiles` field is private to this module).
+    pub(crate) fn empty_store() -> ProfileStore {
+        ProfileStore {
+            profiles: IProfiles::default(),
+        }
+    }
+
     #[tokio::test]
     async fn append_bundle_persists_profiles_yaml_and_body() {
-        let root = std::env::temp_dir().join(format!("clash-verge-cli-profile-{}", uuid::Uuid::new_v4()));
-        match std::fs::create_dir_all(root.join("profiles")) {
-            Ok(()) => {}
-            Err(error) => panic!("create temp profiles dir: {error}"),
-        }
-        dirs::set_app_home_dir(root.clone());
-        let home = match dirs::app_home_dir() {
-            Ok(home) => home,
-            Err(error) => panic!("app home dir: {error}"),
-        };
-        assert_eq!(
-            home, root,
-            "test requires exclusive app home dir; another test may have claimed OnceLock"
-        );
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = claim_test_app_home(root.clone()).await;
 
         let mut store = ProfileStore {
             profiles: IProfiles::default(),
@@ -361,6 +406,85 @@ mod tests {
             Err(error) => panic!("read profile body: {error}"),
         };
         assert!(body.contains("proxies:"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn add_trusted_host_persists_merged_allowlist_into_the_profiles_option() {
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = claim_test_app_home(root.clone()).await;
+
+        let mut store = ProfileStore {
+            profiles: IProfiles::default(),
+        };
+        let uid = "Rtrusted01ab";
+        let bundle = RemoteProfileBundle {
+            item: PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                name: Some("trust-demo".into()),
+                file: Some(format!("{uid}.yaml").into()),
+                url: Some("https://8ry1xfih.doggygosubs.com/sub".into()),
+                option: Some(clash_verge_core::config::PrfOption {
+                    trusted_hosts: Some(vec!["existing.example.org".into()]),
+                    ..Default::default()
+                }),
+                file_data: Some("proxies: []\n".into()),
+                ..Default::default()
+            },
+            fragments: vec![match PrfItem::from_merge(None) {
+                Ok(item) => item,
+                Err(error) => panic!("merge fragment: {error}"),
+            }],
+        };
+        match store.append_bundle(bundle).await {
+            Ok(_) => {}
+            Err(error) => panic!("append_bundle: {error}"),
+        }
+
+        match ProfileStore::add_trusted_host_locked(uid, "8ry1xfih.doggygosubs.com").await {
+            Ok(()) => {}
+            Err(error) => panic!("add_trusted_host_locked: {error}"),
+        }
+
+        // The stored option now merges the new host WITHOUT dropping the one
+        // the profile already trusted (the update trust flow must merge).
+        let snapshot = match ProfileStore::snapshot().await {
+            Ok(store) => store,
+            Err(error) => panic!("snapshot: {error}"),
+        };
+        let item = snapshot
+            .items()
+            .into_iter()
+            .find(|item| item.uid.as_deref() == Some(uid))
+            .unwrap_or_else(|| panic!("profile {uid} missing after persist"));
+        let hosts = item
+            .option
+            .and_then(|option| option.trusted_hosts)
+            .expect("trusted_hosts persisted");
+        let expected: Vec<SmartString> = vec!["existing.example.org".into(), "8ry1xfih.doggygosubs.com".into()];
+        assert_eq!(hosts, expected);
+
+        // A repeated confirm for the same host is idempotent: no duplicate entry.
+        match ProfileStore::add_trusted_host_locked(uid, "8ry1xfih.doggygosubs.com").await {
+            Ok(()) => {}
+            Err(error) => panic!("second add_trusted_host_locked: {error}"),
+        }
+        let snapshot = match ProfileStore::snapshot().await {
+            Ok(store) => store,
+            Err(error) => panic!("snapshot: {error}"),
+        };
+        let item = snapshot
+            .items()
+            .into_iter()
+            .find(|item| item.uid.as_deref() == Some(uid))
+            .unwrap_or_else(|| panic!("profile {uid} missing after second persist"));
+        let hosts = item
+            .option
+            .and_then(|option| option.trusted_hosts)
+            .expect("trusted_hosts persisted");
+        assert_eq!(hosts.len(), 2, "duplicate confirm must not grow the allowlist");
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

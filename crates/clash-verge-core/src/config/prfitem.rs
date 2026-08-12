@@ -107,6 +107,13 @@ pub struct PrfOption {
     pub proxies: Option<String>,
 
     pub groups: Option<String>,
+
+    /// for `remote` profile
+    /// SSRF allowlist of trusted hosts. Values may be bare hostnames/IPs or
+    /// full URLs (reduced to their host when fetched). Fetches to these hosts
+    /// are permitted even when they resolve to private/loopback ranges.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_hosts: Option<Vec<String>>,
 }
 
 impl PrfOption {
@@ -127,6 +134,7 @@ impl PrfOption {
                 result.proxies = b_ref.proxies.clone().or(result.proxies);
                 result.groups = b_ref.groups.clone().or(result.groups);
                 result.timeout_seconds = b_ref.timeout_seconds.or(result.timeout_seconds);
+                result.trusted_hosts = b_ref.trusted_hosts.clone().or(result.trusted_hosts);
                 Some(result)
             }
             (Some(a_ref), None) => Some(a_ref.clone()),
@@ -325,5 +333,61 @@ impl PrfItem {
             }
             typ => bail!("invalid profile item type \"{typ}\" (remote types require network; excluded from Phase 1)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_hosts_serde_absent_is_none_and_none_is_omitted() {
+        // Old profiles.yaml (no `trusted_hosts` key) deserializes to None.
+        let plain: PrfOption = serde_yaml_ng::from_str("user_agent: Mozilla\n").expect("old yaml parses");
+        assert_eq!(plain.trusted_hosts, None);
+
+        // `None` must not be serialized, keeping existing stored YAML shape.
+        let empty = PrfOption::default();
+        let yaml = serde_yaml_ng::to_string(&empty).expect("serialize");
+        assert!(!yaml.contains("trusted_hosts"));
+    }
+
+    #[test]
+    fn trusted_hosts_serde_roundtrip() {
+        let option = PrfOption {
+            trusted_hosts: Some(vec!["sub.example.com".into(), "192.168.1.1".into()]),
+            ..Default::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&option).expect("serialize");
+        assert!(yaml.contains("trusted_hosts"));
+
+        let back: PrfOption = serde_yaml_ng::from_str(&yaml).expect("deserialize");
+        assert_eq!(
+            back.trusted_hosts,
+            Some(vec!["sub.example.com".into(), "192.168.1.1".into()])
+        );
+    }
+
+    #[test]
+    fn trusted_hosts_merge_override_wins_else_keeps_base() {
+        let base = PrfOption {
+            trusted_hosts: Some(vec!["base.example.org".into()]),
+            ..Default::default()
+        };
+        let override_with = PrfOption {
+            trusted_hosts: Some(vec!["other.example.org".into()]),
+            ..Default::default()
+        };
+
+        // Override (b) wins, matching every other PrfOption field.
+        let merged = PrfOption::merge(Some(&base), Some(&override_with)).expect("merge");
+        assert_eq!(merged.trusted_hosts, Some(vec!["other.example.org".into()]));
+
+        // No override keeps the stored allowlist (update/scheduler path).
+        let kept = PrfOption::merge(Some(&base), None).expect("merge");
+        assert_eq!(kept.trusted_hosts, Some(vec!["base.example.org".into()]));
+
+        // Neither side present stays None.
+        assert_eq!(PrfOption::merge(None, None), None);
     }
 }
