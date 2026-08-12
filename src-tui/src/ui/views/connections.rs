@@ -1,11 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Padding, Paragraph, Wrap};
 
-use crate::app::App;
+use crate::app::{App, Focus};
 use crate::mihomo_api::types::ConnectionInfo;
+use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let columns = Layout::default()
@@ -49,8 +50,8 @@ fn draw_list(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&Conne
                 .unwrap_or(app.tr("connections.unknown_host"));
             let rule = connection.rule.as_deref().unwrap_or("-");
             ListItem::new(Line::from(vec![
-                Span::styled(host, Style::default().fg(Color::White)),
-                Span::styled(format!("  {rule}"), Style::default().fg(Color::DarkGray)),
+                Span::styled(host, Style::new().fg(theme::text())),
+                Span::styled(format!("  {rule}"), Style::new().fg(theme::dim())),
             ]))
         })
         .collect();
@@ -64,10 +65,7 @@ fn draw_list(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&Conne
         } else {
             app.tr("connections.empty").to_string()
         };
-        items.push(ListItem::new(Span::styled(
-            message,
-            Style::default().fg(Color::DarkGray),
-        )));
+        items.push(ListItem::new(Span::styled(message, Style::new().fg(theme::dim()))));
     }
 
     let selected = app
@@ -76,13 +74,11 @@ fn draw_list(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&Conne
         .and_then(|id| connections.iter().position(|connection| connection.id == id));
     let mut state = ListState::default().with_selected(selected);
     let list = List::new(items)
-        .block(Block::bordered().title(app.tr("connections.title")))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .block(theme::panel_block(
+            app.tr("connections.title"),
+            app.focus == Focus::Content,
+        ))
+        .highlight_style(theme::highlight(true))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -104,10 +100,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&Con
             .and_then(|metadata| metadata.network.as_deref())
             .unwrap_or(app.tr("common.unknown"));
         vec![
-            Line::from(Span::styled(
-                host,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled(host, theme::bold(theme::accent()))),
             Line::from(format!("ID: {}", connection.id)),
             Line::from(format!("{}: {network}", app.tr("connections.network"))),
             Line::from(format!(
@@ -122,24 +115,24 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&Con
             ),
             Line::from(Span::styled(
                 app.tr("connections.close_hint"),
-                Style::default().fg(Color::Red),
+                Style::new().fg(theme::danger()),
             )),
         ]
     } else {
         vec![
-            Line::from(Span::styled(
-                app.tr("connections.none"),
-                Style::default().fg(Color::Yellow),
-            )),
+            Line::from(Span::styled(app.tr("connections.none"), Style::new().fg(theme::warn()))),
             Line::from(Span::styled(
                 app.tr("connections.browse_filter"),
-                Style::default().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
         ]
     };
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(app.tr("connections.detail")))
+            .block(
+                theme::panel_block(app.tr("connections.detail"), app.focus == Focus::Content)
+                    .padding(Padding::horizontal(1)),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );

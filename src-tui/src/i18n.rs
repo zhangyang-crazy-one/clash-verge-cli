@@ -207,11 +207,37 @@ fn english(key: &'static str) -> &'static str {
         "settings.tun_setup" => "TUN setup",
         "settings.tun_capable" => "capabilities present",
         "settings.tun_missing" => "not configured — Enter grants once",
-        "settings.tun_setup_prompt" => "Enter password to grant TUN capabilities to mihomo",
-        "settings.tun_setup_present" => "TUN capabilities already present — nothing to do",
+        "settings.tun_setup_prompt" => {
+            "Enter password to install the TUN capability and the systemd-resolved DNS polkit rule for mihomo"
+        }
+        "settings.tun_setup_present" => "TUN setup already complete — capability and DNS rule present",
+        "settings.tun_dns_rule_missing" => "TUN DNS polkit rule missing — run TUN setup once to avoid system dialogs",
         "home.mode" => "Mode",
         "dialog.confirm_close" => "Close active connection?",
         "dialog.target" => "Target",
+        "dialog.password.title" => "Administrator privileges",
+        "dialog.password.prompt" => "Password: ",
+        "dialog.password.hint" => "Enter = confirm | Esc = cancel",
+        "dialog.trust" => "Trust Host",
+        "dialog.trust_title" => "Import blocked by SSRF safety check",
+        "dialog.trust_warning" => {
+            "This subscription resolves to a private or loopback address. Confirming trusts only this host for this profile, so it can be imported and updated later."
+        }
+        "dialog.trust_confirm" => "y = trust & import | n/Esc = cancel (no trust saved)",
+        "dialog.trust_update" => "Trust & Update",
+        "dialog.trust_update_title" => "Update blocked by SSRF safety check",
+        "dialog.trust_update_warning" => {
+            "This subscription resolves to a private or loopback address. Confirming trusts only this host for this profile and retries the update with it allow-listed."
+        }
+        "dialog.trust_update_confirm" => "y = trust & update | n/Esc = cancel (update stays failed)",
+        "dialog.tun_setup" => "TUN Setup",
+        "dialog.tun_setup_title" => "TUN needs one-time setup",
+        "dialog.tun_setup_warning" => {
+            "Starting with TUN enabled needs the mihomo file capability and the systemd-resolved DNS polkit rule. Installing them now means core start requires no system dialogs."
+        }
+        "dialog.tun_setup_confirm" => "y = setup now | n/Esc/q = start without setup",
+        "dialog.tun_setup_confirm_hard" => "y = setup now | n/Esc/q = cancel start (TUN setup required)",
+        "settings.tun_capability_missing" => "TUN capability missing",
         _ => key,
     }
 }
@@ -379,11 +405,33 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "settings.tun_setup" => "TUN 权限设置",
         "settings.tun_capable" => "已具备权限",
         "settings.tun_missing" => "未配置 — Enter 一次性授权",
-        "settings.tun_setup_prompt" => "输入密码为 mihomo 授予 TUN 权限",
-        "settings.tun_setup_present" => "TUN 权限已存在，无需操作",
+        "settings.tun_setup_prompt" => "输入密码为 mihomo 安装 TUN 权限与 systemd-resolved DNS polkit 规则",
+        "settings.tun_setup_present" => "TUN 设置已完成 — 权限与 DNS 规则均已安装",
+        "settings.tun_dns_rule_missing" => "TUN DNS polkit 规则缺失 — 请先运行一次 TUN 权限设置以避免系统弹窗",
         "home.mode" => "模式",
         "dialog.confirm_close" => "关闭活动连接？",
         "dialog.target" => "目标",
+        "dialog.password.title" => "管理员权限",
+        "dialog.password.prompt" => "密码: ",
+        "dialog.password.hint" => "Enter = 确认 | Esc = 取消",
+        "dialog.trust" => "信任主机",
+        "dialog.trust_title" => "导入被 SSRF 安全检查拦截",
+        "dialog.trust_warning" => "该订阅解析到私有或回环地址。确认后仅对本配置文件信任此主机，以便后续导入与更新。",
+        "dialog.trust_confirm" => "y = 信任并导入 | n/Esc = 取消（不保存信任）",
+        "dialog.trust_update" => "信任并更新",
+        "dialog.trust_update_title" => "更新被 SSRF 安全检查拦截",
+        "dialog.trust_update_warning" => {
+            "该订阅解析到私有或回环地址。确认后仅对本配置文件信任此主机，并在更新时放行该主机。"
+        }
+        "dialog.trust_update_confirm" => "y = 信任并更新 | n/Esc = 取消（更新保持失败）",
+        "dialog.tun_setup" => "TUN 权限设置",
+        "dialog.tun_setup_title" => "启动 TUN 需要一次性权限设置",
+        "dialog.tun_setup_warning" => {
+            "启用 TUN 启动需要 mihomo 文件能力与 systemd-resolved DNS polkit 规则。现在安装它们可让核心启动不再弹出系统对话框。"
+        }
+        "dialog.tun_setup_confirm" => "y = 立即设置 | n/Esc/q = 不设置直接启动",
+        "dialog.tun_setup_confirm_hard" => "y = 立即设置 | n/Esc/q = 取消启动（需先完成 TUN 设置）",
+        "settings.tun_capability_missing" => "TUN 文件权限缺失",
         _ => return None,
     })
 }

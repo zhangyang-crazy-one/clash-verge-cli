@@ -1,10 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
 
 use crate::app::{App, Focus};
+use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let content_focus = app.focus == Focus::Content;
@@ -20,26 +21,18 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
     let title = format!("{} ({})", app.tr("rules.title"), app.rules.len());
+    let block = theme::panel_block(title, focused);
 
     if app.rules_loading {
-        let msg = Paragraph::new(Line::from(Span::styled(
-            "Loading...",
-            Style::default().fg(Color::DarkGray),
-        )))
-        .block(Block::bordered().title(title).border_style(border_style));
+        let msg = Paragraph::new(Line::from(Span::styled("Loading...", Style::new().fg(theme::dim())))).block(block);
         frame.render_widget(msg, area);
         return;
     }
 
     if let Some(error) = &app.rules_error {
-        let msg = Paragraph::new(Line::from(Span::styled(error, Style::default().fg(Color::Red))))
-            .block(Block::bordered().title(title).border_style(border_style))
+        let msg = Paragraph::new(Line::from(Span::styled(error, Style::new().fg(theme::danger()))))
+            .block(block)
             .wrap(Wrap { trim: true });
         frame.render_widget(msg, area);
         return;
@@ -48,9 +41,9 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
     if app.rules.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
             app.tr("rules.empty"),
-            Style::default().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )))
-        .block(Block::bordered().title(title).border_style(border_style));
+        .block(block);
         frame.render_widget(msg, area);
         return;
     }
@@ -66,50 +59,42 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
                 Span::styled(
                     format!("{prefix} {:<10}", rule.rule_type),
                     if is_selected {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        theme::bold(theme::accent())
                     } else {
-                        Style::default().fg(Color::Green)
+                        Style::new().fg(theme::ok())
                     },
                 ),
                 Span::styled(
                     format!("{:<40}", rule.payload),
                     if is_selected {
-                        Style::default().fg(Color::White)
+                        Style::new().fg(theme::text())
                     } else {
-                        Style::default().fg(Color::Gray)
+                        Style::new().fg(theme::dim())
                     },
                 ),
-                Span::styled(&rule.proxy, Style::default().fg(Color::Yellow)),
+                Span::styled(&rule.proxy, Style::new().fg(theme::warn())),
             ]);
             ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title(title).border_style(border_style));
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
 }
 
 fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
     let title = format!("Rule Providers ({})", app.rule_providers.len());
+    let block = theme::panel_block(title, focused);
 
     if app.rule_providers_loading {
-        let msg = Paragraph::new(Line::from(Span::styled(
-            "Loading...",
-            Style::default().fg(Color::DarkGray),
-        )))
-        .block(Block::bordered().title(title).border_style(border_style));
+        let msg = Paragraph::new(Line::from(Span::styled("Loading...", Style::new().fg(theme::dim())))).block(block);
         frame.render_widget(msg, area);
         return;
     }
 
     if let Some(error) = &app.rule_providers_error {
-        let msg = Paragraph::new(Line::from(Span::styled(error, Style::default().fg(Color::Red))))
-            .block(Block::bordered().title(title).border_style(border_style))
+        let msg = Paragraph::new(Line::from(Span::styled(error, Style::new().fg(theme::danger()))))
+            .block(block)
             .wrap(Wrap { trim: true });
         frame.render_widget(msg, area);
         return;
@@ -118,9 +103,9 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
     if app.rule_providers.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
             "No rule providers",
-            Style::default().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )))
-        .block(Block::bordered().title(title).border_style(border_style));
+        .block(block);
         frame.render_widget(msg, area);
         return;
     }
@@ -137,30 +122,30 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
                 Span::styled(
                     format!("{prefix} "),
                     if is_selected {
-                        Style::default().fg(Color::Cyan)
+                        Style::new().fg(theme::accent())
                     } else {
-                        Style::default()
+                        Style::new()
                     },
                 ),
                 Span::styled(
                     format!("{:<20}", provider.name),
                     if is_selected {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                        theme::bold(theme::text())
                     } else {
-                        Style::default().fg(Color::White)
+                        Style::new().fg(theme::text())
                     },
                 ),
-                Span::styled(format!("{:<10}", provider.behavior), Style::default().fg(Color::Green)),
+                Span::styled(format!("{:<10}", provider.behavior), Style::new().fg(theme::ok())),
                 Span::styled(
                     format!("{:>4} rules  ", provider.rule_count),
-                    Style::default().fg(Color::Yellow),
+                    Style::new().fg(theme::warn()),
                 ),
-                Span::styled(format!("{:<20}", updated), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{:<20}", updated), Style::new().fg(theme::dim())),
             ]);
             ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).block(Block::bordered().title(title).border_style(border_style));
+    let list = List::new(items).block(block);
     frame.render_widget(list, area);
 }

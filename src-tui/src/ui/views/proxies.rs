@@ -1,10 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, ProxyDisplayRow, proxy_display_rows};
+use crate::app::{App, Focus, ProxyDisplayRow, proxy_display_rows};
+use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let expanded_group = app.expanded_proxy_group.as_deref();
@@ -26,6 +27,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &left_title,
         app.tr("proxies.detail"),
         64,
+        app.focus == Focus::Content,
     );
 
     crate::ui::proxy_list::draw(
@@ -52,7 +54,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
         }) => vec![
             Line::from(Span::styled(
                 crate::ui::terminal_text::display(name),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                theme::bold(theme::accent()),
             )),
             Line::from(format!("{}: {group_type}", app.tr("proxies.type"))),
             Line::from(format!(
@@ -65,10 +67,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
             )),
             Line::from(format!("{}: {node_count}", app.tr("proxies.nodes"))),
             Line::from(chain_selection_label(app)),
-            Line::from(Span::styled(
-                chain_command_hint(app),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(chain_command_hint(app), Style::new().fg(theme::dim()))),
         ],
         Some(ProxyDisplayRow::Node { group, name, current }) => {
             let delay = match app.delay_map.get(name) {
@@ -79,7 +78,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
             vec![
                 Line::from(Span::styled(
                     crate::ui::terminal_text::display(name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    theme::bold(theme::accent()),
                 )),
                 Line::from(format!(
                     "{}: {}",
@@ -96,24 +95,18 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
                         app.tr("common.no")
                     }
                 )),
-                Line::from(Span::styled(
-                    chain_selection_label(app),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(Span::styled(
-                    chain_command_hint(app),
-                    Style::default().fg(Color::DarkGray),
-                )),
+                Line::from(Span::styled(chain_selection_label(app), Style::new().fg(theme::dim()))),
+                Line::from(Span::styled(chain_command_hint(app), Style::new().fg(theme::dim()))),
             ]
         }
         None => vec![
             Line::from(Span::styled(
                 app.tr("proxies.no_selection"),
-                Style::default().fg(Color::Yellow),
+                Style::new().fg(theme::warn()),
             )),
             Line::from(Span::styled(
                 app.tr("proxies.start_or_profile"),
-                Style::default().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
         ],
     };
@@ -121,7 +114,7 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
     if let Some((done, total)) = app.batch_delay {
         lines.push(Line::from(Span::styled(
             format!("{}: {done}/{total}", app.tr("proxies.batch_delay")),
-            Style::default().fg(Color::Yellow),
+            Style::new().fg(theme::warn()),
         )));
     }
 

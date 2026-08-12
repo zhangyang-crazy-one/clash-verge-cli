@@ -7,8 +7,8 @@ use tokio::time;
 use tokio_stream::StreamExt as _;
 
 use crate::app::{
-    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TunPending, View,
-    first_selectable_proxy_group, proxy_display_rows,
+    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TrustPending, TunPending,
+    TunSetupReason, View, first_selectable_proxy_group, proxy_display_rows,
 };
 use crate::i18n::Language;
 use crate::mihomo_api::types::{LogEntry, TrafficData};
@@ -31,6 +31,7 @@ fn dismiss_overlay(app: &mut App) {
     app.overlay = None;
     app.filter = None;
     app.pending_connection_close = None;
+    app.pending_trust = None;
     app.focus = Focus::Menu;
 }
 
@@ -229,29 +230,296 @@ async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, Strin
     write_runtime_config_unlocked(config, enable_tun).await
 }
 
-/// Handle a submitted password for the explicit TUN setup action.
+/// Detect an SSRF-blocked subscription host without parsing error strings.
+///
+/// Returns the bare host only when all three hold: the URL parses, the
+/// default (empty) allowlist check returns a genuine `CheckError::Blocked`
+/// result (the host actually resolved to a private/loopback/link-local/ULA
+/// address), AND adding that host to the allowlist would let it through.
+/// Matching the typed `Blocked` variant — rather than treating any failure as
+/// a block — excludes DNS-resolution and no-address failures, so the trust
+/// prompt is never offered for a host that trusting would not actually
+/// unblock. The allowlist lookup in `ssrf::check_url_host` precedes DNS
+/// resolution, so the trusted re-check is exact and needs no network.
+fn ssrf_blocked_host(url: &str) -> Option<String> {
+    let cleaned = crate::subscribe::from_url::fix_dirty_url(url).ok()?;
+    let host = cleaned.host_str().map(str::to_string)?;
+    // Ordinary imports keep default SSRF protection: empty allowlist. Only a
+    // genuine blocked-address result may offer trust; DNS failures surface as
+    // plain import errors instead of a "trust this host" prompt.
+    let blocked = matches!(
+        crate::subscribe::ssrf::check_url_host(cleaned.as_str(), &[]),
+        Err(crate::subscribe::ssrf::CheckError::Blocked { .. })
+    );
+    if !blocked {
+        return None;
+    }
+    crate::subscribe::ssrf::check_url_host(cleaned.as_str(), std::slice::from_ref(&host))
+        .is_ok()
+        .then_some(host)
+}
+
+/// Import a subscription URL in the background, preserving default SSRF
+/// protection (`option` is `None` for ordinary imports). Results arrive back
+/// as `ProfileImported` / `ProfileImportFailed`.
+fn spawn_import(
+    action_tx: &mpsc::UnboundedSender<Action>,
+    url: String,
+    option: Option<clash_verge_core::config::PrfOption>,
+) {
+    let tx = action_tx.clone();
+    tokio::spawn(async move {
+        match crate::profile_store::store::ProfileStore::import_url_locked(&url, None, option.as_ref()).await {
+            Ok(_) => {
+                let _ = tx.send(Action::ProfileImported);
+            }
+            Err(error) => {
+                let _ = tx.send(Action::ProfileImportFailed(error.to_string()));
+            }
+        }
+    });
+}
+
+/// Resolve a confirmed SSRF trust prompt.
+///
+/// Import (`pending.uid` is `None`): retry only that import with the host in
+/// `trusted_hosts`; the option is persisted into the imported profile by the
+/// existing `from_url` path, so later manual/automatic updates reuse it.
+///
+/// Manual refresh (`pending.uid` is `Some`): persist the normalized host into
+/// that profile's stored `option.trusted_hosts` (merge + save `profiles.yaml`),
+/// then retry the update; the re-read allowlist unblocks the fetch. The uid is
+/// required so trust lands on the existing profile, never on a new one.
+fn handle_confirm_trust(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+    let Some(pending) = app.pending_trust.take() else {
+        // Stale duplicate `y` after the prompt already closed: ignore instead
+        // of retrying an import the user may have cancelled.
+        return;
+    };
+    app.overlay = None;
+    if let Some(uid) = pending.uid {
+        let host = pending.host;
+        app.status_msg = Some(format!("Updating profile {uid} (trusted host)..."));
+        let tx = action_tx.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::profile_store::store::ProfileStore::add_trusted_host_locked(&uid, &host).await {
+                let _ = tx.send(Action::ProfileUpdateFailed(format!("trust persist: {error}")));
+                return;
+            }
+            // update_remote_locked re-reads profiles.yaml, so the persisted
+            // (merged) allowlist is what unblocks this retry.
+            match crate::profile_store::store::ProfileStore::update_remote_locked(&uid, None).await {
+                Ok(is_current) => {
+                    let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                }
+                Err(error) => {
+                    let _ = tx.send(Action::ProfileUpdateFailed(error.to_string()));
+                }
+            }
+        });
+        return;
+    }
+    app.status_msg = Some(format!("Importing {} (trusted host)...", pending.host));
+    let option = clash_verge_core::config::PrfOption {
+        trusted_hosts: Some(vec![pending.host.clone().into()]),
+        ..Default::default()
+    };
+    spawn_import(action_tx, pending.url, Some(option));
+}
+
+/// Cancel the trust prompt. Only in-memory state changes: no exception is
+/// written to `profiles.yaml`, so the host stays blocked and the update/import
+/// keeps its failure status.
+fn handle_cancel_trust(app: &mut App) {
+    let was_update = app.pending_trust.as_ref().is_some_and(|pending| pending.uid.is_some());
+    app.pending_trust = None;
+    app.overlay = None;
+    app.status_msg = Some(if was_update {
+        "Update cancelled — host was not trusted".into()
+    } else {
+        "Import cancelled — host was not trusted".into()
+    });
+}
+
+/// Open the SSRF trust prompt for a manual refresh blocked on `host`.
+/// The pending state carries the profile `uid` so confirming persists the
+/// trust into that profile's stored option before retrying.
+fn begin_update_trust(app: &mut App, uid: String, host: String) {
+    app.pending_trust = Some(TrustPending {
+        url: String::new(),
+        host: host.clone(),
+        uid: Some(uid),
+    });
+    app.overlay = Some(Overlay::TrustConfirmation);
+    app.focus = Focus::Content;
+    app.status_msg = Some(format!(
+        "{} — {}: {host}",
+        app.tr("dialog.trust_update_title"),
+        app.tr("dialog.target")
+    ));
+}
+
+/// Decide whether a manual refresh of `item` must first ask the user to trust
+/// its URL host. Returns `(uid, host)` when the host is genuinely SSRF-blocked
+/// AND the profile's stored allowlist does not already cover it — i.e. the
+/// update would fail right now and trusting this host would fix it.
+///
+/// Hosts already in the profile's `trusted_hosts` never prompt again: their
+/// refresh passes the SSRF check through the stored allowlist. Background and
+/// auto updates never route through this decision (they keep their existing
+/// error surface), so only an explicit user refresh can open the prompt.
+fn update_flow_decision(item: &clash_verge_core::config::PrfItem) -> Option<(String, String)> {
+    let uid = item.uid.as_deref()?;
+    let url = item.url.as_deref()?;
+    let allowlist = crate::subscribe::from_url::trusted_hosts_allowlist(item.option.as_ref());
+    if crate::subscribe::ssrf::check_url_host(url, &allowlist).is_ok() {
+        return None;
+    }
+    let host = ssrf_blocked_host(url)?;
+    Some((uid.to_string(), host))
+}
+
+/// Handle a submitted password for the TUN setup transaction.
 ///
 /// A submit with no pending setup is a stale duplicate Enter (e.g. the
 /// second Enter of a double-press after the popup already closed): it is
 /// ignored instead of aborting the TUI event loop. The spawned task only
 /// runs when a pending setup actually exists.
+///
+/// On success the resume context (`resume_start`, set when the setup was
+/// offered from the core-start prompt) travels with `TunSetupSucceeded` so
+/// the pending core start resumes automatically; the explicit Settings flow
+/// passes `None`.
 fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
     let Some(pending) = app.pending_tun.take() else {
         return;
     };
+    let resume_start = pending.resume_start;
     let password: String = app.password_buffer.drain(..).collect();
     app.overlay = None;
     let tx = action_tx.clone();
     tokio::spawn(async move {
         match crate::commands::privilege::apply_tun_capability_with_password(&pending.binary, &password) {
             Ok(()) => {
-                let _ = tx.send(Action::TunPrivilegeApplied);
+                let _ = tx.send(Action::TunSetupSucceeded { resume_start });
             }
             Err(error) => {
                 let _ = tx.send(Action::CoreError(error.to_string()));
             }
         }
     });
+}
+
+/// Cancel the password popup. When a core start depended on this setup, the
+/// start is abandoned: the transient `Starting` state is reset to `Stopped`
+/// and nothing stale remains (no resume can fire).
+fn handle_password_cancel(app: &mut App) {
+    let resume_pending = app
+        .pending_tun
+        .as_ref()
+        .is_some_and(|pending| pending.resume_start.is_some());
+    app.overlay = None;
+    app.pending_tun = None;
+    app.password_buffer.clear();
+    if resume_pending {
+        app.core_state = CoreState::Stopped;
+        app.status_msg = Some("TUN setup cancelled — core not started".into());
+    } else {
+        app.status_msg = Some("TUN setup cancelled".into());
+    }
+}
+
+/// Pure decision for the TUI-native setup gate on core start: the inline
+/// confirm is offered when the binary lacks the TUN file capability (and the
+/// process is not root) OR the systemd-resolved DNS polkit rule is missing.
+/// Injectable so all four combinations are testable without getcap/polkit.
+fn tun_start_offers_setup(capable: bool, root: bool, rule_needed: bool) -> bool {
+    let cap_ok = root || capable;
+    !cap_ok || rule_needed
+}
+
+/// Open the TUI-native setup confirm dialog for a TUN-enabled core start
+/// that needs the one-time setup. The pending state carries the resolved
+/// binary and `resume_start: Some(enable_tun)` so a confirmed setup resumes
+/// the start on success, plus the gate that fired (`reason`) so the skip key
+/// knows whether starting anyway is safe.
+fn begin_tun_setup_confirm(app: &mut App, binary: std::path::PathBuf, enable_tun: bool, reason: TunSetupReason) {
+    app.pending_tun = Some(TunPending {
+        binary,
+        resume_start: Some(enable_tun),
+        reason,
+    });
+    app.overlay = Some(Overlay::TunSetupConfirmation);
+    app.focus = Focus::Content;
+    app.status_msg = Some(app.tun_setup_confirm_hint().into());
+}
+
+/// `y` on the core-start setup confirm: open the existing password popup.
+/// `pending_tun` (binary + resume context) is kept so the password submit
+/// can resume the pending start on success.
+fn confirm_tun_setup(app: &mut App) {
+    app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
+    app.password_buffer.clear();
+    app.overlay = Some(Overlay::PasswordInput);
+}
+
+/// `n`/Esc/`q` on the core-start setup confirm: dismiss the dialog. What
+/// "skip" means depends on why the setup was offered:
+/// - missing file capability (hard gate): the spawn preflight would
+///   hard-fail on the uncapped binary a moment later, so skip CANCELS the
+///   start, resets the transient Starting state, and points at the TUN
+///   setup command instead of a confusing resume-then-fail.
+/// - missing DNS polkit rule only (soft gate, capability present): skip
+///   starts anyway, preserving the passive DNS-rule warning.
+fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+    let pending = app.pending_tun.take();
+    app.overlay = None;
+    let Some(TunPending {
+        resume_start, reason, ..
+    }) = pending
+    else {
+        return;
+    };
+    let Some(enable_tun) = resume_start else {
+        return;
+    };
+    if reason == TunSetupReason::MissingCapability {
+        // The capability gate cannot be skipped: starting anyway would only
+        // hit the spawn preflight hard-fail. Cancel cleanly instead.
+        app.core_state = CoreState::Stopped;
+        app.status_msg = Some(format!(
+            "{} — run {} to install it",
+            app.tr("settings.tun_capability_missing"),
+            crate::commands::privilege::TUN_SETUP_COMMAND
+        ));
+        return;
+    }
+    // Capability present; only the DNS rule may be missing → start anyway.
+    if crate::commands::privilege::resolve1_rule_needed(true) {
+        app.status_msg = Some(format!(
+            "{} — {}",
+            app.tr("settings.tun_dns_rule_missing"),
+            crate::commands::privilege::TUN_SETUP_COMMAND
+        ));
+    } else {
+        app.status_msg = Some(app.tr("home.starting_core").into());
+    }
+    let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+}
+
+/// Record a successful TUN setup transaction. With `resume_start` set, the
+/// pending core start is resumed via `ResumeCoreStart`; `None` (explicit
+/// Settings flow) just marks the TUI as privileged.
+fn note_tun_setup_succeeded(app: &mut App, resume_start: Option<bool>, action_tx: &mpsc::UnboundedSender<Action>) {
+    app.tun_privileged = true;
+    app.status_msg = Some(if crate::commands::privilege::resolved_policy_present() {
+        "TUN capability and DNS polkit rule installed (one-time sudo)".into()
+    } else {
+        "TUN capability installed (one-time sudo)".into()
+    });
+    if let Some(enable_tun) = resume_start {
+        let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+    }
 }
 
 fn next_clash_mode(current: &str) -> &'static str {
@@ -601,17 +869,22 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         Action::PasswordChar(_)
                                         | Action::PasswordBackspace
                                         | Action::PasswordSubmit
-                                        | Action::PasswordCancel => {
+                                        | Action::PasswordCancel
+                                        | Action::ConfirmTrustImport
+                                        | Action::CancelTrustImport
+                                        | Action::ConfirmTunSetup
+                                        | Action::SkipTunSetupStart => {
                                             let _ = action_tx.send(action);
                                         }
                                         Action::Quit => break,
                                         Action::StartCore => {
-                                            // Privilege-free daily path: resolve the binary,
-                                            // run the read-only TUN preflight (no sudo/setcap/
-                                            // askpass — the manager repeats it before spawn), and
-                                            // start. A missing capability fails with a recoverable
-                                            // error naming `tun setup`; the password popup is only
-                                            // reachable via Settings → TUN setup.
+                                            // Daily path: resolve the binary and run the
+                                            // read-only TUN preflight (no sudo/setcap/askpass
+                                            // here — the manager repeats it before spawn). When
+                                            // the one-time setup (file capability and/or the DNS
+                                            // polkit rule) is missing, the app offers the
+                                            // TUI-native setup confirm inline instead of
+                                            // hard-blocking or relying on system dialogs.
                                             let enable_tun =
                                                 app.gui_config.enable_tun_mode.unwrap_or(false);
                                             app.core_state = CoreState::Starting;
@@ -625,12 +898,30 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         .await
                                                     {
                                                         Ok(resolved) => {
-                                                            if let Err(error) = crate::commands::privilege::require_tun_capability(
+                                                            let capable = crate::commands::privilege::has_tun_capability(
                                                                 &resolved.path,
-                                                            ) {
-                                                                let _ = tx.send(Action::CoreError(
-                                                                    error.to_string(),
-                                                                ));
+                                                            );
+                                                            let root = crate::commands::privilege::running_as_root();
+                                                            let needs_setup = tun_start_offers_setup(
+                                                                capable,
+                                                                root,
+                                                                crate::commands::privilege::resolve1_rule_needed(true),
+                                                            );
+                                                            if needs_setup {
+                                                                // Record which gate fired: dismissing a
+                                                                // capability-missing prompt must cancel the
+                                                                // start, while a missing-DNS-rule prompt may
+                                                                // start anyway.
+                                                                let reason = if root || capable {
+                                                                    TunSetupReason::MissingDnsRule
+                                                                } else {
+                                                                    TunSetupReason::MissingCapability
+                                                                };
+                                                                let _ = tx.send(Action::TunSetupPrompt {
+                                                                    binary: resolved.path,
+                                                                    enable_tun,
+                                                                    reason,
+                                                                });
                                                                 return;
                                                             }
                                                         }
@@ -1057,6 +1348,15 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                     ));
                                                                     break 'tun_toggle;
                                                                 }
+                                                                // Same TUI-native warning as the start path: a missing DNS
+                                                                // polkit rule means the next start would hit system dialogs.
+                                                                if crate::commands::privilege::resolve1_rule_needed(true) {
+                                                                    app.status_msg = Some(format!(
+                                                                        "{} — {}",
+                                                                        app.tr("settings.tun_dns_rule_missing"),
+                                                                        crate::commands::privilege::TUN_SETUP_COMMAND
+                                                                    ));
+                                                                }
                                                             }
                                                             let mut updated = app.gui_config.clone();
                                                             updated.enable_tun_mode = Some(enabled);
@@ -1319,47 +1619,62 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             }
                                         }
                                         Action::UpdateProfile => {
-                                            app.status_msg = Some("Updating subscriptions...".into());
-                                            let selected_uid = app
+                                            // Manual refresh: a host the SSRF
+                                            // check blocks (and the profile does
+                                            // not already trust) opens the same
+                                            // interactive trust prompt as import.
+                                            // Background/auto updates never route
+                                            // here, so they can never prompt.
+                                            let needs_trust = app
                                                 .profiles
                                                 .get(app.selected_index)
-                                                .and_then(|item| item.uid.clone())
-                                                .map(|u| u.to_string());
-                                            let tx = action_tx.clone();
-                                            tokio::spawn(async move {
-                                                let result = if let Some(uid) = selected_uid {
-                                                    crate::profile_store::store::ProfileStore::update_remote_locked(
-                                                        &uid, None,
-                                                    )
-                                                    .await
-                                                    .map(|is_current| (uid, is_current))
-                                                } else {
-                                                    crate::profile_store::store::ProfileStore::update_all_remote_locked(
-                                                    )
-                                                    .await
-                                                    .map(|currents| {
-                                                        let uid = currents
-                                                            .first()
-                                                            .map(|u| u.to_string())
-                                                            .unwrap_or_default();
-                                                        let is_current = !currents.is_empty();
-                                                        (uid, is_current)
-                                                    })
-                                                };
-                                                match result {
-                                                    Ok((uid, is_current)) => {
-                                                        let _ = tx.send(Action::ProfileUpdated {
-                                                            uid,
-                                                            is_current,
-                                                        });
+                                                .and_then(update_flow_decision);
+                                            if let Some((uid, host)) = needs_trust {
+                                                let _ =
+                                                    action_tx.send(Action::UpdateNeedsTrust { uid, host });
+                                            } else {
+                                                app.status_msg = Some("Updating subscriptions...".into());
+                                                let selected_uid = app
+                                                    .profiles
+                                                    .get(app.selected_index)
+                                                    .and_then(|item| item.uid.clone())
+                                                    .map(|u| u.to_string());
+                                                let tx = action_tx.clone();
+                                                tokio::spawn(async move {
+                                                    let result = if let Some(uid) = selected_uid {
+                                                        crate::profile_store::store::ProfileStore::update_remote_locked(
+                                                            &uid, None,
+                                                        )
+                                                        .await
+                                                        .map(|is_current| (uid, is_current))
+                                                    } else {
+                                                        crate::profile_store::store::ProfileStore::update_all_remote_locked(
+                                                        )
+                                                        .await
+                                                        .map(|currents| {
+                                                            let uid = currents
+                                                                .first()
+                                                                .map(|u| u.to_string())
+                                                                .unwrap_or_default();
+                                                            let is_current = !currents.is_empty();
+                                                            (uid, is_current)
+                                                        })
+                                                    };
+                                                    match result {
+                                                        Ok((uid, is_current)) => {
+                                                            let _ = tx.send(Action::ProfileUpdated {
+                                                                uid,
+                                                                is_current,
+                                                            });
+                                                        }
+                                                        Err(error) => {
+                                                            let _ = tx.send(Action::ProfileUpdateFailed(
+                                                                error.to_string(),
+                                                            ));
+                                                        }
                                                     }
-                                                    Err(error) => {
-                                                        let _ = tx.send(Action::ProfileUpdateFailed(
-                                                            error.to_string(),
-                                                        ));
-                                                    }
-                                                }
-                                            });
+                                                });
+                                            }
                                         }
                                         Action::ToggleChainMode => {
                                             app.chain_mode = !app.chain_mode;
@@ -1863,21 +2178,45 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.status_msg = Some(format!("Failed to update {name}: {error}"));
                     }
                     Some(Action::ConfirmImport(url)) => {
+                        // Ordinary import path: SSRF protection stays enabled.
+                        // The safety check runs off the event loop; if the host
+                        // is blocked, the user gets an explicit trust prompt
+                        // instead of a silent failure.
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
-                            match crate::profile_store::store::ProfileStore::import_url_locked(
-                                &url, None, None,
-                            )
-                                .await
-                            {
-                                Ok(_) => {
-                                    let _ = tx.send(Action::ProfileImported);
+                            match ssrf_blocked_host(&url) {
+                                Some(host) => {
+                                    let _ = tx.send(Action::ImportNeedsTrust { url, host });
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(Action::ProfileImportFailed(e.to_string()));
+                                None => {
+                                    let tx = tx.clone();
+                                    spawn_import(&tx, url, None);
                                 }
                             }
                         });
+                    }
+                    Some(Action::ImportNeedsTrust { url, host }) => {
+                        app.pending_trust = Some(TrustPending {
+                            url,
+                            host: host.clone(),
+                            uid: None,
+                        });
+                        app.overlay = Some(Overlay::TrustConfirmation);
+                        app.focus = Focus::Content;
+                        app.status_msg = Some(format!(
+                            "{} — {}: {host}",
+                            app.tr("dialog.trust_title"),
+                            app.tr("dialog.target")
+                        ));
+                    }
+                    Some(Action::UpdateNeedsTrust { uid, host }) => {
+                        begin_update_trust(&mut app, uid, host);
+                    }
+                    Some(Action::ConfirmTrustImport) => {
+                        handle_confirm_trust(&mut app, &action_tx);
+                    }
+                    Some(Action::CancelTrustImport) => {
+                        handle_cancel_trust(&mut app);
                     }
                     Some(Action::ProfileImportFailed(error)) => {
                         app.status_msg = Some(format!("Import failed: {error}"));
@@ -1952,9 +2291,34 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ProbeNotice(message)) => {
                         app.status_msg = Some(message);
                     }
-                    Some(Action::TunPrivilegeApplied) => {
-                        app.tun_privileged = true;
-                        app.status_msg = Some("TUN capability installed (one-time sudo)".into());
+                    Some(Action::TunSetupPrompt {
+                        binary,
+                        enable_tun,
+                        reason,
+                    }) => {
+                        // Preflight found a missing capability or DNS polkit
+                        // rule: offer the TUI-native setup confirm inline so a
+                        // system polkit dialog is never the first notice.
+                        begin_tun_setup_confirm(&mut app, binary, enable_tun, reason);
+                    }
+                    Some(Action::ConfirmTunSetup) => {
+                        confirm_tun_setup(&mut app);
+                    }
+                    Some(Action::SkipTunSetupStart) => {
+                        skip_tun_setup_start(&mut app, &action_tx);
+                    }
+                    Some(Action::TunSetupSucceeded { resume_start }) => {
+                        note_tun_setup_succeeded(&mut app, resume_start, &action_tx);
+                    }
+                    Some(Action::ResumeCoreStart { enable_tun }) => {
+                        let m = manager.clone();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = start_core_with_tun(&m, enable_tun).await {
+                                let _ = tx.send(Action::CoreError(error));
+                            }
+                            // On success, manager emits CoreStarted.
+                        });
                     }
                     Some(Action::TunCapabilityState(privileged)) => {
                         app.tun_privileged = privileged;
@@ -1962,7 +2326,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::TunSetupRequested(binary)) => {
                         app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
                         app.password_buffer.clear();
-                        app.pending_tun = Some(TunPending { binary });
+                        app.pending_tun = Some(TunPending {
+                            binary,
+                            resume_start: None,
+                            reason: TunSetupReason::MissingCapability,
+                        });
                         app.overlay = Some(Overlay::PasswordInput);
                     }
                     Some(Action::PasswordChar(c)) => {
@@ -1972,10 +2340,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.password_buffer.pop();
                     }
                     Some(Action::PasswordCancel) => {
-                        app.overlay = None;
-                        app.pending_tun = None;
-                        app.password_buffer.clear();
-                        app.status_msg = Some("TUN setup cancelled".into());
+                        handle_password_cancel(&mut app);
                     }
                     Some(Action::PasswordSubmit) => {
                         handle_password_submit(&mut app, &action_tx);
@@ -2299,5 +2664,497 @@ mod tests {
             Some(Overlay::PasswordInput),
             "stale overlay is left untouched"
         );
+    }
+
+    #[test]
+    fn tun_start_offers_setup_when_capability_or_dns_rule_is_missing() {
+        // Ready: capable + non-root + rule present → no prompt.
+        assert!(!tun_start_offers_setup(true, false, false));
+        // Root bypasses the capability gate entirely (rule_needed is already
+        // false for root) → no prompt.
+        assert!(!tun_start_offers_setup(false, true, false));
+        // Missing file capability (non-root) → prompt.
+        assert!(tun_start_offers_setup(false, false, false));
+        // Capability present but DNS polkit rule missing → prompt.
+        assert!(tun_start_offers_setup(true, false, true));
+    }
+
+    #[test]
+    fn tun_setup_prompt_opens_confirm_with_resume_context() {
+        // Preflight found a missing capability/rule → the TUI-native confirm
+        // dialog opens carrying the resolved binary, the resume settings,
+        // and the gate that fired.
+        let mut app = App::new();
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
+
+        assert_eq!(app.overlay, Some(Overlay::TunSetupConfirmation));
+        let pending = app.pending_tun.as_ref().expect("pending setup must be set");
+        assert_eq!(
+            pending.resume_start,
+            Some(true),
+            "confirm must carry enable_tun for the resume"
+        );
+        assert_eq!(
+            pending.reason,
+            TunSetupReason::MissingCapability,
+            "confirm must carry the gate that fired"
+        );
+        assert_eq!(pending.binary, std::path::PathBuf::from("/fake/mihomo"));
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some(app.tun_setup_confirm_hint()),
+            "status hint must match the hard-gate choice text"
+        );
+    }
+
+    #[test]
+    fn confirm_tun_setup_opens_the_password_popup_keeping_resume_context() {
+        // `y` on the confirm reuses the existing password popup; the resume
+        // context stays in pending_tun so the submit can resume the start.
+        let mut app = App::new();
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
+        confirm_tun_setup(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::PasswordInput));
+        assert!(app.password_prompt.is_some(), "prompt label must be set");
+        assert_eq!(
+            app.pending_tun.as_ref().map(|pending| pending.resume_start),
+            Some(Some(true)),
+            "password popup must keep the pending resume"
+        );
+    }
+
+    #[test]
+    fn tun_setup_success_with_resume_requests_the_pending_start() {
+        // Success after `s` → y → password: the start must resume. The resume
+        // request is observed on the action channel (no tokio needed); the
+        // explicit Settings flow (None) never emits one.
+        let mut app = App::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        note_tun_setup_succeeded(&mut app, Some(true), &tx);
+
+        assert!(app.tun_privileged, "setup success must mark the TUI privileged");
+        match rx.try_recv() {
+            Ok(Action::ResumeCoreStart { enable_tun }) => assert!(enable_tun),
+            other => panic!("expected ResumeCoreStart, got {other:?}"),
+        }
+
+        let mut app = App::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        note_tun_setup_succeeded(&mut app, None, &tx);
+        assert!(rx.try_recv().is_err(), "Settings flow must not resume any start");
+    }
+
+    #[test]
+    fn skip_tun_setup_start_dismisses_and_resumes_the_start() {
+        // `n`/Esc/q on the confirm when only the DNS rule is missing (soft
+        // gate, capability present): dismiss and start anyway, preserving
+        // the current behavior (no setup transaction runs).
+        let mut app = App::new();
+        app.core_state = CoreState::Starting;
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        skip_tun_setup_start(&mut app, &tx);
+
+        assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
+        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        match rx.try_recv() {
+            Ok(Action::ResumeCoreStart { enable_tun }) => assert!(enable_tun),
+            other => panic!("expected ResumeCoreStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skip_tun_setup_start_when_capability_missing_cancels_the_start() {
+        // `n`/Esc/q when the prompt fired because the binary lacks the TUN
+        // capability (hard gate): starting anyway would only hit the spawn
+        // preflight hard-fail a moment later. The skip must CANCEL the
+        // start, reset the transient Starting state, and point at TUN setup.
+        let mut app = App::new();
+        app.core_state = CoreState::Starting;
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        skip_tun_setup_start(&mut app, &tx);
+
+        assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
+        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(
+            rx.try_recv().is_err(),
+            "capability-missing skip must NOT resume the start"
+        );
+        assert_eq!(
+            app.core_state,
+            CoreState::Stopped,
+            "cancelled start must not stay Starting"
+        );
+        let message = app.status_msg.as_deref().expect("status message set");
+        assert!(
+            message.contains(crate::commands::privilege::TUN_SETUP_COMMAND),
+            "cancel message must point at the TUN setup command: {message}"
+        );
+    }
+
+    #[test]
+    fn tun_setup_confirm_hint_reflects_the_gate_that_fired() {
+        // The prompt text must reflect the two cases: the hard gate cancels
+        // on n/Esc/q, the soft gate starts without setup.
+        let mut hard = App::new();
+        begin_tun_setup_confirm(
+            &mut hard,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
+        let mut soft = App::new();
+        begin_tun_setup_confirm(
+            &mut soft,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
+
+        let hard_hint = hard.tun_setup_confirm_hint();
+        let soft_hint = soft.tun_setup_confirm_hint();
+        assert_ne!(hard_hint, soft_hint, "the two cases must read differently");
+        assert!(hard_hint.contains("cancel"), "hard hint must say cancel: {hard_hint}");
+        assert!(
+            soft_hint.contains("start without setup"),
+            "soft hint must offer start: {soft_hint}"
+        );
+    }
+
+    #[test]
+    fn password_cancel_with_pending_start_leaves_no_stale_state() {
+        // Esc on the password popup after `s` → y: the setup was abandoned, so
+        // the pending start must not resume and the transient Starting state
+        // is reset — no stale flag can fire a resume later.
+        let mut app = App::new();
+        app.core_state = CoreState::Starting;
+        app.pending_tun = Some(TunPending {
+            binary: std::path::PathBuf::from("/fake/mihomo"),
+            resume_start: Some(true),
+            reason: TunSetupReason::MissingCapability,
+        });
+        app.overlay = Some(Overlay::PasswordInput);
+        app.password_buffer = vec!['x'];
+
+        handle_password_cancel(&mut app);
+
+        assert!(app.pending_tun.is_none());
+        assert_eq!(app.overlay, None);
+        assert!(app.password_buffer.is_empty());
+        assert_eq!(
+            app.core_state,
+            CoreState::Stopped,
+            "cancelled start setup must not stay Starting"
+        );
+        assert!(app.status_msg.is_some());
+    }
+
+    #[test]
+    fn password_cancel_from_settings_keeps_plain_cancel_message() {
+        // The explicit Settings flow has nothing to resume: cancel just closes
+        // the popup with the plain message and no state reset.
+        let mut app = App::new();
+        app.core_state = CoreState::Stopped;
+        app.pending_tun = Some(TunPending {
+            binary: std::path::PathBuf::from("/fake/mihomo"),
+            resume_start: None,
+            reason: TunSetupReason::MissingCapability,
+        });
+        app.overlay = Some(Overlay::PasswordInput);
+
+        handle_password_cancel(&mut app);
+
+        assert!(app.pending_tun.is_none());
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.status_msg.as_deref(), Some("TUN setup cancelled"));
+    }
+
+    #[test]
+    fn ssrf_blocked_host_detects_private_host_and_ignores_unrelated_failures() {
+        // A literal private IP needs no DNS: the default allowlist blocks it,
+        // and trusting the host makes the check pass — genuine SSRF block.
+        assert_eq!(
+            ssrf_blocked_host("http://192.168.1.1/sub"),
+            Some("192.168.1.1".to_string())
+        );
+        assert_eq!(
+            ssrf_blocked_host("http://127.0.0.1:8080/x"),
+            Some("127.0.0.1".to_string())
+        );
+
+        // A literal public IP passes the default check: no trust needed.
+        assert_eq!(ssrf_blocked_host("http://1.1.1.1/sub"), None);
+
+        // Malformed URLs are NOT trust prompts — they surface as import errors.
+        assert_eq!(ssrf_blocked_host("not a url"), None);
+        assert_eq!(ssrf_blocked_host(""), None);
+    }
+
+    #[test]
+    fn ssrf_blocked_host_dns_failure_is_not_trust_offered() {
+        // `.invalid` (RFC 6761) never resolves. A DNS/no-address failure must
+        // NOT produce a trust prompt: trusting could never unblock it, so
+        // offering (and persisting) trust would be wrong.
+        assert_eq!(ssrf_blocked_host("http://host.invalid/sub"), None);
+    }
+
+    #[test]
+    fn ssrf_blocked_host_ula_v6_is_trust_offered() {
+        // A literal IPv6 unique-local address resolves without DNS and is a
+        // genuine block: the trust prompt must still fire for it.
+        assert!(ssrf_blocked_host("http://[fd00::1]/sub").is_some());
+    }
+
+    #[test]
+    fn cancel_trust_leaves_no_trust_state_and_no_overlay() {
+        let mut app = App::new();
+        app.pending_trust = Some(TrustPending {
+            url: "http://192.168.1.1/sub".to_string(),
+            host: "192.168.1.1".to_string(),
+            uid: None,
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+
+        handle_cancel_trust(&mut app);
+
+        assert!(app.pending_trust.is_none(), "cancel must drop the pending trust");
+        assert_eq!(app.overlay, None, "cancel must close the trust overlay");
+        // Nothing was written: cancelling only mutated in-memory state, so no
+        // exception reached profiles.yaml and the host stays blocked.
+    }
+
+    #[test]
+    fn dismiss_overlay_also_drops_a_pending_trust() {
+        // `q` on the trust prompt routes through the generic DismissOverlay
+        // fallback; it must cancel exactly like `n`/Esc (no trust saved).
+        let mut app = App::new();
+        app.pending_trust = Some(TrustPending {
+            url: "http://192.168.1.1/sub".to_string(),
+            host: "192.168.1.1".to_string(),
+            uid: None,
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+
+        dismiss_overlay(&mut app);
+
+        assert!(app.pending_trust.is_none());
+        assert_eq!(app.overlay, None);
+    }
+
+    #[test]
+    fn stale_trust_confirm_without_pending_is_ignored() {
+        // A duplicate `y` after the prompt already closed must not spawn a
+        // retry import. No tokio runtime here, so a spawn would panic — the
+        // test passing proves the early return.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::TrustConfirmation); // stale overlay
+        app.pending_trust = None;
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Action>();
+        handle_confirm_trust(&mut app, &tx);
+
+        assert!(app.pending_trust.is_none());
+        assert_eq!(app.overlay, Some(Overlay::TrustConfirmation));
+    }
+
+    #[test]
+    fn update_flow_decision_prompts_only_for_a_genuinely_blocked_refresh() {
+        use clash_verge_core::config::PrfOption;
+
+        // The live-case shape: a remote profile whose URL host has no
+        // trusted_hosts and resolves to a private address → the refresh must be
+        // routed to the trust prompt, carrying the profile uid. A literal
+        // private IP keeps the test DNS-free and deterministic.
+        let blocked = clash_verge_core::config::PrfItem {
+            uid: Some("R7iHvBBicAOz".into()),
+            itype: Some("remote".into()),
+            url: Some("http://192.168.1.1/sub".into()),
+            option: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            update_flow_decision(&blocked),
+            Some(("R7iHvBBicAOz".to_string(), "192.168.1.1".to_string()))
+        );
+
+        // A public host passes the SSRF check: no prompt, plain update.
+        let public = clash_verge_core::config::PrfItem {
+            url: Some("http://1.1.1.1/sub".into()),
+            ..blocked.clone()
+        };
+        assert_eq!(update_flow_decision(&public), None);
+
+        // A host the profile already trusts never prompts again: the stored
+        // allowlist covers it, so the refresh would succeed on its own.
+        let already_trusted = clash_verge_core::config::PrfItem {
+            option: Some(PrfOption {
+                trusted_hosts: Some(vec!["192.168.1.1".into()]),
+                ..Default::default()
+            }),
+            ..blocked.clone()
+        };
+        assert_eq!(update_flow_decision(&already_trusted), None);
+
+        // Profiles without a URL are not trust prompts — they surface as
+        // ordinary update errors (same as before).
+        let no_url = clash_verge_core::config::PrfItem {
+            url: None,
+            ..blocked.clone()
+        };
+        assert_eq!(update_flow_decision(&no_url), None);
+    }
+
+    #[test]
+    fn update_flow_decision_ignores_dns_failures() {
+        // A host that cannot resolve must NOT open a trust prompt: trusting
+        // could never unblock it. `.invalid` (RFC 6761) never resolves.
+        let dns_failure = clash_verge_core::config::PrfItem {
+            uid: Some("Rdn".into()),
+            itype: Some("remote".into()),
+            url: Some("http://host.invalid/sub".into()),
+            ..Default::default()
+        };
+        assert_eq!(update_flow_decision(&dns_failure), None);
+    }
+
+    #[test]
+    fn begin_update_trust_carries_the_profile_uid_and_opens_the_overlay() {
+        let mut app = App::new();
+        begin_update_trust(&mut app, "R7iHvBBicAOz".into(), "8ry1xfih.doggygosubs.com".into());
+
+        assert_eq!(app.overlay, Some(Overlay::TrustConfirmation));
+        let pending = app.pending_trust.as_ref().expect("pending trust must be set");
+        assert_eq!(pending.uid.as_deref(), Some("R7iHvBBicAOz"));
+        assert_eq!(pending.host, "8ry1xfih.doggygosubs.com");
+    }
+
+    #[test]
+    fn cancel_update_trust_persists_nothing() {
+        // `n`/Esc on the update prompt must leave the stored option untouched:
+        // the pending state and overlay close, the update keeps its failure.
+        let mut app = App::new();
+        app.pending_trust = Some(TrustPending {
+            url: "http://192.168.1.1/sub".to_string(),
+            host: "192.168.1.1".to_string(),
+            uid: Some("R7iHvBBicAOz".to_string()),
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+
+        handle_cancel_trust(&mut app);
+
+        assert!(app.pending_trust.is_none(), "cancel must drop the pending trust");
+        assert_eq!(app.overlay, None, "cancel must close the trust overlay");
+        // Cancel only mutates in-memory state: no trusted_hosts entry is ever
+        // written to profiles.yaml for the profile.
+    }
+
+    #[tokio::test]
+    async fn confirm_trust_update_persists_trust_and_retries_end_to_end() {
+        use tokio::io::AsyncWriteExt;
+
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        // Serve a valid subscription body on loopback so the trusted retry can
+        // complete without any external network. The URL host is loopback → the
+        // SSRF check blocks it until the host is trusted.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("local addr");
+        let url = format!("http://{addr}/sub.yaml");
+        let serve = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\nproxies: []\n")
+                    .await;
+            }
+        });
+
+        // Existing remote profile with NO trusted_hosts (the live-case shape).
+        let mut store = crate::profile_store::store::tests::empty_store();
+        let uid = "R7iHvBBicAOz";
+        let bundle = crate::subscribe::from_url::RemoteProfileBundle {
+            item: clash_verge_core::config::PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                name: Some("update-trust-demo".into()),
+                file: Some(format!("{uid}.yaml").into()),
+                url: Some(url.clone().into()),
+                file_data: Some("proxies: []\n".into()),
+                ..Default::default()
+            },
+            fragments: vec![match clash_verge_core::config::PrfItem::from_merge(None) {
+                Ok(item) => item,
+                Err(error) => panic!("merge fragment: {error}"),
+            }],
+        };
+        store.append_bundle(bundle).await.expect("append existing profile");
+
+        // User pressed `y` on the refresh trust prompt (blocked → prompt state).
+        let mut app = App::new();
+        app.pending_trust = Some(TrustPending {
+            url,
+            host: "127.0.0.1".to_string(),
+            uid: Some(uid.to_string()),
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        handle_confirm_trust(&mut app, &tx);
+
+        // Confirm must persist the host into the EXISTING profile's stored
+        // option and retry the update; the allowlist lets the loopback fetch
+        // through, so the refresh reports success.
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("update result must arrive")
+            .expect("action channel stays open");
+        match received {
+            Action::ProfileUpdated { uid: updated_uid, .. } => assert_eq!(updated_uid, uid),
+            other => panic!("expected ProfileUpdated, got {other:?}"),
+        }
+        let _ = serve.await;
+
+        // The persisted option now carries the normalized trusted host.
+        let snapshot = crate::profile_store::store::ProfileStore::snapshot()
+            .await
+            .expect("snapshot");
+        let item = snapshot
+            .items()
+            .into_iter()
+            .find(|item| item.uid.as_deref() == Some(uid))
+            .expect("profile still present");
+        assert_eq!(
+            item.option.and_then(|option| option.trusted_hosts),
+            Some(vec!["127.0.0.1".into()])
+        );
+
+        // The prompt closed and the pending state is consumed.
+        assert!(app.pending_trust.is_none());
+        assert_eq!(app.overlay, None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

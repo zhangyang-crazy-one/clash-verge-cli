@@ -1,10 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Padding, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::ui::theme;
 
 pub const SETTINGS_ROW_COUNT: usize = 5;
 
@@ -23,7 +24,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let core = Paragraph::new(vec![
         Line::from(Span::styled(
             app.tr("settings.runtime_heading"),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            theme::bold(theme::accent()),
         )),
         Line::from(format!("{}: {}", app.tr("settings.core"), core_state_label(app))),
         Line::from(format!("{}: {}", app.tr("settings.profile_count"), app.profiles.len())),
@@ -37,15 +38,12 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::from(format!("{}: {}", app.tr("settings.core_pid"), core_owner_label(app))),
     ])
-    .block(Block::bordered().title(app.tr("settings.runtime")));
+    .block(theme::panel_block(app.tr("settings.runtime"), false).padding(Padding::horizontal(1)));
     frame.render_widget(core, rows[0]);
 
     let cursor = app.settings_selected_index.min(SETTINGS_ROW_COUNT - 1);
     let support = Paragraph::new(vec![
-        Line::from(Span::styled(
-            app.tr("settings.gui_config"),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
+        Line::from(Span::styled(app.tr("settings.gui_config"), theme::bold(theme::warn()))),
         settings_row(
             app,
             0,
@@ -101,14 +99,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         )),
         Line::from(Span::styled(
             app.tr("settings.writable_hint"),
-            Style::default().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )),
         Line::from(Span::styled(
             "TUN setup = the only action that asks for sudo; start/toggle never prompt.",
-            Style::default().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )),
     ])
-    .block(Block::bordered().title(app.tr("settings.system")))
+    .block(theme::panel_block(app.tr("settings.system"), false).padding(Padding::horizontal(1)))
     .wrap(Wrap { trim: true });
     frame.render_widget(support, rows[1]);
 }
@@ -116,9 +114,9 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn settings_row(app: &App, index: usize, cursor: usize, text: String) -> Line<'static> {
     let focused = app.focus == crate::app::Focus::Content && index == cursor;
     let style = if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        theme::highlight(true)
     } else {
-        Style::default().fg(Color::White)
+        Style::new().fg(theme::text())
     };
     let prefix = if focused { "> " } else { "  " };
     Line::from(Span::styled(format!("{prefix}{text}"), style))

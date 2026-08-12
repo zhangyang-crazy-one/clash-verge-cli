@@ -1,6 +1,6 @@
 # clash-verge-cli
 
-A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo). It provides an interactive Ratatui interface and small non-interactive commands while remaining compatible with an existing Clash Verge Rev configuration directory.
+A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo). It provides an interactive Ratatui interface and small non-interactive commands, fully standalone: it owns its data directory, its mihomo core, and its controller socket, with no runtime dependency on the Clash Verge Rev GUI.
 
 ## Features
 
@@ -10,8 +10,8 @@ A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo).
 - Live traffic, connection, and log streams over the mihomo controller socket
 - English and Simplified Chinese interfaces
 - `start`, `stop`, `restart`, and machine-readable `status` commands
-
-The current release target is Linux. System proxy integration uses GNOME/KDE tools, service management uses systemd, and process control uses Unix signals.
+- TUN mode with one-time capability setup (bordered askpass popup, works
+  over SSH on headless servers; no root service or daemon)
 
 ## Mihomo core
 
@@ -35,7 +35,7 @@ The binary is written to `target/release/clash-verge-cli`.
 
 ## Usage
 
-Open the TUI using the default Clash Verge Rev data directory:
+Open the TUI (standalone data directory, created on first run):
 
 ```bash
 clash-verge-cli
@@ -44,7 +44,6 @@ clash-verge-cli
 Use another configuration directory or invoke a non-interactive command:
 
 ```bash
-clash-verge-cli --config-dir ~/.local/share/io.github.clash-verge-rev.clash-verge-rev
 clash-verge-cli status --json
 clash-verge-cli start
 clash-verge-cli stop
@@ -54,7 +53,16 @@ clash-verge-cli profile import 'https://example.com/sub.yaml' --name my-sub
 clash-verge-cli profile update --all
 ```
 
-The TUI looks for an already running Clash Verge Rev/mihomo controller before starting its own process. It prefers `clash-verge.yaml` and retains `config.yaml` as a compatibility fallback.
+## Migrating from Clash Verge Rev GUI
+
+To import an existing GUI profile set (subscriptions, chain fragments,
+settings) into the standalone directory:
+
+```bash
+clash-verge-cli profile migrate --from ~/.local/share/io.github.clash-verge-rev.clash-verge-rev
+```
+
+The CLI never reads the GUI directory at runtime; migration is one-shot.
 
 ## Keyboard shortcuts
 

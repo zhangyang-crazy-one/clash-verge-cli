@@ -1,10 +1,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Padding, Paragraph};
 
 use crate::app::{App, CoreState};
+use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
@@ -37,37 +38,34 @@ fn draw_core(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 app.tr("home.core_accepting")
             };
-            (app.tr("status.running"), Color::Green, detail)
+            (app.tr("status.running"), theme::ok(), detail)
         }
-        CoreState::Starting => (app.tr("status.starting"), Color::Yellow, app.tr("home.core_waiting")),
+        CoreState::Starting => (app.tr("status.starting"), theme::warn(), app.tr("home.core_waiting")),
         CoreState::Stopped => (
             app.tr("status.stopped"),
-            Color::DarkGray,
+            theme::dim(),
             if area.width < 36 {
                 app.tr("home.press_start")
             } else {
                 app.tr("home.press_start_core")
             },
         ),
-        CoreState::Error(message) => (app.tr("status.error"), Color::Red, message.as_str()),
+        CoreState::Error(message) => (app.tr("status.error"), theme::danger(), message.as_str()),
     };
     let mut lines = vec![
-        Line::from(Span::styled(
-            label,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(detail, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(label, theme::bold(color))),
+        Line::from(Span::styled(detail, Style::new().fg(theme::dim()))),
     ];
     if matches!(app.core_state, CoreState::Running)
         && let Some(pid) = app.core_pid
     {
         lines.push(Line::from(Span::styled(
             format!("pid {pid}"),
-            Style::default().fg(Color::DarkGray),
+            Style::new().fg(theme::dim()),
         )));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(app.tr("home.core"))),
+        Paragraph::new(lines).block(theme::panel_block(app.tr("home.core"), false).padding(Padding::horizontal(1))),
         area,
     );
 }
@@ -79,27 +77,25 @@ fn draw_profile(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![
             Line::from(Span::styled(
                 crate::ui::terminal_text::display(name),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                theme::bold(theme::text()),
             )),
-            Line::from(Span::styled(
-                format!("type: {kind}"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(format!("type: {kind}"), Style::new().fg(theme::dim()))),
         ]
     } else {
         vec![
             Line::from(Span::styled(
                 app.tr("home.no_active_profile"),
-                Style::default().fg(Color::Yellow),
+                Style::new().fg(theme::warn()),
             )),
             Line::from(Span::styled(
                 app.tr("home.import_profile"),
-                Style::default().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
         ]
     };
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(app.tr("home.active_profile"))),
+        Paragraph::new(lines)
+            .block(theme::panel_block(app.tr("home.active_profile"), false).padding(Padding::horizontal(1))),
         area,
     );
 }
@@ -122,13 +118,14 @@ fn draw_system(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = vec![
         Line::from(Span::styled(
             format!("{}: {mode}", app.tr("home.mode")),
-            Style::default().fg(Color::Cyan),
+            Style::new().fg(theme::accent()),
         )),
-        Line::from(Span::styled(selection, Style::default().fg(Color::DarkGray))),
-        Line::from(Span::styled(focus, Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(selection, Style::new().fg(theme::dim()))),
+        Line::from(Span::styled(focus, Style::new().fg(theme::dim()))),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(app.tr("home.proxy_system"))),
+        Paragraph::new(lines)
+            .block(theme::panel_block(app.tr("home.proxy_system"), false).padding(Padding::horizontal(1))),
         area,
     );
 }
@@ -137,42 +134,44 @@ fn draw_traffic(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = if let Some(traffic) = &app.traffic {
         vec![
             Line::from(vec![
-                Span::styled("UP   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} B/s", traffic.up), Style::default().fg(Color::Cyan)),
+                Span::styled("UP   ", Style::new().fg(theme::dim())),
+                Span::styled(format!("{} B/s", traffic.up), Style::new().fg(theme::accent())),
             ]),
             Line::from(vec![
-                Span::styled("DOWN ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} B/s", traffic.down), Style::default().fg(Color::Magenta)),
+                Span::styled("DOWN ", Style::new().fg(theme::dim())),
+                Span::styled(format!("{} B/s", traffic.down), Style::new().fg(theme::accent())),
             ]),
         ]
     } else {
         vec![
-            Line::from(Span::styled(
-                app.tr("home.no_traffic"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(app.tr("home.no_traffic"), Style::new().fg(theme::dim()))),
             Line::from(Span::styled(
                 if area.width < 36 {
                     app.tr("home.press_traffic")
                 } else {
                     app.tr("home.start_traffic")
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::new().fg(theme::dim()),
             )),
         ]
     };
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(app.tr("home.traffic"))),
+        Paragraph::new(lines).block(theme::panel_block(app.tr("home.traffic"), false).padding(Padding::horizontal(1))),
         area,
     );
 }
 
 fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let message = app.status_msg.as_deref().unwrap_or(app.tr("home.no_messages"));
+    let color = if app.status_msg.is_some() {
+        theme::status_color(message)
+    } else {
+        theme::dim()
+    };
     let paragraph = Paragraph::new(Line::from(Span::styled(
         crate::ui::terminal_text::display(message),
-        Style::default().fg(Color::DarkGray),
+        Style::new().fg(color),
     )))
-    .block(Block::bordered().title(app.tr("home.messages")));
+    .block(theme::panel_block(app.tr("home.messages"), false).padding(Padding::horizontal(1)));
     frame.render_widget(paragraph, area);
 }

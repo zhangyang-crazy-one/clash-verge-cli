@@ -28,7 +28,8 @@ pub async fn from_url(
     option: Option<&PrfOption>,
 ) -> anyhow::Result<RemoteProfileBundle> {
     let cleaned = fix_dirty_url(url)?;
-    let result = fetch::fetch_subscription(cleaned.as_str(), option, &[]).await?;
+    let allowlist = trusted_hosts_allowlist(option);
+    let result = fetch::fetch_subscription(cleaned.as_str(), option, &allowlist).await?;
 
     let allow_auto_update = Some(allow_auto_update_enabled(option));
     let mut merge = option.and_then(|o| o.merge.clone());
@@ -95,6 +96,7 @@ pub async fn from_url(
             self_proxy: option.and_then(|o| o.self_proxy),
             timeout_seconds: option.and_then(|o| o.timeout_seconds),
             danger_accept_invalid_certs: option.and_then(|o| o.danger_accept_invalid_certs),
+            trusted_hosts: option.and_then(|o| o.trusted_hosts.clone()),
         }),
         home,
         updated: Some(chrono::Local::now().timestamp() as usize),
@@ -204,6 +206,63 @@ where
     Ok(())
 }
 
+/// Build the SSRF allowlist from the caller's `trusted_hosts` option.
+///
+/// Entries are normalized to the bare-host form `ssrf::check_url_host`
+/// compares against (`url::Url::host_str`): values that parse as URLs are
+/// reduced to their host, everything else is trimmed and passed through
+/// unchanged. An absent option yields an empty allowlist, preserving the
+/// default SSRF protection.
+pub fn trusted_hosts_allowlist(option: Option<&PrfOption>) -> Vec<std::string::String> {
+    option
+        .and_then(|o| o.trusted_hosts.as_ref())
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|raw| normalize_trusted_host(raw.as_str()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Normalize one user-supplied trusted-host entry into the bare host form
+/// the SSRF checker compares against (its `extract_host` returns
+/// `Url::host_str`). Full URLs become their host; bare hostnames/IPs pass
+/// through trimmed.
+pub fn normalize_trusted_host(raw: &str) -> Option<std::string::String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = Url::parse(trimmed) {
+        return parsed.host_str().map(str::to_string);
+    }
+    Some(trimmed.to_string())
+}
+
+/// Merge a normalized trusted host into an existing allowlist, preserving
+/// every existing entry (deduplicated) and appending the new host.
+///
+/// Used by the refresh trust flow: confirming persists the host into the
+/// profile's stored `option.trusted_hosts` without dropping hosts the user
+/// already trusted. Returns `None` when the entry does not normalize (the
+/// caller should not persist it). Accepts any string-ish element so both the
+/// stored `SmartString` option and the std-String allowlist can merge.
+pub fn merge_trusted_host<S: AsRef<str>>(existing: Option<&[S]>, raw: &str) -> Option<Vec<std::string::String>> {
+    let host = normalize_trusted_host(raw)?;
+    let mut hosts: Vec<std::string::String> = existing
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| normalize_trusted_host(entry.as_ref()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !hosts.iter().any(|entry| entry == &host) {
+        hosts.push(host);
+    }
+    Some(hosts)
+}
+
 fn allow_auto_update_enabled(option: Option<&PrfOption>) -> bool {
     option.and_then(|o| o.allow_auto_update).unwrap_or(true)
 }
@@ -308,6 +367,101 @@ mod tests {
             ..Default::default()
         };
         assert!(!allow_auto_update_enabled(Some(&disabled)));
+    }
+
+    use crate::subscribe::ssrf;
+
+    #[test]
+    fn trusted_hosts_option_reaches_ssrf_allowlist() {
+        // URL-form, bare-IP, and whitespace-padded entries all normalize to
+        // the bare host form the SSRF checker compares against.
+        let option = PrfOption {
+            trusted_hosts: Some(vec![
+                "https://sub.example.com/path?token=abc".into(),
+                "192.168.1.1".into(),
+                "  trusted.example.org  ".into(),
+            ]),
+            ..Default::default()
+        };
+
+        let allowlist = trusted_hosts_allowlist(Some(&option));
+        assert_eq!(
+            allowlist,
+            vec![
+                "sub.example.com".to_string(),
+                "192.168.1.1".to_string(),
+                "trusted.example.org".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_trusted_host_bypasses_ssrf_block() {
+        // Without the option the private host is blocked...
+        assert!(ssrf::check_url_host("http://192.168.1.1/sub", &[]).is_err());
+
+        // ...and a matching trusted host in the option reaches the allowlist.
+        let option = PrfOption {
+            trusted_hosts: Some(vec!["192.168.1.1".into()]),
+            ..Default::default()
+        };
+        let allowlist = trusted_hosts_allowlist(Some(&option));
+        assert!(ssrf::check_url_host("http://192.168.1.1/sub", &allowlist).is_ok());
+    }
+
+    #[test]
+    fn unrelated_trusted_host_preserves_ssrf_protection() {
+        // Trusting one host must not open up unrelated private/loopback hosts.
+        let option = PrfOption {
+            trusted_hosts: Some(vec!["trusted.example.org".into()]),
+            ..Default::default()
+        };
+        let allowlist = trusted_hosts_allowlist(Some(&option));
+
+        assert!(ssrf::check_url_host("http://trusted.example.org/sub", &allowlist).is_ok());
+        assert!(ssrf::check_url_host("http://192.168.1.1/sub", &allowlist).is_err());
+        assert!(ssrf::check_url_host("http://127.0.0.1/sub", &allowlist).is_err());
+    }
+
+    #[test]
+    fn absent_trusted_hosts_yields_empty_allowlist() {
+        assert!(trusted_hosts_allowlist(None).is_empty());
+        assert!(trusted_hosts_allowlist(Some(&PrfOption::default())).is_empty());
+    }
+
+    #[test]
+    fn merge_trusted_host_keeps_existing_entries_and_dedups() {
+        let existing = vec!["sub.example.com".to_string(), "192.168.1.1".to_string()];
+
+        // A new host is appended after the existing ones.
+        let merged = merge_trusted_host(Some(&existing), "8ry1xfih.doggygosubs.com").expect("merge");
+        assert_eq!(
+            merged,
+            vec![
+                "sub.example.com".to_string(),
+                "192.168.1.1".to_string(),
+                "8ry1xfih.doggygosubs.com".to_string()
+            ]
+        );
+
+        // A duplicate host (URL-form or bare) is not added twice.
+        let again = merge_trusted_host(Some(&merged), "https://sub.example.com/path?token=abc").expect("merge");
+        assert_eq!(again.len(), merged.len());
+        assert_eq!(again, merged);
+    }
+
+    #[test]
+    fn merge_trusted_host_starts_empty_and_rejects_blank_input() {
+        assert_eq!(
+            merge_trusted_host::<std::string::String>(None, "8ry1xfih.doggygosubs.com"),
+            Some(vec!["8ry1xfih.doggygosubs.com".to_string()])
+        );
+        assert_eq!(
+            merge_trusted_host::<std::string::String>(None, "  "),
+            None,
+            "blank entries never persist"
+        );
+        assert_eq!(merge_trusted_host::<std::string::String>(None, ""), None);
     }
 
     #[test]

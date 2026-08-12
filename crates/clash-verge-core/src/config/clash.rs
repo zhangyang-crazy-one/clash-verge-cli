@@ -77,6 +77,13 @@ impl IClashTemp {
         map.insert("ipv6".into(), true.into());
         map.insert("mode".into(), "rule".into());
         map.insert("external-controller".into(), DEFAULT_EXTERNAL_CONTROLLER.into());
+        map.insert(
+            "external-controller-unix".into(),
+            crate::utils::dirs::standalone_socket_path()
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
         map.insert("tun".into(), tun_config.into());
         cors_map.insert("allow-private-network".into(), true.into());
         cors_map.insert(
