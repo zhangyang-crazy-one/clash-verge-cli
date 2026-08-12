@@ -53,7 +53,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         format!("{} ", app.tr("dialog.tun_setup")),
                         Style::new().fg(theme::warn()),
                     ),
-                    Span::styled(app.tr("dialog.tun_setup_confirm"), Style::new().fg(theme::dim())),
+                    Span::styled(app.tun_setup_confirm_hint(), Style::new().fg(theme::dim())),
                 ]);
                 frame.render_widget(Paragraph::new(line), area);
                 return;

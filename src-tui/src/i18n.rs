@@ -236,6 +236,8 @@ fn english(key: &'static str) -> &'static str {
             "Starting with TUN enabled needs the mihomo file capability and the systemd-resolved DNS polkit rule. Installing them now means core start requires no system dialogs."
         }
         "dialog.tun_setup_confirm" => "y = setup now | n/Esc/q = start without setup",
+        "dialog.tun_setup_confirm_hard" => "y = setup now | n/Esc/q = cancel start (TUN setup required)",
+        "settings.tun_capability_missing" => "TUN capability missing",
         _ => key,
     }
 }
@@ -428,6 +430,8 @@ fn chinese(key: &'static str) -> Option<&'static str> {
             "启用 TUN 启动需要 mihomo 文件能力与 systemd-resolved DNS polkit 规则。现在安装它们可让核心启动不再弹出系统对话框。"
         }
         "dialog.tun_setup_confirm" => "y = 立即设置 | n/Esc/q = 不设置直接启动",
+        "dialog.tun_setup_confirm_hard" => "y = 立即设置 | n/Esc/q = 取消启动（需先完成 TUN 设置）",
+        "settings.tun_capability_missing" => "TUN 文件权限缺失",
         _ => return None,
     })
 }

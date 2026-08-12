@@ -95,19 +95,33 @@ fn migrate_files(from: &std::path::Path, dest: &std::path::Path, force: bool) ->
         anyhow::bail!("standalone profiles.yaml already exists; pass --force to overwrite");
     }
     std::fs::create_dir_all(dest)?;
-    std::fs::copy(&source_profiles, &dest_profiles)?;
 
-    // Chain fragments + subscription bodies live under profiles/.
+    // Subscription bodies + chain fragments live under profiles/. Copy them
+    // BEFORE profiles.yaml: a silently dropped body would leave profiles.yaml
+    // referencing a missing file while the migration still reports success.
+    // Any per-file failure aborts the whole migration with the file named.
     let source_dir = from.join("profiles");
     if source_dir.exists() {
         let dest_dir = dest.join("profiles");
         std::fs::create_dir_all(&dest_dir)?;
+        let mut failed: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(&source_dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
-            let _ = std::fs::copy(entry.path(), dest_dir.join(&file_name));
+            if let Err(error) = std::fs::copy(entry.path(), dest_dir.join(&file_name)) {
+                failed.push(format!("{}: {error}", file_name.to_string_lossy()));
+            }
+        }
+        if !failed.is_empty() {
+            anyhow::bail!(
+                "migration failed to copy {} profile file(s) under profiles/ (profiles.yaml would reference missing files): {}",
+                failed.len(),
+                failed.join("; ")
+            );
         }
     }
+
+    std::fs::copy(&source_profiles, &dest_profiles)?;
 
     // Settings (best-effort; templates exist if absent).
     let _ = std::fs::copy(from.join("verge.yaml"), dest.join("verge.yaml"));
@@ -204,6 +218,37 @@ mod tests {
         let dest = temp_dir("dest2");
         must(std::fs::create_dir_all(&src), "mkdir");
         assert!(migrate_files(&src, &dest, false).is_err());
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn migrate_fails_and_names_file_when_a_profile_body_cannot_be_copied() {
+        let src = temp_dir("broken-src");
+        let dest = temp_dir("broken-dest");
+        must(std::fs::create_dir_all(src.join("profiles")), "mkdir");
+        must(
+            std::fs::write(src.join("profiles.yaml"), "current: R1\nitems:\n- uid: R1\n"),
+            "write",
+        );
+        // A directory where a subscription body should be: std::fs::copy
+        // cannot read it as a file, simulating an unreadable/missing source
+        // body that must abort the migration instead of being silently
+        // dropped.
+        must(std::fs::create_dir_all(src.join("profiles").join("R1.yaml")), "mkdir");
+
+        match migrate_files(&src, &dest, false) {
+            Ok(()) => panic!("migration with an uncopyable body must fail"),
+            Err(error) => {
+                let text = error.to_string();
+                assert!(text.contains("R1.yaml"), "error must name the failed file: {text}");
+                assert!(text.contains("profiles/"), "error must locate the copy phase: {text}");
+            }
+        }
+        // Fail BEFORE profiles.yaml is written so the destination never
+        // references missing bodies.
+        assert!(!dest.join("profiles.yaml").exists());
+
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
     }

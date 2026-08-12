@@ -7,8 +7,8 @@ use tokio::time;
 use tokio_stream::StreamExt as _;
 
 use crate::app::{
-    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TrustPending, TunPending, View,
-    first_selectable_proxy_group, proxy_display_rows,
+    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TrustPending, TunPending,
+    TunSetupReason, View, first_selectable_proxy_group, proxy_display_rows,
 };
 use crate::i18n::Language;
 use crate::mihomo_api::types::{LogEntry, TrafficData};
@@ -441,15 +441,17 @@ fn tun_start_offers_setup(capable: bool, root: bool, rule_needed: bool) -> bool 
 /// Open the TUI-native setup confirm dialog for a TUN-enabled core start
 /// that needs the one-time setup. The pending state carries the resolved
 /// binary and `resume_start: Some(enable_tun)` so a confirmed setup resumes
-/// the start on success.
-fn begin_tun_setup_confirm(app: &mut App, binary: std::path::PathBuf, enable_tun: bool) {
+/// the start on success, plus the gate that fired (`reason`) so the skip key
+/// knows whether starting anyway is safe.
+fn begin_tun_setup_confirm(app: &mut App, binary: std::path::PathBuf, enable_tun: bool, reason: TunSetupReason) {
     app.pending_tun = Some(TunPending {
         binary,
         resume_start: Some(enable_tun),
+        reason,
     });
     app.overlay = Some(Overlay::TunSetupConfirmation);
     app.focus = Focus::Content;
-    app.status_msg = Some(app.tr("dialog.tun_setup_confirm").into());
+    app.status_msg = Some(app.tun_setup_confirm_hint().into());
 }
 
 /// `y` on the core-start setup confirm: open the existing password popup.
@@ -461,25 +463,48 @@ fn confirm_tun_setup(app: &mut App) {
     app.overlay = Some(Overlay::PasswordInput);
 }
 
-/// `n`/Esc/`q` on the core-start setup confirm: dismiss and start anyway,
-/// preserving today's behavior including the passive DNS-rule warning when
-/// the rule is still missing. The resume request is sent so the start runs
-/// even though this is a skip (not a success-resume).
+/// `n`/Esc/`q` on the core-start setup confirm: dismiss the dialog. What
+/// "skip" means depends on why the setup was offered:
+/// - missing file capability (hard gate): the spawn preflight would
+///   hard-fail on the uncapped binary a moment later, so skip CANCELS the
+///   start, resets the transient Starting state, and points at the TUN
+///   setup command instead of a confusing resume-then-fail.
+/// - missing DNS polkit rule only (soft gate, capability present): skip
+///   starts anyway, preserving the passive DNS-rule warning.
 fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
-    let resume = app.pending_tun.take().and_then(|pending| pending.resume_start);
+    let pending = app.pending_tun.take();
     app.overlay = None;
-    if let Some(enable_tun) = resume {
-        if crate::commands::privilege::resolve1_rule_needed(true) {
-            app.status_msg = Some(format!(
-                "{} — {}",
-                app.tr("settings.tun_dns_rule_missing"),
-                crate::commands::privilege::TUN_SETUP_COMMAND
-            ));
-        } else {
-            app.status_msg = Some(app.tr("home.starting_core").into());
-        }
-        let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+    let Some(TunPending {
+        resume_start, reason, ..
+    }) = pending
+    else {
+        return;
+    };
+    let Some(enable_tun) = resume_start else {
+        return;
+    };
+    if reason == TunSetupReason::MissingCapability {
+        // The capability gate cannot be skipped: starting anyway would only
+        // hit the spawn preflight hard-fail. Cancel cleanly instead.
+        app.core_state = CoreState::Stopped;
+        app.status_msg = Some(format!(
+            "{} — run {} to install it",
+            app.tr("settings.tun_capability_missing"),
+            crate::commands::privilege::TUN_SETUP_COMMAND
+        ));
+        return;
     }
+    // Capability present; only the DNS rule may be missing → start anyway.
+    if crate::commands::privilege::resolve1_rule_needed(true) {
+        app.status_msg = Some(format!(
+            "{} — {}",
+            app.tr("settings.tun_dns_rule_missing"),
+            crate::commands::privilege::TUN_SETUP_COMMAND
+        ));
+    } else {
+        app.status_msg = Some(app.tr("home.starting_core").into());
+    }
+    let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
 }
 
 /// Record a successful TUN setup transaction. With `resume_start` set, the
@@ -873,17 +898,29 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         .await
                                                     {
                                                         Ok(resolved) => {
+                                                            let capable = crate::commands::privilege::has_tun_capability(
+                                                                &resolved.path,
+                                                            );
+                                                            let root = crate::commands::privilege::running_as_root();
                                                             let needs_setup = tun_start_offers_setup(
-                                                                crate::commands::privilege::has_tun_capability(
-                                                                    &resolved.path,
-                                                                ),
-                                                                crate::commands::privilege::running_as_root(),
+                                                                capable,
+                                                                root,
                                                                 crate::commands::privilege::resolve1_rule_needed(true),
                                                             );
                                                             if needs_setup {
+                                                                // Record which gate fired: dismissing a
+                                                                // capability-missing prompt must cancel the
+                                                                // start, while a missing-DNS-rule prompt may
+                                                                // start anyway.
+                                                                let reason = if root || capable {
+                                                                    TunSetupReason::MissingDnsRule
+                                                                } else {
+                                                                    TunSetupReason::MissingCapability
+                                                                };
                                                                 let _ = tx.send(Action::TunSetupPrompt {
                                                                     binary: resolved.path,
                                                                     enable_tun,
+                                                                    reason,
                                                                 });
                                                                 return;
                                                             }
@@ -2254,11 +2291,15 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ProbeNotice(message)) => {
                         app.status_msg = Some(message);
                     }
-                    Some(Action::TunSetupPrompt { binary, enable_tun }) => {
+                    Some(Action::TunSetupPrompt {
+                        binary,
+                        enable_tun,
+                        reason,
+                    }) => {
                         // Preflight found a missing capability or DNS polkit
                         // rule: offer the TUI-native setup confirm inline so a
                         // system polkit dialog is never the first notice.
-                        begin_tun_setup_confirm(&mut app, binary, enable_tun);
+                        begin_tun_setup_confirm(&mut app, binary, enable_tun, reason);
                     }
                     Some(Action::ConfirmTunSetup) => {
                         confirm_tun_setup(&mut app);
@@ -2288,6 +2329,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.pending_tun = Some(TunPending {
                             binary,
                             resume_start: None,
+                            reason: TunSetupReason::MissingCapability,
                         });
                         app.overlay = Some(Overlay::PasswordInput);
                     }
@@ -2640,9 +2682,15 @@ mod tests {
     #[test]
     fn tun_setup_prompt_opens_confirm_with_resume_context() {
         // Preflight found a missing capability/rule → the TUI-native confirm
-        // dialog opens carrying the resolved binary and the resume settings.
+        // dialog opens carrying the resolved binary, the resume settings,
+        // and the gate that fired.
         let mut app = App::new();
-        begin_tun_setup_confirm(&mut app, std::path::PathBuf::from("/fake/mihomo"), true);
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
 
         assert_eq!(app.overlay, Some(Overlay::TunSetupConfirmation));
         let pending = app.pending_tun.as_ref().expect("pending setup must be set");
@@ -2651,7 +2699,17 @@ mod tests {
             Some(true),
             "confirm must carry enable_tun for the resume"
         );
+        assert_eq!(
+            pending.reason,
+            TunSetupReason::MissingCapability,
+            "confirm must carry the gate that fired"
+        );
         assert_eq!(pending.binary, std::path::PathBuf::from("/fake/mihomo"));
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some(app.tun_setup_confirm_hint()),
+            "status hint must match the hard-gate choice text"
+        );
     }
 
     #[test]
@@ -2659,7 +2717,12 @@ mod tests {
         // `y` on the confirm reuses the existing password popup; the resume
         // context stays in pending_tun so the submit can resume the start.
         let mut app = App::new();
-        begin_tun_setup_confirm(&mut app, std::path::PathBuf::from("/fake/mihomo"), true);
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
         confirm_tun_setup(&mut app);
 
         assert_eq!(app.overlay, Some(Overlay::PasswordInput));
@@ -2694,10 +2757,17 @@ mod tests {
 
     #[test]
     fn skip_tun_setup_start_dismisses_and_resumes_the_start() {
-        // `n`/Esc/q on the confirm: dismiss and start anyway, preserving the
-        // current behavior (no setup transaction runs).
+        // `n`/Esc/q on the confirm when only the DNS rule is missing (soft
+        // gate, capability present): dismiss and start anyway, preserving
+        // the current behavior (no setup transaction runs).
         let mut app = App::new();
-        begin_tun_setup_confirm(&mut app, std::path::PathBuf::from("/fake/mihomo"), true);
+        app.core_state = CoreState::Starting;
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
         let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
         skip_tun_setup_start(&mut app, &tx);
 
@@ -2710,6 +2780,70 @@ mod tests {
     }
 
     #[test]
+    fn skip_tun_setup_start_when_capability_missing_cancels_the_start() {
+        // `n`/Esc/q when the prompt fired because the binary lacks the TUN
+        // capability (hard gate): starting anyway would only hit the spawn
+        // preflight hard-fail a moment later. The skip must CANCEL the
+        // start, reset the transient Starting state, and point at TUN setup.
+        let mut app = App::new();
+        app.core_state = CoreState::Starting;
+        begin_tun_setup_confirm(
+            &mut app,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        skip_tun_setup_start(&mut app, &tx);
+
+        assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
+        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(
+            rx.try_recv().is_err(),
+            "capability-missing skip must NOT resume the start"
+        );
+        assert_eq!(
+            app.core_state,
+            CoreState::Stopped,
+            "cancelled start must not stay Starting"
+        );
+        let message = app.status_msg.as_deref().expect("status message set");
+        assert!(
+            message.contains(crate::commands::privilege::TUN_SETUP_COMMAND),
+            "cancel message must point at the TUN setup command: {message}"
+        );
+    }
+
+    #[test]
+    fn tun_setup_confirm_hint_reflects_the_gate_that_fired() {
+        // The prompt text must reflect the two cases: the hard gate cancels
+        // on n/Esc/q, the soft gate starts without setup.
+        let mut hard = App::new();
+        begin_tun_setup_confirm(
+            &mut hard,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingCapability,
+        );
+        let mut soft = App::new();
+        begin_tun_setup_confirm(
+            &mut soft,
+            std::path::PathBuf::from("/fake/mihomo"),
+            true,
+            TunSetupReason::MissingDnsRule,
+        );
+
+        let hard_hint = hard.tun_setup_confirm_hint();
+        let soft_hint = soft.tun_setup_confirm_hint();
+        assert_ne!(hard_hint, soft_hint, "the two cases must read differently");
+        assert!(hard_hint.contains("cancel"), "hard hint must say cancel: {hard_hint}");
+        assert!(
+            soft_hint.contains("start without setup"),
+            "soft hint must offer start: {soft_hint}"
+        );
+    }
+
+    #[test]
     fn password_cancel_with_pending_start_leaves_no_stale_state() {
         // Esc on the password popup after `s` → y: the setup was abandoned, so
         // the pending start must not resume and the transient Starting state
@@ -2719,6 +2853,7 @@ mod tests {
         app.pending_tun = Some(TunPending {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: Some(true),
+            reason: TunSetupReason::MissingCapability,
         });
         app.overlay = Some(Overlay::PasswordInput);
         app.password_buffer = vec!['x'];
@@ -2745,6 +2880,7 @@ mod tests {
         app.pending_tun = Some(TunPending {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: None,
+            reason: TunSetupReason::MissingCapability,
         });
         app.overlay = Some(Overlay::PasswordInput);
 

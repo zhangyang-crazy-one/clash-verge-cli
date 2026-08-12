@@ -117,6 +117,23 @@ pub struct TrustPending {
     pub uid: Option<String>,
 }
 
+/// Why the core-start setup confirm was offered. Decides what `n`/Esc/q
+/// means on the dialog: dismissing a capability-missing prompt must cancel
+/// the start (the spawn preflight would hard-fail anyway), while dismissing
+/// a missing-DNS-rule prompt may start without setup (that path works, it
+/// just triggers system polkit dialogs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunSetupReason {
+    /// The resolved binary lacks the TUN file capability (and the process
+    /// is not root): hard gate — setup is required before the core can run
+    /// with TUN enabled.
+    MissingCapability,
+    /// Capability is fine; only the systemd-resolved DNS polkit rule is
+    /// missing: soft gate — the core can still start, it will just show
+    /// system auth dialogs until the rule is installed.
+    MissingDnsRule,
+}
+
 /// Context for a TUN setup waiting on password input (or the inline confirm
 /// dialog on core start).
 #[derive(Debug, Clone)]
@@ -127,6 +144,9 @@ pub struct TunPending {
     /// prompt, `None` for the explicit Settings → TUN setup action (nothing
     /// to resume).
     pub resume_start: Option<bool>,
+    /// Which gate prompted the setup; only meaningful for the core-start
+    /// confirm (the explicit Settings flow has nothing to skip).
+    pub reason: TunSetupReason,
 }
 
 #[derive(Debug, Default)]
@@ -283,6 +303,22 @@ impl App {
 
     pub fn tr(&self, key: &'static str) -> &'static str {
         crate::i18n::tr(self.language, key)
+    }
+
+    /// Choice hint for the core-start TUN setup confirm dialog: the two
+    /// cases differ in what `n`/Esc/q does. Missing capability → dismissing
+    /// cancels the start; only the DNS rule missing → dismissing starts
+    /// without setup.
+    pub fn tun_setup_confirm_hint(&self) -> &'static str {
+        if self
+            .pending_tun
+            .as_ref()
+            .is_some_and(|pending| pending.reason == TunSetupReason::MissingCapability)
+        {
+            self.tr("dialog.tun_setup_confirm_hard")
+        } else {
+            self.tr("dialog.tun_setup_confirm")
+        }
     }
 }
 

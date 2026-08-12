@@ -1,4 +1,4 @@
-use super::View;
+use super::{TunSetupReason, View};
 use crate::mihomo_api::types::{ConnectionInfo, LogEntry, Rule, RuleProvider, TrafficData};
 
 /// What config file to open in `$EDITOR`.
@@ -166,16 +166,21 @@ pub enum Action {
         resume_start: Option<bool>,
     },
     /// The TUN-enabled core-start preflight found a missing file capability
-    /// or DNS polkit rule; open the TUI-native confirm dialog.
+    /// or DNS polkit rule; open the TUI-native confirm dialog. `reason`
+    /// records which gate fired so the skip key knows whether starting
+    /// anyway is safe (missing DNS rule only) or must cancel (missing
+    /// capability).
     TunSetupPrompt {
         binary: std::path::PathBuf,
         enable_tun: bool,
+        reason: TunSetupReason,
     },
     /// User pressed `y` on the core-start setup confirm: open the password
     /// popup; the same one-time transaction runs and the start resumes.
     ConfirmTunSetup,
-    /// User pressed `n`/Esc/q on the core-start setup confirm: dismiss and
-    /// start anyway (preserving the passive warning behavior).
+    /// User pressed `n`/Esc/q on the core-start setup confirm: dismiss.
+    /// Starts anyway when only the DNS rule is missing; cancels the start
+    /// with a pointer at TUN setup when the capability is missing.
     SkipTunSetupStart,
     /// Resume the pending core start (post-setup success or after the user
     /// chose to start without setup).
@@ -229,6 +234,7 @@ mod tests {
         let _ = Action::TunSetupPrompt {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             enable_tun: true,
+            reason: TunSetupReason::MissingDnsRule,
         };
         let _ = Action::ConfirmTunSetup;
         let _ = Action::SkipTunSetupStart;

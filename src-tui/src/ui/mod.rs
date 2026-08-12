@@ -169,7 +169,7 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Line::from(app.tr("dialog.tun_setup_warning")),
                 Line::from(""),
                 Line::from(Span::styled(
-                    app.tr("dialog.tun_setup_confirm"),
+                    app.tun_setup_confirm_hint(),
                     Style::new().fg(theme::dim()),
                 )),
             ];

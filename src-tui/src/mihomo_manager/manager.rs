@@ -107,6 +107,13 @@ impl ManagerInner {
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
         preflight_tun_capability(&resolved.path, tun_enabled)?;
 
+        // D-01: the external-controller unix socket's parent dir must exist
+        // before mihomo binds it. On a fresh install neither
+        // $XDG_RUNTIME_DIR/clash-verge-cli nor the /tmp fallback exists yet,
+        // and a missing parent fails the bind with ENOENT.
+        clash_verge_core::utils::dirs::ensure_standalone_socket_dir()
+            .context("failed to prepare external-controller socket dir")?;
+
         *inner.resolved_binary.lock() = Some(resolved.path.clone());
         let mut command = Command::new(&resolved.path);
         command.arg("-d").arg(config_dir);
