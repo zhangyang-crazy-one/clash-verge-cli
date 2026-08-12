@@ -43,7 +43,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDisplayRow]) {
-    let lines = match rows.get(app.node_selected_index) {
+    let mut lines = match rows.get(app.node_selected_index) {
         Some(ProxyDisplayRow::Group {
             name,
             group_type,
@@ -117,6 +117,13 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
             )),
         ],
     };
+
+    if let Some((done, total)) = app.batch_delay {
+        lines.push(Line::from(Span::styled(
+            format!("{}: {done}/{total}", app.tr("proxies.batch_delay")),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
 
     frame.render_widget(Paragraph::new(lines), area);
 }

@@ -63,7 +63,10 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             if let Err(e) = ManagerInner::try_auto_restart(Arc::clone(&inner), &config_dir, &socket_path).await {
                 tracing::error!("auto-restart failed: {e}");
-                let msg = format!("exited {exit_code} (restart failed)");
+                // Keep the underlying error (which carries the `tun setup`
+                // guidance when the preflight rejects the binary) so the
+                // user sees how to recover, not just the exit code.
+                let msg = auto_restart_failure_message(exit_code, &e);
                 *inner.state.lock() = CoreState::Error(msg.clone());
                 if let Some(tx) = inner.action_tx.lock().as_ref() {
                     let _ = tx.send(Action::CoreError(msg));
@@ -77,6 +80,13 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
             }
         }
     })
+}
+
+/// User-visible message when an automatic restart fails: keeps the exit
+/// code AND the underlying error, so preflight rejections (which carry the
+/// `tun setup` guidance) reach the user instead of being logged only.
+fn auto_restart_failure_message(exit_code: i32, error: &anyhow::Error) -> String {
+    format!("exited {exit_code} (auto-restart failed: {error})")
 }
 
 fn pipe_to_tracing<R>(reader: R, level: tracing::Level, label: &'static str)
@@ -97,4 +107,30 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_restart_failure_message_keeps_the_underlying_error() {
+        // The preflight rejection carries the `tun setup` guidance; the
+        // user-visible auto-restart failure must preserve it.
+        let error = anyhow::anyhow!(
+            "TUN is enabled but '/x/verge-mihomo' lacks cap_net_admin,cap_net_raw+eip.\nRun: clash-verge-cli tun setup (or use the TUI Settings → TUN setup action), then start again."
+        );
+        let msg = auto_restart_failure_message(137, &error);
+        assert!(msg.contains("exited 137"), "{msg}");
+        assert!(msg.contains("tun setup"), "{msg}");
+        assert!(msg.contains("/x/verge-mihomo"), "{msg}");
+    }
+
+    #[test]
+    fn auto_restart_failure_message_uses_the_descriptive_format() {
+        let error = anyhow::anyhow!("cannot run getcap: No such file or directory");
+        let msg = auto_restart_failure_message(-1, &error);
+        assert!(msg.contains("auto-restart failed"), "{msg}");
+        assert!(msg.contains("cannot run getcap"), "{msg}");
+    }
 }

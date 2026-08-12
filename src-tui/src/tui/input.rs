@@ -53,6 +53,13 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
                 .pending_connection_close
                 .map(|id| Action::ConfirmCloseConnection(id.to_string())),
             (Overlay::CloseAllConnectionsConfirmation, KeyCode::Enter) => Some(Action::ConfirmCloseAllConnections),
+            // `q` cancels the password popup (the popup UI advertises q to
+            // cancel); it must NOT be appended to the password buffer.
+            (Overlay::PasswordInput, KeyCode::Char('q')) => Some(Action::PasswordCancel),
+            (Overlay::PasswordInput, KeyCode::Char(c)) => Some(Action::PasswordChar(c)),
+            (Overlay::PasswordInput, KeyCode::Backspace) => Some(Action::PasswordBackspace),
+            (Overlay::PasswordInput, KeyCode::Enter) => Some(Action::PasswordSubmit),
+            (Overlay::PasswordInput, KeyCode::Esc) => Some(Action::PasswordCancel),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -292,6 +299,26 @@ mod tests {
     }
 
     #[test]
+    fn batch_delay_shortcut_maps_on_the_proxy_view() {
+        let proxies = base(View::Proxies);
+        // Shift+T is the one-key batch delay test.
+        assert!(matches!(
+            map_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), proxies),
+            Some(Action::NodeDelayAll)
+        ));
+        // Plain t keeps the single-node delay test.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('t')), proxies),
+            Some(Action::NodeDelayTest)
+        ));
+        // The batch shortcut only exists on the Proxies view.
+        assert!(!matches!(
+            map_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), base(View::Home)),
+            Some(Action::NodeDelayAll)
+        ));
+    }
+
+    #[test]
     fn context_hints_follow_the_active_focus_region() {
         assert_eq!(
             context_hint(View::Connections, Focus::Menu, Language::English),
@@ -301,5 +328,44 @@ mod tests {
             context_hint(View::Connections, Focus::Content, Language::English),
             "Enter/d close | / filter"
         );
+        assert_eq!(
+            context_hint(View::Proxies, Focus::Content, Language::English),
+            "Enter group/node | t delay | T all | c chain"
+        );
+    }
+
+    fn password_context() -> KeyContext<'static> {
+        KeyContext {
+            view: View::Settings,
+            focus: Focus::Content,
+            overlay: Some(Overlay::PasswordInput),
+            pending_connection_close: None,
+        }
+    }
+
+    #[test]
+    fn q_cancels_the_password_popup_instead_of_entering_q() {
+        // Regression: the popup UI advertises `q` as cancel, but the generic
+        // char arm used to append 'q' to the (hidden) password buffer.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('q')), password_context()),
+            Some(Action::PasswordCancel)
+        ));
+    }
+
+    #[test]
+    fn other_password_characters_still_enter_the_buffer() {
+        assert!(matches!(
+            map_key(event(KeyCode::Char('p')), password_context()),
+            Some(Action::PasswordChar('p'))
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Backspace), password_context()),
+            Some(Action::PasswordBackspace)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Enter), password_context()),
+            Some(Action::PasswordSubmit)
+        ));
     }
 }

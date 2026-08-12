@@ -89,6 +89,14 @@ pub enum Overlay {
     Filter,
     CloseConfirmation,
     CloseAllConnectionsConfirmation,
+    /// Bordered password popup for one-time TUN capability setup.
+    PasswordInput,
+}
+
+/// Context for the explicit TUN setup action waiting on password input.
+#[derive(Debug, Clone)]
+pub struct TunPending {
+    pub binary: std::path::PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +150,9 @@ pub struct App {
     pub expanded_proxy_group: Option<String>,
     pub node_selected_index: usize,
     pub delay_map: HashMap<String, Option<u64>>,
+    /// Progress of the active batch delay test: (completed, total).
+    /// `None` while no batch is running (also used to reject duplicate starts).
+    pub batch_delay: Option<(usize, usize)>,
     // Chain proxy state
     pub chain_mode: bool,
     pub chain_nodes: Vec<String>,
@@ -161,6 +172,15 @@ pub struct App {
     /// Tab between Rules and Providers panels.
     pub rules_focus_providers: bool,
     pub rules_selected_index: usize,
+    /// Whether the mihomo binary carries TUN capabilities (set after the
+    /// one-time askpass setup).
+    pub tun_privileged: bool,
+    /// Hidden password buffer for the `PasswordInput` overlay.
+    pub password_buffer: Vec<char>,
+    /// Prompt label shown in the password popup.
+    pub password_prompt: Option<String>,
+    /// TUN-enable action waiting on password input.
+    pub pending_tun: Option<TunPending>,
 }
 
 impl App {
@@ -195,6 +215,7 @@ impl App {
             expanded_proxy_group: None,
             node_selected_index: 0,
             delay_map: HashMap::new(),
+            batch_delay: None,
             chain_mode: false,
             chain_nodes: Vec::new(),
             settings_selected_index: 0,
@@ -207,6 +228,10 @@ impl App {
             rule_providers_error: None,
             rules_focus_providers: false,
             rules_selected_index: 0,
+            tun_privileged: false,
+            password_buffer: Vec::new(),
+            password_prompt: None,
+            pending_tun: None,
         }
     }
 

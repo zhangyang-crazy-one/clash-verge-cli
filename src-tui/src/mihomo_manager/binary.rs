@@ -79,6 +79,17 @@ pub fn system_mihomo() -> Option<PathBuf> {
     None
 }
 
+/// Resolve the binary that WOULD be used without downloading anything:
+/// the system `verge-mihomo` if present, else the managed binary if it
+/// already exists. Used by read-only TUN capability preflights (TUI toggle
+/// and capability state) that must not trigger a network install.
+pub fn candidate_without_install() -> Option<PathBuf> {
+    system_mihomo().or_else(|| {
+        let managed = mihomo_binary_path();
+        managed.is_file().then_some(managed)
+    })
+}
+
 /// Where the runnable mihomo binary came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MihomoBinarySource {
@@ -331,6 +342,59 @@ mod tests {
         assert_eq!(extract_version_token("v1.19.29"), Some("v1.19.29".into()));
         assert!(version_matches_target("v1.19.29", "v1.19.29"));
         assert!(!version_matches_target("v1.19.25", "v1.19.29"));
+    }
+
+    #[test]
+    fn candidate_without_install_prefers_system_binary() {
+        // A regular executable file in XDG bin is preferred over a managed
+        // path; neither triggers a download.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("cv-bin-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sys = dir.join("verge-mihomo");
+        let _ = std::fs::write(&sys, b"#!/bin/sh\n");
+        let _ = std::fs::set_permissions(&sys, std::fs::Permissions::from_mode(0o755));
+
+        let old_exec = std::env::var_os("XDG_DATA_HOME");
+        let old_exec_dir = std::env::var_os("XDG_BIN_HOME");
+        unsafe {
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::set_var("XDG_BIN_HOME", &dir);
+        }
+
+        let candidate = candidate_without_install();
+        assert_eq!(candidate.as_deref(), Some(sys.as_path()));
+
+        match old_exec {
+            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
+        match old_exec_dir {
+            Some(v) => unsafe { std::env::set_var("XDG_BIN_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_BIN_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn candidate_without_install_is_a_no_download_probe() {
+        // candidate_without_install must mirror the resolve preference
+        // (system first, then existing managed) without downloading and
+        // without mutating anything. Works on hosts with or without a
+        // system verge-mihomo.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let candidate = candidate_without_install();
+        match system_mihomo() {
+            Some(sys) => assert_eq!(candidate.as_deref(), Some(sys.as_path())),
+            None => {
+                let managed = mihomo_binary_path();
+                if managed.is_file() {
+                    assert_eq!(candidate.as_deref(), Some(managed.as_path()));
+                } else {
+                    assert!(candidate.is_none());
+                }
+            }
+        }
     }
 
     #[test]

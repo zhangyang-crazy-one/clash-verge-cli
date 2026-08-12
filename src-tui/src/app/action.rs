@@ -57,6 +57,11 @@ pub enum Action {
     NodeDelayAll,
     DelayResult(String, Option<u64>),
     DelayFailed(String, String),
+    /// Batch-only result events. Kept distinct from the single-node
+    /// `DelayResult`/`DelayFailed` so a single-node `t` result can never
+    /// advance or clear the active batch progress/guard.
+    BatchDelayResult(String, Option<u64>),
+    BatchDelayFailed(String, String),
 
     // Chain proxy
     ToggleChainMode,
@@ -131,6 +136,20 @@ pub enum Action {
 
     // Probe loop (dead-node detection → forced refresh / rollback notices).
     ProbeNotice(String),
+    /// Read-only report of the resolved binary's TUN capability state
+    /// (refresh after setup / start / startup probe).
+    TunCapabilityState(bool),
+    /// TUN capability was applied (explicit one-time sudo); settings shows
+    /// (privileged).
+    TunPrivilegeApplied,
+    /// Password popup input (hidden buffer, `•` masked).
+    PasswordChar(char),
+    PasswordBackspace,
+    PasswordSubmit,
+    PasswordCancel,
+    /// The user chose the explicit Settings → TUN setup action and the
+    /// resolved binary needs capabilities; open the popup.
+    TunSetupRequested(std::path::PathBuf),
 }
 
 const fn _assert_send_sync() {

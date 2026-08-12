@@ -36,6 +36,9 @@ pub struct ManagerInner {
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
+    /// Path of the resolved mihomo binary (set on start; None before first
+    /// start). Used by TUN capability setup.
+    pub resolved_binary: Mutex<Option<PathBuf>>,
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart.
     pub expected_exit: AtomicBool,
@@ -49,6 +52,7 @@ impl ManagerInner {
             started_at: Mutex::new(None),
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
+            resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
         }
     }
@@ -85,12 +89,24 @@ impl ManagerInner {
     /// Spawn a mihomo child from a resolved binary, wire up the watcher,
     /// and update the inner state.  Used by both `start` (initial launch)
     /// and `try_auto_restart` (crash recovery).
-    fn spawn_and_watch(
+    ///
+    /// Single-point TUN preflight (D2): after the binary has been resolved
+    /// and before every TUN-enabled spawn we check the file capability.
+    /// The check is read-only — no sudo/setcap/askpass here — and root
+    /// processes bypass it. This covers CLI start/restart, TUI Start/Restart,
+    /// the TUN toggle, watcher auto-restart, and post-upgrade replacement.
+    async fn spawn_and_watch(
         resolved: &binary::ResolvedMihomo,
         config_dir: &Path,
         socket_path: &Path,
         inner: Arc<ManagerInner>,
     ) -> anyhow::Result<()> {
+        // TUN disabled → no capability needed. If the config cannot be read
+        // we assume TUN is off and let mihomo fail on its own if it is not.
+        let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
+        preflight_tun_capability(resolved, tun_enabled)?;
+
+        *inner.resolved_binary.lock() = Some(resolved.path.clone());
         let mut command = Command::new(&resolved.path);
         command.arg("-d").arg(config_dir);
         if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
@@ -155,7 +171,9 @@ impl ManagerInner {
             resolved.version
         );
 
-        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner).context("auto-restart: failed to spawn mihomo")
+        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner)
+            .await
+            .context("auto-restart: failed to spawn mihomo")
     }
 }
 
@@ -209,6 +227,11 @@ impl MihomoManager {
 
     pub fn pid(&self) -> Option<u32> {
         *self.inner.pid.lock()
+    }
+
+    /// Path of the resolved mihomo binary, when the core has been started.
+    pub fn binary_path(&self) -> Option<std::path::PathBuf> {
+        self.inner.resolved_binary.lock().clone()
     }
 
     pub fn uptime(&self) -> Option<chrono::Duration> {
@@ -272,6 +295,7 @@ impl MihomoManager {
             .context("failed to resolve or auto-install mihomo core")?;
 
         ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
+            .await
             .context("failed to spawn mihomo")?;
 
         Ok(resolved)
@@ -349,6 +373,29 @@ fn observed_state(managed_state: CoreState, version: Option<&str>) -> CoreState 
     }
 }
 
+/// Whether the runtime clash config enables TUN mode.
+pub async fn runtime_tun_enabled() -> anyhow::Result<bool> {
+    let config = clash_verge_core::config::IClashTemp::new().await.0;
+    Ok(config
+        .get("tun")
+        .and_then(|value| value.as_mapping())
+        .and_then(|map| map.get("enable"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false))
+}
+
+/// D2 preflight gate: when TUN is enabled, require the resolved binary to
+/// carry the TUN capability (unless the process is root). Pure check —
+/// never performs sudo/setcap. Runs after binary resolution and before
+/// every spawn, so a replaced/upgraded binary loses its capability into
+/// this same failure path instead of silently degrading.
+fn preflight_tun_capability(resolved: &binary::ResolvedMihomo, tun_enabled: bool) -> anyhow::Result<()> {
+    if tun_enabled {
+        crate::commands::privilege::require_tun_capability(&resolved.path)?;
+    }
+    Ok(())
+}
+
 /// Public status snapshot returned by `MihomoManager::status()`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CoreStatus {
@@ -408,5 +455,61 @@ mod tests {
             CoreState::Running
         );
         assert_eq!(observed_state(CoreState::Stopped, None), CoreState::Stopped);
+    }
+
+    #[test]
+    fn preflight_skips_check_when_tun_disabled() {
+        let tmp = std::env::temp_dir().join(format!("cv-preflight-{}.bin", uuid::Uuid::new_v4()));
+        let _ = std::fs::write(&tmp, b"x");
+        let resolved = binary::ResolvedMihomo {
+            path: tmp.clone(),
+            source: binary::MihomoBinarySource::ManagedCached,
+            version: "v0.0.0".into(),
+        };
+        // TUN off → spawn allowed regardless of file capabilities.
+        assert!(preflight_tun_capability(&resolved, false).is_ok());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn preflight_rejects_uncapped_binary_when_tun_enabled() {
+        let tmp = std::env::temp_dir().join(format!("cv-preflight-{}.bin", uuid::Uuid::new_v4()));
+        let _ = std::fs::write(&tmp, b"x");
+        let resolved = binary::ResolvedMihomo {
+            path: tmp.clone(),
+            source: binary::MihomoBinarySource::ManagedCached,
+            version: "v0.0.0".into(),
+        };
+        // Root bypasses the check; non-root (the normal CI/user case) must
+        // get an actionable error naming the binary and the setup command.
+        if crate::commands::privilege::running_as_root() {
+            assert!(preflight_tun_capability(&resolved, true).is_ok());
+        } else {
+            let error = preflight_tun_capability(&resolved, true)
+                .expect_err("uncapped TUN-enabled spawn must fail before spawn")
+                .to_string();
+            assert!(error.contains("tun setup"), "{error}");
+            assert!(error.contains(&tmp.display().to_string()), "{error}");
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn preflight_rejects_replaced_binary_without_capability() {
+        // A post-upgrade binary at a new path must hit the same failure.
+        let tmp = std::env::temp_dir().join(format!("cv-replaced-{}.bin", uuid::Uuid::new_v4()));
+        let _ = std::fs::write(&tmp, b"x");
+        let resolved = binary::ResolvedMihomo {
+            path: tmp.clone(),
+            source: binary::MihomoBinarySource::Downloaded,
+            version: "v9.9.9".into(),
+        };
+        if !crate::commands::privilege::running_as_root() {
+            let error = preflight_tun_capability(&resolved, true)
+                .expect_err("replaced uncapped binary must fail")
+                .to_string();
+            assert!(error.contains(&tmp.display().to_string()), "{error}");
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 }
