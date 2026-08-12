@@ -1,23 +1,46 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, Focus};
+use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
     let panes = crate::ui::split_view::draw(
         frame,
-        area,
+        rows[0],
         app.tr("profiles.title"),
         app.tr("profiles.title"),
         app.tr("profiles.detail"),
         60,
+        app.focus == Focus::Content,
     );
 
     crate::ui::profile_list::draw(frame, panes.left, &app.profiles, app.selected_index, app.language);
     draw_detail(frame, panes.right, app);
+    draw_status(frame, rows[1], app);
+}
+
+/// Transient import/update feedback for the Profiles view. The user starts
+/// the import here, so the outcome (success or failure) must be visible here
+/// instead of only on Home.
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(message) = app.status_msg.as_deref() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::ui::terminal_text::display(message),
+                Style::new().fg(theme::status_color(message)),
+            ))),
+            area,
+        );
+    }
 }
 
 fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -32,31 +55,25 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         vec![
             Line::from(Span::styled(
                 crate::ui::terminal_text::display(name),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                theme::bold(theme::accent()),
             )),
             Line::from(format!("{}: {kind}", app.tr("profiles.type"))),
             Line::from(vec![
                 Span::styled(
                     format!("{}: ", app.tr("profiles.source")),
-                    Style::default().fg(Color::DarkGray),
+                    Style::new().fg(theme::dim()),
                 ),
                 Span::raw(source),
             ]),
-            Line::from(Span::styled(
-                app.tr("profiles.hint"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(app.tr("profiles.hint"), Style::new().fg(theme::dim()))),
         ]
     } else {
         vec![
             Line::from(Span::styled(
                 app.tr("profiles.no_selection"),
-                Style::default().fg(Color::Yellow),
+                Style::new().fg(theme::warn()),
             )),
-            Line::from(Span::styled(
-                app.tr("profiles.import"),
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled(app.tr("profiles.import"), Style::new().fg(theme::dim()))),
         ]
     };
 

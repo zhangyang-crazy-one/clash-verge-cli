@@ -1,8 +1,9 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+
+use crate::ui::theme;
 
 /// A two-pane workspace with one outer border and one shared divider.
 ///
@@ -20,8 +21,9 @@ pub fn draw(
     left_title: &str,
     right_title: &str,
     left_percent: u16,
+    focused: bool,
 ) -> SplitViewAreas {
-    let outer = Block::bordered().title(title);
+    let outer = theme::panel_block(title, focused);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
 
@@ -34,7 +36,7 @@ pub fn draw(
         ])
         .split(inner);
 
-    let header_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let header_style = theme::bold(theme::accent());
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(left_title, header_style))),
         header_area(columns[0]),

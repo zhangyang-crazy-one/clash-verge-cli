@@ -10,13 +10,24 @@ use std::os::fd::AsRawFd;
 use anyhow::Context;
 use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
 
+/// ANSI palette mirrors for the semantic TUI palette. The askpass subprocess
+/// runs before config load (and over plain `/dev/tty`), so it styles with raw
+/// escape sequences instead of the ratatui theme: cyan borders, bold yellow
+/// prompt, bold white password field.
+const RESET: &str = "\x1b[0m";
+const CYAN: &str = "\x1b[36m";
+const BOLD_YELLOW: &str = "\x1b[1;33m";
+const BOLD_WHITE: &str = "\x1b[1;37m";
+
 /// Run the askpass popup. `SUDO_PROMPT` (when set) becomes the popup label.
 pub fn run() -> anyhow::Result<()> {
     // sudo passes the prompt as the first argument ("[sudo] password for x:").
+    // The fallback is neutral English: this subprocess runs before config load,
+    // so it cannot localize; sudo normally supplies the prompt anyway.
     let prompt = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("SUDO_PROMPT").ok())
-        .unwrap_or_else(|| "需要管理员权限".to_string());
+        .unwrap_or_else(|| "Administrator password required".to_string());
     let password = read_password(&prompt)?;
     println!("{password}");
     Ok(())
@@ -58,23 +69,53 @@ fn draw_and_read(
     let mut out = String::new();
     out.push_str("\x1b[2J"); // clear screen
     out.push_str(&format!("\x1b[{};{}H", top + 1, left + 1));
+    out.push_str(CYAN);
     out.push('┌');
     out.push_str(&"─".repeat(width - 2));
     out.push('┐');
+    out.push_str(RESET);
     out.push_str(&format!("\x1b[{};{}H", top + 2, left + 1));
-    out.push_str(&format!("│ {} │", pad(&truncate(prompt, width - 4), width - 4)));
+    out.push_str(CYAN);
+    out.push('│');
+    out.push_str(RESET);
+    out.push(' ');
+    out.push_str(BOLD_YELLOW);
+    out.push_str(&pad(&truncate(prompt, width - 4), width - 4));
+    out.push_str(RESET);
+    out.push(' ');
+    out.push_str(CYAN);
+    out.push('│');
+    out.push_str(RESET);
     out.push_str(&format!("\x1b[{};{}H", top + 3, left + 1));
-    out.push_str(&format!("│ 密码: {} │", " ".repeat(width - 10)));
+    out.push_str(CYAN);
+    out.push('│');
+    out.push_str(RESET);
+    out.push(' ');
+    out.push_str(BOLD_WHITE);
+    out.push_str("Password: ");
+    out.push_str(RESET);
+    out.push_str(&" ".repeat(width - 14));
+    out.push(' ');
+    out.push_str(CYAN);
+    out.push('│');
+    out.push_str(RESET);
     out.push_str(&format!("\x1b[{};{}H", top + 4, left + 1));
+    out.push_str(CYAN);
     out.push('│');
+    out.push_str(RESET);
     out.push_str(&" ".repeat(width - 2));
+    out.push_str(CYAN);
     out.push('│');
+    out.push_str(RESET);
     out.push_str(&format!("\x1b[{};{}H", top + 5, left + 1));
+    out.push_str(CYAN);
     out.push('└');
     out.push_str(&"─".repeat(width - 2));
     out.push('┘');
-    // Cursor to the password field.
-    out.push_str(&format!("\x1b[{};{}H", top + 3, left + 9));
+    out.push_str(RESET);
+    // Cursor to the password field (border + space + "Password: " label).
+    out.push_str(&format!("\x1b[{};{}H", top + 3, left + 13));
+    out.push_str(BOLD_WHITE);
     write!(tty, "{out}").ok();
 
     // Collect raw bytes and decode once at the end: a per-byte `char::from`
@@ -91,7 +132,7 @@ fn draw_and_read(
                     // Ctrl-C aborts with 130 (SIGINT convention); restore the
                     // terminal before exiting so the abort leaves a usable tty.
                     let _ = tcsetattr(&*tty, SetArg::TCSANOW, original);
-                    let _ = write!(tty, "\x1b[2J\x1b[H");
+                    let _ = write!(tty, "{RESET}\x1b[2J\x1b[H");
                     std::process::exit(130);
                 }
                 0x7f | 0x08 => {
@@ -107,7 +148,7 @@ fn draw_and_read(
             Err(_) => break,
         }
     }
-    let _ = write!(tty, "\x1b[2J\x1b[H");
+    let _ = write!(tty, "{RESET}\x1b[2J\x1b[H");
     decode_password(password_bytes)
 }
 

@@ -1,12 +1,13 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
 use std::collections::HashMap;
 
 use crate::app::{CoreState, ProxyDisplayRow};
 use crate::i18n::{Language, tr};
+use crate::ui::theme;
 
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
@@ -32,17 +33,14 @@ pub fn draw(
             } => {
                 let display_name = crate::ui::terminal_text::display(name);
                 let mut spans = vec![
-                    Span::styled(
-                        format!("+ {display_name}"),
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("+ {display_name}"), theme::bold(theme::warn())),
                     Span::styled(
                         format!(" {node_count} {}", tr(language, "proxies.nodes")),
-                        Style::default().fg(Color::DarkGray),
+                        Style::new().fg(theme::dim()),
                     ),
                 ];
                 if current.is_some() {
-                    spans.push(Span::styled(" *", Style::default().fg(Color::Green)));
+                    spans.push(Span::styled(" *", Style::new().fg(theme::ok())));
                 }
                 items.push(ListItem::new(Line::from(spans)));
             }
@@ -58,12 +56,12 @@ pub fn draw(
                     Span::styled(
                         format!("  {display_name}"),
                         if *current {
-                            Style::default().fg(Color::Green)
+                            Style::new().fg(theme::ok())
                         } else {
-                            Style::default()
+                            Style::new()
                         },
                     ),
-                    Span::styled(format!(" {delay}{suffix}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!(" {delay}{suffix}"), Style::new().fg(theme::dim())),
                 ])));
             }
         }
@@ -82,10 +80,7 @@ pub fn draw(
                 CoreState::Error(error) => format!("mihomo error: {error}"),
             }
         };
-        items.push(ListItem::new(Span::styled(
-            status,
-            Style::default().fg(Color::DarkGray),
-        )));
+        items.push(ListItem::new(Span::styled(status, Style::new().fg(theme::dim()))));
     }
 
     let selection = if rows.is_empty() {
@@ -95,7 +90,7 @@ pub fn draw(
     };
     let mut state = ListState::default().with_selected(selection);
     let list = List::new(items)
-        .highlight_style(Style::default().fg(Color::Cyan))
+        .highlight_style(theme::highlight(true))
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut state);
