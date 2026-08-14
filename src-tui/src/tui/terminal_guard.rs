@@ -30,6 +30,20 @@ impl TerminalGuard {
         Ok(())
     }
 
+    /// Self-heal when the terminal emulator resizes without delivering a
+    /// `Event::Resize` (observed in Orca's embedded terminal): the diff
+    /// renderer never touches rows outside the frame, so stale glyphs from
+    /// earlier frames linger below it. Compare the backend's live size with
+    /// the frame's cached area and force a full repaint on mismatch.
+    pub fn sync_size_if_changed(&mut self) -> Result<()> {
+        let live = ratatui::layout::Rect::from(self.terminal.size()?);
+        let frame_area = self.terminal.get_frame().area();
+        if live != frame_area {
+            self.reset_screen()?;
+        }
+        Ok(())
+    }
+
     pub const fn terminal_mut(
         &mut self,
     ) -> &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>> {
