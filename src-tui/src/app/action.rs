@@ -204,6 +204,10 @@ pub enum Action {
     ServiceStatus {
         active: String,
         enabled: String,
+        /// Whether the system service unit file is installed (unit presence
+        /// probe, not `is-enabled` — an installed-but-disabled unit must
+        /// still offer uninstall).
+        installed: bool,
         auto_launch: bool,
     },
     /// User pressed `y` on the service-uninstall confirm: open the password
@@ -273,6 +277,7 @@ mod tests {
         let _ = Action::ServiceStatus {
             active: "active".to_string(),
             enabled: "enabled".to_string(),
+            installed: true,
             auto_launch: true,
         };
         let _ = Action::ConfirmServiceUninstall;

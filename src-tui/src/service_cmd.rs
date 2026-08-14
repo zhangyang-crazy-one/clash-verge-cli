@@ -304,6 +304,35 @@ pub fn service_enabled_state() -> String {
     }
 }
 
+/// Whether the system service unit is installed (unit file present).
+///
+/// `systemctl is-enabled` alone misclassifies an installed-but-disabled unit
+/// as `disabled` — the exact state the Settings uninstall offer must still
+/// cover — so installation is probed by unit-file presence instead:
+/// `systemctl list-unit-files` prints the unit's own STATE row
+/// (enabled/disabled/static) when the file exists, and "0 unit files
+/// listed." when it does not.
+pub fn service_installed_state() -> bool {
+    service_installed_state_with(&|name| {
+        Command::new("systemctl")
+            .args(["list-unit-files", name])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Injectable installation probe (test boundary): the probe returns the
+/// `systemctl list-unit-files` stdout for the service name.
+fn service_installed_state_with(probe: &dyn Fn(&str) -> String) -> bool {
+    // The unit's own row (e.g. "clash-verge-cli.service disabled") appears
+    // after the header only when the unit file exists; a missing unit prints
+    // "0 unit files listed." instead.
+    probe(SERVICE_NAME)
+        .lines()
+        .any(|line| line.trim_start().starts_with(SERVICE_NAME))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,6 +468,34 @@ mod tests {
             script.contains("rm -f '/etc/systemd/system/clash-verge-cli.service'"),
             "{script}"
         );
+    }
+
+    #[test]
+    fn installed_probe_classifies_disabled_unit_as_installed() {
+        // P2b: `is-enabled` reports 'disabled' for an installed-but-disabled
+        // unit; the installation probe (unit-file presence via
+        // `list-unit-files`) must still report installed so uninstall stays
+        // offered.
+        let output = format!(
+            "UNIT FILE               STATE   PRESET\n{name}.service disabled disabled\n",
+            name = SERVICE_NAME
+        );
+        assert!(service_installed_state_with(&|_name| output.clone()));
+    }
+
+    #[test]
+    fn installed_probe_classifies_missing_unit_as_not_installed() {
+        // A unit that does not exist prints "0 unit files listed." with no
+        // unit row: not installed.
+        let output = "UNIT FILE STATE PRESET\n\n0 unit files listed.\n".to_string();
+        assert!(!service_installed_state_with(&|_name| output.clone()));
+    }
+
+    #[test]
+    fn installed_probe_error_is_treated_as_not_installed() {
+        // systemctl unavailable (e.g. headless/no systemd) → conservative
+        // "not installed".
+        assert!(!service_installed_state_with(&|_name| String::new()));
     }
 
     #[test]

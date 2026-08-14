@@ -254,6 +254,10 @@ pub struct App {
     /// Cached `systemctl is-enabled clash-verge-cli` output for the Settings
     /// service row.
     pub service_enabled: String,
+    /// Whether the system service unit file is installed (unit presence
+    /// probe, refreshed on Settings entry; `is-enabled` alone would
+    /// misclassify an installed-but-disabled unit as not-installed).
+    pub service_installed: bool,
     /// Whether the systemd `--user` autostart unit is enabled
     /// (`systemctl --user is-enabled`).
     pub auto_launch_enabled: bool,
@@ -311,6 +315,7 @@ impl App {
             pending_sudo: None,
             service_active: String::new(),
             service_enabled: String::new(),
+            service_installed: false,
             auto_launch_enabled: false,
         }
     }

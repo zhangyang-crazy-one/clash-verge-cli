@@ -35,6 +35,54 @@ fn dismiss_overlay(app: &mut App) {
     app.focus = Focus::Menu;
 }
 
+/// Transition into `view`, firing the per-view refresh probes. Every entry
+/// path (number keys via `SwitchView`, menu j/k via `MoveNext`/`MovePrevious`)
+/// routes through here so cached state — notably the Settings
+/// service/autostart probes — is refreshed on every transition INTO a view,
+/// never only on the explicit switch keys.
+fn transition_to_view(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>, view: View) {
+    app.view = view;
+    match view {
+        View::Proxies if app.proxy_groups.is_empty() => {
+            let _ = action_tx.send(Action::ProxiesRefresh);
+        }
+        View::Connections => {
+            let _ = action_tx.send(Action::ConnectionsRefresh);
+        }
+        View::Logs => {
+            let _ = action_tx.send(Action::LogsRefresh);
+        }
+        View::Rules => {
+            if app.rules.is_empty() {
+                let _ = action_tx.send(Action::RulesRefresh);
+            }
+            if app.rule_providers.is_empty() {
+                let _ = action_tx.send(Action::RuleProvidersRefresh);
+            }
+        }
+        View::Settings => {
+            // Refresh the cached read-only service/autostart probes on every
+            // Settings entry (SwitchView AND menu navigation) so the two
+            // lifecycle rows stay fresh — no stale install/uninstall offers.
+            let _ = action_tx.send(Action::ServiceStatusRefresh);
+        }
+        _ => {}
+    }
+}
+
+/// Menu j/k navigation: wrap the view cursor and route through
+/// [`transition_to_view`] so entering Settings by menu navigation runs the
+/// same lifecycle probe refresh as the explicit switch keys.
+fn menu_move(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>, forward: bool) {
+    let index = View::ALL.iter().position(|view| *view == app.view).unwrap_or_default();
+    let next = if forward {
+        (index + 1) % View::ALL.len()
+    } else {
+        (index + View::ALL.len() - 1) % View::ALL.len()
+    };
+    transition_to_view(app, action_tx, View::ALL[next]);
+}
+
 fn begin_connection_close(app: &mut App) {
     if let Some(id) = app.selected_connection_id.clone() {
         app.pending_connection_close = Some(id.clone());
@@ -379,6 +427,44 @@ fn update_flow_decision(item: &clash_verge_core::config::PrfItem) -> Option<(Str
     Some((uid.to_string(), host))
 }
 
+/// Failure of a Settings service install that needed the core handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceInstallError {
+    /// Stopping the running TUI core failed; the install was aborted (a
+    /// second mihomo on the same config/socket/ports must never be spawned).
+    HandoffStop(String),
+    /// The sudo -S install transaction failed after the handoff.
+    Transaction(String),
+}
+
+/// Install the system service from Settings with the handoff ordering.
+///
+/// A second mihomo on the same config/socket/ports must never be spawned, so
+/// a running TUI-owned core is stopped BEFORE the sudo -S transaction runs
+/// with start_now=true. `stop_core` is only awaited while `core_running`;
+/// its failure aborts the install (the core is still up — installing would
+/// conflict). Injectable so the stop-before-install ordering is testable
+/// without sudo or a real core.
+async fn handoff_then_install_service<F, G>(
+    core_running: bool,
+    stop_core: F,
+    install: G,
+) -> Result<(), ServiceInstallError>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+    G: std::future::Future<Output = std::io::Result<()>>,
+{
+    if core_running {
+        stop_core
+            .await
+            .map_err(|error| ServiceInstallError::HandoffStop(error.to_string()))?;
+    }
+    install
+        .await
+        .map_err(|error| ServiceInstallError::Transaction(error.to_string()))?;
+    Ok(())
+}
+
 /// Handle a submitted password for the one pending sudo action (TUN setup /
 /// service install / service uninstall).
 ///
@@ -391,13 +477,27 @@ fn update_flow_decision(item: &clash_verge_core::config::PrfItem) -> Option<(Str
 /// offered from the core-start prompt) travels with `TunSetupSucceeded` so
 /// the pending core start resumes automatically; the explicit Settings flow
 /// passes `None`.
-fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+///
+/// A service install hands off a running TUI-owned core BEFORE the sudo -S
+/// transaction: installing with start_now=true while the core runs would
+/// spawn a second mihomo on the same config/socket/ports (the dual-core
+/// conflict). The handoff stop failure aborts the install; a transaction
+/// failure surfaces as a service action error that records the handoff.
+fn handle_password_submit(
+    app: &mut App,
+    action_tx: &mpsc::UnboundedSender<Action>,
+    manager: &crate::mihomo_manager::manager::MihomoManager,
+) {
     let Some(pending) = app.pending_sudo.take() else {
         return;
     };
     let password: String = app.password_buffer.drain(..).collect();
     app.overlay = None;
     let tx = action_tx.clone();
+    let manager = manager.clone();
+    // Capture at submit time (the popup was opened on the running core): the
+    // handoff must stop the core the user saw running when they confirmed.
+    let core_running = app.core_state == CoreState::Running && manager.pid().is_some();
     tokio::spawn(async move {
         match pending {
             PendingSudoAction::TunSetup {
@@ -413,14 +513,32 @@ fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Actio
             PendingSudoAction::ServiceInstall {
                 binary_path,
                 config_dir,
-            } => match crate::service_cmd::install_service_with_password(&binary_path, &config_dir, true, &password) {
-                Ok(()) => {
-                    let _ = tx.send(Action::ServiceInstalled);
+            } => {
+                let result =
+                    handoff_then_install_service(core_running, async move { manager.stop().await }, async move {
+                        crate::service_cmd::install_service_with_password(&binary_path, &config_dir, true, &password)
+                    })
+                    .await;
+                match result {
+                    Ok(()) => {
+                        let _ = tx.send(Action::ServiceInstalled);
+                    }
+                    Err(ServiceInstallError::HandoffStop(message)) => {
+                        let _ = tx.send(Action::ServiceActionFailed(message));
+                    }
+                    Err(ServiceInstallError::Transaction(message)) if core_running => {
+                        // The core was already handed off (stopped) before the
+                        // transaction ran; say so so the user is not surprised
+                        // their running core is gone.
+                        let _ = tx.send(Action::ServiceActionFailed(format!(
+                            "{message} — the running core was stopped for the service handoff"
+                        )));
+                    }
+                    Err(ServiceInstallError::Transaction(message)) => {
+                        let _ = tx.send(Action::ServiceActionFailed(message));
+                    }
                 }
-                Err(error) => {
-                    let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
-                }
-            },
+            }
             PendingSudoAction::ServiceUninstall => {
                 match crate::service_cmd::uninstall_service_with_password(&password) {
                     Ok(()) => {
@@ -552,23 +670,33 @@ fn note_tun_setup_succeeded(app: &mut App, resume_start: Option<bool>, action_tx
     }
 }
 
-/// Whether the system service unit is installed (per the cached read-only
-/// probes: `is-enabled` reports `enabled` or `is-active` reports `active`).
+/// Whether the system service unit is installed (per the cached unit-file
+/// presence probe, refreshed on Settings entry). `is-enabled` alone is NOT
+/// used: an installed-but-disabled unit reports `disabled` and would be
+/// misclassified as not-installed, dropping the uninstall offer.
 fn service_installed(app: &App) -> bool {
-    app.service_enabled == "enabled" || app.service_active == "active"
+    app.service_installed
 }
 
 /// Begin the Settings 'System service' row action.
 ///
-/// Not installed → reuse the password popup directly with a `ServiceInstall`
-/// pending action (the sudo -S transaction installs and starts the service).
-/// Installed → explicit TUI confirm overlay; `y` then opens the password
-/// popup with a `ServiceUninstall` pending action.
+/// Installed (unit present — including installed-but-disabled) → explicit
+/// TUI confirm overlay; `y` then opens the password popup with a
+/// `ServiceUninstall` pending action. Not installed → install, unless login
+/// autostart is enabled: the two lifecycle mechanisms are mutually
+/// exclusive, so installing while autostart is on is rejected with a clear
+/// status pointing at the row to disable first.
 fn begin_service_action(app: &mut App) {
     if service_installed(app) {
         app.overlay = Some(Overlay::ServiceUninstallConfirmation);
         app.focus = Focus::Content;
         app.status_msg = Some(app.tr("dialog.service_uninstall_hint").into());
+    } else if app.auto_launch_enabled {
+        // The system service (boot) and login autostart (login) are mutually
+        // exclusive lifecycle mechanisms: both enabled would start a second
+        // mihomo on the same config/socket/ports at the next login. Reject
+        // the install and point at the autostart row.
+        app.status_msg = Some(app.tr("settings.service_conflicts_autostart").into());
     } else {
         app.password_prompt = Some(app.tr("settings.service_install_prompt").into());
         app.password_buffer.clear();
@@ -637,6 +765,29 @@ fn apply_autostart_unit(enabled: bool, binary_path: &str, config_dir: &str) -> R
         crate::autostart::enable(binary_path, config_dir).map_err(|error| error.to_string())
     } else {
         crate::autostart::disable().map_err(|error| error.to_string())
+    }
+}
+
+/// Outcome of the Settings 'Launch at login' toggle decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutostartToggle {
+    /// Enabling is blocked: the system service is installed+enabled and the
+    /// two lifecycle mechanisms are mutually exclusive (both enabled would
+    /// spawn a second mihomo at the next boot/login).
+    BlockedByService,
+    /// The toggle may proceed with `enabled`.
+    Proceed { enabled: bool },
+}
+
+/// Decide what the Settings 'Launch at login' toggle may do. Enabling is
+/// rejected while the system service is installed+enabled; disabling (and
+/// toggling with no enabled service) is always allowed.
+fn autostart_toggle_decision(app: &App) -> AutostartToggle {
+    let enabled = !app.auto_launch_enabled;
+    if enabled && app.service_enabled == "enabled" {
+        AutostartToggle::BlockedByService
+    } else {
+        AutostartToggle::Proceed { enabled }
     }
 }
 
@@ -1088,10 +1239,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::MoveNext => {
                                             if app.focus == Focus::Menu {
-                                                let index = View::ALL.iter()
-                                                    .position(|view| *view == app.view)
-                                                    .unwrap_or_default();
-                                                app.view = View::ALL[(index + 1) % View::ALL.len()];
+                                                menu_move(&mut app, &action_tx, true);
                                             } else {
                                             match app.view {
                                                 View::Profiles => {
@@ -1128,10 +1276,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                         }
                                         Action::MovePrevious => {
                                             if app.focus == Focus::Menu {
-                                                let index = View::ALL.iter()
-                                                    .position(|view| *view == app.view)
-                                                    .unwrap_or_default();
-                                                app.view = View::ALL[(index + View::ALL.len() - 1) % View::ALL.len()];
+                                                menu_move(&mut app, &action_tx, false);
                                             } else {
                                             match app.view {
                                                 View::Profiles => {
@@ -1608,36 +1753,49 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             // Launch at login: on/off toggle backed by the
                                                             // systemd --user unit (enable never passes --now, so
                                                             // the running TUI core is not shadowed by a second
-                                                            // foreground core). The toggle flips the displayed
+                                                            // foreground core). Mutually exclusive with the
+                                                            // system service: enabling while the service is
+                                                            // installed+enabled is rejected with a clear status
+                                                            // (both enabled would collide at the next
+                                                            // boot/login). The toggle flips the displayed
                                                             // systemd state; the persisted flag follows it.
-                                                            let enabled = !app.auto_launch_enabled;
-                                                            let binary_path = std::env::current_exe()
-                                                                .map(|path| path.to_string_lossy().into_owned())
-                                                                .unwrap_or_default();
-                                                            let config_dir =
-                                                                clash_verge_core::utils::dirs::app_home_dir()
-                                                                    .map(|path| path.to_string_lossy().into_owned())
-                                                                    .unwrap_or_default();
-                                                            let tx = action_tx.clone();
-                                                            tokio::spawn(async move {
-                                                                match toggle_autostart(
-                                                                    enabled,
-                                                                    &binary_path,
-                                                                    &config_dir,
-                                                                    &apply_autostart_unit,
-                                                                )
-                                                                .await
-                                                                {
-                                                                    Ok(()) => {
-                                                                        let _ = tx.send(Action::AutoLaunchChanged {
-                                                                            enabled,
-                                                                        });
-                                                                    }
-                                                                    Err(error) => {
-                                                                        let _ = tx.send(Action::AutoLaunchFailed(error));
-                                                                    }
+                                                            match autostart_toggle_decision(&app) {
+                                                                AutostartToggle::BlockedByService => {
+                                                                    app.status_msg = Some(
+                                                                        app.tr("settings.autostart_conflicts_service")
+                                                                            .into(),
+                                                                    );
                                                                 }
-                                                            });
+                                                                AutostartToggle::Proceed { enabled } => {
+                                                                    let binary_path = std::env::current_exe()
+                                                                        .map(|path| path.to_string_lossy().into_owned())
+                                                                        .unwrap_or_default();
+                                                                    let config_dir =
+                                                                        clash_verge_core::utils::dirs::app_home_dir()
+                                                                            .map(|path| path.to_string_lossy().into_owned())
+                                                                            .unwrap_or_default();
+                                                                    let tx = action_tx.clone();
+                                                                    tokio::spawn(async move {
+                                                                        match toggle_autostart(
+                                                                            enabled,
+                                                                            &binary_path,
+                                                                            &config_dir,
+                                                                            &apply_autostart_unit,
+                                                                        )
+                                                                        .await
+                                                                        {
+                                                                            Ok(()) => {
+                                                                                let _ = tx.send(Action::AutoLaunchChanged {
+                                                                                    enabled,
+                                                                                });
+                                                                            }
+                                                                            Err(error) => {
+                                                                                let _ = tx.send(Action::AutoLaunchFailed(error));
+                                                                            }
+                                                                        }
+                                                                    });
+                                                                }
+                                                            }
                                                         }
                                                         _ => {}
                                                     }
@@ -1664,32 +1822,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             }
                                         }
                                         Action::SwitchView(view) => {
-                                            app.view = view;
-                                            match view {
-                                                View::Proxies if app.proxy_groups.is_empty() => {
-                                                    let _ = action_tx.send(Action::ProxiesRefresh);
-                                                }
-                                                View::Connections => {
-                                                    let _ = action_tx.send(Action::ConnectionsRefresh);
-                                                }
-                                                View::Logs => {
-                                                    let _ = action_tx.send(Action::LogsRefresh);
-                                                }
-                                                View::Rules => {
-                                                    if app.rules.is_empty() {
-                                                        let _ = action_tx.send(Action::RulesRefresh);
-                                                    }
-                                                    if app.rule_providers.is_empty() {
-                                                        let _ = action_tx.send(Action::RuleProvidersRefresh);
-                                                    }
-                                                }
-                                                View::Settings => {
-                                                    // Refresh the cached read-only service/autostart probes
-                                                    // on every Settings entry so the two new rows stay fresh.
-                                                    let _ = action_tx.send(Action::ServiceStatusRefresh);
-                                                }
-                                                _ => {}
-                                            }
+                                            // Route through the shared transition so menu
+                                            // navigation and the number keys refresh the
+                                            // same per-view probes (Settings re-probes the
+                                            // read-only service/autostart state).
+                                            transition_to_view(&mut app, &action_tx, view);
                                         }
                                         Action::CycleFocus => {
                                             // On Rules view, cycle between Rules ↔ Providers panels.
@@ -2509,7 +2646,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         handle_password_cancel(&mut app);
                     }
                     Some(Action::PasswordSubmit) => {
-                        handle_password_submit(&mut app, &action_tx);
+                        handle_password_submit(&mut app, &action_tx, &manager);
                     }
                     Some(Action::ConfirmServiceUninstall) => {
                         confirm_service_uninstall(&mut app);
@@ -2532,12 +2669,18 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ServiceStatusRefresh) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
+                            // All read-only probes — no sudo/askpass anywhere on this path.
                             let active = crate::service_cmd::service_active_state();
                             let enabled = crate::service_cmd::service_enabled_state();
+                            // Installation is unit-file presence, NOT `is-enabled`
+                            // (an installed-but-disabled unit must still offer
+                            // uninstall; `is-enabled` alone would say 'disabled').
+                            let installed = crate::service_cmd::service_installed_state();
                             let auto_launch = crate::autostart::is_enabled();
                             let _ = tx.send(Action::ServiceStatus {
                                 active,
                                 enabled,
+                                installed,
                                 auto_launch,
                             });
                         });
@@ -2545,10 +2688,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ServiceStatus {
                         active,
                         enabled,
+                        installed,
                         auto_launch,
                     }) => {
                         app.service_active = active;
                         app.service_enabled = enabled;
+                        app.service_installed = installed;
                         app.auto_launch_enabled = auto_launch;
                     }
                     Some(Action::AutoLaunchChanged { enabled }) => {
@@ -2877,7 +3022,8 @@ mod tests {
         app.pending_sudo = None;
 
         let (tx, _rx) = mpsc::unbounded_channel::<Action>();
-        handle_password_submit(&mut app, &tx);
+        let manager = crate::mihomo_manager::manager::MihomoManager::new(std::path::PathBuf::from("/tmp/fake"));
+        handle_password_submit(&mut app, &tx, &manager);
 
         assert!(app.pending_sudo.is_none(), "nothing may be created by a stale submit");
         assert_eq!(
@@ -3130,8 +3276,10 @@ mod tests {
         // existing password popup opens with a ServiceInstall pending action
         // (no separate confirm — installing is the only next step).
         let mut app = App::new();
+        app.service_installed = false;
         app.service_active = "inactive".into();
         app.service_enabled = "disabled".into();
+        app.auto_launch_enabled = false;
         assert!(!service_installed(&app));
 
         begin_service_action(&mut app);
@@ -3151,11 +3299,35 @@ mod tests {
     }
 
     #[test]
+    fn service_install_is_rejected_while_autostart_is_enabled() {
+        // P1b: the system service and login autostart are mutually exclusive
+        // lifecycle mechanisms. Installing the service while autostart is on
+        // must be rejected with a clear status pointing at the row to disable
+        // first — no install popup, no pending action.
+        let mut app = App::new();
+        app.service_installed = false;
+        app.service_active = "inactive".into();
+        app.service_enabled = "disabled".into();
+        app.auto_launch_enabled = true;
+
+        begin_service_action(&mut app);
+
+        assert_eq!(app.overlay, None, "no install popup may open");
+        assert!(app.pending_sudo.is_none(), "no pending install may be created");
+        let message = app.status_msg.as_deref().expect("status message set");
+        assert!(
+            message.contains("Launch at login"),
+            "rejection must point at the autostart row: {message}"
+        );
+    }
+
+    #[test]
     fn service_row_installed_opens_the_uninstall_confirm() {
         // Enter on 'System service' when a unit is installed (enabled or
         // active): an explicit confirm overlay opens; the password popup
         // must NOT open until `y`.
         let mut app = App::new();
+        app.service_installed = true;
         app.service_active = "active".into();
         app.service_enabled = "enabled".into();
         assert!(service_installed(&app));
@@ -3171,6 +3343,7 @@ mod tests {
         // Installed-but-stopped (enabled, inactive) still routes to the
         // uninstall confirm, not the install popup.
         let mut app = App::new();
+        app.service_installed = true;
         app.service_active = "inactive".into();
         app.service_enabled = "enabled".into();
         assert!(service_installed(&app));
@@ -3178,6 +3351,24 @@ mod tests {
         begin_service_action(&mut app);
 
         assert_eq!(app.overlay, Some(Overlay::ServiceUninstallConfirmation));
+    }
+
+    #[test]
+    fn service_row_installed_but_disabled_still_confirms_uninstall() {
+        // P2b regression: an installed-but-disabled/inactive unit reports
+        // `is-enabled` == 'disabled'. The installation probe (unit file
+        // presence) must still classify it as installed so uninstall stays
+        // offered — never the install popup.
+        let mut app = App::new();
+        app.service_installed = true;
+        app.service_active = "inactive".into();
+        app.service_enabled = "disabled".into();
+        assert!(service_installed(&app));
+
+        begin_service_action(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::ServiceUninstallConfirmation));
+        assert!(app.pending_sudo.is_none(), "no password flow before confirm");
     }
 
     #[test]
@@ -3227,6 +3418,200 @@ mod tests {
             message.contains("cancel"),
             "service cancel message must mention cancel: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn service_install_handoff_stops_the_core_before_installing() {
+        // P1a ordering: when a TUI-owned core is running, the handoff stop
+        // must complete BEFORE the install transaction runs — a second mihomo
+        // on the same config/socket/ports must never be spawned.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop_events = events.clone();
+        let install_events = events.clone();
+        let result = handoff_then_install_service(
+            true,
+            async move {
+                stop_events.lock().expect("lock").push("stop");
+                Ok(())
+            },
+            async move {
+                install_events.lock().expect("lock").push("install");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "handoff + install must succeed");
+        let events = events.lock().expect("lock");
+        assert_eq!(
+            *events,
+            vec!["stop", "install"],
+            "core stop must strictly precede the install transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_install_handoff_skips_stop_when_no_core_is_running() {
+        // No running TUI core → no handoff stop; only the install runs.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let install_events = events.clone();
+        let result = handoff_then_install_service(
+            false,
+            async {
+                panic!("stop must not run without a running core");
+                #[allow(unreachable_code)]
+                Ok(())
+            },
+            async move {
+                install_events.lock().expect("lock").push("install");
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "install without a core must succeed");
+        assert_eq!(*events.lock().expect("lock"), vec!["install"]);
+    }
+
+    #[tokio::test]
+    async fn service_install_handoff_aborts_install_when_stop_fails() {
+        // A failed handoff stop must abort the install: the core is still up,
+        // so installing would conflict on the same socket/ports.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop_events = events.clone();
+        let result = handoff_then_install_service(
+            true,
+            async move {
+                stop_events.lock().expect("lock").push("stop");
+                Err(anyhow::anyhow!("stop failed"))
+            },
+            async {
+                panic!("install must not run after a failed handoff stop");
+                #[allow(unreachable_code)]
+                Ok(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(ServiceInstallError::HandoffStop("stop failed".to_string())),
+            "stop failure must be classified and surfaced"
+        );
+        assert_eq!(
+            *events.lock().expect("lock"),
+            vec!["stop"],
+            "install must never run after a failed handoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_install_handoff_transaction_failure_is_classified() {
+        // After a successful handoff, a failing install transaction surfaces
+        // as Transaction (the caller records that the core was stopped).
+        let result = handoff_then_install_service(true, async { Ok(()) }, async {
+            Err(std::io::Error::other("systemctl start failed"))
+        })
+        .await;
+        assert_eq!(
+            result,
+            Err(ServiceInstallError::Transaction("systemctl start failed".to_string()))
+        );
+    }
+
+    #[test]
+    fn autostart_enable_is_rejected_while_service_is_installed_and_enabled() {
+        // P1b: enabling 'Launch at login' while the system service is
+        // installed+enabled must be rejected — both enabled would collide at
+        // the next boot/login.
+        let mut app = App::new();
+        app.auto_launch_enabled = false;
+        app.service_enabled = "enabled".into();
+        app.service_installed = true;
+        assert_eq!(autostart_toggle_decision(&app), AutostartToggle::BlockedByService);
+
+        // A disabled (or absent) service does not block enabling.
+        app.service_enabled = "disabled".into();
+        app.service_installed = false;
+        assert_eq!(
+            autostart_toggle_decision(&app),
+            AutostartToggle::Proceed { enabled: true }
+        );
+
+        // Disabling autostart is never blocked.
+        app.auto_launch_enabled = true;
+        app.service_enabled = "enabled".into();
+        app.service_installed = true;
+        assert_eq!(
+            autostart_toggle_decision(&app),
+            AutostartToggle::Proceed { enabled: false }
+        );
+    }
+
+    #[test]
+    fn autostart_toggle_blocked_by_service_sets_a_clear_status() {
+        // The blocked decision renders a status message pointing at the
+        // service row, and the row is NOT flipped.
+        let mut app = App::new();
+        app.auto_launch_enabled = false;
+        app.service_enabled = "enabled".into();
+        app.service_installed = true;
+        assert!(matches!(
+            autostart_toggle_decision(&app),
+            AutostartToggle::BlockedByService
+        ));
+
+        let message = app.tr("settings.autostart_conflicts_service");
+        assert!(
+            message.contains("system service"),
+            "status must point at the service row: {message}"
+        );
+    }
+
+    #[test]
+    fn menu_navigation_into_settings_refreshes_service_probes() {
+        // P2a: entering Settings by menu j/k (MoveNext/MovePrevious — which
+        // change app.view directly, NOT via SwitchView) must still trigger the
+        // lifecycle probe refresh, or the rows go stale (install offered on an
+        // installed service, etc.).
+        let mut app = App::new();
+        app.focus = Focus::Menu;
+        app.view = View::Unlock; // Unlock is the view right before Settings.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+
+        menu_move(&mut app, &tx, true);
+
+        assert_eq!(app.view, View::Settings, "j must move into Settings");
+        match rx.try_recv() {
+            Ok(Action::ServiceStatusRefresh) => {}
+            other => panic!("expected ServiceStatusRefresh, got {other:?}"),
+        }
+
+        // Backwards menu navigation into Settings fires the same probe.
+        let mut app = App::new();
+        app.focus = Focus::Menu;
+        app.view = View::Home; // Home wraps around to Settings on k.
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        menu_move(&mut app, &tx, false);
+        assert_eq!(app.view, View::Settings, "k must wrap into Settings");
+        match rx.try_recv() {
+            Ok(Action::ServiceStatusRefresh) => {}
+            other => panic!("expected ServiceStatusRefresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switch_view_into_settings_still_refreshes_service_probes() {
+        // The number-key path (SwitchView) keeps the probe refresh: both
+        // entry paths now share transition_to_view.
+        let mut app = App::new();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
+        transition_to_view(&mut app, &tx, View::Settings);
+        assert_eq!(app.view, View::Settings);
+        match rx.try_recv() {
+            Ok(Action::ServiceStatusRefresh) => {}
+            other => panic!("expected ServiceStatusRefresh, got {other:?}"),
+        }
     }
 
     #[tokio::test]

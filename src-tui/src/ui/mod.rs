@@ -610,6 +610,7 @@ mod tests {
     fn settings_view_renders_service_and_autostart_rows() {
         let mut app = representative_app();
         app.view = View::Settings;
+        app.service_installed = true;
         app.service_active = "active".into();
         app.service_enabled = "enabled".into();
         app.auto_launch_enabled = true;

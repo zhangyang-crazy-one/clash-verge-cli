@@ -244,6 +244,7 @@ fn english(key: &'static str) -> &'static str {
         "settings.service_status_running" => "installed · enabled · running",
         "settings.service_status_enabled_stopped" => "installed · enabled · stopped",
         "settings.service_status_running_disabled" => "installed · running · not enabled",
+        "settings.service_status_installed_disabled" => "installed · not enabled · stopped",
         "settings.service_status_not_installed" => "not installed",
         "settings.service_install_prompt" => {
             "Enter password to install the clash-verge-cli system service (runs the core at boot)"
@@ -265,6 +266,12 @@ fn english(key: &'static str) -> &'static str {
         "settings.auto_launch_on_msg" => "Autostart enabled — core starts at login",
         "settings.auto_launch_off_msg" => "Autostart disabled",
         "settings.auto_launch_failed" => "Could not change autostart",
+        "settings.autostart_conflicts_service" => {
+            "Disable the system service first — 'Launch at login' and the system service are mutually exclusive"
+        }
+        "settings.service_conflicts_autostart" => {
+            "Disable 'Launch at login' first — the system service and login autostart are mutually exclusive"
+        }
         "settings.sudo_hint" => "TUN setup + service install/uninstall ask for sudo; start/toggle never prompt.",
         _ => key,
     }
@@ -464,6 +471,7 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "settings.service_status_running" => "已安装 · 已启用 · 运行中",
         "settings.service_status_enabled_stopped" => "已安装 · 已启用 · 已停止",
         "settings.service_status_running_disabled" => "已安装 · 运行中 · 未启用",
+        "settings.service_status_installed_disabled" => "已安装 · 未启用 · 已停止",
         "settings.service_status_not_installed" => "未安装",
         "settings.service_install_prompt" => "输入密码以安装 clash-verge-cli 系统服务（开机时运行内核）",
         "settings.service_uninstall_prompt" => "输入密码以卸载 clash-verge-cli 系统服务",
@@ -481,6 +489,8 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "settings.auto_launch_on_msg" => "已启用开机自启 — 登录时启动内核",
         "settings.auto_launch_off_msg" => "已禁用开机自启",
         "settings.auto_launch_failed" => "无法更改开机自启",
+        "settings.autostart_conflicts_service" => "请先禁用系统服务 — 「登录时启动」与系统服务互斥",
+        "settings.service_conflicts_autostart" => "请先关闭「登录时启动」— 系统服务与登录自启互斥",
         "settings.sudo_hint" => "TUN 权限设置与服务安装/卸载需要 sudo；启动/开关不会弹出密码。",
         _ => return None,
     })
