@@ -311,7 +311,10 @@ pub fn service_enabled_state() -> String {
 /// cover — so installation is probed by unit-file presence instead:
 /// `systemctl list-unit-files` prints the unit's own STATE row
 /// (enabled/disabled/static) when the file exists, and "0 unit files
-/// listed." when it does not.
+/// listed." when it does not. The probe argument must carry the `.service`
+/// suffix: `list-unit-files` takes a PATTERN and does not apply the unit-name
+/// suffix inference that `start`/`is-enabled` perform, so the bare name
+/// returns zero rows even when the unit file exists.
 pub fn service_installed_state() -> bool {
     service_installed_state_with(&|name| {
         Command::new("systemctl")
@@ -323,12 +326,13 @@ pub fn service_installed_state() -> bool {
 }
 
 /// Injectable installation probe (test boundary): the probe returns the
-/// `systemctl list-unit-files` stdout for the service name.
+/// `systemctl list-unit-files` stdout for the full unit file name.
 fn service_installed_state_with(probe: &dyn Fn(&str) -> String) -> bool {
     // The unit's own row (e.g. "clash-verge-cli.service disabled") appears
     // after the header only when the unit file exists; a missing unit prints
     // "0 unit files listed." instead.
-    probe(SERVICE_NAME)
+    let unit_file = format!("{SERVICE_NAME}.service");
+    probe(&unit_file)
         .lines()
         .any(|line| line.trim_start().starts_with(SERVICE_NAME))
 }
@@ -489,6 +493,18 @@ mod tests {
         // unit row: not installed.
         let output = "UNIT FILE STATE PRESET\n\n0 unit files listed.\n".to_string();
         assert!(!service_installed_state_with(&|_name| output.clone()));
+    }
+
+    #[test]
+    fn installed_probe_queries_the_full_unit_file_name() {
+        // `list-unit-files` does not infer the `.service` suffix (verified
+        // against systemd 255): the bare name returns "0 unit files listed."
+        // even when the unit is installed, so the probe must append it.
+        let row = format!("{SERVICE_NAME}.service disabled disabled\n");
+        assert!(service_installed_state_with(&|name| {
+            assert_eq!(name, format!("{SERVICE_NAME}.service"));
+            row.clone()
+        }));
     }
 
     #[test]
