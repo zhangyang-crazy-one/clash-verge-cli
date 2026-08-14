@@ -168,15 +168,19 @@ fn core_state_label(app: &App) -> String {
 }
 
 /// Human-readable status for the 'System service' row, derived from the
-/// cached read-only probes (`systemctl is-enabled` / `is-active`):
-/// installed+enabled+running, installed+enabled+stopped, running-but-not-
-/// enabled, or not installed.
+/// cached read-only probes: installed (unit-file presence, NOT `is-enabled`
+/// — an installed-but-disabled unit must still render as installed) +
+/// enabled + running, installed + enabled + stopped, installed + running +
+/// not enabled, installed + not enabled + stopped, or not installed.
 fn service_status(app: &App) -> &'static str {
+    if !app.service_installed {
+        return app.tr("settings.service_status_not_installed");
+    }
     match (app.service_enabled.as_str(), app.service_active.as_str()) {
         ("enabled", "active") => app.tr("settings.service_status_running"),
         ("enabled", _) => app.tr("settings.service_status_enabled_stopped"),
         (_, "active") => app.tr("settings.service_status_running_disabled"),
-        _ => app.tr("settings.service_status_not_installed"),
+        _ => app.tr("settings.service_status_installed_disabled"),
     }
 }
 
@@ -217,6 +221,7 @@ mod tests {
     #[test]
     fn service_status_covers_all_probe_states() {
         let mut app = App::new();
+        app.service_installed = true;
         app.service_enabled = "enabled".into();
         app.service_active = "active".into();
         assert_eq!(service_status(&app), "installed · enabled · running");
@@ -228,7 +233,13 @@ mod tests {
         app.service_active = "active".into();
         assert_eq!(service_status(&app), "installed · running · not enabled");
 
+        // P2b regression: installed-but-disabled/inactive must NOT render as
+        // "not installed" (is-enabled alone would say 'disabled').
         app.service_active = "inactive".into();
+        assert_eq!(service_status(&app), "installed · not enabled · stopped");
+
+        // Not installed (no unit file): the fallback state.
+        app.service_installed = false;
         assert_eq!(service_status(&app), "not installed");
 
         // Unknown probes (systemctl missing) render as not installed.
