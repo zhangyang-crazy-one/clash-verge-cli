@@ -24,7 +24,10 @@ const SERVICE_PATH: &str = "/etc/systemd/system/clash-verge-cli.service";
 ///
 /// (systemd does not run commands through a shell, so no shell
 /// metacharacters need handling beyond these.)
-fn systemd_escape(value: &str) -> String {
+///
+/// `pub(crate)` so the login-autostart user unit ([`crate::autostart`])
+/// reuses the exact same escaping — the two unit renderers must agree.
+pub(crate) fn systemd_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for c in value.chars() {
         match c {
@@ -109,9 +112,50 @@ pub fn build_uninstall_script(service_path: &str, service_name: &str) -> String 
     script
 }
 
+/// Build the `sudo -S` command for a password-authenticated transaction.
+/// `-S` makes sudo read the password from stdin; `SUDO_ASKPASS` is never
+/// touched, so the TUI popup's captured password goes straight to sudo and
+/// no askpass subprocess fights the raw-mode terminal.
+fn sudo_password_transaction_command(script: &str) -> Command {
+    use std::process::Stdio;
+    let mut command = Command::new("sudo");
+    command.arg("-S").args(["sh", "-c", script]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Run one privileged transaction under `sudo -S`: the password captured by
+/// the TUI popup is written to sudo's stdin, so no askpass subprocess is
+/// needed (the popup stays rendered by the TUI) and nothing is logged. The
+/// whole transaction stays inside a single sudo authentication boundary.
+fn run_sudo_transaction_with_password(script: &str, password: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut child = sudo_password_transaction_command(script)
+        .spawn()
+        .map_err(|error| std::io::Error::other(format!("cannot run sudo (is sudo installed?): {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        writeln!(stdin, "{password}")?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "sudo transaction failed: {} {}",
+            stdout.trim(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Run one privileged transaction under a single sudo authentication
 /// boundary: `sudo -A sh -c <script>` with `SUDO_ASKPASS` pointing at this
 /// binary's hidden `askpass` subcommand (works over SSH without DISPLAY).
+/// CLI-only: the TUI uses [`run_sudo_transaction_with_password`] instead.
 fn run_sudo_transaction(script: &str) -> std::io::Result<()> {
     let askpass = std::env::current_exe().unwrap_or_default();
     let output = Command::new("sudo")
@@ -165,9 +209,72 @@ fn install_service_with(
     Ok(())
 }
 
+/// Install systemd service using a password captured by the TUI password
+/// popup: `sudo -S` reads the password from stdin (no askpass — the popup
+/// must stay rendered by the raw-mode TUI). The whole transaction (copy
+/// unit, daemon-reload, enable, optional start) runs under one sudo call.
+pub fn install_service_with_password(
+    binary_path: &str,
+    config_dir: &str,
+    start_now: bool,
+    password: &str,
+) -> std::io::Result<()> {
+    install_service_with_password_with(
+        binary_path,
+        config_dir,
+        start_now,
+        password,
+        &mut run_sudo_transaction_with_password,
+    )
+}
+
+/// Install with an injectable password-transaction executor (test boundary).
+/// The executor receives `(script, password)` so tests can record both the
+/// transaction text and that the captured password reaches the boundary.
+fn install_service_with_password_with(
+    binary_path: &str,
+    config_dir: &str,
+    start_now: bool,
+    password: &str,
+    executor: &mut dyn FnMut(&str, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let unit = unit_content(binary_path, config_dir);
+    // Write to a temp dir under /tmp with a unique name — avoids the
+    // well-known /tmp/clash-verge-cli.service symlink race.
+    let dir = tempfile::tempdir().map_err(std::io::Error::other)?;
+    let tmp_path = dir.path().join("clash-verge-cli.service");
+    std::fs::write(&tmp_path, unit)?;
+
+    let script = build_install_script(&tmp_path.to_string_lossy(), SERVICE_PATH, SERVICE_NAME, start_now);
+    // Exactly one sudo -S authentication boundary for the whole transaction.
+    // No stdout output here: the TUI password path must never write to the
+    // terminal while the alternate screen is active (status bar reports it).
+    executor(&script, password)?;
+
+    Ok(())
+}
+
 /// Uninstall systemd service. One sudo call for the whole transaction.
 pub fn uninstall_service() -> std::io::Result<()> {
     uninstall_service_with(&mut run_sudo_transaction)
+}
+
+/// Uninstall systemd service using a password captured by the TUI popup
+/// (`sudo -S`, no askpass). One sudo call for the whole transaction.
+pub fn uninstall_service_with_password(password: &str) -> std::io::Result<()> {
+    uninstall_service_with_password_with(password, &mut run_sudo_transaction_with_password)
+}
+
+/// Uninstall with an injectable password-transaction executor (test boundary).
+fn uninstall_service_with_password_with(
+    password: &str,
+    executor: &mut dyn FnMut(&str, &str) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let script = build_uninstall_script(SERVICE_PATH, SERVICE_NAME);
+    // No stdout output: the TUI password path must never write to the
+    // terminal while the alternate screen is active.
+    executor(&script, password)?;
+    Ok(())
 }
 
 /// Uninstall with an injectable transaction executor (test boundary).
@@ -293,6 +400,85 @@ mod tests {
         );
         assert!(result.is_err(), "a failing transaction step must surface");
         assert_eq!(calls, 1, "the single boundary is still one call");
+    }
+
+    #[test]
+    fn install_with_password_invokes_executor_once_with_script_and_password() {
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let result = install_service_with_password_with(
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            true,
+            "s3cret",
+            &mut |script: &str, password: &str| {
+                calls.push((script.to_string(), password.to_string()));
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "install must succeed with a recording executor");
+        assert_eq!(calls.len(), 1, "install must run exactly one sudo -S transaction");
+        let (script, password) = &calls[0];
+        assert_eq!(password, "s3cret", "the captured password must reach the executor");
+        assert!(script.contains("cp -- "), "{script}");
+        assert!(script.contains("systemctl enable 'clash-verge-cli'"), "{script}");
+        assert!(script.contains("systemctl start 'clash-verge-cli'"), "{script}");
+    }
+
+    #[test]
+    fn uninstall_with_password_invokes_executor_once_with_password() {
+        let mut calls: Vec<(String, String)> = Vec::new();
+        let result = uninstall_service_with_password_with("hunter2", &mut |script: &str, password: &str| {
+            calls.push((script.to_string(), password.to_string()));
+            Ok(())
+        });
+        assert!(result.is_ok(), "uninstall must succeed with a recording executor");
+        assert_eq!(calls.len(), 1, "uninstall must run exactly one sudo -S transaction");
+        let (script, password) = &calls[0];
+        assert_eq!(password, "hunter2");
+        assert!(
+            script.contains("rm -f '/etc/systemd/system/clash-verge-cli.service'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn password_transaction_failure_is_propagated() {
+        let mut calls = 0;
+        let result = install_service_with_password_with(
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            true,
+            "wrong",
+            &mut |_script: &str, _password: &str| {
+                calls += 1;
+                Err(std::io::Error::other("incorrect password"))
+            },
+        );
+        assert!(result.is_err(), "a failing password transaction must surface");
+        assert_eq!(calls, 1, "the single boundary is still one call");
+    }
+
+    #[test]
+    fn sudo_password_command_uses_minus_s_and_no_askpass_env() {
+        // The TUI password path must authenticate with `-S` (password on
+        // stdin) and must NEVER set SUDO_ASKPASS: an askpass subprocess
+        // would fight the raw-mode TUI popup.
+        let command = sudo_password_transaction_command("echo hi");
+        assert_eq!(command.get_program(), "sudo");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["-S", "sh", "-c", "echo hi"]);
+        assert!(
+            command.get_envs().all(|(key, _)| key != "SUDO_ASKPASS"),
+            "no SUDO_ASKPASS may be set on the -S path"
+        );
+        // -S reads the password from stdin (that is the askpass-free
+        // mechanism the TUI relies on); nothing may fall back to the
+        // askpass flags.
+        assert!(!args.contains(&"-A".to_string()));
+        assert!(!args.contains(&"--askpass".to_string()));
     }
 
     #[test]

@@ -181,6 +181,27 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 content,
             );
         }
+        Overlay::ServiceUninstallConfirmation => {
+            let content = vec![
+                Line::from(Span::styled(
+                    app.tr("dialog.service_uninstall_title"),
+                    theme::bold(theme::danger()),
+                )),
+                Line::from(app.tr("dialog.service_uninstall_warning")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    app.tr("dialog.service_uninstall_confirm"),
+                    Style::new().fg(theme::dim()),
+                )),
+            ];
+            dialog::draw_dialog(
+                frame,
+                frame.area(),
+                dialog::DialogKind::Danger,
+                app.tr("dialog.service_uninstall"),
+                content,
+            );
+        }
         Overlay::PasswordInput => {
             let prompt = app.password_prompt.as_deref().unwrap_or("sudo");
             let masked = dialog::mask_password(app.password_buffer.len());
@@ -570,6 +591,34 @@ mod tests {
         assert!(rendered.contains("polkit"));
         assert!(rendered.contains("y = setup now"));
         assert!(rendered.contains("start without setup"));
+    }
+
+    #[test]
+    fn service_uninstall_confirmation_renders_warning_and_choice() {
+        let mut app = representative_app();
+        app.view = View::Settings;
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+
+        let (rendered, _) = render(&app, 120, 32);
+        assert!(rendered.contains("Uninstall service"));
+        assert!(rendered.contains("system service"));
+        assert!(rendered.contains("y = uninstall"));
+        assert!(rendered.contains("n/Esc"));
+    }
+
+    #[test]
+    fn settings_view_renders_service_and_autostart_rows() {
+        let mut app = representative_app();
+        app.view = View::Settings;
+        app.service_active = "active".into();
+        app.service_enabled = "enabled".into();
+        app.auto_launch_enabled = true;
+
+        let (rendered, _) = render(&app, 160, 40);
+        assert!(rendered.contains("System service"));
+        assert!(rendered.contains("installed · enabled · running"));
+        assert!(rendered.contains("Launch at login"));
+        assert!(rendered.contains("Launch at login: on"));
     }
 
     #[test]

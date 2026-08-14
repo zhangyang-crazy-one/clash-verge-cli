@@ -1,4 +1,5 @@
 mod app;
+mod autostart;
 mod chain;
 mod cli;
 mod commands;

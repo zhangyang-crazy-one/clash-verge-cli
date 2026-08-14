@@ -98,6 +98,9 @@ pub enum Overlay {
     /// and/or the systemd-resolved DNS polkit rule); explicit `y` opens the
     /// password popup, `n`/Esc/q starts without setup.
     TunSetupConfirmation,
+    /// The System service row is installed; uninstalling needs an explicit
+    /// `y` before the password popup opens (`n`/Esc/q cancel).
+    ServiceUninstallConfirmation,
 }
 
 /// Pending SSRF trust confirmation for a subscription import or refresh.
@@ -134,19 +137,29 @@ pub enum TunSetupReason {
     MissingDnsRule,
 }
 
-/// Context for a TUN setup waiting on password input (or the inline confirm
-/// dialog on core start).
-#[derive(Debug, Clone)]
-pub struct TunPending {
-    pub binary: std::path::PathBuf,
-    /// Resume a pending core start after the transaction succeeds:
-    /// `Some(enable_tun)` when the setup was offered from the core-start
-    /// prompt, `None` for the explicit Settings → TUN setup action (nothing
-    /// to resume).
-    pub resume_start: Option<bool>,
-    /// Which gate prompted the setup; only meaningful for the core-start
-    /// confirm (the explicit Settings flow has nothing to skip).
-    pub reason: TunSetupReason,
+/// One-time sudo action waiting on the password popup. Generalized over the
+/// TUN capability setup, service install, and service uninstall so all three
+/// share ONE password flow (the popup renders the same way; only the pending
+/// action — and the spawned transaction — differs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSudoAction {
+    /// TUN capability + DNS polkit rule setup for `binary`.
+    TunSetup {
+        binary: std::path::PathBuf,
+        /// Resume a pending core start after the transaction succeeds:
+        /// `Some(enable_tun)` when the setup was offered from the core-start
+        /// prompt, `None` for the explicit Settings → TUN setup action
+        /// (nothing to resume).
+        resume_start: Option<bool>,
+        /// Which gate prompted the setup; only meaningful for the core-start
+        /// confirm (the explicit Settings flow has nothing to skip).
+        reason: TunSetupReason,
+    },
+    /// Install the systemd service (unit copy + enable + start). Carries the
+    /// resolved binary and config dir for the unit `ExecStart=`.
+    ServiceInstall { binary_path: String, config_dir: String },
+    /// Uninstall the systemd service.
+    ServiceUninstall,
 }
 
 #[derive(Debug, Default)]
@@ -232,8 +245,18 @@ pub struct App {
     pub password_buffer: Vec<char>,
     /// Prompt label shown in the password popup.
     pub password_prompt: Option<String>,
-    /// TUN-enable action waiting on password input.
-    pub pending_tun: Option<TunPending>,
+    /// One-time sudo action waiting on password input (TUN setup / service
+    /// install / service uninstall).
+    pub pending_sudo: Option<PendingSudoAction>,
+    /// Cached `systemctl is-active clash-verge-cli` output for the Settings
+    /// service row (read-only probe, refreshed on Settings entry).
+    pub service_active: String,
+    /// Cached `systemctl is-enabled clash-verge-cli` output for the Settings
+    /// service row.
+    pub service_enabled: String,
+    /// Whether the systemd `--user` autostart unit is enabled
+    /// (`systemctl --user is-enabled`).
+    pub auto_launch_enabled: bool,
 }
 
 impl App {
@@ -285,7 +308,10 @@ impl App {
             tun_privileged: false,
             password_buffer: Vec::new(),
             password_prompt: None,
-            pending_tun: None,
+            pending_sudo: None,
+            service_active: String::new(),
+            service_enabled: String::new(),
+            auto_launch_enabled: false,
         }
     }
 
@@ -310,11 +336,14 @@ impl App {
     /// cancels the start; only the DNS rule missing → dismissing starts
     /// without setup.
     pub fn tun_setup_confirm_hint(&self) -> &'static str {
-        if self
-            .pending_tun
-            .as_ref()
-            .is_some_and(|pending| pending.reason == TunSetupReason::MissingCapability)
-        {
+        let hard_gate = matches!(
+            self.pending_sudo.as_ref(),
+            Some(PendingSudoAction::TunSetup {
+                reason: TunSetupReason::MissingCapability,
+                ..
+            })
+        );
+        if hard_gate {
             self.tr("dialog.tun_setup_confirm_hard")
         } else {
             self.tr("dialog.tun_setup_confirm")

@@ -7,7 +7,7 @@ use ratatui::widgets::{Padding, Paragraph, Wrap};
 use crate::app::App;
 use crate::ui::theme;
 
-pub const SETTINGS_ROW_COUNT: usize = 5;
+pub const SETTINGS_ROW_COUNT: usize = 7;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
@@ -89,6 +89,26 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ),
         settings_row(app, 4, cursor, format!("{}: {mode}", app.tr("settings.mihomo_mode"))),
+        settings_row(
+            app,
+            5,
+            cursor,
+            format!("{}: {}", app.tr("settings.service"), service_status(app)),
+        ),
+        settings_row(
+            app,
+            6,
+            cursor,
+            format!(
+                "{}: {}",
+                app.tr("settings.auto_launch"),
+                if app.auto_launch_enabled {
+                    app.tr("settings.on")
+                } else {
+                    app.tr("settings.off")
+                }
+            ),
+        ),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),
@@ -102,7 +122,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::new().fg(theme::dim()),
         )),
         Line::from(Span::styled(
-            "TUN setup = the only action that asks for sudo; start/toggle never prompt.",
+            app.tr("settings.sudo_hint"),
             Style::new().fg(theme::dim()),
         )),
     ])
@@ -147,9 +167,22 @@ fn core_state_label(app: &App) -> String {
     }
 }
 
+/// Human-readable status for the 'System service' row, derived from the
+/// cached read-only probes (`systemctl is-enabled` / `is-active`):
+/// installed+enabled+running, installed+enabled+stopped, running-but-not-
+/// enabled, or not installed.
+fn service_status(app: &App) -> &'static str {
+    match (app.service_enabled.as_str(), app.service_active.as_str()) {
+        ("enabled", "active") => app.tr("settings.service_status_running"),
+        ("enabled", _) => app.tr("settings.service_status_enabled_stopped"),
+        (_, "active") => app.tr("settings.service_status_running_disabled"),
+        _ => app.tr("settings.service_status_not_installed"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::core_owner_label;
+    use super::{SETTINGS_ROW_COUNT, core_owner_label, service_status};
     use crate::app::{App, CoreState};
 
     #[test]
@@ -158,5 +191,49 @@ mod tests {
         app.core_state = CoreState::Running;
 
         assert_eq!(core_owner_label(&app), "GUI-managed");
+    }
+
+    #[test]
+    fn settings_rows_append_after_the_existing_five() {
+        // The two new rows (System service, Launch at login) are appended at
+        // indices 5 and 6 so the existing index handlers (0..4) never shift.
+        assert_eq!(SETTINGS_ROW_COUNT, 7, "new rows must append after the existing five");
+    }
+
+    #[test]
+    fn settings_navigation_wraps_within_the_new_row_count() {
+        // Mirrors the event loop's MoveNext/MovePrevious math for Settings:
+        // indices wrap within SETTINGS_ROW_COUNT, so the two appended rows
+        // (5, 6) are reachable and the existing rows never shift.
+        let next = |index: usize| (index + 1) % SETTINGS_ROW_COUNT;
+        let prev = |index: usize| (index + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+        assert_eq!(next(4), 5, "service row follows the mode row");
+        assert_eq!(next(5), 6, "autostart row follows the service row");
+        assert_eq!(next(6), 0, "navigation wraps past the last row");
+        assert_eq!(prev(0), 6, "navigation wraps back to the last row");
+        assert_eq!(prev(5), 4, "previous row from the service row is the mode row");
+    }
+
+    #[test]
+    fn service_status_covers_all_probe_states() {
+        let mut app = App::new();
+        app.service_enabled = "enabled".into();
+        app.service_active = "active".into();
+        assert_eq!(service_status(&app), "installed · enabled · running");
+
+        app.service_active = "inactive".into();
+        assert_eq!(service_status(&app), "installed · enabled · stopped");
+
+        app.service_enabled = "disabled".into();
+        app.service_active = "active".into();
+        assert_eq!(service_status(&app), "installed · running · not enabled");
+
+        app.service_active = "inactive".into();
+        assert_eq!(service_status(&app), "not installed");
+
+        // Unknown probes (systemctl missing) render as not installed.
+        app.service_enabled = "unknown".into();
+        app.service_active = "unknown".into();
+        assert_eq!(service_status(&app), "not installed");
     }
 }

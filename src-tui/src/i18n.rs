@@ -192,7 +192,9 @@ fn english(key: &'static str) -> &'static str {
         "settings.not_running" => "not running",
         "settings.on" => "on",
         "settings.off" => "off",
-        "settings.readonly_note" => "Writes for system proxy, TUN, DNS, and service controls are not wired yet.",
+        "settings.readonly_note" => {
+            "System proxy, TUN, DNS, service controls, and autostart are all wired; toggles persist here."
+        }
         "settings.writable_hint" => "Enter toggles the highlighted setting. TUN reloads or restarts the core.",
         "settings.language_saved" => "Language saved",
         "settings.language_save_failed" => "Could not save language",
@@ -238,6 +240,32 @@ fn english(key: &'static str) -> &'static str {
         "dialog.tun_setup_confirm" => "y = setup now | n/Esc/q = start without setup",
         "dialog.tun_setup_confirm_hard" => "y = setup now | n/Esc/q = cancel start (TUN setup required)",
         "settings.tun_capability_missing" => "TUN capability missing",
+        "settings.service" => "System service",
+        "settings.service_status_running" => "installed · enabled · running",
+        "settings.service_status_enabled_stopped" => "installed · enabled · stopped",
+        "settings.service_status_running_disabled" => "installed · running · not enabled",
+        "settings.service_status_not_installed" => "not installed",
+        "settings.service_install_prompt" => {
+            "Enter password to install the clash-verge-cli system service (runs the core at boot)"
+        }
+        "settings.service_uninstall_prompt" => "Enter password to uninstall the clash-verge-cli system service",
+        "settings.service_installed" => "Service installed and started",
+        "settings.service_uninstalled" => "Service uninstalled",
+        "settings.service_failed" => "Service action failed",
+        "settings.service_cancelled" => "Service action cancelled",
+        "settings.service_uninstall_cancelled" => "Service uninstall cancelled",
+        "dialog.service_uninstall" => "Uninstall service",
+        "dialog.service_uninstall_title" => "Remove the system service?",
+        "dialog.service_uninstall_warning" => {
+            "This removes the clash-verge-cli systemd service. The core will no longer start automatically at boot."
+        }
+        "dialog.service_uninstall_confirm" => "y = uninstall | n/Esc/q = cancel",
+        "dialog.service_uninstall_hint" => "Uninstall the system service? y = uninstall | n/Esc/q = cancel",
+        "settings.auto_launch" => "Launch at login",
+        "settings.auto_launch_on_msg" => "Autostart enabled — core starts at login",
+        "settings.auto_launch_off_msg" => "Autostart disabled",
+        "settings.auto_launch_failed" => "Could not change autostart",
+        "settings.sudo_hint" => "TUN setup + service install/uninstall ask for sudo; start/toggle never prompt.",
         _ => key,
     }
 }
@@ -390,7 +418,7 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "settings.not_running" => "未运行",
         "settings.on" => "开",
         "settings.off" => "关",
-        "settings.readonly_note" => "系统代理、TUN、DNS 与服务控制的写入功能尚未接入。",
+        "settings.readonly_note" => "系统代理、TUN、DNS、服务控制与开机自启均已接入，开关会持久化到本配置。",
         "settings.writable_hint" => "Enter 切换高亮项。开启/关闭 TUN 会重载或重启内核。",
         "settings.language_saved" => "语言已保存",
         "settings.language_save_failed" => "无法保存语言设置",
@@ -432,6 +460,28 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "dialog.tun_setup_confirm" => "y = 立即设置 | n/Esc/q = 不设置直接启动",
         "dialog.tun_setup_confirm_hard" => "y = 立即设置 | n/Esc/q = 取消启动（需先完成 TUN 设置）",
         "settings.tun_capability_missing" => "TUN 文件权限缺失",
+        "settings.service" => "系统服务",
+        "settings.service_status_running" => "已安装 · 已启用 · 运行中",
+        "settings.service_status_enabled_stopped" => "已安装 · 已启用 · 已停止",
+        "settings.service_status_running_disabled" => "已安装 · 运行中 · 未启用",
+        "settings.service_status_not_installed" => "未安装",
+        "settings.service_install_prompt" => "输入密码以安装 clash-verge-cli 系统服务（开机时运行内核）",
+        "settings.service_uninstall_prompt" => "输入密码以卸载 clash-verge-cli 系统服务",
+        "settings.service_installed" => "服务已安装并启动",
+        "settings.service_uninstalled" => "服务已卸载",
+        "settings.service_failed" => "服务操作失败",
+        "settings.service_cancelled" => "服务操作已取消",
+        "settings.service_uninstall_cancelled" => "服务卸载已取消",
+        "dialog.service_uninstall" => "卸载服务",
+        "dialog.service_uninstall_title" => "移除系统服务？",
+        "dialog.service_uninstall_warning" => "这将移除 clash-verge-cli systemd 服务。内核将不再于开机时自动启动。",
+        "dialog.service_uninstall_confirm" => "y = 卸载 | n/Esc/q = 取消",
+        "dialog.service_uninstall_hint" => "卸载系统服务？y = 卸载 | n/Esc/q = 取消",
+        "settings.auto_launch" => "登录时启动",
+        "settings.auto_launch_on_msg" => "已启用开机自启 — 登录时启动内核",
+        "settings.auto_launch_off_msg" => "已禁用开机自启",
+        "settings.auto_launch_failed" => "无法更改开机自启",
+        "settings.sudo_hint" => "TUN 权限设置与服务安装/卸载需要 sudo；启动/开关不会弹出密码。",
         _ => return None,
     })
 }
