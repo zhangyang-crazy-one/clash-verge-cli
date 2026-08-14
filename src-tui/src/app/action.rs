@@ -195,6 +195,36 @@ pub enum Action {
     /// The user chose the explicit Settings → TUN setup action and the
     /// resolved binary needs capabilities; open the popup.
     TunSetupRequested(std::path::PathBuf),
+
+    // System service + login autostart (Settings rows 5 and 6)
+    /// Refresh the cached read-only service/autostart probes
+    /// (`systemctl is-active/is-enabled`, `systemctl --user is-enabled`).
+    ServiceStatusRefresh,
+    /// Result of the refresh probe: cached values for the Settings rows.
+    ServiceStatus {
+        active: String,
+        enabled: String,
+        auto_launch: bool,
+    },
+    /// User pressed `y` on the service-uninstall confirm: open the password
+    /// popup with a `ServiceUninstall` pending action.
+    ConfirmServiceUninstall,
+    /// User pressed `n`/Esc/q on the service-uninstall confirm: cancel.
+    CancelServiceUninstall,
+    /// The sudo -S service install transaction succeeded.
+    ServiceInstalled,
+    /// The sudo -S service uninstall transaction succeeded.
+    ServiceUninstalled,
+    /// A service install/uninstall transaction failed (`sudo`/`systemctl`
+    /// stderr is the payload).
+    ServiceActionFailed(String),
+    /// The login-autostart toggle succeeded; `enabled` is the new state.
+    AutoLaunchChanged {
+        enabled: bool,
+    },
+    /// The login-autostart toggle failed (`systemctl --user` error text is
+    /// the payload — headless/no-user-session surfaces verbatim).
+    AutoLaunchFailed(String),
 }
 
 const fn _assert_send_sync() {
@@ -239,6 +269,19 @@ mod tests {
         let _ = Action::ConfirmTunSetup;
         let _ = Action::SkipTunSetupStart;
         let _ = Action::ResumeCoreStart { enable_tun: true };
+        let _ = Action::ServiceStatusRefresh;
+        let _ = Action::ServiceStatus {
+            active: "active".to_string(),
+            enabled: "enabled".to_string(),
+            auto_launch: true,
+        };
+        let _ = Action::ConfirmServiceUninstall;
+        let _ = Action::CancelServiceUninstall;
+        let _ = Action::ServiceInstalled;
+        let _ = Action::ServiceUninstalled;
+        let _ = Action::ServiceActionFailed("sudo: no tty".to_string());
+        let _ = Action::AutoLaunchChanged { enabled: true };
+        let _ = Action::AutoLaunchFailed("systemctl --user enable failed".to_string());
     }
 
     fn assert_send_sync<T: Send + Sync>() {}

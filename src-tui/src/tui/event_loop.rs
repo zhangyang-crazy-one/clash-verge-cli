@@ -7,7 +7,7 @@ use tokio::time;
 use tokio_stream::StreamExt as _;
 
 use crate::app::{
-    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, ProxyDisplayRow, TrustPending, TunPending,
+    Action, App, CoreState, EditorTarget, Focus, InputMode, Overlay, PendingSudoAction, ProxyDisplayRow, TrustPending,
     TunSetupReason, View, first_selectable_proxy_group, proxy_display_rows,
 };
 use crate::i18n::Language;
@@ -379,32 +379,57 @@ fn update_flow_decision(item: &clash_verge_core::config::PrfItem) -> Option<(Str
     Some((uid.to_string(), host))
 }
 
-/// Handle a submitted password for the TUN setup transaction.
+/// Handle a submitted password for the one pending sudo action (TUN setup /
+/// service install / service uninstall).
 ///
-/// A submit with no pending setup is a stale duplicate Enter (e.g. the
+/// A submit with no pending action is a stale duplicate Enter (e.g. the
 /// second Enter of a double-press after the popup already closed): it is
 /// ignored instead of aborting the TUI event loop. The spawned task only
-/// runs when a pending setup actually exists.
+/// runs when a pending action actually exists.
 ///
-/// On success the resume context (`resume_start`, set when the setup was
+/// On success the resume context (`resume_start`, set when the TUN setup was
 /// offered from the core-start prompt) travels with `TunSetupSucceeded` so
 /// the pending core start resumes automatically; the explicit Settings flow
 /// passes `None`.
 fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
-    let Some(pending) = app.pending_tun.take() else {
+    let Some(pending) = app.pending_sudo.take() else {
         return;
     };
-    let resume_start = pending.resume_start;
     let password: String = app.password_buffer.drain(..).collect();
     app.overlay = None;
     let tx = action_tx.clone();
     tokio::spawn(async move {
-        match crate::commands::privilege::apply_tun_capability_with_password(&pending.binary, &password) {
-            Ok(()) => {
-                let _ = tx.send(Action::TunSetupSucceeded { resume_start });
-            }
-            Err(error) => {
-                let _ = tx.send(Action::CoreError(error.to_string()));
+        match pending {
+            PendingSudoAction::TunSetup {
+                binary, resume_start, ..
+            } => match crate::commands::privilege::apply_tun_capability_with_password(&binary, &password) {
+                Ok(()) => {
+                    let _ = tx.send(Action::TunSetupSucceeded { resume_start });
+                }
+                Err(error) => {
+                    let _ = tx.send(Action::CoreError(error.to_string()));
+                }
+            },
+            PendingSudoAction::ServiceInstall {
+                binary_path,
+                config_dir,
+            } => match crate::service_cmd::install_service_with_password(&binary_path, &config_dir, true, &password) {
+                Ok(()) => {
+                    let _ = tx.send(Action::ServiceInstalled);
+                }
+                Err(error) => {
+                    let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                }
+            },
+            PendingSudoAction::ServiceUninstall => {
+                match crate::service_cmd::uninstall_service_with_password(&password) {
+                    Ok(()) => {
+                        let _ = tx.send(Action::ServiceUninstalled);
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                    }
+                }
             }
         }
     });
@@ -414,18 +439,23 @@ fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Actio
 /// start is abandoned: the transient `Starting` state is reset to `Stopped`
 /// and nothing stale remains (no resume can fire).
 fn handle_password_cancel(app: &mut App) {
-    let resume_pending = app
-        .pending_tun
-        .as_ref()
-        .is_some_and(|pending| pending.resume_start.is_some());
+    let pending = app.pending_sudo.take();
     app.overlay = None;
-    app.pending_tun = None;
     app.password_buffer.clear();
-    if resume_pending {
-        app.core_state = CoreState::Stopped;
-        app.status_msg = Some("TUN setup cancelled — core not started".into());
-    } else {
-        app.status_msg = Some("TUN setup cancelled".into());
+    match pending {
+        Some(PendingSudoAction::TunSetup {
+            resume_start: Some(_), ..
+        }) => {
+            app.core_state = CoreState::Stopped;
+            app.status_msg = Some("TUN setup cancelled — core not started".into());
+        }
+        Some(PendingSudoAction::TunSetup { .. }) => {
+            app.status_msg = Some("TUN setup cancelled".into());
+        }
+        Some(PendingSudoAction::ServiceInstall { .. } | PendingSudoAction::ServiceUninstall) => {
+            app.status_msg = Some(app.tr("settings.service_cancelled").into());
+        }
+        None => {}
     }
 }
 
@@ -444,7 +474,7 @@ fn tun_start_offers_setup(capable: bool, root: bool, rule_needed: bool) -> bool 
 /// the start on success, plus the gate that fired (`reason`) so the skip key
 /// knows whether starting anyway is safe.
 fn begin_tun_setup_confirm(app: &mut App, binary: std::path::PathBuf, enable_tun: bool, reason: TunSetupReason) {
-    app.pending_tun = Some(TunPending {
+    app.pending_sudo = Some(PendingSudoAction::TunSetup {
         binary,
         resume_start: Some(enable_tun),
         reason,
@@ -472,9 +502,9 @@ fn confirm_tun_setup(app: &mut App) {
 /// - missing DNS polkit rule only (soft gate, capability present): skip
 ///   starts anyway, preserving the passive DNS-rule warning.
 fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
-    let pending = app.pending_tun.take();
+    let pending = app.pending_sudo.take();
     app.overlay = None;
-    let Some(TunPending {
+    let Some(PendingSudoAction::TunSetup {
         resume_start, reason, ..
     }) = pending
     else {
@@ -519,6 +549,94 @@ fn note_tun_setup_succeeded(app: &mut App, resume_start: Option<bool>, action_tx
     });
     if let Some(enable_tun) = resume_start {
         let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+    }
+}
+
+/// Whether the system service unit is installed (per the cached read-only
+/// probes: `is-enabled` reports `enabled` or `is-active` reports `active`).
+fn service_installed(app: &App) -> bool {
+    app.service_enabled == "enabled" || app.service_active == "active"
+}
+
+/// Begin the Settings 'System service' row action.
+///
+/// Not installed → reuse the password popup directly with a `ServiceInstall`
+/// pending action (the sudo -S transaction installs and starts the service).
+/// Installed → explicit TUI confirm overlay; `y` then opens the password
+/// popup with a `ServiceUninstall` pending action.
+fn begin_service_action(app: &mut App) {
+    if service_installed(app) {
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+        app.focus = Focus::Content;
+        app.status_msg = Some(app.tr("dialog.service_uninstall_hint").into());
+    } else {
+        app.password_prompt = Some(app.tr("settings.service_install_prompt").into());
+        app.password_buffer.clear();
+        app.pending_sudo = Some(PendingSudoAction::ServiceInstall {
+            binary_path: std::env::current_exe()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            config_dir: clash_verge_core::utils::dirs::app_home_dir()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        });
+        app.overlay = Some(Overlay::PasswordInput);
+    }
+}
+
+/// `y` on the service-uninstall confirm: open the existing password popup
+/// with a `ServiceUninstall` pending action.
+fn confirm_service_uninstall(app: &mut App) {
+    app.password_prompt = Some(app.tr("settings.service_uninstall_prompt").into());
+    app.password_buffer.clear();
+    app.pending_sudo = Some(PendingSudoAction::ServiceUninstall);
+    app.overlay = Some(Overlay::PasswordInput);
+}
+
+/// `n`/Esc/q on the service-uninstall confirm: dismiss, no transaction runs.
+fn cancel_service_uninstall(app: &mut App) {
+    app.pending_sudo = None;
+    app.overlay = None;
+    app.status_msg = Some(app.tr("settings.service_uninstall_cancelled").into());
+}
+
+/// Apply the login-autostart toggle end to end: persist `enable_auto_launch`
+/// into verge.yaml, then apply the systemd `--user` unit via `unit_apply`
+/// (the injected seam — production uses [`apply_autostart_unit`]).
+///
+/// On unit failure the persisted flag is rolled back so verge.yaml stays
+/// aligned with the real systemd state, and the error (systemctl stderr,
+/// e.g. "Failed to connect to bus" on a headless session) is surfaced.
+async fn toggle_autostart(
+    enabled: bool,
+    binary_path: &str,
+    config_dir: &str,
+    unit_apply: &(dyn Fn(bool, &str, &str) -> Result<(), String> + Send + Sync),
+) -> Result<(), String> {
+    let mut gui_config = clash_verge_core::config::IVerge::new().await;
+    let previous = gui_config.enable_auto_launch;
+    gui_config.enable_auto_launch = Some(enabled);
+    gui_config.save_file().await.map_err(|error| error.to_string())?;
+    match unit_apply(enabled, binary_path, config_dir) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Keep verge.yaml aligned with the real systemd state so the next
+            // toggle decision starts from reality.
+            gui_config.enable_auto_launch = previous;
+            let _ = gui_config.save_file().await;
+            Err(error)
+        }
+    }
+}
+
+/// Production seam for [`toggle_autostart`]: enable writes the unit +
+/// `daemon-reload` + `enable` (no `--now`); disable runs `disable` + removes
+/// the unit. systemctl errors surface verbatim.
+fn apply_autostart_unit(enabled: bool, binary_path: &str, config_dir: &str) -> Result<(), String> {
+    if enabled {
+        crate::autostart::enable(binary_path, config_dir).map_err(|error| error.to_string())
+    } else {
+        crate::autostart::disable().map_err(|error| error.to_string())
     }
 }
 
@@ -1478,6 +1596,49 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 }
                                                             });
                                                         }
+                                                        5 => {
+                                                            // System service: install (password popup, sudo -S
+                                                            // transaction with start_now=true) when not installed;
+                                                            // explicit confirm → password popup → uninstall when
+                                                            // installed. Never the CLI's sudo -A/askpass path (the
+                                                            // askpass subprocess would fight the raw-mode TUI).
+                                                            begin_service_action(&mut app);
+                                                        }
+                                                        6 => {
+                                                            // Launch at login: on/off toggle backed by the
+                                                            // systemd --user unit (enable never passes --now, so
+                                                            // the running TUI core is not shadowed by a second
+                                                            // foreground core). The toggle flips the displayed
+                                                            // systemd state; the persisted flag follows it.
+                                                            let enabled = !app.auto_launch_enabled;
+                                                            let binary_path = std::env::current_exe()
+                                                                .map(|path| path.to_string_lossy().into_owned())
+                                                                .unwrap_or_default();
+                                                            let config_dir =
+                                                                clash_verge_core::utils::dirs::app_home_dir()
+                                                                    .map(|path| path.to_string_lossy().into_owned())
+                                                                    .unwrap_or_default();
+                                                            let tx = action_tx.clone();
+                                                            tokio::spawn(async move {
+                                                                match toggle_autostart(
+                                                                    enabled,
+                                                                    &binary_path,
+                                                                    &config_dir,
+                                                                    &apply_autostart_unit,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(()) => {
+                                                                        let _ = tx.send(Action::AutoLaunchChanged {
+                                                                            enabled,
+                                                                        });
+                                                                    }
+                                                                    Err(error) => {
+                                                                        let _ = tx.send(Action::AutoLaunchFailed(error));
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
                                                         _ => {}
                                                     }
                                                 }
@@ -1521,6 +1682,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                     if app.rule_providers.is_empty() {
                                                         let _ = action_tx.send(Action::RuleProvidersRefresh);
                                                     }
+                                                }
+                                                View::Settings => {
+                                                    // Refresh the cached read-only service/autostart probes
+                                                    // on every Settings entry so the two new rows stay fresh.
+                                                    let _ = action_tx.send(Action::ServiceStatusRefresh);
                                                 }
                                                 _ => {}
                                             }
@@ -2326,7 +2492,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::TunSetupRequested(binary)) => {
                         app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
                         app.password_buffer.clear();
-                        app.pending_tun = Some(TunPending {
+                        app.pending_sudo = Some(PendingSudoAction::TunSetup {
                             binary,
                             resume_start: None,
                             reason: TunSetupReason::MissingCapability,
@@ -2344,6 +2510,61 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::PasswordSubmit) => {
                         handle_password_submit(&mut app, &action_tx);
+                    }
+                    Some(Action::ConfirmServiceUninstall) => {
+                        confirm_service_uninstall(&mut app);
+                    }
+                    Some(Action::CancelServiceUninstall) => {
+                        cancel_service_uninstall(&mut app);
+                    }
+                    Some(Action::ServiceInstalled) => {
+                        app.status_msg = Some(app.tr("settings.service_installed").into());
+                        let _ = action_tx.send(Action::ServiceStatusRefresh);
+                    }
+                    Some(Action::ServiceUninstalled) => {
+                        app.status_msg = Some(app.tr("settings.service_uninstalled").into());
+                        let _ = action_tx.send(Action::ServiceStatusRefresh);
+                    }
+                    Some(Action::ServiceActionFailed(error)) => {
+                        app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
+                        let _ = action_tx.send(Action::ServiceStatusRefresh);
+                    }
+                    Some(Action::ServiceStatusRefresh) => {
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            let active = crate::service_cmd::service_active_state();
+                            let enabled = crate::service_cmd::service_enabled_state();
+                            let auto_launch = crate::autostart::is_enabled();
+                            let _ = tx.send(Action::ServiceStatus {
+                                active,
+                                enabled,
+                                auto_launch,
+                            });
+                        });
+                    }
+                    Some(Action::ServiceStatus {
+                        active,
+                        enabled,
+                        auto_launch,
+                    }) => {
+                        app.service_active = active;
+                        app.service_enabled = enabled;
+                        app.auto_launch_enabled = auto_launch;
+                    }
+                    Some(Action::AutoLaunchChanged { enabled }) => {
+                        app.gui_config.enable_auto_launch = Some(enabled);
+                        app.auto_launch_enabled = enabled;
+                        app.status_msg = Some(if enabled {
+                            app.tr("settings.auto_launch_on_msg").into()
+                        } else {
+                            app.tr("settings.auto_launch_off_msg").into()
+                        });
+                    }
+                    Some(Action::AutoLaunchFailed(error)) => {
+                        app.status_msg = Some(format!("{}: {error}", app.tr("settings.auto_launch_failed")));
+                        // Re-sync the row with the real systemd state (the
+                        // failed unit apply means it did not change).
+                        let _ = action_tx.send(Action::ServiceStatusRefresh);
                     }
                     Some(Action::AutoUpdateFinished) => {
                         auto_update_in_flight = false;
@@ -2653,12 +2874,12 @@ mod tests {
         let mut app = App::new();
         app.overlay = Some(Overlay::PasswordInput); // stale overlay from a closed popup
         app.password_buffer = vec!['x'];
-        app.pending_tun = None;
+        app.pending_sudo = None;
 
         let (tx, _rx) = mpsc::unbounded_channel::<Action>();
         handle_password_submit(&mut app, &tx);
 
-        assert!(app.pending_tun.is_none(), "nothing may be created by a stale submit");
+        assert!(app.pending_sudo.is_none(), "nothing may be created by a stale submit");
         assert_eq!(
             app.overlay,
             Some(Overlay::PasswordInput),
@@ -2693,18 +2914,25 @@ mod tests {
         );
 
         assert_eq!(app.overlay, Some(Overlay::TunSetupConfirmation));
-        let pending = app.pending_tun.as_ref().expect("pending setup must be set");
+        let PendingSudoAction::TunSetup {
+            binary,
+            resume_start,
+            reason,
+        } = app.pending_sudo.as_ref().expect("pending setup must be set")
+        else {
+            panic!("pending action must be a TunSetup");
+        };
         assert_eq!(
-            pending.resume_start,
+            *resume_start,
             Some(true),
             "confirm must carry enable_tun for the resume"
         );
         assert_eq!(
-            pending.reason,
+            *reason,
             TunSetupReason::MissingCapability,
             "confirm must carry the gate that fired"
         );
-        assert_eq!(pending.binary, std::path::PathBuf::from("/fake/mihomo"));
+        assert_eq!(*binary, std::path::PathBuf::from("/fake/mihomo"));
         assert_eq!(
             app.status_msg.as_deref(),
             Some(app.tun_setup_confirm_hint()),
@@ -2727,9 +2955,14 @@ mod tests {
 
         assert_eq!(app.overlay, Some(Overlay::PasswordInput));
         assert!(app.password_prompt.is_some(), "prompt label must be set");
-        assert_eq!(
-            app.pending_tun.as_ref().map(|pending| pending.resume_start),
-            Some(Some(true)),
+        assert!(
+            matches!(
+                app.pending_sudo.as_ref(),
+                Some(PendingSudoAction::TunSetup {
+                    resume_start: Some(true),
+                    ..
+                })
+            ),
             "password popup must keep the pending resume"
         );
     }
@@ -2772,7 +3005,7 @@ mod tests {
         skip_tun_setup_start(&mut app, &tx);
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
-        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");
         match rx.try_recv() {
             Ok(Action::ResumeCoreStart { enable_tun }) => assert!(enable_tun),
             other => panic!("expected ResumeCoreStart, got {other:?}"),
@@ -2797,7 +3030,7 @@ mod tests {
         skip_tun_setup_start(&mut app, &tx);
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
-        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");
         assert!(
             rx.try_recv().is_err(),
             "capability-missing skip must NOT resume the start"
@@ -2850,7 +3083,7 @@ mod tests {
         // is reset — no stale flag can fire a resume later.
         let mut app = App::new();
         app.core_state = CoreState::Starting;
-        app.pending_tun = Some(TunPending {
+        app.pending_sudo = Some(PendingSudoAction::TunSetup {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: Some(true),
             reason: TunSetupReason::MissingCapability,
@@ -2860,7 +3093,7 @@ mod tests {
 
         handle_password_cancel(&mut app);
 
-        assert!(app.pending_tun.is_none());
+        assert!(app.pending_sudo.is_none());
         assert_eq!(app.overlay, None);
         assert!(app.password_buffer.is_empty());
         assert_eq!(
@@ -2877,7 +3110,7 @@ mod tests {
         // the popup with the plain message and no state reset.
         let mut app = App::new();
         app.core_state = CoreState::Stopped;
-        app.pending_tun = Some(TunPending {
+        app.pending_sudo = Some(PendingSudoAction::TunSetup {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: None,
             reason: TunSetupReason::MissingCapability,
@@ -2886,9 +3119,188 @@ mod tests {
 
         handle_password_cancel(&mut app);
 
-        assert!(app.pending_tun.is_none());
+        assert!(app.pending_sudo.is_none());
         assert_eq!(app.overlay, None);
         assert_eq!(app.status_msg.as_deref(), Some("TUN setup cancelled"));
+    }
+
+    #[test]
+    fn service_row_not_installed_opens_password_popup_with_install_pending() {
+        // Enter on 'System service' when the probes report no service: the
+        // existing password popup opens with a ServiceInstall pending action
+        // (no separate confirm — installing is the only next step).
+        let mut app = App::new();
+        app.service_active = "inactive".into();
+        app.service_enabled = "disabled".into();
+        assert!(!service_installed(&app));
+
+        begin_service_action(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::PasswordInput));
+        assert!(app.password_prompt.is_some(), "install prompt label must be set");
+        match &app.pending_sudo {
+            Some(PendingSudoAction::ServiceInstall {
+                binary_path,
+                config_dir,
+            }) => {
+                assert!(!binary_path.is_empty(), "ExecStart binary must be carried");
+                assert!(!config_dir.is_empty(), "--config-dir must be carried");
+            }
+            other => panic!("expected ServiceInstall pending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_row_installed_opens_the_uninstall_confirm() {
+        // Enter on 'System service' when a unit is installed (enabled or
+        // active): an explicit confirm overlay opens; the password popup
+        // must NOT open until `y`.
+        let mut app = App::new();
+        app.service_active = "active".into();
+        app.service_enabled = "enabled".into();
+        assert!(service_installed(&app));
+
+        begin_service_action(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::ServiceUninstallConfirmation));
+        assert!(app.pending_sudo.is_none(), "no password flow before confirm");
+    }
+
+    #[test]
+    fn service_row_installed_by_enabled_alone_also_confirms() {
+        // Installed-but-stopped (enabled, inactive) still routes to the
+        // uninstall confirm, not the install popup.
+        let mut app = App::new();
+        app.service_active = "inactive".into();
+        app.service_enabled = "enabled".into();
+        assert!(service_installed(&app));
+
+        begin_service_action(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::ServiceUninstallConfirmation));
+    }
+
+    #[test]
+    fn confirm_service_uninstall_opens_password_popup_with_uninstall_pending() {
+        // `y` on the confirm reuses the existing password popup; the pending
+        // action switches to ServiceUninstall so the submit runs the
+        // uninstall transaction.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+
+        confirm_service_uninstall(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::PasswordInput));
+        assert_eq!(app.pending_sudo, Some(PendingSudoAction::ServiceUninstall));
+        assert!(app.password_prompt.is_some(), "uninstall prompt label must be set");
+    }
+
+    #[test]
+    fn cancel_service_uninstall_closes_the_confirm_overlay() {
+        // `n`/Esc/q on the confirm: overlay closes, no transaction runs.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+
+        cancel_service_uninstall(&mut app);
+
+        assert_eq!(app.overlay, None);
+        assert!(app.pending_sudo.is_none());
+        assert!(app.status_msg.is_some(), "cancel must report in the status bar");
+    }
+
+    #[test]
+    fn service_password_cancel_reports_a_service_cancel() {
+        // Esc inside the password popup for a service action: the message
+        // names the service, not TUN.
+        let mut app = App::new();
+        app.pending_sudo = Some(PendingSudoAction::ServiceUninstall);
+        app.overlay = Some(Overlay::PasswordInput);
+        app.password_buffer = vec!['x'];
+
+        handle_password_cancel(&mut app);
+
+        assert!(app.pending_sudo.is_none());
+        assert_eq!(app.overlay, None);
+        assert!(app.password_buffer.is_empty());
+        let message = app.status_msg.as_deref().expect("status message set");
+        assert!(
+            message.contains("cancel"),
+            "service cancel message must mention cancel: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autostart_toggle_success_persists_flag_and_applies_unit() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+
+        let root = test_app_home_root();
+        let _dir_guard = claim_test_app_home(root.clone()).await;
+
+        let calls = std::sync::Mutex::new(Vec::new());
+        let result = toggle_autostart(
+            true,
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            &|enabled, binary, config| {
+                calls
+                    .lock()
+                    .expect("lock calls")
+                    .push((enabled, binary.to_string(), config.to_string()));
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "successful unit apply must succeed");
+        let recorded = calls.into_inner().expect("unlock calls");
+        assert_eq!(
+            recorded,
+            vec![(
+                true,
+                "/usr/bin/clash-verge-cli".to_string(),
+                "/home/u/.config/clash-verge-cli".to_string()
+            )],
+            "the unit seam must receive the exact toggle and paths"
+        );
+        let persisted = clash_verge_core::config::IVerge::new().await;
+        assert_eq!(persisted.enable_auto_launch, Some(true), "flag must persist");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn autostart_toggle_failure_surfaces_error_and_rolls_back_flag() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+
+        let root = test_app_home_root();
+        let _dir_guard = claim_test_app_home(root.clone()).await;
+
+        // Seed a prior state so the rollback is observable.
+        let mut seeded = clash_verge_core::config::IVerge::new().await;
+        seeded.enable_auto_launch = Some(true);
+        seeded.save_file().await.expect("seed verge.yaml");
+
+        let result = toggle_autostart(
+            false,
+            "/usr/bin/clash-verge-cli",
+            "/home/u/.config/clash-verge-cli",
+            &|_enabled, _binary, _config| Err("Failed to connect to bus: No such file or directory".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err("Failed to connect to bus: No such file or directory".to_string()),
+            "systemctl failure must surface verbatim (headless/no-session)"
+        );
+        let persisted = clash_verge_core::config::IVerge::new().await;
+        assert_eq!(
+            persisted.enable_auto_launch,
+            Some(true),
+            "failed unit apply must roll back the persisted flag"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

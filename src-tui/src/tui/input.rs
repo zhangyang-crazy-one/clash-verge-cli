@@ -79,6 +79,15 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             | (Overlay::TunSetupConfirmation, KeyCode::Char('N'))
             | (Overlay::TunSetupConfirmation, KeyCode::Esc)
             | (Overlay::TunSetupConfirmation, KeyCode::Char('q')) => Some(Action::SkipTunSetupStart),
+            // Service uninstall confirm is an explicit opt-in: `y` opens the
+            // existing password popup (uninstall runs after the sudo -S
+            // submit); `n`/Esc/`q` cancel without a transaction.
+            (Overlay::ServiceUninstallConfirmation, KeyCode::Char('y'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('Y')) => Some(Action::ConfirmServiceUninstall),
+            (Overlay::ServiceUninstallConfirmation, KeyCode::Char('n'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('N'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Esc)
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('q')) => Some(Action::CancelServiceUninstall),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -380,6 +389,15 @@ mod tests {
         }
     }
 
+    fn service_uninstall_context() -> KeyContext<'static> {
+        KeyContext {
+            view: View::Settings,
+            focus: Focus::Content,
+            overlay: Some(Overlay::ServiceUninstallConfirmation),
+            pending_connection_close: None,
+        }
+    }
+
     #[test]
     fn tun_setup_confirm_y_opens_setup_and_n_escalates() {
         // `y` opens the password popup (setup then resumes the start); `n`,
@@ -419,6 +437,47 @@ mod tests {
             assert!(
                 map_key(event(code), tun_setup_confirm_context()).is_none(),
                 "key {code:?} must not confirm or skip the setup"
+            );
+        }
+    }
+
+    #[test]
+    fn service_uninstall_confirm_y_opens_password_and_n_escalates() {
+        // `y` opens the password popup (uninstall pending); `n`, `N`, Esc,
+        // and `q` all cancel — no key may fall through to the generic
+        // dismiss that would strand a stale pending action.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('y')), service_uninstall_context()),
+            Some(Action::ConfirmServiceUninstall)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('Y')), service_uninstall_context()),
+            Some(Action::ConfirmServiceUninstall)
+        ));
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(
+                matches!(
+                    map_key(event(code), service_uninstall_context()),
+                    Some(Action::CancelServiceUninstall)
+                ),
+                "key {code:?} must cancel the uninstall"
+            );
+        }
+    }
+
+    #[test]
+    fn service_uninstall_confirm_does_not_swallow_other_keys_as_confirmation() {
+        // No other key may confirm the uninstall: accidental keystrokes must
+        // not open the password popup.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                map_key(event(code), service_uninstall_context()).is_none(),
+                "key {code:?} must not confirm the uninstall"
             );
         }
     }

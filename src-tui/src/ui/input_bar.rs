@@ -58,6 +58,22 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 frame.render_widget(Paragraph::new(line), area);
                 return;
             }
+            // The service-uninstall confirm mirrors the tun confirm: dialog
+            // renders the warning, the input bar hints at the choice keys.
+            Overlay::ServiceUninstallConfirmation => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{} ", app.tr("dialog.service_uninstall")),
+                        Style::new().fg(theme::danger()),
+                    ),
+                    Span::styled(
+                        app.tr("dialog.service_uninstall_confirm"),
+                        Style::new().fg(theme::dim()),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+                return;
+            }
             // The canonical password dialog (rounded, localized) renders the
             // prompt and masked buffer; the input bar only hints at the keys.
             Overlay::PasswordInput => {
