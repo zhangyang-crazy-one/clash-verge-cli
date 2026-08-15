@@ -2725,7 +2725,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         // fallible re-read so a config that fails to parse cannot swap in
                         // the template's default port behind a running core.
                         let core_listening = std::os::unix::net::UnixStream::connect(
-                            clash_verge_core::utils::dirs::standalone_socket_path(),
+                            manager.socket_path().clone(),
                         )
                         .is_ok();
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
