@@ -2096,6 +2096,38 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
+                        // Re-assert the system proxy once the controller actually answers:
+                        // the GNOME setting is global and can be clobbered by other tools
+                        // (e.g. the GUI's sysproxy guard restoring state on exit), leaving
+                        // verge.yaml enabled while the OS mode is 'none'. CoreStarted fires
+                        // right after spawn() — before the API/listeners are up — so a
+                        // readiness probe arms Action::SysProxyReassert and the event loop
+                        // itself performs the final toggle/port re-read and the apply. That
+                        // keeps the apply serialized with the user's toggle actions (a
+                        // deferred task can never re-enable a proxy they just turned off),
+                        // never points the OS at a dead port, and never downgrades PAC.
+                        if app.gui_config.enable_system_proxy.unwrap_or(false)
+                            && !app.gui_config.proxy_auto_config.unwrap_or(false)
+                        {
+                            let api = manager.api();
+                            let tx = action_tx.clone();
+                            let probe_manager = manager.clone();
+                            tokio::spawn(async move {
+                                // Attached cores (no managed pid) are probed once: their
+                                // CoreStarted already implies an answered controller.
+                                // Spawned cores are probed for as long as they live.
+                                loop {
+                                    if api.version().await.is_ok() {
+                                        let _ = tx.send(Action::SysProxyReassert);
+                                        break;
+                                    }
+                                    if probe_manager.pid().is_none() {
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                }
+                            });
+                        }
                         // Keep the Settings capability state in sync with the
                         // binary that actually got spawned (may have changed
                         // after an upgrade or a fresh setup).
@@ -2683,6 +2715,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
                         let _ = action_tx.send(Action::ServiceStatusRefresh);
                     }
+                    Some(Action::SysProxyReassert)
+                        // Final decision on the event loop against LIVE state: a toggle
+                        // processed before this action can never be clobbered by a deferred
+                        // task, and the mixed port is re-read so external config edits
+                        // between core starts are honored.
+                        if app.gui_config.enable_system_proxy.unwrap_or(false)
+                            && !app.gui_config.proxy_auto_config.unwrap_or(false)
+                        => {
+                            let host = app
+                                .gui_config
+                                .proxy_host
+                                .clone()
+                                .unwrap_or_else(|| "127.0.0.1".into());
+                            let port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
+                            if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
+                                app.status_msg =
+                                    Some(format!("system proxy re-apply failed: {error}"));
+                            }
+                        }
                     Some(Action::ServiceStatusRefresh) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {

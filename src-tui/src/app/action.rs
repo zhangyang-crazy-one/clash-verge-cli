@@ -222,6 +222,11 @@ pub enum Action {
     /// A service install/uninstall transaction failed (`sudo`/`systemctl`
     /// stderr is the payload).
     ServiceActionFailed(String),
+    /// The core's controller answered after CoreStarted; the event loop
+    /// should now re-read the live toggle/port and re-assert the GNOME/KDE
+    /// system proxy. The apply happens on the loop (never in the detached
+    /// probe task) so it stays serialized with the user's proxy toggle.
+    SysProxyReassert,
     /// The login-autostart toggle succeeded; `enabled` is the new state.
     AutoLaunchChanged {
         enabled: bool,
