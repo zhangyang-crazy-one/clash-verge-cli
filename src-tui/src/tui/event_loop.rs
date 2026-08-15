@@ -32,7 +32,9 @@ fn key_context(app: &App) -> input::KeyContext<'_> {
 /// `input::map_key` has its handler in the channel match; missing an entry
 /// here silently drops the key (the PR #13 service-uninstall dialog could
 /// never be dismissed because Confirm/CancelServiceUninstall fell through to
-/// the key path's discard arm).
+/// the key path's discard arm). `DismissOverlay` is deliberately NOT listed:
+/// it has an inline handler in the key-path match, and the channel match has
+/// no arm for it.
 fn forward_to_channel(action: &Action) -> bool {
     matches!(
         action,
@@ -46,7 +48,6 @@ fn forward_to_channel(action: &Action) -> bool {
             | Action::SkipTunSetupStart
             | Action::ConfirmServiceUninstall
             | Action::CancelServiceUninstall
-            | Action::DismissOverlay
     )
 }
 
@@ -3421,13 +3422,14 @@ mod tests {
             Action::CancelTrustImport,
             Action::PasswordSubmit,
             Action::PasswordCancel,
-            Action::DismissOverlay,
         ] {
             assert!(forward_to_channel(&action), "{action:?} must be forwarded");
         }
         // Inline-handled key actions must not be forwarded.
         assert!(!forward_to_channel(&Action::Quit));
         assert!(!forward_to_channel(&Action::StartCore));
+        // DismissOverlay stays inline: the channel match has no arm for it.
+        assert!(!forward_to_channel(&Action::DismissOverlay));
     }
 
     #[test]
