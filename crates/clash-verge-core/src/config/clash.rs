@@ -22,34 +22,30 @@ pub struct IClashTemp(pub Mapping);
 
 impl IClashTemp {
     pub async fn new() -> Self {
-        let clash_path_result = dirs::clash_path();
-        let map_result = if let Ok(path) = clash_path_result {
-            help::read_mapping(&path).await
-        } else {
-            Err(anyhow::anyhow!("Failed to get clash path"))
-        };
+        Self::try_read().await.unwrap_or_else(|_| Self::template())
+    }
 
-        match map_result {
-            Ok(mut map) => {
-                let template_map = Self::template().0;
-                for (key, value) in template_map.into_iter() {
-                    if !map.contains_key(&key) {
-                        map.insert(key, value);
-                    }
-                }
-
-                // Ensure secret field is present and not empty
-                if let Some(val) = map.get_mut("secret")
-                    && let Value::String(s) = val
-                    && s.is_empty()
-                {
-                    *s = "set-your-secret".into();
-                }
-
-                Self(Self::guard(map))
+    /// Fallible read: unlike [`Self::new`], a missing/unreadable/malformed
+    /// config file is an error instead of silently returning the template
+    /// (whose default ports may not match the running core).
+    pub async fn try_read() -> anyhow::Result<Self> {
+        let path = dirs::clash_path()?;
+        let mut map = help::read_mapping(&path).await?;
+        let template_map = Self::template().0;
+        for (key, value) in template_map.into_iter() {
+            if !map.contains_key(&key) {
+                map.insert(key, value);
             }
-            Err(_) => Self::template(),
         }
+
+        // Ensure secret field is present and not empty
+        if let Some(val) = map.get_mut("secret")
+            && let Value::String(s) = val
+            && s.is_empty()
+        {
+            *s = "set-your-secret".into();
+        }
+        Ok(Self(Self::guard(map)))
     }
 
     pub fn template() -> Self {

@@ -2718,8 +2718,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::SysProxyReassert)
                         // Final decision on the event loop against LIVE state: a toggle
                         // processed before this action can never be clobbered by a deferred
-                        // task, and the mixed port is re-read so external config edits
-                        // between core starts are honored.
+                        // task. The port is re-read fallibly — a config that fails to parse
+                        // must not substitute the template's default port, and the startup
+                        // snapshot may be equally stale, so the apply is skipped rather than
+                        // guessed. The sync socket check runs immediately before the apply
+                        // with no awaits in between, so a queued CoreStopped cannot
+                        // interleave and reopen the dead-port race.
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
                             && !app.gui_config.proxy_auto_config.unwrap_or(false)
                         => {
@@ -2728,10 +2732,28 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                 .proxy_host
                                 .clone()
                                 .unwrap_or_else(|| "127.0.0.1".into());
-                            let port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
-                            if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
-                                app.status_msg =
-                                    Some(format!("system proxy re-apply failed: {error}"));
+                            match clash_verge_core::config::IClashTemp::try_read().await {
+                                Ok(config) => {
+                                    let core_listening = std::os::unix::net::UnixStream::connect(
+                                        manager.socket_path().clone(),
+                                    )
+                                    .is_ok();
+                                    if core_listening
+                                        && let Err(error) = crate::sys_proxy::set_system_proxy(
+                                            &host,
+                                            config.get_mixed_port(),
+                                        )
+                                    {
+                                        app.status_msg = Some(format!(
+                                            "system proxy re-apply failed: {error}"
+                                        ));
+                                    }
+                                }
+                                Err(_) => {
+                                    app.status_msg = Some(
+                                        "system proxy re-apply skipped: clash config unreadable".into(),
+                                    );
+                                }
                             }
                         }
                     Some(Action::ServiceStatusRefresh) => {
