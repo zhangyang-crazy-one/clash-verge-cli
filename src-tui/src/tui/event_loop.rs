@@ -1037,17 +1037,6 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
     }
 
-    // Re-assert the system proxy on startup: the GNOME setting is global and
-    // can be clobbered by other tools (e.g. the GUI's sysproxy guard restoring
-    // state on exit), leaving verge.yaml enabled while the OS mode is 'none'.
-    if app.gui_config.enable_system_proxy.unwrap_or(false) {
-        let host = app.gui_config.proxy_host.clone().unwrap_or_else(|| "127.0.0.1".into());
-        let port = app.core_config.get_mixed_port();
-        if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
-            app.status_msg = Some(format!("system proxy re-apply failed: {error}"));
-        }
-    }
-
     let mut events = EventStream::new();
     let mut render_tick = time::interval(Duration::from_millis(100));
     let mut runtime_refresh_tick = time::interval(Duration::from_secs(1));
@@ -2107,6 +2096,26 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
+                        // Re-assert the system proxy now that a live core is confirmed:
+                        // the GNOME setting is global and can be clobbered by other tools
+                        // (e.g. the GUI's sysproxy guard restoring state on exit), leaving
+                        // verge.yaml enabled while the OS mode is 'none'. Only re-apply
+                        // against a live core (never point the OS at a dead port) and
+                        // never downgrade a configured PAC setup to manual mode.
+                        if app.gui_config.enable_system_proxy.unwrap_or(false)
+                            && !app.gui_config.proxy_auto_config.unwrap_or(false)
+                        {
+                            let host = app
+                                .gui_config
+                                .proxy_host
+                                .clone()
+                                .unwrap_or_else(|| "127.0.0.1".into());
+                            let port = app.core_config.get_mixed_port();
+                            if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
+                                app.status_msg =
+                                    Some(format!("system proxy re-apply failed: {error}"));
+                            }
+                        }
                         // Keep the Settings capability state in sync with the
                         // binary that actually got spawned (may have changed
                         // after an upgrade or a fresh setup).
