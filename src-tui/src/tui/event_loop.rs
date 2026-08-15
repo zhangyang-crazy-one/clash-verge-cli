@@ -2100,56 +2100,31 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         // the GNOME setting is global and can be clobbered by other tools
                         // (e.g. the GUI's sysproxy guard restoring state on exit), leaving
                         // verge.yaml enabled while the OS mode is 'none'. CoreStarted fires
-                        // right after spawn() — before the API/listeners are up — so the
-                        // apply must wait for a readiness probe; otherwise a failed launch
-                        // would point the OS at a dead port. PAC setups are never downgraded
-                        // to manual mode. Failures surface via SysProxyApplyFailed so the
-                        // core-started status message cannot overwrite them.
+                        // right after spawn() — before the API/listeners are up — so a
+                        // readiness probe arms Action::SysProxyReassert and the event loop
+                        // itself performs the final toggle/port re-read and the apply. That
+                        // keeps the apply serialized with the user's toggle actions (a
+                        // deferred task can never re-enable a proxy they just turned off),
+                        // never points the OS at a dead port, and never downgrades PAC.
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
                             && !app.gui_config.proxy_auto_config.unwrap_or(false)
                         {
-                            let host = app
-                                .gui_config
-                                .proxy_host
-                                .clone()
-                                .unwrap_or_else(|| "127.0.0.1".into());
-                            let port = app.core_config.get_mixed_port();
                             let api = manager.api();
                             let tx = action_tx.clone();
                             let probe_manager = manager.clone();
-                                tokio::spawn(async move {
-                                // Wait for the controller for as long as THIS core lives: a
-                                // fixed attempt cap would silently drop the apply whenever
-                                // initialization outlasts it (large configs), leaving the
-                                // persisted setting enabled while the OS proxy stays off.
-                                // Attached cores (no managed pid — started by an earlier CLI
-                                // run) are probed once: their CoreStarted only fires after the
-                                // controller already answered, so a miss here means it just
-                                // died and there is nothing to wait for.
-                                let mut ready = false;
+                            tokio::spawn(async move {
+                                // Attached cores (no managed pid) are probed once: their
+                                // CoreStarted already implies an answered controller.
+                                // Spawned cores are probed for as long as they live.
                                 loop {
                                     if api.version().await.is_ok() {
-                                        ready = true;
+                                        let _ = tx.send(Action::SysProxyReassert);
                                         break;
                                     }
                                     if probe_manager.pid().is_none() {
                                         break;
                                     }
                                     tokio::time::sleep(Duration::from_millis(500)).await;
-                                }
-                                if ready {
-                                    // Re-read the persisted toggle before applying: the user may
-                                    // have disabled the system proxy while this probe was running,
-                                    // and the captured snapshot must not re-enable it behind their
-                                    // back (Codex P1 on PR #17).
-                                    let current = clash_verge_core::config::IVerge::new().await;
-                                    let still_enabled = current.enable_system_proxy.unwrap_or(false)
-                                        && !current.proxy_auto_config.unwrap_or(false);
-                                    if still_enabled
-                                        && let Err(error) = crate::sys_proxy::set_system_proxy(&host, port)
-                                    {
-                                        let _ = tx.send(Action::SysProxyApplyFailed(error.to_string()));
-                                    }
                                 }
                             });
                         }
@@ -2740,11 +2715,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
                         let _ = action_tx.send(Action::ServiceStatusRefresh);
                     }
-                    Some(Action::SysProxyApplyFailed(error)) => {
-                        // Runs after the core-started status line, so the
-                        // failure is never overwritten by it.
-                        app.status_msg = Some(format!("system proxy re-apply failed: {error}"));
-                    }
+                    Some(Action::SysProxyReassert)
+                        // Final decision on the event loop against LIVE state: a toggle
+                        // processed before this action can never be clobbered by a deferred
+                        // task, and the mixed port is re-read so external config edits
+                        // between core starts are honored.
+                        if app.gui_config.enable_system_proxy.unwrap_or(false)
+                            && !app.gui_config.proxy_auto_config.unwrap_or(false)
+                        => {
+                            let host = app
+                                .gui_config
+                                .proxy_host
+                                .clone()
+                                .unwrap_or_else(|| "127.0.0.1".into());
+                            let port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
+                            if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
+                                app.status_msg =
+                                    Some(format!("system proxy re-apply failed: {error}"));
+                            }
+                        }
                     Some(Action::ServiceStatusRefresh) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
