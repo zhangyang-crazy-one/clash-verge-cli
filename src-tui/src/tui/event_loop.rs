@@ -2718,17 +2718,23 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::SysProxyReassert)
                         // Final decision on the event loop against LIVE state: a toggle
                         // processed before this action can never be clobbered by a deferred
-                        // task, and the mixed port is re-read so external config edits
-                        // between core starts are honored.
+                        // task. Liveness is revalidated (the core may have exited between
+                        // the probe and this queued action), and the mixed port comes from
+                        // a fallible re-read — a config that fails to parse must not swap
+                        // in the template's default port behind a running core.
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
                             && !app.gui_config.proxy_auto_config.unwrap_or(false)
+                            && manager.api().version().await.is_ok()
                         => {
                             let host = app
                                 .gui_config
                                 .proxy_host
                                 .clone()
                                 .unwrap_or_else(|| "127.0.0.1".into());
-                            let port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
+                            let port = match clash_verge_core::config::IClashTemp::try_read().await {
+                                Ok(config) => config.get_mixed_port(),
+                                Err(_) => app.core_config.get_mixed_port(),
+                            };
                             if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
                                 app.status_msg =
                                     Some(format!("system proxy re-apply failed: {error}"));
