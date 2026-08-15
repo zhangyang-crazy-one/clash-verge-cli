@@ -222,6 +222,10 @@ pub enum Action {
     /// A service install/uninstall transaction failed (`sudo`/`systemctl`
     /// stderr is the payload).
     ServiceActionFailed(String),
+    /// Re-asserting the GNOME/KDE system proxy after a live core was
+    /// confirmed failed (no working backend / command error). Routed through
+    /// its own action so the failure survives the core-started status line.
+    SysProxyApplyFailed(String),
     /// The login-autostart toggle succeeded; `enabled` is the new state.
     AutoLaunchChanged {
         enabled: bool,

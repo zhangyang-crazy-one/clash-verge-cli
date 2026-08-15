@@ -2096,12 +2096,15 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }) => {
                         app.core_state = CoreState::Running;
                         app.core_pid = manager.pid();
-                        // Re-assert the system proxy now that a live core is confirmed:
+                        // Re-assert the system proxy once the controller actually answers:
                         // the GNOME setting is global and can be clobbered by other tools
                         // (e.g. the GUI's sysproxy guard restoring state on exit), leaving
-                        // verge.yaml enabled while the OS mode is 'none'. Only re-apply
-                        // against a live core (never point the OS at a dead port) and
-                        // never downgrade a configured PAC setup to manual mode.
+                        // verge.yaml enabled while the OS mode is 'none'. CoreStarted fires
+                        // right after spawn() — before the API/listeners are up — so the
+                        // apply must wait for a readiness probe; otherwise a failed launch
+                        // would point the OS at a dead port. PAC setups are never downgraded
+                        // to manual mode. Failures surface via SysProxyApplyFailed so the
+                        // core-started status message cannot overwrite them.
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
                             && !app.gui_config.proxy_auto_config.unwrap_or(false)
                         {
@@ -2111,10 +2114,23 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                 .clone()
                                 .unwrap_or_else(|| "127.0.0.1".into());
                             let port = app.core_config.get_mixed_port();
-                            if let Err(error) = crate::sys_proxy::set_system_proxy(&host, port) {
-                                app.status_msg =
-                                    Some(format!("system proxy re-apply failed: {error}"));
-                            }
+                            let api = manager.api();
+                            let tx = action_tx.clone();
+                            tokio::spawn(async move {
+                                let mut ready = false;
+                                for _ in 0..50 {
+                                    if api.version().await.is_ok() {
+                                        ready = true;
+                                        break;
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                }
+                                if ready
+                                    && let Err(error) = crate::sys_proxy::set_system_proxy(&host, port)
+                                {
+                                    let _ = tx.send(Action::SysProxyApplyFailed(error.to_string()));
+                                }
+                            });
                         }
                         // Keep the Settings capability state in sync with the
                         // binary that actually got spawned (may have changed
@@ -2702,6 +2718,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::ServiceActionFailed(error)) => {
                         app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
                         let _ = action_tx.send(Action::ServiceStatusRefresh);
+                    }
+                    Some(Action::SysProxyApplyFailed(error)) => {
+                        // Runs after the core-started status line, so the
+                        // failure is never overwritten by it.
+                        app.status_msg = Some(format!("system proxy re-apply failed: {error}"));
                     }
                     Some(Action::ServiceStatusRefresh) => {
                         let tx = action_tx.clone();
