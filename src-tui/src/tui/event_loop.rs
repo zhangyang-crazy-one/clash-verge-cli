@@ -2116,14 +2116,20 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                             let port = app.core_config.get_mixed_port();
                             let api = manager.api();
                             let tx = action_tx.clone();
+                            let probe_manager = manager.clone();
                             tokio::spawn(async move {
+                                // Wait for the controller for as long as THIS core lives: a
+                                // fixed attempt cap would silently drop the apply whenever
+                                // initialization outlasts it (large configs), leaving the
+                                // persisted setting enabled while the OS proxy stays off.
+                                // Core exit/restart ends the probe via the pid going None.
                                 let mut ready = false;
-                                for _ in 0..50 {
+                                while probe_manager.pid().is_some() {
                                     if api.version().await.is_ok() {
                                         ready = true;
                                         break;
                                     }
-                                    tokio::time::sleep(Duration::from_millis(200)).await;
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
                                 }
                                 if ready {
                                     // Re-read the persisted toggle before applying: the user may
