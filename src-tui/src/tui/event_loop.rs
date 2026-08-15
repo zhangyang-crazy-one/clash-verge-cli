@@ -27,6 +27,30 @@ fn key_context(app: &App) -> input::KeyContext<'_> {
     }
 }
 
+/// Key-path actions that must be forwarded to the action channel instead of
+/// being handled inline. Every overlay-confirm/cancel action produced by
+/// `input::map_key` has its handler in the channel match; missing an entry
+/// here silently drops the key (the PR #13 service-uninstall dialog could
+/// never be dismissed because Confirm/CancelServiceUninstall fell through to
+/// the key path's discard arm). `DismissOverlay` is deliberately NOT listed:
+/// it has an inline handler in the key-path match, and the channel match has
+/// no arm for it.
+fn forward_to_channel(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::PasswordChar(_)
+            | Action::PasswordBackspace
+            | Action::PasswordSubmit
+            | Action::PasswordCancel
+            | Action::ConfirmTrustImport
+            | Action::CancelTrustImport
+            | Action::ConfirmTunSetup
+            | Action::SkipTunSetupStart
+            | Action::ConfirmServiceUninstall
+            | Action::CancelServiceUninstall
+    )
+}
+
 fn dismiss_overlay(app: &mut App) {
     app.overlay = None;
     app.filter = None;
@@ -1135,14 +1159,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     match action {
                                         // Password popup input is handled uniformly in the action
                                         // channel match (buffer updates, submit, cancel).
-                                        Action::PasswordChar(_)
-                                        | Action::PasswordBackspace
-                                        | Action::PasswordSubmit
-                                        | Action::PasswordCancel
-                                        | Action::ConfirmTrustImport
-                                        | Action::CancelTrustImport
-                                        | Action::ConfirmTunSetup
-                                        | Action::SkipTunSetupStart => {
+                                        action if forward_to_channel(&action) => {
                                             let _ = action_tx.send(action);
                                         }
                                         Action::Quit => break,
@@ -3387,6 +3404,32 @@ mod tests {
         assert_eq!(app.overlay, Some(Overlay::PasswordInput));
         assert_eq!(app.pending_sudo, Some(PendingSudoAction::ServiceUninstall));
         assert!(app.password_prompt.is_some(), "uninstall prompt label must be set");
+    }
+
+    #[test]
+    fn every_overlay_dismiss_action_is_forwarded_to_the_channel() {
+        // Regression for the stuck service-uninstall dialog: the key path
+        // used to discard Confirm/CancelServiceUninstall via its `_ => {}`
+        // arm, so no key could ever close the overlay. Every overlay-
+        // confirm/cancel action that input::map_key can produce must be
+        // forwarded to the action channel where its handler lives.
+        for action in [
+            Action::ConfirmServiceUninstall,
+            Action::CancelServiceUninstall,
+            Action::ConfirmTunSetup,
+            Action::SkipTunSetupStart,
+            Action::ConfirmTrustImport,
+            Action::CancelTrustImport,
+            Action::PasswordSubmit,
+            Action::PasswordCancel,
+        ] {
+            assert!(forward_to_channel(&action), "{action:?} must be forwarded");
+        }
+        // Inline-handled key actions must not be forwarded.
+        assert!(!forward_to_channel(&Action::Quit));
+        assert!(!forward_to_channel(&Action::StartCore));
+        // DismissOverlay stays inline: the channel match has no arm for it.
+        assert!(!forward_to_channel(&Action::DismissOverlay));
     }
 
     #[test]
