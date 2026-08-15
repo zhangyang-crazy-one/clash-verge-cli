@@ -2715,17 +2715,23 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
                         let _ = action_tx.send(Action::ServiceStatusRefresh);
                     }
-                    Some(Action::SysProxyReassert)
+                    Some(Action::SysProxyReassert) => {
                         // Final decision on the event loop against LIVE state: a toggle
                         // processed before this action can never be clobbered by a deferred
                         // task. Liveness is revalidated (the core may have exited between
-                        // the probe and this queued action), and the mixed port comes from
-                        // a fallible re-read — a config that fails to parse must not swap
-                        // in the template's default port behind a running core.
+                        // the probe and this queued action) via a sync unix-socket connect
+                        // — an async API probe here would stall the whole loop when the
+                        // controller accepts but never answers. The mixed port comes from a
+                        // fallible re-read so a config that fails to parse cannot swap in
+                        // the template's default port behind a running core.
+                        let core_listening = std::os::unix::net::UnixStream::connect(
+                            clash_verge_core::utils::dirs::standalone_socket_path(),
+                        )
+                        .is_ok();
                         if app.gui_config.enable_system_proxy.unwrap_or(false)
                             && !app.gui_config.proxy_auto_config.unwrap_or(false)
-                            && manager.api().version().await.is_ok()
-                        => {
+                            && core_listening
+                        {
                             let host = app
                                 .gui_config
                                 .proxy_host
@@ -2740,6 +2746,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     Some(format!("system proxy re-apply failed: {error}"));
                             }
                         }
+                    }
                     Some(Action::ServiceStatusRefresh) => {
                         let tx = action_tx.clone();
                         tokio::spawn(async move {
