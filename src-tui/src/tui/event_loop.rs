@@ -2125,10 +2125,19 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     }
                                     tokio::time::sleep(Duration::from_millis(200)).await;
                                 }
-                                if ready
-                                    && let Err(error) = crate::sys_proxy::set_system_proxy(&host, port)
-                                {
-                                    let _ = tx.send(Action::SysProxyApplyFailed(error.to_string()));
+                                if ready {
+                                    // Re-read the persisted toggle before applying: the user may
+                                    // have disabled the system proxy while this probe was running,
+                                    // and the captured snapshot must not re-enable it behind their
+                                    // back (Codex P1 on PR #17).
+                                    let current = clash_verge_core::config::IVerge::new().await;
+                                    let still_enabled = current.enable_system_proxy.unwrap_or(false)
+                                        && !current.proxy_auto_config.unwrap_or(false);
+                                    if still_enabled
+                                        && let Err(error) = crate::sys_proxy::set_system_proxy(&host, port)
+                                    {
+                                        let _ = tx.send(Action::SysProxyApplyFailed(error.to_string()));
+                                    }
                                 }
                             });
                         }
