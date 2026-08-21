@@ -146,9 +146,7 @@ pub struct ResolvedSingBox {
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedSingBox> {
     let target_version = latest_singbox_version().await;
     if let Some(system) = system_singbox() {
-        let version = read_singbox_version(&system)
-            .await?
-            .unwrap_or_else(|| "unknown".into());
+        let version = read_singbox_version(&system).await?.unwrap_or_else(|| "unknown".into());
         return Ok(ResolvedSingBox {
             path: system,
             source: SingboxBinarySource::System,
@@ -242,7 +240,10 @@ async fn download_managed_singbox(dest: &Path, version: &str) -> anyhow::Result<
         .error_for_status()
         .with_context(|| format!("sing-box download returned error for {url}"))?;
 
-    let compressed = response.bytes().await.context("failed to read sing-box download body")?;
+    let compressed = response
+        .bytes()
+        .await
+        .context("failed to read sing-box download body")?;
 
     let guard = DOWNLOAD_LOCK.lock().await;
     let result = extract_tar_gz_binary(&compressed, dest).await;
@@ -264,9 +265,7 @@ async fn extract_tar_gz_binary(compressed: &[u8], dest: &Path) -> anyhow::Result
 
     let mut payload: Option<Vec<u8>> = None;
     {
-        let mut entries = archive
-            .entries()
-            .context("failed to read sing-box tarball entries")?;
+        let mut entries = archive.entries().context("failed to read sing-box tarball entries")?;
         for entry in entries.by_ref() {
             let mut entry = entry.context("failed to read tar entry")?;
             if entry.header().entry_type() != tar::EntryType::Regular {
@@ -322,7 +321,10 @@ mod tests {
     fn extracts_version_from_singbox_output() {
         let output = "Version: 1.13.12\nEnvironment: linux, amd64\nTags: with_gvisor,with_quic\n";
         assert_eq!(extract_version_token(output), Some("1.13.12".into()));
-        assert!(extract_version_token("no version here").is_none(), "should parse nothing but must not panic");
+        assert!(
+            extract_version_token("no version here").is_none(),
+            "should parse nothing but must not panic"
+        );
     }
 
     #[test]

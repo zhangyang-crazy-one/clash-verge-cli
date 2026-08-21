@@ -12,4 +12,3 @@
 // scaffold plus its mihomo impl.
 #[allow(dead_code)]
 pub mod proxy_core;
-
