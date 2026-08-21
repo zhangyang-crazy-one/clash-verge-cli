@@ -130,6 +130,11 @@ pub struct IVerge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clash_core: Option<String>,
 
+    /// Which proxy core the TUI manages: "mihomo" (default) or "singbox".
+    /// add-singbox-dual-core D4. Unknown values fall back to mihomo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_core: Option<String>,
+
     /// hotkey map
     /// format: {func},{key}
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -274,6 +279,14 @@ impl IVerge {
         self.clash_core.clone().unwrap_or_else(|| "verge-mihomo".into())
     }
 
+    /// Validated proxy core selection: "mihomo" (default) or "singbox".
+    /// Unknown stored values degrade to mihomo rather than failing.
+    pub fn get_valid_proxy_core(&self) -> &'static str {
+        match self.proxy_core.as_deref() {
+            Some("singbox") => "singbox",
+            _ => "mihomo",
+        }
+    }
     pub async fn new() -> Self {
         match dirs::verge_path() {
             Ok(path) => match help::read_yaml::<Self>(&path).await {
@@ -393,5 +406,27 @@ fn system_language() -> &'static str {
         "zh"
     } else {
         "en"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IVerge;
+
+    #[test]
+    fn proxy_core_defaults_to_mihomo_and_rejects_unknown() {
+        assert_eq!(IVerge::default().get_valid_proxy_core(), "mihomo");
+
+        let v = IVerge {
+            proxy_core: Some("singbox".into()),
+            ..Default::default()
+        };
+        assert_eq!(v.get_valid_proxy_core(), "singbox");
+
+        let v = IVerge {
+            proxy_core: Some("nonsense".into()),
+            ..Default::default()
+        };
+        assert_eq!(v.get_valid_proxy_core(), "mihomo");
     }
 }
