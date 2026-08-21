@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -40,9 +40,39 @@ pub struct ManagerInner {
     /// Path of the resolved mihomo binary (set on start; None before first
     /// start). Used by TUN capability setup.
     pub resolved_binary: Mutex<Option<PathBuf>>,
-    /// Set by `stop()` so the watcher knows this exit was intentional and
-    /// should NOT trigger an auto-restart.
-    pub expected_exit: AtomicBool,
+    /// Generation of the currently-owning spawn. Bumped on every spawn;
+    /// a watcher bound to an older generation stands down on exit events
+    /// (task 3.1: replaces the racy global `expected_exit` bool).
+    pub generation: AtomicU64,
+    /// Generation whose exit is intentional (`u64::MAX` = none). Set by
+    /// `stop()`; only honored when it equals the watcher's own generation.
+    pub expected_exit_gen: AtomicU64,
+}
+
+
+/// What a watcher should do when its child exits (task 3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitDisposition {
+    /// A newer spawn owns the lifecycle — the stale watcher must stand
+    /// down entirely (no restart, no state mutation).
+    StaleWatchedOver,
+    /// Intentional stop within this generation — record Stopped, no restart.
+    IntentionalStop,
+    /// Unexpected exit within this generation — auto-restart path applies.
+    Crash,
+}
+
+/// Pure classifier so the generation-race semantics are unit-testable:
+/// a watcher whose generation no longer matches NEVER restarts, even if
+/// the expected-exit slot still carries its own generation.
+pub(super) fn classify_exit(spawned_gen: u64, current_gen: u64, expected_exit_gen: u64) -> ExitDisposition {
+    if spawned_gen != current_gen {
+        ExitDisposition::StaleWatchedOver
+    } else if expected_exit_gen == spawned_gen {
+        ExitDisposition::IntentionalStop
+    } else {
+        ExitDisposition::Crash
+    }
 }
 
 impl ManagerInner {
@@ -54,7 +84,8 @@ impl ManagerInner {
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
-            expected_exit: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            expected_exit_gen: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -140,7 +171,10 @@ impl ManagerInner {
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
         *inner.started_at.lock() = Some(Utc::now());
-        inner.expected_exit.store(false, std::sync::atomic::Ordering::SeqCst);
+        let spawned_gen = inner.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        inner
+            .expected_exit_gen
+            .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
@@ -150,7 +184,7 @@ impl ManagerInner {
             });
         }
 
-        spawn_watcher(child, inner, config_dir, socket_path);
+        spawn_watcher(child, inner, config_dir, socket_path, spawned_gen);
         Ok(())
     }
 
@@ -329,9 +363,10 @@ impl MihomoManager {
     pub async fn stop(&self) -> anyhow::Result<()> {
         // Set a flag so the watcher knows this was intentional and skips
         // auto-restart.  The flag is cleared by the next successful start.
+        let current_gen = self.inner.generation.load(std::sync::atomic::Ordering::SeqCst);
         self.inner
-            .expected_exit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .expected_exit_gen
+            .store(current_gen, std::sync::atomic::Ordering::SeqCst);
         let pid = { *self.inner.pid.lock() };
 
         if let Some(pid) = pid {
@@ -511,6 +546,42 @@ pub struct CoreStatus {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ---- TDD red: exit disposition (task 3.1, add-singbox-dual-core) ----
+    // The old global `expected_exit` bool had a race: stop(old) set the
+    // flag, start(new) cleared it, and the OLD watcher could process the
+    // exit event afterwards and misread the cleared flag as "crash" —
+    // resurrecting the old core to fight the new one for ports.
+    // The generation-based classifier below must make that impossible:
+    // a watcher whose generation no longer matches NEVER restarts.
+    #[test]
+    fn stale_watcher_never_restarts_even_after_flag_clear() {
+        // Old core spawned at gen 1; a new core already bumped gen to 2.
+        // Whatever the expected-exit slot says, the stale watcher must stand down.
+        assert_eq!(
+            classify_exit(1, 2, u64::MAX),
+            ExitDisposition::StaleWatchedOver
+        );
+        assert_eq!(
+            classify_exit(1, 2, 1),
+            ExitDisposition::StaleWatchedOver,
+            "even a matching expected-exit must not resurrect a superseded core"
+        );
+    }
+
+    #[test]
+    fn intentional_stop_within_generation_is_not_a_crash() {
+        assert_eq!(classify_exit(3, 3, 3), ExitDisposition::IntentionalStop);
+    }
+
+    #[test]
+    fn unexpected_exit_within_generation_is_a_crash() {
+        assert_eq!(classify_exit(3, 3, u64::MAX), ExitDisposition::Crash);
+        // A stale expected-exit from an older generation must not suppress
+        // the current generation's crash handling.
+        assert_eq!(classify_exit(4, 4, 3), ExitDisposition::Crash);
+    }
+
 
     #[test]
     fn test_new_manager_is_stopped_no_pid() {

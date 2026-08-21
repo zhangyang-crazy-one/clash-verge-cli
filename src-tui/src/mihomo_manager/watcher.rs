@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 
+use super::manager::{classify_exit, ExitDisposition};
 use crate::app::{Action, CoreState};
 use crate::mihomo_manager::manager::ManagerInner;
 
@@ -20,7 +21,13 @@ use crate::mihomo_manager::manager::ManagerInner;
 /// `ManagerInner::try_auto_restart` after a small backoff. Otherwise
 /// the manager state is transitioned to `Error` and a
 /// `Action::CoreError` is sent.
-pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, socket_path: &Path) -> JoinHandle<()> {
+pub fn spawn_watcher(
+    child: Child,
+    inner: Arc<ManagerInner>,
+    config_dir: &Path,
+    socket_path: &Path,
+    spawned_gen: u64,
+) -> JoinHandle<()> {
     // The auto-restart path outlives this function, so own the paths.
     let config_dir = config_dir.to_path_buf();
     let socket_path = socket_path.to_path_buf();
@@ -52,10 +59,22 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
             let _ = tx.send(Action::CoreExited(exit_code));
         }
 
-        // Skip auto-restart when stop() intentionally shut down the core.
-        if inner.expected_exit.swap(false, Ordering::SeqCst) {
-            *inner.state.lock() = CoreState::Stopped;
-            return;
+        // Task 3.1: a watcher bound to an older generation stands down
+        // entirely — the newer spawn owns the lifecycle now. This closes the
+        // race where the old watcher processed its exit event after the new
+        // spawn cleared the global flag and resurrected the old core.
+        let current_gen = inner.generation.load(Ordering::SeqCst);
+        match super::manager::classify_exit(
+            spawned_gen,
+            current_gen,
+            inner.expected_exit_gen.load(Ordering::SeqCst),
+        ) {
+            ExitDisposition::StaleWatchedOver => return,
+            ExitDisposition::IntentionalStop => {
+                *inner.state.lock() = CoreState::Stopped;
+                return;
+            }
+            ExitDisposition::Crash => {}
         }
 
         if inner.should_auto_restart() {
