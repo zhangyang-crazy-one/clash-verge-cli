@@ -20,6 +20,10 @@ pub static CLASH_CONFIG: &str = "config.yaml";
 pub static GUI_CLASH_CONFIG: &str = "clash-verge.yaml";
 pub static VERGE_CONFIG: &str = "verge.yaml";
 pub static PROFILE_YAML: &str = "profiles.yaml";
+/// Runtime config for the sing-box core (add-singbox-dual-core).
+/// Kept separate from `config.yaml` so the mihomo path and the GUI stay
+/// untouched while sing-box mode is active.
+pub static SINGBOX_CONFIG: &str = "singbox.json";
 
 /// get the verge app home dir
 pub fn app_home_dir() -> Result<PathBuf> {
@@ -61,6 +65,11 @@ pub fn clash_path() -> Result<PathBuf> {
     } else {
         app_dir.join(CLASH_CONFIG)
     })
+}
+
+/// Runtime config path for the sing-box core (`singbox.json`).
+pub fn singbox_config_path() -> Result<PathBuf> {
+    Ok(app_home_dir()?.join(SINGBOX_CONFIG))
 }
 
 pub fn verge_path() -> Result<PathBuf> {
