@@ -12,5 +12,6 @@ pub mod binary;
 pub mod manager;
 pub mod signal;
 pub mod watcher;
+pub mod singbox_binary;
 
 pub use manager::{ManagerInner, MihomoManager};
