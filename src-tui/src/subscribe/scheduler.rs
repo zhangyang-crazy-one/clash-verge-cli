@@ -494,7 +494,7 @@ mod tests {
 
         assert_eq!(
             classify_delay(&Err(MihomoError::CoreDown {
-                path: "/tmp/x.sock".into()
+                endpoint: "/tmp/x.sock".into()
             })),
             ProbeVerdict::ApiIssue
         );

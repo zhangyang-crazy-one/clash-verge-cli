@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use thiserror::Error;
 
 /// Errors produced when communicating with the mihomo REST API.
@@ -13,8 +12,11 @@ use thiserror::Error;
 /// - `InvalidUri` — bad URL/path (e.g. secret contains a NUL byte).
 #[derive(Debug, Error)]
 pub enum MihomoError {
-    #[error("mihomo is not running at {path}")]
-    CoreDown { path: PathBuf },
+    #[error("mihomo is not running at {endpoint}")]
+    CoreDown {
+        /// Human-readable controller endpoint: unix socket path or `ip:port`.
+        endpoint: String,
+    },
 
     #[error("mihomo returned 401 Unauthorized — check secret in verge.yaml")]
     Unauthorized,
@@ -46,10 +48,15 @@ mod tests {
     fn test_error_display() {
         // CoreDown
         let err = MihomoError::CoreDown {
-            path: PathBuf::from("/tmp/x.sock"),
+            endpoint: "/tmp/x.sock".into(),
         };
         assert!(err.to_string().contains("/tmp/x.sock"));
         assert!(err.to_string().contains("not running"));
+
+        let err = MihomoError::CoreDown {
+            endpoint: "127.0.0.1:9090".into(),
+        };
+        assert!(err.to_string().contains("127.0.0.1:9090"));
 
         // Unauthorized
         assert!(MihomoError::Unauthorized.to_string().contains("401"));

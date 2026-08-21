@@ -3,12 +3,53 @@ use crate::mihomo_api::types::{
     ConnectionsData, MihomoVersion, ProxyData, ProxyDelay, RuleProvidersResponse, RulesResponse, SelectProxyRequest,
 };
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
-use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
-/// Thin wrapper around a `reqwest::Client` configured to talk to mihomo
-/// over a Unix domain socket with a `Authorization: Bearer {secret}`
-/// header applied to every request.
+/// Transport endpoint of a proxy core's external controller.
+///
+/// mihomo listens on a Unix domain socket; sing-box's `clash_api` only
+/// supports TCP listeners. Both speak the same HTTP protocol on top, so
+/// the transport only changes how reqwest connects and which base URL
+/// the request paths are appended to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Tcp is constructed by SingboxApi (group 4 of add-singbox-dual-core);
+// until then only tests construct it.
+#[allow(dead_code)]
+pub enum Transport {
+    /// Unix domain socket (mihomo external-controller).
+    UnixSocket(PathBuf),
+    /// TCP listener (sing-box clash_api, or any TCP controller).
+    Tcp(SocketAddr),
+}
+
+impl Transport {
+    /// Base URL for request paths.
+    ///
+    /// For Unix sockets reqwest ignores the host portion of the URL, so
+    /// `http://localhost` is the conventional placeholder. For TCP the
+    /// socket address itself is the authority.
+    fn base_url(&self) -> String {
+        match self {
+            Self::UnixSocket(_) => "http://localhost".to_string(),
+            Self::Tcp(addr) => format!("http://{addr}"),
+        }
+    }
+
+    /// Human-readable endpoint label for error messages.
+    fn endpoint_label(&self) -> String {
+        match self {
+            Self::UnixSocket(path) => path.display().to_string(),
+            Self::Tcp(addr) => addr.to_string(),
+        }
+    }
+}
+
+/// Thin wrapper around a `reqwest::Client` configured to talk to a proxy
+/// core's external controller (mihomo over a Unix domain socket, sing-box
+/// over TCP) with an `Authorization: Bearer {secret}` header applied to
+/// every request.
 ///
 /// One instance is built once and reused — building a new
 /// `reqwest::Client` per call leaks file descriptors and re-resolves
@@ -16,44 +57,64 @@ use std::time::Duration;
 pub struct MihomoApi {
     pub client: reqwest::Client,
     stream_client: reqwest::Client,
-    socket_path: PathBuf,
+    transport: Transport,
+    base_url: String,
 }
 
 impl MihomoApi {
-    /// Build a new client targeting `socket_path` with bearer `secret`.
+    /// Build a new client targeting the mihomo unix socket at `socket_path`
+    /// with bearer `secret`.
     ///
-    /// Construction is lazy: the socket is not contacted until the
+    /// Convenience constructor preserving the historical unix-socket-only
+    /// signature; equivalent to [`Self::with_transport`] with
+    /// [`Transport::UnixSocket`].
+    pub fn new(socket_path: PathBuf, secret: impl Into<String>) -> Result<Self, MihomoError> {
+        Self::with_transport(Transport::UnixSocket(socket_path), secret)
+    }
+
+    /// Build a new client for an arbitrary controller transport with
+    /// bearer `secret`.
+    ///
+    /// Construction is lazy: the endpoint is not contacted until the
     /// first request. Returns `Err` only if the secret cannot be
     /// encoded as a header value (e.g. contains a NUL byte) or the
     /// underlying `reqwest::Client` fails to build.
-    pub fn new(socket_path: PathBuf, secret: impl Into<String>) -> Result<Self, MihomoError> {
+    pub fn with_transport(transport: Transport, secret: impl Into<String>) -> Result<Self, MihomoError> {
         let secret = secret.into();
         let mut headers = HeaderMap::new();
         let bearer = format!("Bearer {secret}");
         let header_value = HeaderValue::from_str(&bearer).map_err(|e| MihomoError::InvalidUri(e.to_string()))?;
         headers.insert(AUTHORIZATION, header_value);
 
-        let client = reqwest::Client::builder()
-            .unix_socket(socket_path.clone())
+        let mut short_builder = reqwest::Client::builder()
             .default_headers(headers.clone())
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(2))
-            .pool_max_idle_per_host(4)
-            .build()?;
-
-        // Mihomo keeps /traffic and /logs open indefinitely. They need a
-        // separate client because reqwest's global timeout includes body reads.
-        let stream_client = reqwest::Client::builder()
-            .unix_socket(socket_path.clone())
+            .pool_max_idle_per_host(4);
+        let mut stream_builder = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(2))
-            .pool_max_idle_per_host(4)
-            .build()?;
+            .pool_max_idle_per_host(4);
 
+        match &transport {
+            Transport::UnixSocket(path) => {
+                short_builder = short_builder.unix_socket(path.clone());
+                stream_builder = stream_builder.unix_socket(path.clone());
+            }
+            Transport::Tcp(_) => {}
+        }
+
+        let client = short_builder.build()?;
+        // Mihomo keeps /traffic and /logs open indefinitely. They need a
+        // separate client because reqwest's global timeout includes body reads.
+        let stream_client = stream_builder.build()?;
+
+        let base_url = transport.base_url();
         Ok(Self {
             client,
             stream_client,
-            socket_path,
+            transport,
+            base_url,
         })
     }
 
@@ -64,15 +125,13 @@ impl MihomoApi {
     /// `MihomoError::CoreDown` so the caller can transition the core
     /// state machine.
     pub async fn version(&self) -> Result<MihomoVersion, MihomoError> {
-        let resp = self.client.get("http://localhost/version").send().await;
+        let resp = self.client.get(format!("{}/version", self.base_url)).send().await;
 
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
                 if e.is_connect() || e.is_timeout() || e.is_request() {
-                    return Err(MihomoError::CoreDown {
-                        path: self.socket_path.clone(),
-                    });
+                    return Err(self.core_down());
                 }
                 return Err(MihomoError::Http(e));
             }
@@ -97,7 +156,7 @@ impl MihomoApi {
     pub async fn get_proxies(&self) -> Result<ProxyData, MihomoError> {
         let resp = self
             .client
-            .get("http://localhost/proxies")
+            .get(format!("{}/proxies", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -117,7 +176,7 @@ impl MihomoApi {
     /// `PUT /proxies/:group` — select a proxy node for a group.
     pub async fn select_proxy(&self, group: &str, name: &str) -> Result<(), MihomoError> {
         let req = SelectProxyRequest { name: name.to_string() };
-        let path = format!("http://localhost/proxies/{group}");
+        let path = format!("{}/proxies/{group}", self.base_url);
         let resp = self
             .client
             .put(&path)
@@ -141,7 +200,7 @@ impl MihomoApi {
     pub async fn patch_mode(&self, mode: &str) -> Result<(), MihomoError> {
         let resp = self
             .client
-            .patch("http://localhost/configs")
+            .patch(format!("{}/configs", self.base_url))
             .json(&serde_json::json!({ "mode": mode }))
             .send()
             .await
@@ -161,7 +220,7 @@ impl MihomoApi {
     pub async fn get_mode(&self) -> Result<String, MihomoError> {
         let resp = self
             .client
-            .get("http://localhost/configs")
+            .get(format!("{}/configs", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -186,7 +245,7 @@ impl MihomoApi {
 
     /// `GET /proxies/:name/delay?timeout=N&url=U` — test delay for a node.
     pub async fn delay_test(&self, name: &str, test_url: &str, timeout_ms: u64) -> Result<ProxyDelay, MihomoError> {
-        let url = delay_test_url(name, test_url, timeout_ms)?;
+        let url = delay_test_url(&self.base_url, name, test_url, timeout_ms)?;
         let resp = self.client.get(url).send().await.map_err(|e| self.map_http_err(e))?;
 
         let status = resp.status();
@@ -203,11 +262,15 @@ impl MihomoApi {
 
     fn map_http_err(&self, e: reqwest::Error) -> MihomoError {
         if e.is_connect() || e.is_timeout() {
-            MihomoError::CoreDown {
-                path: self.socket_path.clone(),
-            }
+            self.core_down()
         } else {
             MihomoError::Http(e)
+        }
+    }
+
+    fn core_down(&self) -> MihomoError {
+        MihomoError::CoreDown {
+            endpoint: self.transport.endpoint_label(),
         }
     }
 
@@ -219,7 +282,7 @@ impl MihomoApi {
     pub async fn get_connections(&self) -> Result<ConnectionsData, MihomoError> {
         let resp = self
             .client
-            .get("http://localhost/connections")
+            .get(format!("{}/connections", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -234,7 +297,7 @@ impl MihomoApi {
     }
 
     pub async fn close_connection(&self, id: &str) -> Result<(), MihomoError> {
-        let path = format!("http://localhost/connections/{id}");
+        let path = format!("{}/connections/{id}", self.base_url);
         let resp = self
             .client
             .delete(&path)
@@ -255,7 +318,7 @@ impl MihomoApi {
     pub async fn close_all_connections(&self) -> Result<(), MihomoError> {
         let resp = self
             .client
-            .delete("http://localhost/connections")
+            .delete(format!("{}/connections", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -278,7 +341,7 @@ impl MihomoApi {
     pub async fn get_rules(&self) -> Result<RulesResponse, MihomoError> {
         let resp = self
             .client
-            .get("http://localhost/rules")
+            .get(format!("{}/rules", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -298,7 +361,7 @@ impl MihomoApi {
     pub async fn get_rule_providers(&self) -> Result<RuleProvidersResponse, MihomoError> {
         let resp = self
             .client
-            .get("http://localhost/providers/rules")
+            .get(format!("{}/providers/rules", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -316,7 +379,7 @@ impl MihomoApi {
 
     /// `PUT /providers/rules/:name` — update a rule provider.
     pub async fn update_rule_provider(&self, name: &str) -> Result<(), MihomoError> {
-        let path = format!("http://localhost/providers/rules/{name}");
+        let path = format!("{}/providers/rules/{name}", self.base_url);
         let resp = self.client.put(&path).send().await.map_err(|e| self.map_http_err(e))?;
         if resp.status().is_success() {
             Ok(())
@@ -331,7 +394,7 @@ impl MihomoApi {
     async fn stream_endpoint(&self, endpoint: &str) -> Result<reqwest::Response, MihomoError> {
         let resp = self
             .stream_client
-            .get(format!("http://localhost{endpoint}"))
+            .get(format!("{}{endpoint}", self.base_url))
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -346,11 +409,10 @@ impl MihomoApi {
     }
 }
 
-fn delay_test_url(name: &str, test_url: &str, timeout_ms: u64) -> Result<reqwest::Url, MihomoError> {
-    let mut url =
-        reqwest::Url::parse("http://localhost/").map_err(|error| MihomoError::InvalidUri(error.to_string()))?;
+fn delay_test_url(base: &str, name: &str, test_url: &str, timeout_ms: u64) -> Result<reqwest::Url, MihomoError> {
+    let mut url = reqwest::Url::parse(base).map_err(|error| MihomoError::InvalidUri(error.to_string()))?;
     url.path_segments_mut()
-        .map_err(|_| MihomoError::InvalidUri("localhost URL cannot hold path segments".into()))?
+        .map_err(|_| MihomoError::InvalidUri("base URL cannot hold path segments".into()))?
         .extend(["proxies", name, "delay"]);
     url.query_pairs_mut()
         .append_pair("timeout", &timeout_ms.to_string())
@@ -361,8 +423,8 @@ fn delay_test_url(name: &str, test_url: &str, timeout_ms: u64) -> Result<reqwest
 /// Helper trait for building a client from anything path-like.
 impl MihomoApi {
     #[allow(dead_code)]
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn transport(&self) -> &Transport {
+        &self.transport
     }
 }
 
@@ -372,6 +434,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
     use tokio::net::UnixListener;
     use tokio::sync::Notify;
 
@@ -380,14 +443,33 @@ mod tests {
         let path = PathBuf::from("/tmp/nonexistent-for-test.sock");
         // We don't touch the file at construction; the client is lazy.
         let api = MihomoApi::new(path.clone(), "secret").expect("build");
-        assert_eq!(api.socket_path(), path.as_path());
+        assert_eq!(api.transport(), &Transport::UnixSocket(path));
+    }
+
+    #[test]
+    fn transport_base_url_matches_transport_kind() {
+        let unix = Transport::UnixSocket(PathBuf::from("/tmp/x.sock"));
+        assert_eq!(unix.base_url(), "http://localhost");
+
+        let tcp = Transport::Tcp("127.0.0.1:9090".parse::<SocketAddr>().expect("addr"));
+        assert_eq!(tcp.base_url(), "http://127.0.0.1:9090");
+        assert_eq!(tcp.endpoint_label(), "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn tcp_transport_construction_is_lazy() {
+        // An address with no listener must still construct fine; the
+        // endpoint is only contacted on the first request.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "secret").expect("build");
+        assert_eq!(api.transport(), &Transport::Tcp(addr));
     }
 
     #[test]
     fn delay_url_encodes_proxy_name_and_test_url() {
         let name = "\u{1f1fa}\u{1f1f8}11\u{7f8e}\u{56fd}\u{897f}\u{96c6}\u{7fa4}-\u{5168}\u{7f51}\u{4f18}\u{5316}(M)";
         let test_url = "http://www.gstatic.com/generate_204?source=tui";
-        let url = delay_test_url(name, test_url, 5000).expect("delay URL");
+        let url = delay_test_url("http://localhost", name, test_url, 5000).expect("delay URL");
 
         let segments = url.path_segments().expect("path segments").collect::<Vec<_>>();
         assert_eq!(segments.first(), Some(&"proxies"));
@@ -411,8 +493,23 @@ mod tests {
         let api = MihomoApi::new(path.clone(), "secret").expect("build");
         let res = api.version().await;
         match res {
-            Err(MihomoError::CoreDown { path: p }) => {
-                assert_eq!(p, path);
+            Err(MihomoError::CoreDown { endpoint }) => {
+                assert_eq!(endpoint, path.display().to_string());
+            }
+            Err(other) => panic!("expected CoreDown, got {other:?}"),
+            Ok(v) => panic!("expected CoreDown, got Ok({v:?})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_version_against_missing_tcp_endpoint() {
+        // Port 1 on loopback is never the controller in practice.
+        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "secret").expect("build");
+        let res = api.version().await;
+        match res {
+            Err(MihomoError::CoreDown { endpoint }) => {
+                assert_eq!(endpoint, "127.0.0.1:1");
             }
             Err(other) => panic!("expected CoreDown, got {other:?}"),
             Ok(v) => panic!("expected CoreDown, got Ok({v:?})"),
@@ -479,5 +576,56 @@ mod tests {
 
         server.await.expect("server task");
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_header_over_tcp_transport() {
+        // Same contract as the unix-socket test, but over TCP: this is the
+        // transport sing-box's clash_api speaks.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _addr) = listener.accept().await.expect("accept");
+
+            let mut buf = Vec::with_capacity(1024);
+            let mut tmp_buf = [0u8; 256];
+            loop {
+                let n = stream.read(&mut tmp_buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp_buf[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 4096 {
+                    break;
+                }
+            }
+
+            let request = String::from_utf8_lossy(&buf).to_lowercase();
+            assert!(
+                request.contains("authorization: bearer tcp-secret"),
+                "request did not contain expected bearer header:\n{request}"
+            );
+            assert!(
+                request.starts_with("get /version"),
+                "unexpected request line: {request}"
+            );
+
+            // Reply with a minimal sing-box /version body.
+            let body = r#"{"version":"sing-box 1.13.12","meta":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.expect("write response");
+            let _ = stream.shutdown().await;
+        });
+
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "tcp-secret").expect("build");
+        let v = api.version().await.expect("version should succeed");
+        assert_eq!(v.version, "sing-box 1.13.12");
+
+        server.await.expect("server task");
     }
 }
