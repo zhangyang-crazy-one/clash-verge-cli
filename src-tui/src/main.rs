@@ -1,6 +1,7 @@
 mod app;
 mod autostart;
 mod chain;
+mod core_api;
 mod cli;
 mod commands;
 mod config_dir;

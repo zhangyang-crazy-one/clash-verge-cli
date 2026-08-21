@@ -27,6 +27,7 @@ tokio = { workspace = true, features = [
   "process",
 ] }
 clap = { workspace = true }
+async-trait = { workspace = true }
 anyhow = { workspace = true }
 color-eyre = { workspace = true }
 dirs = { workspace = true }

@@ -12,6 +12,7 @@ license = "GPL-3.0-only"
 rust-version = "1.95"
 
 [workspace.dependencies]
+async-trait = "0.1.89"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 chrono = "0.4.45"
