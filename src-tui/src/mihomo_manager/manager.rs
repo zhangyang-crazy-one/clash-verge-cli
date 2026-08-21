@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -31,6 +31,24 @@ const MAX_RESTARTS_IN_WINDOW: usize = 3;
 /// `config_dir`, `socket_path`, and `secret` are owned by `MihomoManager`
 /// and passed in as `&Path` references to spawn operations, so they are
 /// not duplicated here.
+/// Which proxy core this manager owns. Selecting the kind decides the
+/// binary resolver, spawn arguments, runtime config file, and API transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoreKind {
+    #[default]
+    Mihomo,
+    SingBox,
+}
+
+impl CoreKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mihomo => "mihomo",
+            Self::SingBox => "singbox",
+        }
+    }
+}
+
 pub struct ManagerInner {
     pub state: Mutex<CoreState>,
     pub action_tx: Mutex<Option<UnboundedSender<Action>>>,
@@ -47,8 +65,11 @@ pub struct ManagerInner {
     /// Generation whose exit is intentional (`u64::MAX` = none). Set by
     /// `stop()`; only honored when it equals the watcher's own generation.
     pub expected_exit_gen: AtomicU64,
+    /// Core kind decided at construction; drives binary resolution and
+    /// spawn arguments. Stored atomically because the watcher's
+    /// auto-restart path reads it through the shared `Arc`.
+    pub core_kind: AtomicU8,
 }
-
 
 /// What a watcher should do when its child exits (task 3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +86,9 @@ pub enum ExitDisposition {
 /// Pure classifier so the generation-race semantics are unit-testable:
 /// a watcher whose generation no longer matches NEVER restarts, even if
 /// the expected-exit slot still carries its own generation.
+/// Pure classifier so the generation-race semantics are unit-testable:
+/// a watcher whose generation no longer matches NEVER restarts, even if
+/// the expected-exit slot still carries its own generation.
 pub(super) fn classify_exit(spawned_gen: u64, current_gen: u64, expected_exit_gen: u64) -> ExitDisposition {
     if spawned_gen != current_gen {
         ExitDisposition::StaleWatchedOver
@@ -73,6 +97,24 @@ pub(super) fn classify_exit(spawned_gen: u64, current_gen: u64, expected_exit_ge
     } else {
         ExitDisposition::Crash
     }
+}
+
+/// Default sing-box skeleton payload (pure; unit-testable without touching
+/// the real data directory).
+pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
+    let input = crate::singbox::ConfigInput {
+        outbounds: Vec::new(),
+        groups: Vec::new(),
+        mixed_port: 7897,
+        enable_tun: false,
+        tun: crate::singbox::TunSettings { stack: "gvisor".into(), mtu: 9000 },
+        clash_api: crate::singbox::ClashApiSettings {
+            listen: "127.0.0.1:9090".parse().expect("static addr"),
+            secret: String::new(),
+        },
+    };
+    let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
+    serde_json::to_string_pretty(&config).map_err(Into::into)
 }
 
 impl ManagerInner {
@@ -86,6 +128,7 @@ impl ManagerInner {
             resolved_binary: Mutex::new(None),
             generation: AtomicU64::new(0),
             expected_exit_gen: AtomicU64::new(u64::MAX),
+            core_kind: AtomicU8::new(0),
         }
     }
 
@@ -118,6 +161,21 @@ impl ManagerInner {
         self.restart_history.lock().clear();
     }
 
+    pub fn core_kind(&self) -> CoreKind {
+        match self.core_kind.load(Ordering::SeqCst) {
+            1 => CoreKind::SingBox,
+            _ => CoreKind::Mihomo,
+        }
+    }
+
+    pub fn set_core_kind(&self, kind: CoreKind) {
+        let v = match kind {
+            CoreKind::Mihomo => 0,
+            CoreKind::SingBox => 1,
+        };
+        self.core_kind.store(v, Ordering::SeqCst);
+    }
+
     /// Spawn a mihomo child from a resolved binary, wire up the watcher,
     /// and update the inner state.  Used by both `start` (initial launch)
     /// and `try_auto_restart` (crash recovery).
@@ -128,15 +186,33 @@ impl ManagerInner {
     /// processes bypass it. This covers CLI start/restart, TUI Start/Restart,
     /// the TUN toggle, watcher auto-restart, and post-upgrade replacement.
     async fn spawn_and_watch(
-        resolved: &binary::ResolvedMihomo,
+        resolved_path: &Path,
+        version: &str,
+        source: &str,
         config_dir: &Path,
         socket_path: &Path,
+        inner: Arc<ManagerInner>,
+    ) -> anyhow::Result<()> {
+        Self::spawn_core(resolved_path, version, source, config_dir, socket_path, None, inner).await
+    }
+
+    /// Spawn a core child from a resolved binary, wire up the watcher, and
+    /// update the inner state. `config_path` overrides the default mihomo
+    /// `-f` argument (used by sing-box, which always passes its generated
+    /// `singbox.json`).
+    async fn spawn_core(
+        resolved_path: &Path,
+        version: &str,
+        source: &str,
+        config_dir: &Path,
+        socket_path: &Path,
+        config_path: Option<PathBuf>,
         inner: Arc<ManagerInner>,
     ) -> anyhow::Result<()> {
         // TUN disabled → no capability needed. If the config cannot be read
         // we assume TUN is off and let mihomo fail on its own if it is not.
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
-        preflight_tun_capability(&resolved.path, tun_enabled)?;
+        preflight_tun_capability(resolved_path, tun_enabled)?;
 
         // D-01: the external-controller unix socket's parent dir must exist
         // before mihomo binds it. On a fresh install neither
@@ -145,25 +221,37 @@ impl ManagerInner {
         clash_verge_core::utils::dirs::ensure_standalone_socket_dir()
             .context("failed to prepare external-controller socket dir")?;
 
-        *inner.resolved_binary.lock() = Some(resolved.path.clone());
-        let mut command = Command::new(&resolved.path);
-        command.arg("-d").arg(config_dir);
-        if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
-            && config_path.exists()
-        {
-            command.arg("-f").arg(config_path);
+        *inner.resolved_binary.lock() = Some(resolved_path.to_path_buf());
+        let mut command = Command::new(resolved_path);
+        match inner.core_kind() {
+            CoreKind::Mihomo => {
+                command.arg("-d").arg(config_dir);
+                if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
+                    && config_path.exists()
+                {
+                    command.arg("-f").arg(config_path);
+                }
+                command.arg("-ext-ctl-unix").arg(socket_path);
+            }
+            CoreKind::SingBox => {
+                // clash_api endpoint lives inside the generated JSON (TCP);
+                // no controller flag needed.
+                let path = config_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(clash_verge_core::utils::dirs::singbox_config_path)?;
+                command.arg("run").arg("-c").arg(path);
+            }
         }
         let child = command
-            .arg("-ext-ctl-unix")
-            .arg(socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false)
             .spawn()
             .with_context(|| format!(
-                "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
-                resolved.path.display(), resolved.path.display()
+                "failed to spawn core from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
+                resolved_path.display(), resolved_path.display()
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
@@ -178,9 +266,9 @@ impl ManagerInner {
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
-                version: Some(resolved.version.clone()),
-                binary_path: Some(resolved.path.display().to_string()),
-                binary_source: Some(resolved.source.as_str().into()),
+                version: Some(version.to_string()),
+                binary_path: Some(resolved_path.display().to_string()),
+                binary_source: Some(source.to_string()),
             });
         }
 
@@ -203,19 +291,46 @@ impl ManagerInner {
         config_dir: &Path,
         socket_path: &Path,
     ) -> anyhow::Result<()> {
-        let resolved = binary::resolve_or_install()
-            .await
-            .context("auto-restart: failed to resolve mihomo binary")?;
+        match inner.core_kind() {
+            CoreKind::Mihomo => {
+                let resolved = binary::resolve_or_install()
+                    .await
+                    .context("auto-restart: failed to resolve mihomo binary")?;
+                tracing::info!(target: "mihomo", "auto-restarting mihomo {}", resolved.version);
+                Self::spawn_and_watch(&resolved.path, &resolved.version, resolved.source.as_str(), config_dir, socket_path, Arc::clone(&inner))
+                    .await
+                    .context("auto-restart: failed to spawn mihomo")
+            }
+            CoreKind::SingBox => {
+                let resolved = super::singbox_binary::resolve_or_install()
+                    .await
+                    .context("auto-restart: failed to resolve sing-box binary")?;
+                tracing::info!(target: "singbox", "auto-restarting sing-box {}", resolved.version);
+                let config_path = Self::write_singbox_runtime_config(config_dir).await?;
+                Self::spawn_core(&resolved.path, &resolved.version, resolved.source.as_str(), config_dir, socket_path, Some(config_path), Arc::clone(&inner))
+                    .await
+                    .context("auto-restart: failed to spawn sing-box")
+            }
+        }
+    }
 
-        tracing::info!(
-            target: "mihomo",
-            "auto-restarting mihomo {}",
-            resolved.version
-        );
-
-        Self::spawn_and_watch(&resolved, config_dir, socket_path, inner)
-            .await
-            .context("auto-restart: failed to spawn mihomo")
+    /// Generate and persist the sing-box runtime config (`singbox.json`).
+    ///
+    /// Skeleton stage: empty outbound set (route falls back to `direct`),
+    /// which is a valid starting config; node outbounds are spliced in by
+    /// the subscription converter from group 5.
+    async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
+        let _ = config_dir;
+        let body = build_singbox_skeleton_json()?;
+        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        // Write-then-rename so a crash mid-write never leaves a truncated config.
+        let tmp = path.with_extension("json.download");
+        tokio::fs::write(&tmp, body).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(path)
     }
 }
 
@@ -229,6 +344,9 @@ pub struct MihomoManager {
     config_dir: PathBuf,
     socket_path: PathBuf,
     secret: String,
+    core_kind: CoreKind,
+    /// sing-box clash_api TCP endpoint (used when `core_kind == SingBox`).
+    singbox_controller: std::net::SocketAddr,
 }
 
 impl MihomoManager {
@@ -243,7 +361,26 @@ impl MihomoManager {
             config_dir,
             socket_path,
             secret: String::new(),
+            core_kind: CoreKind::default(),
+            singbox_controller: "127.0.0.1:9090".parse().expect("static addr"),
         }
+    }
+
+    /// Select which core this manager owns. Must be set before `start()`.
+    pub fn with_core_kind(mut self, kind: CoreKind) -> Self {
+        self.core_kind = kind;
+        self.inner.set_core_kind(kind);
+        self
+    }
+
+    /// Override the sing-box clash_api TCP endpoint.
+    pub fn with_singbox_controller(mut self, addr: std::net::SocketAddr) -> Self {
+        self.singbox_controller = addr;
+        self
+    }
+
+    pub const fn core_kind(&self) -> CoreKind {
+        self.core_kind
     }
 
     pub fn with_socket(mut self, socket_path: PathBuf) -> Self {
@@ -320,8 +457,13 @@ impl MihomoManager {
     /// Build a MihomoApi client targeting this manager's socket with
     /// bearer auth from the configured secret.
     pub fn api(&self) -> MihomoApi {
-        MihomoApi::new(self.socket_path.clone(), self.secret.clone())
-            .expect("MihomoApi construction failed — secret may contain invalid header characters")
+        let result = match self.core_kind {
+            CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
+            CoreKind::SingBox => {
+                MihomoApi::with_transport(crate::mihomo_api::Transport::Tcp(self.singbox_controller), self.secret.clone())
+            }
+        };
+        result.expect("MihomoApi construction failed — secret may contain invalid header characters")
     }
 
     /// D1: resolve the next mihomo binary and run the read-only TUN
@@ -347,9 +489,16 @@ impl MihomoManager {
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
 
-        ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
-            .await
-            .context("failed to spawn mihomo")?;
+        ManagerInner::spawn_and_watch(
+            &resolved.path,
+            &resolved.version,
+            resolved.source.as_str(),
+            &self.config_dir,
+            &self.socket_path,
+            Arc::clone(&self.inner),
+        )
+        .await
+        .context("failed to spawn mihomo")?;
 
         Ok(resolved)
     }
@@ -425,9 +574,16 @@ resolved binary; the running core was left untouched",
                     Arc::clone(&self.inner),
                 );
                 async move {
-                    ManagerInner::spawn_and_watch(&resolved, &config_dir, &socket_path, inner)
-                        .await
-                        .context("failed to spawn mihomo")
+                    ManagerInner::spawn_and_watch(
+                        &resolved.path,
+                        &resolved.version,
+                        resolved.source.as_str(),
+                        &config_dir,
+                        &socket_path,
+                        inner,
+                    )
+                    .await
+                    .context("failed to spawn mihomo")
                 }
             },
         )
@@ -558,10 +714,7 @@ mod tests {
     fn stale_watcher_never_restarts_even_after_flag_clear() {
         // Old core spawned at gen 1; a new core already bumped gen to 2.
         // Whatever the expected-exit slot says, the stale watcher must stand down.
-        assert_eq!(
-            classify_exit(1, 2, u64::MAX),
-            ExitDisposition::StaleWatchedOver
-        );
+        assert_eq!(classify_exit(1, 2, u64::MAX), ExitDisposition::StaleWatchedOver);
         assert_eq!(
             classify_exit(1, 2, 1),
             ExitDisposition::StaleWatchedOver,
@@ -582,6 +735,44 @@ mod tests {
         assert_eq!(classify_exit(4, 4, 3), ExitDisposition::Crash);
     }
 
+    #[test]
+    fn core_kind_defaults_to_mihomo_and_setter_roundtrips() {
+        let mgr = MihomoManager::new(PathBuf::from("/tmp/cfg"));
+        assert_eq!(mgr.core_kind(), CoreKind::Mihomo);
+
+        let mgr = mgr.with_core_kind(CoreKind::SingBox);
+        assert_eq!(mgr.core_kind(), CoreKind::SingBox);
+        // The shared inner (watcher auto-restart path) sees it too.
+        assert_eq!(mgr.inner.core_kind(), CoreKind::SingBox);
+    }
+
+    #[test]
+    fn api_transport_matches_core_kind() {
+        use crate::mihomo_api::Transport;
+
+        let mgr = MihomoManager::new(PathBuf::from("/tmp/cfg"));
+        match mgr.api().transport() {
+            Transport::UnixSocket(_) => {}
+            other => panic!("mihomo api must use unix socket, got {other:?}"),
+        }
+
+        let mgr = mgr.with_core_kind(CoreKind::SingBox);
+        match mgr.api().transport() {
+            Transport::Tcp(addr) => assert_eq!(addr.to_string(), "127.0.0.1:9090"),
+            other => panic!("sing-box api must use tcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn singbox_skeleton_is_valid_json_with_direct_fallback() {
+        let body = build_singbox_skeleton_json().expect("skeleton");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        assert_eq!(value["route"]["final"], "direct");
+        assert_eq!(
+            value["experimental"]["clash_api"]["external_controller"],
+            "127.0.0.1:9090"
+        );
+    }
 
     #[test]
     fn test_new_manager_is_stopped_no_pid() {

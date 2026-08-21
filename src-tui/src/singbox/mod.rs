@@ -11,3 +11,7 @@
 #[allow(dead_code)]
 pub mod config_gen;
 
+pub use config_gen::{
+    generate_config, ClashApiSettings, ConfigInput, TunSettings,
+};
+
