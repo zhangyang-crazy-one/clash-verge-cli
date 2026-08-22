@@ -11,6 +11,50 @@ use tokio::sync::Mutex;
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Reload the running mihomo core from a config file via `PUT /configs`.
+
+/// How a committed config reaches the running core (task 3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadStrategy {
+    /// mihomo: `PUT /configs` hot reload; roll the file back on rejection.
+    HotReload,
+    /// sing-box: `PUT /configs` is a no-op — prevalidate with
+    /// `sing-box check`, then restart the process; the spawn-path
+    /// readiness probe (manager task 3.3) confirms the new config came up.
+    Restart,
+}
+
+impl ReloadStrategy {
+    pub fn for_core(kind: crate::mihomo_manager::CoreKind) -> Self {
+        match kind {
+            crate::mihomo_manager::CoreKind::Mihomo => Self::HotReload,
+            crate::mihomo_manager::CoreKind::SingBox => Self::Restart,
+        }
+    }
+}
+
+/// Pre-validate a sing-box config without starting the core
+/// (`sing-box check -c`). Runs before any restart so most bad configs
+/// are rejected while the old one is still running.
+pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::path::Path) -> Result<(), String> {
+    let output = tokio::process::Command::new(binary)
+        .arg("check")
+        .arg("-c")
+        .arg(config)
+        .output()
+        .await
+        .map_err(|error| format!("failed to run {} check: {error}", binary.display()))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "sing-box check rejected {}: {stderr}{stdout}",
+            config.display()
+        ))
+    }
+}
+
 pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {
     let config_path = path
         .to_str()
@@ -180,4 +224,45 @@ pub async fn write_runtime_config_unlocked(
         .await
         .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
     Ok(path)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strategy_maps_from_core_kind() {
+        assert_eq!(
+            ReloadStrategy::for_core(crate::mihomo_manager::CoreKind::Mihomo),
+            ReloadStrategy::HotReload
+        );
+        assert_eq!(
+            ReloadStrategy::for_core(crate::mihomo_manager::CoreKind::SingBox),
+            ReloadStrategy::Restart
+        );
+    }
+
+    #[tokio::test]
+    async fn prevalidate_passes_on_zero_exit() {
+        // /bin/true ignores arguments and exits 0 — stands in for a
+        // sing-box binary accepting the config.
+        let config = std::env::temp_dir().join("rv-fake-config.json");
+        std::fs::write(&config, "{}").expect("write");
+        prevalidate_singbox_config(std::path::Path::new("/bin/true"), &config)
+            .await
+            .expect("/bin/true must pass");
+        let _ = std::fs::remove_file(&config);
+    }
+
+    #[tokio::test]
+    async fn prevalidate_surfaces_stderr_on_failure() {
+        let config = std::env::temp_dir().join("rv-fake-bad.json");
+        std::fs::write(&config, "{}").expect("write");
+        let err = prevalidate_singbox_config(std::path::Path::new("/bin/false"), &config)
+            .await
+            .expect_err("/bin/false always fails");
+        assert!(err.contains(&config.display().to_string()), "{err}");
+        let _ = std::fs::remove_file(&config);
+    }
 }
