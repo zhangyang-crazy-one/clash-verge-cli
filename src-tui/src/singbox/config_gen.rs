@@ -13,7 +13,7 @@
 //! work; unknown fields survive because generation starts from scratch each
 //! time the profile changes.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::SocketAddr;
 
 /// A selector or urltest outbound group derived from the profile.
@@ -187,7 +187,10 @@ mod tests {
             ],
             mixed_port: 7897,
             enable_tun: false,
-            tun: TunSettings { stack: "gvisor".into(), mtu: 9000 },
+            tun: TunSettings {
+                stack: "gvisor".into(),
+                mtu: 9000,
+            },
             clash_api: ClashApiSettings {
                 listen: "127.0.0.1:9090".parse().expect("addr"),
                 secret: "s3cret".into(),
@@ -200,7 +203,10 @@ mod tests {
         let config = generate_config(&sample_input()).expect("config");
 
         assert_eq!(config["route"]["final"], "PROXY");
-        assert_eq!(config["experimental"]["clash_api"]["external_controller"], "127.0.0.1:9090");
+        assert_eq!(
+            config["experimental"]["clash_api"]["external_controller"],
+            "127.0.0.1:9090"
+        );
         assert_eq!(config["experimental"]["clash_api"]["secret"], "s3cret");
 
         let outbounds = config["outbounds"].as_array().expect("outbounds array");

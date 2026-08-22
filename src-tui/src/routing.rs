@@ -8,7 +8,7 @@
 //! verbatim — data loss is impossible by construction; callers block
 //! saves when a Raw fragment would have to be reinterpreted.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A single match condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +124,10 @@ pub fn from_clash_rule_str(rule: &str) -> IRouteRule {
     let Some(field) = field_from_clash_str(parts[0], parts[1]) else {
         return IRouteRule::Raw { clash_raw: rule.into() };
     };
-    IRouteRule::Simple { matches: vec![field], target }
+    IRouteRule::Simple {
+        matches: vec![field],
+        target,
+    }
 }
 
 /// Serialize back to a clash rule string. Raw rules round-trip verbatim.
@@ -299,7 +302,10 @@ mod tests {
     #[test]
     fn singbox_json_round_trips_simple_and_logical() {
         let simple = IRouteRule::Simple {
-            matches: vec![MatchField::DomainSuffix("google.com".into()), MatchField::IpCidr("10.0.0.0/8".into())],
+            matches: vec![
+                MatchField::DomainSuffix("google.com".into()),
+                MatchField::IpCidr("10.0.0.0/8".into()),
+            ],
             target: RuleTarget::Outbound("PROXY".into()),
         };
         let json = to_singbox_json(&simple).expect("simple");
@@ -309,8 +315,14 @@ mod tests {
         let logical = IRouteRule::Logical {
             op: LogicOp::Or,
             rules: vec![
-                IRouteRule::Simple { matches: vec![MatchField::Domain("a.com".into())], target: RuleTarget::Direct },
-                IRouteRule::Simple { matches: vec![MatchField::Port(443)], target: RuleTarget::Direct },
+                IRouteRule::Simple {
+                    matches: vec![MatchField::Domain("a.com".into())],
+                    target: RuleTarget::Direct,
+                },
+                IRouteRule::Simple {
+                    matches: vec![MatchField::Port(443)],
+                    target: RuleTarget::Direct,
+                },
             ],
             target: RuleTarget::Direct,
         };
@@ -322,7 +334,9 @@ mod tests {
 
     #[test]
     fn raw_rules_have_no_singbox_form() {
-        let raw = IRouteRule::Raw { clash_raw: "SUB-RULE,x,DIRECT".into() };
+        let raw = IRouteRule::Raw {
+            clash_raw: "SUB-RULE,x,DIRECT".into(),
+        };
         assert!(to_singbox_json(&raw).is_none());
     }
 }

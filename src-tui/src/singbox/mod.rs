@@ -12,7 +12,4 @@
 pub mod config_gen;
 pub mod convert;
 
-pub use config_gen::{
-    generate_config, ClashApiSettings, ConfigInput, GroupKind, GroupSpec, TunSettings,
-};
-
+pub use config_gen::{ClashApiSettings, ConfigInput, GroupKind, GroupSpec, TunSettings, generate_config};

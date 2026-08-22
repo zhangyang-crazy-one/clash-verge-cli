@@ -25,7 +25,7 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
     let Yaml::Mapping(map) = proxy else {
         return Err("proxy entry is not a mapping".into());
     };
-    let get = |key: &str| map.get(&Yaml::String(key.into()));
+    let get = |key: &str| map.get(Yaml::String(key.into()));
     let as_str = |key: &str| get(key).and_then(Yaml::as_str).map(str::to_string);
 
     let name = as_str("name").ok_or_else(|| "node missing name".to_string())?;
@@ -33,11 +33,10 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
 
     let mut dropped: Vec<String> = Vec::new();
     for key in map.keys() {
-        if let Yaml::String(k) = key {
-            if !RESERVED_FIELDS.contains(&k.as_str()) {
+        if let Yaml::String(k) = key
+            && !RESERVED_FIELDS.contains(&k.as_str()) {
                 dropped.push(format!("{name}.{k}"));
             }
-        }
     }
 
     let server = as_str("server").ok_or_else(|| format!("node '{name}' missing server"))?;
@@ -150,7 +149,7 @@ fn yaml_to_json(value: Option<&Yaml>) -> Option<Value> {
 /// TLS handling: trojan/vLESS/Hysteria-family are TLS-native; the rest
 /// need `tls: true` to emit the block. reality-opts maps onto uTLS/reality.
 fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) {
-    let get = |key: &str| map.get(&Yaml::String(key.into()));
+    let get = |key: &str| map.get(Yaml::String(key.into()));
     let native_tls = matches!(ptype, "trojan" | "vless" | "hysteria" | "hysteria2" | "tuic" | "naive");
     let explicit_tls = get("tls").and_then(Yaml::as_bool).unwrap_or(false);
     if !native_tls && !explicit_tls {
@@ -165,8 +164,8 @@ fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) {
         tls["insecure"] = json!(true);
     }
     if let Some(Yaml::Mapping(reality)) = get("reality-opts") {
-        let public_key = reality.get(&Yaml::String("public-key".into())).and_then(Yaml::as_str);
-        let short_id = reality.get(&Yaml::String("short-id".into())).and_then(Yaml::as_str);
+        let public_key = reality.get(Yaml::String("public-key".into())).and_then(Yaml::as_str);
+        let short_id = reality.get(Yaml::String("short-id".into())).and_then(Yaml::as_str);
         if let Some(pk) = public_key {
             tls["utls"] = json!({ "enabled": true, "fingerprint": "chrome" });
             tls["reality"] = json!({ "enabled": true, "public_key": pk, "short_id": short_id.unwrap_or("") });
@@ -178,7 +177,7 @@ fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) {
 /// Transport layer for ws/grpc networks; other networks are noted by the
 /// caller through the dropped-fields report (they never reach `outbound`).
 fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: &mut Vec<String>) {
-    let get = |key: &str| map.get(&Yaml::String(key.into()));
+    let get = |key: &str| map.get(Yaml::String(key.into()));
     let Some(network) = get("network").and_then(Yaml::as_str) else {
         return;
     };
@@ -186,10 +185,10 @@ fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: 
         "ws" => {
             let mut transport = json!({ "type": "ws" });
             if let Some(Yaml::Mapping(opts)) = get("ws-opts") {
-                if let Some(path) = opts.get(&Yaml::String("path".into())).and_then(Yaml::as_str) {
+                if let Some(path) = opts.get(Yaml::String("path".into())).and_then(Yaml::as_str) {
                     transport["path"] = json!(path);
                 }
-                if let Some(Yaml::Mapping(headers)) = opts.get(&Yaml::String("headers".into())) {
+                if let Some(Yaml::Mapping(headers)) = opts.get(Yaml::String("headers".into())) {
                     let mut map = serde_json::Map::new();
                     for (k, v) in headers {
                         if let (Yaml::String(k), Some(v)) = (k, yaml_to_json(Some(v))) {
@@ -203,14 +202,13 @@ fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: 
         }
         "grpc" => {
             let mut transport = json!({ "type": "grpc" });
-            if let Some(Yaml::Mapping(opts)) = get("grpc-opts") {
-                if let Some(service) = opts
-                    .get(&Yaml::String("grpc-service-name".into()))
+            if let Some(Yaml::Mapping(opts)) = get("grpc-opts")
+                && let Some(service) = opts
+                    .get(Yaml::String("grpc-service-name".into()))
                     .and_then(Yaml::as_str)
                 {
                     transport["service_name"] = json!(service);
                 }
-            }
             outbound["transport"] = transport;
         }
         other => dropped.push(format!("transport:{other}")),
@@ -378,7 +376,7 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
 
     let mut result = ProfileConversion::default();
 
-    if let Some(Yaml::Sequence(proxies)) = map.get(&Yaml::String("proxies".into())) {
+    if let Some(Yaml::Sequence(proxies)) = map.get(Yaml::String("proxies".into())) {
         for proxy in proxies {
             match convert_node(proxy) {
                 Ok(converted) => {
@@ -389,7 +387,7 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
                 }
                 Err(reason) => {
                     let name = proxy
-                        .get(&Yaml::String("name".into()))
+                        .get(Yaml::String("name".into()))
                         .and_then(Yaml::as_str)
                         .unwrap_or("<unnamed>");
                     result.skipped.push(format!("{name}: {reason}"));
@@ -398,16 +396,16 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
         }
     }
 
-    if let Some(Yaml::Sequence(groups)) = map.get(&Yaml::String("proxy-groups".into())) {
+    if let Some(Yaml::Sequence(groups)) = map.get(Yaml::String("proxy-groups".into())) {
         for group in groups {
             let Yaml::Mapping(g) = group else { continue };
             let name = g
-                .get(&Yaml::String("name".into()))
+                .get(Yaml::String("name".into()))
                 .and_then(Yaml::as_str)
                 .unwrap_or_default()
                 .to_string();
             let gtype = g
-                .get(&Yaml::String("type".into()))
+                .get(Yaml::String("type".into()))
                 .and_then(Yaml::as_str)
                 .unwrap_or_default();
             let kind = match gtype {
@@ -419,13 +417,9 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
                 }
             };
             let members: Vec<String> = g
-                .get(&Yaml::String("proxies".into()))
+                .get(Yaml::String("proxies".into()))
                 .and_then(Yaml::as_sequence)
-                .map(|seq| {
-                    seq.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
+                .map(|seq| seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
             if members.is_empty() {
                 continue;
@@ -469,7 +463,12 @@ proxy-groups:
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].name, "PROXY");
         assert_eq!(result.groups[0].kind, crate::singbox::GroupKind::Selector);
-        assert_eq!(result.skipped.len(), 2, "bad node + fallback group: {:?}", result.skipped);
+        assert_eq!(
+            result.skipped.len(),
+            2,
+            "bad node + fallback group: {:?}",
+            result.skipped
+        );
         assert!(result.skipped[0].starts_with("bad-node:"), "{:?}", result.skipped);
     }
 

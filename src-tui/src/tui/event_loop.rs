@@ -1434,7 +1434,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                                 enable_tun,
                                                                             )
                                                                             .await
-                                                                            .inspect(|report| {
+                                                                            .inspect(|_report| {
                                                                                 let _ = tx.send(Action::ProxiesRefresh);
                                                                             })
                                                                         } else {

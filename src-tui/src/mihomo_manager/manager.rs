@@ -480,7 +480,10 @@ impl ManagerInner {
             groups: conversion.groups.clone(),
             mixed_port: 7897,
             enable_tun: false,
-            tun: crate::singbox::TunSettings { stack: "gvisor".into(), mtu: 9000 },
+            tun: crate::singbox::TunSettings {
+                stack: "gvisor".into(),
+                mtu: 9000,
+            },
             clash_api: crate::singbox::ClashApiSettings {
                 listen: "127.0.0.1:9090".parse().expect("static addr"),
                 secret: String::new(),
