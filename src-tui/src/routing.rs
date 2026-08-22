@@ -340,3 +340,101 @@ mod tests {
         assert!(to_singbox_json(&raw).is_none());
     }
 }
+
+// ---------- Task 7.1 core: profile rules load/save ----------
+
+/// Load the `rules:` list of a clash profile document into the unified
+/// model. Unexpressible entries come back as Raw passthrough.
+pub fn load_profile_rules(config_yaml: &str) -> Result<Vec<IRouteRule>, String> {
+    let doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(config_yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+    load_rules_from_doc(&doc)
+}
+
+fn load_rules_from_doc(doc: &serde_yaml_ng::Value) -> Result<Vec<IRouteRule>, String> {
+    let Some(rules_seq) = doc
+        .get("rules")
+        .and_then(|v| v.as_sequence().cloned())
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(rules_seq
+        .iter()
+        .filter_map(|r| r.as_str())
+        .map(from_clash_rule_str)
+        .collect())
+}
+
+/// Write the rule list back into a clash profile document, preserving
+/// everything else verbatim. Logical rules cannot live in clash YAML —
+/// callers must refuse the save instead of losing them.
+pub fn save_profile_rules(config_yaml: &str, rules: &[IRouteRule]) -> Result<String, String> {
+    if rules.iter().any(|r| matches!(r, IRouteRule::Logical { .. })) {
+        return Err("logical rules cannot be saved to a clash profile — switch to sing-box".into());
+    }
+    let mut doc: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(config_yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+    let seq: Vec<serde_yaml_ng::Value> = rules
+        .iter()
+        .map(|r| {
+            let raw = match r {
+                IRouteRule::Raw { clash_raw } => clash_raw.clone(),
+                other => to_clash_rule_str(other),
+            };
+            serde_yaml_ng::Value::String(raw)
+        })
+        .collect();
+    if let Some(mapping) = doc.as_mapping_mut() {
+        use serde_yaml_ng::mapping::Entry;
+        let entry = mapping.entry(serde_yaml_ng::Value::String("rules".into()));
+        match entry {
+            Entry::Occupied(mut o) => {
+                o.insert(serde_yaml_ng::Value::Sequence(seq));
+            }
+            Entry::Vacant(v) => {
+                v.insert(serde_yaml_ng::Value::Sequence(seq));
+            }
+        }
+    }
+    serde_yaml_ng::to_string(&doc).map_err(|e| format!("serialize failed: {e}"))
+}
+
+#[cfg(test)]
+mod profile_rules_tests {
+    use super::*;
+
+    const SAMPLE: &str = "mode: rule\nproxies: []\nrules:\n  - DOMAIN,example.com,PROXY\n  - IP-CIDR,10.0.0.0/8,DIRECT\n";
+
+    #[test]
+    fn loads_and_saves_profile_rules_round_trip() {
+        let rules = load_profile_rules(SAMPLE).expect("load");
+        assert_eq!(rules.len(), 2);
+
+        let mut edited = rules.clone();
+        edited.remove(1);
+        let saved = save_profile_rules(SAMPLE, &edited).expect("save");
+
+        let reloaded = load_profile_rules(&saved).expect("reload");
+        assert_eq!(reloaded.len(), 1);
+        assert!(saved.contains("mode: rule"), "non-rule keys survive");
+    }
+
+    #[test]
+    fn raw_rules_survive_save_verbatim() {
+        let rules = vec![from_clash_rule_str("SUB-RULE,(AND((DOMAIN,b.com))),DIRECT")];
+        let saved = save_profile_rules(SAMPLE, &rules).expect("save");
+        assert!(saved.contains("SUB-RULE,(AND((DOMAIN,b.com))),DIRECT"), "{saved}");
+    }
+
+    #[test]
+    fn logical_rules_block_mihomo_save() {
+        let rules = vec![IRouteRule::Logical { op: LogicOp::Or, rules: vec![], target: RuleTarget::Direct }];
+        let err = save_profile_rules(SAMPLE, &rules).expect_err("must block");
+        assert!(err.contains("cannot be saved"), "{err}");
+    }
+
+    #[test]
+    fn profile_without_rules_yields_empty() {
+        assert!(load_profile_rules("mode: rule").expect("load").is_empty());
+    }
+}
