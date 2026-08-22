@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -69,6 +69,8 @@ pub struct ManagerInner {
     /// spawn arguments. Stored atomically because the watcher's
     /// auto-restart path reads it through the shared `Arc`.
     pub core_kind: AtomicU8,
+    /// TCP port of the sing-box clash_api controller (fixed loopback host).
+    pub singbox_port: AtomicU16,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -136,7 +138,9 @@ pub(super) async fn resource_barrier(socket_path: &Path, timeout: std::time::Dur
         match tokio::fs::remove_file(socket_path).await {
             Ok(()) => tracing::info!(target: "mihomo", "removed stale controller socket {}", socket_path.display()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(target: "mihomo", "could not remove stale socket {}: {error}", socket_path.display()),
+            Err(error) => {
+                tracing::warn!(target: "mihomo", "could not remove stale socket {}: {error}", socket_path.display())
+            }
         }
     }
 
@@ -163,6 +167,50 @@ fn net_iface_exists(name: &str) -> bool {
     Path::new("/sys/class/net").join(name).exists()
 }
 
+/// Whether a controller `/version` string belongs to the expected core
+/// kind. Verified against live APIs: sing-box answers "sing-box 1.13.x",
+/// mihomo answers "v1.19.x" / "Mihomo Meta v1.19.x" (design F1).
+fn version_matches_kind(version: &str, kind: CoreKind) -> bool {
+    match kind {
+        CoreKind::SingBox => version.starts_with("sing-box"),
+        CoreKind::Mihomo => !version.starts_with("sing-box"),
+    }
+}
+
+const READINESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Readiness probe (task 3.3): poll the controller until `/version`
+/// answers with the expected core type. sing-box's `PUT /configs` is a
+/// no-op, so EVERY config application for that core restarts the process
+/// and relies on this probe to know the new config actually came up.
+pub(super) async fn probe_readiness(
+    api: &crate::mihomo_api::MihomoApi,
+    kind: CoreKind,
+    timeout: std::time::Duration,
+) -> anyhow::Result<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match api.version().await {
+            Ok(v) => {
+                if version_matches_kind(&v.version, kind) {
+                    return Ok(v.version);
+                }
+                anyhow::bail!(
+                    "controller answered with unexpected core version '{}' — expected {}",
+                    v.version,
+                    kind.as_str()
+                );
+            }
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(error) => {
+                anyhow::bail!("core did not become ready within {timeout:?}: {error}");
+            }
+        }
+    }
+}
+
 impl ManagerInner {
     pub fn new() -> Self {
         Self {
@@ -175,6 +223,7 @@ impl ManagerInner {
             generation: AtomicU64::new(0),
             expected_exit_gen: AtomicU64::new(u64::MAX),
             core_kind: AtomicU8::new(0),
+            singbox_port: AtomicU16::new(9090),
         }
     }
 
@@ -212,6 +261,15 @@ impl ManagerInner {
             1 => CoreKind::SingBox,
             _ => CoreKind::Mihomo,
         }
+    }
+
+    /// Loopback controller endpoint for the sing-box clash_api.
+    pub fn singbox_controller(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], self.singbox_port.load(Ordering::SeqCst)))
+    }
+
+    pub fn set_singbox_port(&self, port: u16) {
+        self.singbox_port.store(port, Ordering::SeqCst);
     }
 
     pub fn set_core_kind(&self, kind: CoreKind) {
@@ -269,11 +327,7 @@ impl ManagerInner {
 
         // Task 3.2: wait out TUN teardown and clear any stale controller
         // socket left by a SIGKILLed predecessor before binding anew.
-        resource_barrier(
-            socket_path,
-            std::time::Duration::from_secs(5),
-        )
-        .await;
+        resource_barrier(socket_path, std::time::Duration::from_secs(5)).await;
 
         *inner.resolved_binary.lock() = Some(resolved_path.to_path_buf());
         let mut command = Command::new(resolved_path);
@@ -318,9 +372,34 @@ impl ManagerInner {
             .expected_exit_gen
             .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
 
+        // Task 3.3: do not report success until the controller actually
+        // answers with the expected core type. A broken config makes the
+        // child exit immediately; probing catches that here so callers can
+        // roll back instead of reporting a healthy core.
+        let probe_api = crate::mihomo_api::MihomoApi::with_transport(
+            match inner.core_kind() {
+                CoreKind::Mihomo => crate::mihomo_api::Transport::UnixSocket(socket_path.to_path_buf()),
+                CoreKind::SingBox => {
+                    crate::mihomo_api::Transport::Tcp(inner.singbox_controller())
+                }
+            },
+            String::new(),
+        )
+        .map_err(|e| anyhow::anyhow!("readiness probe client build failed: {e}"))?;
+        let probed_version = match probe_readiness(&probe_api, inner.core_kind(), READINESS_PROBE_TIMEOUT).await {
+            Ok(v) => v,
+            Err(error) => {
+                // Clean up a half-alive child (broken config usually exits by
+                // itself; a wedged one would otherwise leak past the manager).
+                let _ = signal::graceful_stop_by_pid(pid).await;
+                *inner.state.lock() = CoreState::Error(error.to_string());
+                return Err(error);
+            }
+        };
+
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
-                version: Some(version.to_string()),
+                version: Some(probed_version),
                 binary_path: Some(resolved_path.display().to_string()),
                 binary_source: Some(source.to_string()),
             });
@@ -445,6 +524,7 @@ impl MihomoManager {
     /// Override the sing-box clash_api TCP endpoint.
     pub fn with_singbox_controller(mut self, addr: std::net::SocketAddr) -> Self {
         self.singbox_controller = addr;
+        self.inner.set_singbox_port(addr.port());
         self
     }
 
@@ -866,6 +946,33 @@ mod tests {
         );
     }
 
+    // ---- Task 3.3: readiness probe ----
+
+    #[test]
+    fn version_kind_detection_by_prefix() {
+        assert!(version_matches_kind("sing-box 1.13.12", CoreKind::SingBox));
+        assert!(!version_matches_kind("sing-box 1.13.12", CoreKind::Mihomo));
+        assert!(version_matches_kind("v1.19.29", CoreKind::Mihomo));
+        assert!(version_matches_kind("Mihomo Meta v1.19.29", CoreKind::Mihomo));
+        assert!(!version_matches_kind("v1.19.29", CoreKind::SingBox));
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_matching_core_and_rejects_mismatch() {
+        use crate::mihomo_api::{MihomoApi, Transport};
+        use std::net::SocketAddr;
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s").unwrap();
+
+        // Nothing listens: short timeout must surface as a readiness failure.
+        let started = std::time::Instant::now();
+        let err = probe_readiness(&api, CoreKind::Mihomo, std::time::Duration::from_millis(300))
+            .await
+            .expect_err("no listener");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "must not wait out a long timeout in tests");
+        assert!(err.to_string().contains("did not become ready"), "{err}");
+    }
     #[test]
     fn test_new_manager_is_stopped_no_pid() {
         let mgr = MihomoManager::new(PathBuf::from("/tmp/cfg"));
