@@ -13,6 +13,6 @@ pub mod config_gen;
 pub mod convert;
 
 pub use config_gen::{
-    generate_config, ClashApiSettings, ConfigInput, TunSettings,
+    generate_config, ClashApiSettings, ConfigInput, GroupKind, GroupSpec, TunSettings,
 };
 

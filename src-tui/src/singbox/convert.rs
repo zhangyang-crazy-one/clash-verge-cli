@@ -6,7 +6,7 @@
 //! An entirely unmappable node is an error, also reported upstream so
 //! the UI can list skips.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use serde_yaml_ng::Value as Yaml;
 
 /// One successfully converted node plus its degradation report.
@@ -73,8 +73,19 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
 
 /// Fields read by the converter itself (never reported as dropped).
 const RESERVED_FIELDS: &[&str] = &[
-    "name", "type", "server", "port", "tls", "servername", "sni", "skip-cert-verify",
-    "network", "ws-opts", "grpc-opts", "reality-opts", "client-fingerprint",
+    "name",
+    "type",
+    "server",
+    "port",
+    "tls",
+    "servername",
+    "sni",
+    "skip-cert-verify",
+    "network",
+    "ws-opts",
+    "grpc-opts",
+    "reality-opts",
+    "client-fingerprint",
 ];
 
 /// (clash type, (sing-box type, [(clash field, sing-box field)]))
@@ -92,23 +103,39 @@ const PROTOCOL_MAPS: &[(&str, (&str, &[(&str, &str)]))] = &[
     ("trojan", ("trojan", &[("password", "password")])),
     (
         "hysteria",
-        ("hysteria", &[("auth-str", "auth_str"), ("up", "up_mbps"), ("down", "down_mbps")]),
+        (
+            "hysteria",
+            &[("auth-str", "auth_str"), ("up", "up_mbps"), ("down", "down_mbps")],
+        ),
     ),
     (
         "hysteria2",
-        ("hysteria2", &[("password", "password"), ("up", "up_mbps"), ("down", "down_mbps")]),
+        (
+            "hysteria2",
+            &[("password", "password"), ("up", "up_mbps"), ("down", "down_mbps")],
+        ),
     ),
     (
         "tuic",
         (
             "tuic",
-            &[("uuid", "uuid"), ("password", "password"), ("congestion-controller", "congestion_controller")],
+            &[
+                ("uuid", "uuid"),
+                ("password", "password"),
+                ("congestion-controller", "congestion_controller"),
+            ],
         ),
     ),
-    ("naive", ("naive", &[("username", "username"), ("password", "password")])),
+    (
+        "naive",
+        ("naive", &[("username", "username"), ("password", "password")]),
+    ),
     ("anytls", ("anytls", &[("password", "password")])),
     ("http", ("http", &[("username", "username"), ("password", "password")])),
-    ("socks5", ("socks", &[("username", "username"), ("password", "password")])),
+    (
+        "socks5",
+        ("socks", &[("username", "username"), ("password", "password")]),
+    ),
 ];
 
 fn yaml_to_json(value: Option<&Yaml>) -> Option<Value> {
@@ -177,7 +204,9 @@ fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: 
         "grpc" => {
             let mut transport = json!({ "type": "grpc" });
             if let Some(Yaml::Mapping(opts)) = get("grpc-opts") {
-                if let Some(service) = opts.get(&Yaml::String("grpc-service-name".into())).and_then(Yaml::as_str)
+                if let Some(service) = opts
+                    .get(&Yaml::String("grpc-service-name".into()))
+                    .and_then(Yaml::as_str)
                 {
                     transport["service_name"] = json!(service);
                 }
@@ -223,7 +252,11 @@ udp: true
             })
         );
         // `udp` has no equivalent — must be reported, not silently lost.
-        assert!(converted.dropped.iter().any(|d| d.ends_with(".udp")), "{:?}", converted.dropped);
+        assert!(
+            converted.dropped.iter().any(|d| d.ends_with(".udp")),
+            "{:?}",
+            converted.dropped
+        );
     }
 
     #[test]
@@ -319,5 +352,129 @@ password: p
         let converted = convert_node(&node).expect("convert");
         assert_eq!(converted.outbound["type"], "socks");
         assert_eq!(converted.outbound["username"], "u");
+    }
+}
+
+/// Profile-level conversion result (task 5.2).
+#[derive(Debug, Clone, Default)]
+pub struct ProfileConversion {
+    pub outbounds: Vec<Value>,
+    pub groups: Vec<crate::singbox::GroupSpec>,
+    /// Node names that could not be converted at all.
+    pub skipped: Vec<String>,
+    /// Per-node degradation lines ("node.field").
+    pub degraded: Vec<String>,
+}
+
+/// Convert an entire clash config document (proxies + proxy-groups).
+///
+/// Nodes that fail conversion are skipped and reported; groups map
+/// select→Selector / url-test→UrlTest, other group types are skipped.
+pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
+    let doc: Yaml = serde_yaml_ng::from_str(config_yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+    let Yaml::Mapping(map) = &doc else {
+        return Err("config root is not a mapping".into());
+    };
+
+    let mut result = ProfileConversion::default();
+
+    if let Some(Yaml::Sequence(proxies)) = map.get(&Yaml::String("proxies".into())) {
+        for proxy in proxies {
+            match convert_node(proxy) {
+                Ok(converted) => {
+                    result.outbounds.push(converted.outbound);
+                    for d in converted.dropped {
+                        result.degraded.push(d);
+                    }
+                }
+                Err(reason) => {
+                    let name = proxy
+                        .get(&Yaml::String("name".into()))
+                        .and_then(Yaml::as_str)
+                        .unwrap_or("<unnamed>");
+                    result.skipped.push(format!("{name}: {reason}"));
+                }
+            }
+        }
+    }
+
+    if let Some(Yaml::Sequence(groups)) = map.get(&Yaml::String("proxy-groups".into())) {
+        for group in groups {
+            let Yaml::Mapping(g) = group else { continue };
+            let name = g
+                .get(&Yaml::String("name".into()))
+                .and_then(Yaml::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let gtype = g
+                .get(&Yaml::String("type".into()))
+                .and_then(Yaml::as_str)
+                .unwrap_or_default();
+            let kind = match gtype {
+                "select" => crate::singbox::GroupKind::Selector,
+                "url-test" => crate::singbox::GroupKind::UrlTest,
+                other => {
+                    result.skipped.push(format!("{name}: group type '{other}' unsupported"));
+                    continue;
+                }
+            };
+            let members: Vec<String> = g
+                .get(&Yaml::String("proxies".into()))
+                .and_then(Yaml::as_sequence)
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if members.is_empty() {
+                continue;
+            }
+            result.groups.push(crate::singbox::GroupSpec { name, kind, members });
+        }
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn converts_nodes_and_groups_with_skip_report() {
+        let yaml = r#"
+proxies:
+  - name: ok-node
+    type: ss
+    server: 1.1.1.1
+    port: 8388
+    cipher: aes-256-gcm
+    password: p
+  - name: bad-node
+    type: mieru
+    server: x
+    port: 1
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies: [ok-node]
+  - name: fallback-g
+    type: fallback
+    proxies: [ok-node]
+"#;
+        let result = convert_profile(yaml).expect("convert profile");
+        assert_eq!(result.outbounds.len(), 1);
+        assert_eq!(result.outbounds[0]["tag"], "ok-node");
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].name, "PROXY");
+        assert_eq!(result.groups[0].kind, crate::singbox::GroupKind::Selector);
+        assert_eq!(result.skipped.len(), 2, "bad node + fallback group: {:?}", result.skipped);
+        assert!(result.skipped[0].starts_with("bad-node:"), "{:?}", result.skipped);
+    }
+
+    #[test]
+    fn invalid_yaml_is_an_error() {
+        assert!(convert_profile("{unclosed flow").is_err());
     }
 }
