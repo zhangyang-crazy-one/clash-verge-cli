@@ -238,6 +238,10 @@ pub struct App {
     /// Tab between Rules and Providers panels.
     pub rules_focus_providers: bool,
     pub rules_selected_index: usize,
+    /// Task 7.1: profile rule editing buffer (loaded on entering edit mode).
+    pub rules_edit_mode: bool,
+    pub rules_edit_buffer: Vec<crate::routing::IRouteRule>,
+    pub rules_edit_dirty: bool,
     /// Whether the mihomo binary carries TUN capabilities (set after the
     /// one-time askpass setup).
     pub tun_privileged: bool,
@@ -308,6 +312,9 @@ impl App {
             rule_providers_loading: false,
             rule_providers_error: None,
             rules_focus_providers: false,
+            rules_edit_mode: false,
+            rules_edit_buffer: Vec::new(),
+            rules_edit_dirty: false,
             rules_selected_index: 0,
             tun_privileged: false,
             password_buffer: Vec::new(),

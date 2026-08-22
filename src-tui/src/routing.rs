@@ -346,16 +346,12 @@ mod tests {
 /// Load the `rules:` list of a clash profile document into the unified
 /// model. Unexpressible entries come back as Raw passthrough.
 pub fn load_profile_rules(config_yaml: &str) -> Result<Vec<IRouteRule>, String> {
-    let doc: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(config_yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(config_yaml).map_err(|e| format!("invalid YAML: {e}"))?;
     load_rules_from_doc(&doc)
 }
 
 fn load_rules_from_doc(doc: &serde_yaml_ng::Value) -> Result<Vec<IRouteRule>, String> {
-    let Some(rules_seq) = doc
-        .get("rules")
-        .and_then(|v| v.as_sequence().cloned())
-    else {
+    let Some(rules_seq) = doc.get("rules").and_then(|v| v.as_sequence().cloned()) else {
         return Ok(Vec::new());
     };
     Ok(rules_seq
@@ -403,7 +399,8 @@ pub fn save_profile_rules(config_yaml: &str, rules: &[IRouteRule]) -> Result<Str
 mod profile_rules_tests {
     use super::*;
 
-    const SAMPLE: &str = "mode: rule\nproxies: []\nrules:\n  - DOMAIN,example.com,PROXY\n  - IP-CIDR,10.0.0.0/8,DIRECT\n";
+    const SAMPLE: &str =
+        "mode: rule\nproxies: []\nrules:\n  - DOMAIN,example.com,PROXY\n  - IP-CIDR,10.0.0.0/8,DIRECT\n";
 
     #[test]
     fn loads_and_saves_profile_rules_round_trip() {
@@ -428,7 +425,11 @@ mod profile_rules_tests {
 
     #[test]
     fn logical_rules_block_mihomo_save() {
-        let rules = vec![IRouteRule::Logical { op: LogicOp::Or, rules: vec![], target: RuleTarget::Direct }];
+        let rules = vec![IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![],
+            target: RuleTarget::Direct,
+        }];
         let err = save_profile_rules(SAMPLE, &rules).expect_err("must block");
         assert!(err.contains("cannot be saved"), "{err}");
     }

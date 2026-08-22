@@ -36,6 +36,53 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    // Task 7.1: edit mode renders the profile-rule buffer instead of the
+    // runtime-expanded rule list.
+    if app.rules_edit_mode {
+        let title = format!(
+            "{} [EDIT{}] ({})",
+            app.tr("rules.title"),
+            if app.rules_edit_dirty { "*" } else { "" },
+            app.rules_edit_buffer.len()
+        );
+        let block = theme::panel_block(title, focused);
+        if app.rules_edit_buffer.is_empty() {
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "No rules - W saves, E exits",
+                Style::new().fg(theme::dim()),
+            )))
+            .block(block);
+            frame.render_widget(msg, area);
+            return;
+        }
+        let items: Vec<ListItem> = app
+            .rules_edit_buffer
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| {
+                let is_selected = focused && i == app.rules_selected_index;
+                let prefix = if is_selected { ">" } else { " " };
+                let text = match rule {
+                    crate::routing::IRouteRule::Raw { clash_raw } => clash_raw.clone(),
+                    other => crate::routing::to_clash_rule_str(other),
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{prefix} {text}"),
+                        if is_selected {
+                            theme::bold(theme::accent())
+                        } else {
+                            Style::new().fg(theme::text())
+                        },
+                    ),
+                ]);
+                ListItem::new(line)
+            })
+            .collect();
+        let list = List::new(items).block(block);
+        frame.render_widget(list, area);
+        return;
+    }
     let title = format!("{} ({})", app.tr("rules.title"), app.rules.len());
     let block = theme::panel_block(title, focused);
 

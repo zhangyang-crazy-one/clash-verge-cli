@@ -2575,6 +2575,145 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.rules_loading = false;
                         app.rules_error = Some(error);
                     }
+                    Some(Action::RulesEditToggle) => {
+                        if app.rules_edit_mode {
+                            app.rules_edit_mode = false;
+                            app.rules_edit_buffer.clear();
+                            app.rules_edit_dirty = false;
+                            app.status_msg = Some("rule editing off".into());
+                        } else {
+                            match crate::profile_store::store::ProfileStore::snapshot().await {
+                                Ok(store) => {
+                                    let uid = store.current_uid();
+                                    let item = store.items().into_iter().find(|i| i.uid == uid);
+                                    match item {
+                                        Some(item) if item.file.is_some() => {
+                                            let path = clash_verge_core::utils::dirs::app_profiles_dir()
+                                                .unwrap_or_default()
+                                                .join(item.file.as_deref().unwrap_or_default());
+                                            match std::fs::read_to_string(&path) {
+                                                Ok(yaml) => match crate::routing::load_profile_rules(&yaml) {
+                                                    Ok(rules) => {
+                                                        app.rules_edit_buffer = rules;
+                                                        app.rules_selected_index = 0;
+                                                        app.rules_edit_mode = true;
+                                                        app.rules_edit_dirty = false;
+                                                        app.status_msg =
+                                                            Some("rule editing ON - D del, J/K move, W save, E exit".into());
+                                                    }
+                                                    Err(e) => app.status_msg = Some(format!("load rules: {e}")),
+                                                },
+                                                Err(e) => {
+                                                    app.status_msg = Some(format!("read profile: {e}"));
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            app.status_msg =
+                                                Some("no active remote profile to edit".into());
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    app.status_msg = Some(format!("profile store: {error}"));
+                                }
+                            }
+                        }
+                    }
+                    Some(Action::RulesEditDelete) if app.rules_edit_mode => {
+                        if app.rules_selected_index < app.rules_edit_buffer.len() {
+                            app.rules_edit_buffer.remove(app.rules_selected_index);
+                            app.rules_edit_dirty = true;
+                            app.rules_selected_index =
+                                app.rules_selected_index.min(app.rules_edit_buffer.len().saturating_sub(1));
+                        }
+                    }
+                    Some(Action::RulesEditMoveUp) if app.rules_edit_mode => {
+                        let i = app.rules_selected_index;
+                        if i > 0 && i < app.rules_edit_buffer.len() {
+                            app.rules_edit_buffer.swap(i - 1, i);
+                            app.rules_selected_index = i - 1;
+                            app.rules_edit_dirty = true;
+                        }
+                    }
+                    Some(Action::RulesEditMoveDown) if app.rules_edit_mode => {
+                        let i = app.rules_selected_index;
+                        if i + 1 < app.rules_edit_buffer.len() {
+                            app.rules_edit_buffer.swap(i, i + 1);
+                            app.rules_selected_index = i + 1;
+                            app.rules_edit_dirty = true;
+                        }
+                    }
+                    Some(Action::RulesEditSave) if app.rules_edit_mode && app.rules_edit_dirty => {
+                        let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
+                        let m = manager.clone();
+                        let tx = action_tx.clone();
+                        let buffer = std::mem::take(&mut app.rules_edit_buffer);
+                        tokio::spawn(async move {
+                            let outcome = async {
+                                let store = crate::profile_store::store::ProfileStore::snapshot().await.map_err(|e| e.to_string())?;
+                                let uid = store.current_uid();
+                                let item = store.items().into_iter().find(|i| i.uid == uid);
+                                let Some(item) = item else {
+                                    return Err("no active profile".into());
+                                };
+                                let file = item.file.clone().ok_or("active profile has no file")?;
+                                let path = clash_verge_core::utils::dirs::app_profiles_dir()
+                                    .map_err(|e| e.to_string())?
+                                    .join(file.as_str());
+                                let yaml = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                                let saved = crate::routing::save_profile_rules(&yaml, &buffer)?;
+                                std::fs::write(&path, saved).map_err(|e| e.to_string())?;
+                                Ok((item, yaml))
+                            }
+                            .await;
+                            match outcome {
+                                Ok((item, yaml)) => {
+                                    let report = if m.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+                                        crate::runtime_config::apply_singbox_restart(
+                                            &m,
+                                            Some(yaml.as_str()),
+                                            enable_tun,
+                                        )
+                                        .await
+                                    } else {
+                                        crate::runtime_config::reload_remote_profile(
+                                            &m.api(),
+                                            &item,
+                                            enable_tun,
+                                            true,
+                                        )
+                                        .await
+                                        .map(|_| "rules applied (hot reload)".into())
+                                    };
+                                    match report {
+                                        Ok(msg) => {
+                                            let _ = tx.send(Action::RulesEditSaved(msg));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Action::RulesEditFailed(e));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Action::RulesEditFailed(e));
+                                }
+                            }
+                        });
+                    }
+                    Some(Action::RulesEditSaved(msg)) => {
+                        app.rules_edit_dirty = false;
+                        app.rules_edit_buffer.clear();
+                        app.rules_edit_mode = false;
+                        app.status_msg = Some(msg);
+                        let _ = action_tx.send(Action::RulesRefresh);
+                    }
+                    Some(Action::RulesEditFailed(error)) => {
+                        // Keep the buffer so the user can retry after fixing.
+                        app.rules_edit_buffer = Vec::new();
+                        app.rules_edit_mode = false;
+                        app.status_msg = Some(format!("rule save failed: {error}"));
+                    }
                     Some(Action::RuleProvidersRefresh) if !app.rule_providers_loading => {
                         app.rule_providers_loading = true;
                         app.rule_providers_error = None;

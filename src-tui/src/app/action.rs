@@ -142,6 +142,15 @@ pub enum Action {
 
     // Rules
     RulesRefresh,
+    /// Task 7.1: enter/exit profile rule edit mode.
+    RulesEditToggle,
+    RulesEditDelete,
+    RulesEditMoveUp,
+    RulesEditMoveDown,
+    RulesEditSave,
+    /// Task 7.1: save outcome (status message) — exits edit mode on success.
+    RulesEditSaved(String),
+    RulesEditFailed(String),
     RulesFetched(Vec<Rule>),
     RulesFailed(String),
     RuleProvidersRefresh,

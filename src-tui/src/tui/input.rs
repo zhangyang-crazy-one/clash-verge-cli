@@ -154,6 +154,20 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             // Update the selected rule provider.
             None // handled by event loop's Activate/Update on Rules
         }
+        // Rule editing (task 7.1) — shifted keys so navigation stays intact.
+        KeyCode::Char('E') if context.view == View::Rules => Some(Action::RulesEditToggle),
+        KeyCode::Char('D') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditDelete)
+        }
+        KeyCode::Char('J') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditMoveDown)
+        }
+        KeyCode::Char('K') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditMoveUp)
+        }
+        KeyCode::Char('W') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditSave)
+        }
 
         // Settings editor
         KeyCode::Char('e') if context.view == View::Settings && context.focus == Focus::Content => {
