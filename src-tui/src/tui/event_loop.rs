@@ -1103,6 +1103,39 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         match &app.input_mode {
+                            InputMode::RuleInput(buffer) => {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Enter => {
+                                        let rule = buffer.trim().to_string();
+                                        if !rule.is_empty() && app.rules_edit_mode {
+                                            let parsed =
+                                                crate::routing::from_clash_rule_str(&rule);
+                                            let at = (app.rules_selected_index + 1)
+                                                .min(app.rules_edit_buffer.len());
+                                            app.rules_edit_buffer.insert(at, parsed);
+                                            app.rules_edit_dirty = true;
+                                            app.rules_selected_index = at;
+                                            app.status_msg =
+                                                Some(format!("rule inserted: {rule}"));
+                                        }
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Backspace => {
+                                        let mut b = buffer.clone();
+                                        b.pop();
+                                        app.input_mode = InputMode::RuleInput(b);
+                                    }
+                                    KeyCode::Char(c) => {
+                                        let mut b = buffer.clone();
+                                        b.push(c);
+                                        app.input_mode = InputMode::RuleInput(b);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             InputMode::Importing(buffer) => {
                                 match key.code {
                                     KeyCode::Enter => {
@@ -2619,6 +2652,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                    }
+                    Some(Action::RulesEditAdd) if app.rules_edit_mode => {
+                        app.input_mode = crate::app::InputMode::RuleInput(String::new());
                     }
                     Some(Action::RulesEditDelete) if app.rules_edit_mode => {
                         if app.rules_selected_index < app.rules_edit_buffer.len() {

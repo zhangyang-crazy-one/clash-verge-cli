@@ -12,6 +12,8 @@ use std::collections::HashMap;
 pub enum InputMode {
     Normal,
     Importing(String),
+    /// Task 7.2: type a clash rule string to insert into the edit buffer.
+    RuleInput(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

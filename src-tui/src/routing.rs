@@ -32,6 +32,7 @@ pub enum RuleTarget {
 
 /// Logical combinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LogicOp {
     And,
     Or,
@@ -44,6 +45,7 @@ pub enum IRouteRule {
         matches: Vec<MatchField>,
         target: RuleTarget,
     },
+    #[allow(dead_code)]
     Logical {
         op: LogicOp,
         rules: Vec<IRouteRule>,
@@ -58,6 +60,7 @@ pub enum IRouteRule {
 }
 
 impl IRouteRule {
+    #[allow(dead_code)]
     pub fn is_raw(&self) -> bool {
         matches!(self, IRouteRule::Raw { .. })
     }
@@ -65,7 +68,6 @@ impl IRouteRule {
 
 // ---------- clash YAML rule strings ----------
 
-const CLASH_TARGETS: &[(&str, RuleTarget)] = &[("DIRECT", RuleTarget::Direct), ("REJECT", RuleTarget::Block)];
 
 fn target_to_clash_str(target: &RuleTarget) -> String {
     match target {
@@ -153,6 +155,7 @@ pub fn to_clash_rule_str(rule: &IRouteRule) -> String {
 
 // ---------- sing-box route rule JSON ----------
 
+#[allow(dead_code)]
 fn field_to_singbox(field: &MatchField, rule: &mut Value) {
     let (key, value) = match field {
         MatchField::Domain(v) => ("domain", json!([v])),
@@ -176,6 +179,7 @@ fn field_to_singbox(field: &MatchField, rule: &mut Value) {
     }
 }
 
+#[allow(dead_code)]
 fn target_to_singbox(target: &RuleTarget, rule: &mut Value) {
     rule["outbound"] = match target {
         RuleTarget::Outbound(name) => json!(name),
@@ -184,6 +188,7 @@ fn target_to_singbox(target: &RuleTarget, rule: &mut Value) {
     };
 }
 
+#[allow(dead_code)]
 fn target_from_singbox(rule: &Value) -> Option<RuleTarget> {
     let outbound = rule.get("outbound")?.as_str()?;
     Some(match outbound {
@@ -193,10 +198,12 @@ fn target_from_singbox(rule: &Value) -> Option<RuleTarget> {
     })
 }
 
+#[allow(dead_code)]
 fn field_from_singbox(rule: &Value, key: &str, make: fn(String) -> MatchField) -> Option<MatchField> {
     rule.get(key)?.as_array()?.first()?.as_str().map(|v| make(v.into()))
 }
 
+#[allow(dead_code)]
 fn simple_from_singbox(rule: &Value) -> Option<IRouteRule> {
     let mut matches = Vec::new();
     for (key, make) in [
@@ -221,6 +228,7 @@ fn simple_from_singbox(rule: &Value) -> Option<IRouteRule> {
 /// Convert an IRouteRule into a sing-box route rule JSON object.
 /// Raw rules cannot be represented — callers must splice them verbatim
 /// into the profile (the generator keeps them out of this path).
+#[allow(dead_code)]
 pub fn to_singbox_json(rule: &IRouteRule) -> Option<Value> {
     match rule {
         IRouteRule::Raw { .. } => None,
@@ -251,6 +259,7 @@ pub fn to_singbox_json(rule: &IRouteRule) -> Option<Value> {
 /// Parse a sing-box route rule JSON object back into the model.
 /// Returns None for objects the model cannot express (caller keeps them
 /// as raw JSON fragments in the profile).
+#[allow(dead_code)]
 pub fn from_singbox_json(rule: &Value) -> Option<IRouteRule> {
     if rule.get("type").and_then(Value::as_str) == Some("logical") {
         let op = match rule.get("mode").and_then(Value::as_str) {

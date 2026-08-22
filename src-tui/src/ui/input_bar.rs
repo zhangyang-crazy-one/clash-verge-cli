@@ -135,6 +135,17 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spans.push(Span::styled(app.tr("input.help_quit"), Style::new().fg(theme::dim())));
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
         }
+        InputMode::RuleInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("New rule ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " e.g. DOMAIN-SUFFIX,x.com,PROXY | Enter = insert | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
         InputMode::Importing(buffer) => {
             let line = Line::from(vec![
                 Span::styled(app.tr("input.url"), Style::new().fg(theme::accent())),
