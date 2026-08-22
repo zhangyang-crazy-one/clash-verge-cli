@@ -117,6 +117,7 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
             listen: "127.0.0.1:9090".parse().expect("static addr"),
             secret: String::new(),
         },
+        rule_sets: Vec::new(),
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
     serde_json::to_string_pretty(&config).map_err(Into::into)
@@ -488,6 +489,7 @@ impl ManagerInner {
                 listen: "127.0.0.1:9090".parse().expect("static addr"),
                 secret: String::new(),
             },
+            rule_sets: Vec::new(),
         };
         let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;

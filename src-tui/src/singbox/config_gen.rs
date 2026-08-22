@@ -59,6 +59,9 @@ pub struct ConfigInput {
     pub enable_tun: bool,
     pub tun: TunSettings,
     pub clash_api: ClashApiSettings,
+    /// Task 7.4: sing-box rule-set definitions emitted verbatim as the
+    /// top-level `rule_set` section; rules reference them by tag.
+    pub rule_sets: Vec<Value>,
 }
 
 const TUN_INTERFACE_NAME: &str = "sb-tun0";
@@ -142,7 +145,7 @@ pub fn generate_config(input: &ConfigInput) -> Result<Value, String> {
     }
     outbounds.push(json!({ "type": "direct", "tag": DIRECT_TAG }));
 
-    Ok(json!({
+    let mut config = json!({
         "log": {
             "level": "info",
             "timestamp": true,
@@ -159,7 +162,11 @@ pub fn generate_config(input: &ConfigInput) -> Result<Value, String> {
                 "secret": input.clash_api.secret,
             }
         }
-    }))
+    });
+    if !input.rule_sets.is_empty() {
+        config["rule_set"] = Value::Array(input.rule_sets.clone());
+    }
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -195,6 +202,7 @@ mod tests {
                 listen: "127.0.0.1:9090".parse().expect("addr"),
                 secret: "s3cret".into(),
             },
+            rule_sets: Vec::new(),
         }
     }
 
@@ -296,5 +304,24 @@ mod tests {
         });
         let err = generate_config(&input).expect_err("group colliding with node tag");
         assert!(err.contains("node-a"), "{err}");
+    }
+
+    #[test]
+    fn rule_sets_are_emitted_when_present() {
+        let mut input = sample_input();
+        input.rule_sets = vec![json!({
+            "type": "remote",
+            "tag": "geoip",
+            "format": "binary",
+            "url": "https://example.com/geoip.srs",
+        })];
+
+        let config = generate_config(&input).expect("config");
+        assert_eq!(config["rule_set"].as_array().expect("rule_set array").len(), 1);
+        assert_eq!(config["rule_set"][0]["tag"], "geoip");
+
+        input.rule_sets.clear();
+        let config = generate_config(&input).expect("config");
+        assert!(config.get("rule_set").is_none(), "empty rule_sets must be omitted");
     }
 }
