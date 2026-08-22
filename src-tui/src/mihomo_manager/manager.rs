@@ -466,12 +466,32 @@ impl ManagerInner {
     /// which is a valid starting config; node outbounds are spliced in by
     /// the subscription converter from group 5.
     pub(crate) async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
+        Self::write_singbox_conversion(config_dir, &crate::singbox::convert::ProfileConversion::default()).await
+    }
+
+    /// Persist a sing-box runtime config built from converted profile nodes.
+    pub(crate) async fn write_singbox_conversion(
+        config_dir: &Path,
+        conversion: &crate::singbox::convert::ProfileConversion,
+    ) -> anyhow::Result<PathBuf> {
         let _ = config_dir;
-        let body = build_singbox_skeleton_json()?;
+        let input = crate::singbox::ConfigInput {
+            outbounds: conversion.outbounds.clone(),
+            groups: conversion.groups.clone(),
+            mixed_port: 7897,
+            enable_tun: false,
+            tun: crate::singbox::TunSettings { stack: "gvisor".into(), mtu: 9000 },
+            clash_api: crate::singbox::ClashApiSettings {
+                listen: "127.0.0.1:9090".parse().expect("static addr"),
+                secret: String::new(),
+            },
+        };
+        let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
+        let body = serde_json::to_string_pretty(&config)?;
         // Write-then-rename so a crash mid-write never leaves a truncated config.
         let tmp = path.with_extension("json.download");
         tokio::fs::write(&tmp, body).await?;

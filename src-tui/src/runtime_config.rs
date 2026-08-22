@@ -67,15 +67,33 @@ pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::
 /// is attempted.
 pub async fn apply_singbox_restart(
     manager: &crate::mihomo_manager::MihomoManager,
-) -> Result<(), String> {
+    config_yaml: Option<&str>,
+    // Threaded for future TUN-aware generation; skeleton keeps tun off.
+    _enable_tun: bool,
+) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let config_path =
         clash_verge_core::utils::dirs::singbox_config_path().map_err(|e| e.to_string())?;
     let previous = tokio::fs::read(&config_path).await.ok();
 
-    crate::mihomo_manager::ManagerInner::write_singbox_runtime_config(manager.config_dir())
-        .await
-        .map_err(|e| e.to_string())?;
+    // Task 5.2: convert the active profile when its YAML is available;
+    // otherwise fall back to the empty skeleton.
+    let conversion = match config_yaml {
+        Some(yaml) => Some(crate::singbox::convert::convert_profile(yaml)?),
+        None => None,
+    };
+    match &conversion {
+        Some(conversion) => {
+            crate::mihomo_manager::ManagerInner::write_singbox_conversion(manager.config_dir(), conversion)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        None => {
+            crate::mihomo_manager::ManagerInner::write_singbox_runtime_config(manager.config_dir())
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+    }
 
     let Some(binary) = crate::mihomo_manager::singbox_binary::candidate_without_install() else {
         return Err("sing-box binary not found".into());
@@ -90,7 +108,18 @@ pub async fn apply_singbox_restart(
         }
         return Err(restart_error.to_string());
     }
-    Ok(())
+
+    // Human-readable degradation report for the status bar.
+    let report = match &conversion {
+        Some(c) => format!(
+            "sing-box: {} nodes, {} skipped, {} fields degraded",
+            c.outbounds.len(),
+            c.skipped.len(),
+            c.degraded.len()
+        ),
+        None => "sing-box: skeleton config applied".into(),
+    };
+    Ok(report)
 }
 
 pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {

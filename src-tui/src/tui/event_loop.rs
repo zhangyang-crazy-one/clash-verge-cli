@@ -863,7 +863,7 @@ async fn apply_chain_config(
     // Task 3.4 ReloadStrategy: sing-box ignores PUT /configs — regenerate
     // and restart instead of the mihomo hot-reload pipeline.
     if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
-        return crate::runtime_config::apply_singbox_restart(manager)
+        return crate::runtime_config::apply_singbox_restart(manager, None, enable_tun)
             .await
             .map(|_| clash_verge_core::utils::dirs::singbox_config_path().unwrap_or_default());
     }
@@ -1420,13 +1420,23 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 match crate::chain::resolve_chain(&item, &profiles_dir).await
                                                                 {
                                                                     Ok(chain) => {
+                                                                        // Task 5.2: feed the active profile YAML into the conversion.
+                                                                        let profile_yaml = std::fs::read_to_string(profiles_dir
+                                                                            .join(item.file.as_deref().unwrap_or_default()))
+                                                                            .ok();
                                                                         let commit_result = if m.core_kind()
                                                                             == crate::mihomo_manager::CoreKind::SingBox
                                                                         {
                                                                             // Task 3.4: sing-box ignores PUT /configs.
-                                                                            crate::runtime_config::apply_singbox_restart(&m)
-                                                                                .await
-                                                                                .map(|_| std::path::PathBuf::new())
+                                                                            crate::runtime_config::apply_singbox_restart(
+                                                                                &m,
+                                                                                profile_yaml.as_deref(),
+                                                                                enable_tun,
+                                                                            )
+                                                                            .await
+                                                                            .inspect(|report| {
+                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                            })
                                                                         } else {
                                                                             commit_runtime_config(
                                                                                 &api,
@@ -1441,6 +1451,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                                 },
                                                                             )
                                                                             .await
+                                                                            .map(|_| String::new())
                                                                         };
                                                                         match commit_result
                                                                         {
