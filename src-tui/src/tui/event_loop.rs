@@ -855,10 +855,19 @@ async fn apply_clash_mode(
 }
 
 async fn apply_chain_config(
+    manager: &crate::mihomo_manager::MihomoManager,
     api: &crate::mihomo_api::MihomoApi,
     chain_nodes: &[String],
     enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
+    // Task 3.4 ReloadStrategy: sing-box ignores PUT /configs — regenerate
+    // and restart instead of the mihomo hot-reload pipeline.
+    if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+        return crate::runtime_config::apply_singbox_restart(manager).await.map(|_| {
+            clash_verge_core::utils::dirs::singbox_config_path().unwrap_or_default()
+        });
+    }
+
     // Sidecar backup for diagnostics; the commit path also keeps an in-memory rollback copy.
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
     if path.exists() {
@@ -1350,7 +1359,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
+                                                            let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
                                                                     uid.as_str(),
                                                                 )
                                                                 .await
@@ -1390,6 +1399,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             });
                                                         } else {
                                                             let item = item.clone();
+                                                            let m = manager.clone();
                                                             tokio::spawn(async move {
                                                                 let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
                                                                     uid.as_str(),
@@ -1410,19 +1420,29 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 match crate::chain::resolve_chain(&item, &profiles_dir).await
                                                                 {
                                                                     Ok(chain) => {
-                                                                        match commit_runtime_config(
-                                                                            &api,
-                                                                            enable_tun,
-                                                                            core_running,
-                                                                            Some(&item),
-                                                                            |mut config| {
-                                                                                crate::chain::apply_chain_to_config(
-                                                                                    &mut config, &chain,
-                                                                                );
-                                                                                Ok(config)
-                                                                            },
-                                                                        )
-                                                                        .await
+                                                                        let commit_result = if m.core_kind()
+                                                                            == crate::mihomo_manager::CoreKind::SingBox
+                                                                        {
+                                                                            // Task 3.4: sing-box ignores PUT /configs.
+                                                                            crate::runtime_config::apply_singbox_restart(&m)
+                                                                                .await
+                                                                                .map(|_| std::path::PathBuf::new())
+                                                                        } else {
+                                                                            commit_runtime_config(
+                                                                                &api,
+                                                                                enable_tun,
+                                                                                core_running,
+                                                                                Some(&item),
+                                                                                |mut config| {
+                                                                                    crate::chain::apply_chain_to_config(
+                                                                                        &mut config, &chain,
+                                                                                    );
+                                                                                    Ok(config)
+                                                                                },
+                                                                            )
+                                                                            .await
+                                                                        };
+                                                                        match commit_result
                                                                         {
                                                                             Ok(_) => {
                                                                                 if core_running {
@@ -2045,11 +2065,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 let nodes = app.chain_nodes.clone();
                                                 let enable_tun =
                                                     app.gui_config.enable_tun_mode.unwrap_or(false);
-                                                let api = manager.api();
+                                                let m = manager.clone();
+                                                let api = m.api();
                                                 let tx = action_tx.clone();
                                                 app.status_msg = Some("Applying chain...".into());
                                                 tokio::spawn(async move {
-                                                    match apply_chain_config(&api, &nodes, enable_tun).await {
+                                                    match apply_chain_config(&m, &api, &nodes, enable_tun).await {
                                                         Ok(_) => {
                                                             let _ = tx.send(Action::ChainApplied(nodes));
                                                             let _ = tx.send(Action::ProxiesRefresh);

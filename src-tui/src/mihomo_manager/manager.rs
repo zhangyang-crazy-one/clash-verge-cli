@@ -306,7 +306,7 @@ impl ManagerInner {
     /// `singbox.json`).
     async fn spawn_core(
         resolved_path: &Path,
-        version: &str,
+        _version: &str,
         source: &str,
         config_dir: &Path,
         socket_path: &Path,
@@ -751,7 +751,7 @@ resolved binary; the running core was left untouched",
             .context("failed to resolve or auto-install sing-box core")?;
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
         preflight_tun_capability(&resolved.path, tun_enabled)?;
-        self.stop().await;
+        self.stop().await.context("failed to stop running sing-box")?;
         let config_path = ManagerInner::write_singbox_runtime_config(&self.config_dir).await?;
         ManagerInner::spawn_core(
             &resolved.path,
