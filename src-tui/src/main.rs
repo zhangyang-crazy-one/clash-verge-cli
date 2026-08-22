@@ -11,6 +11,7 @@ mod i18n;
 mod mihomo_api;
 mod mihomo_manager;
 mod profile_store;
+mod routing;
 mod runtime_config;
 mod service_cmd;
 mod singbox;
