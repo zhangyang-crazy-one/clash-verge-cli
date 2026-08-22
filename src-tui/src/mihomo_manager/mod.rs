@@ -12,6 +12,7 @@ pub mod binary;
 pub mod manager;
 pub mod signal;
 pub mod singbox_binary;
+pub mod ownership;
 pub mod watcher;
 
 pub use manager::{CoreKind, ManagerInner, MihomoManager};

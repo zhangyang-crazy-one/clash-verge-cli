@@ -863,9 +863,9 @@ async fn apply_chain_config(
     // Task 3.4 ReloadStrategy: sing-box ignores PUT /configs — regenerate
     // and restart instead of the mihomo hot-reload pipeline.
     if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
-        return crate::runtime_config::apply_singbox_restart(manager).await.map(|_| {
-            clash_verge_core::utils::dirs::singbox_config_path().unwrap_or_default()
-        });
+        return crate::runtime_config::apply_singbox_restart(manager)
+            .await
+            .map(|_| clash_verge_core::utils::dirs::singbox_config_path().unwrap_or_default());
     }
 
     // Sidecar backup for diagnostics; the commit path also keeps an in-memory rollback copy.
@@ -1564,7 +1564,15 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                 } else {
                                                                     "singbox"
                                                                 };
-                                                            if next == "singbox"
+                                                            // Task 3.5: GUI must not manage sing-box mode.
+                                                            let gui_running =
+                                                                crate::mihomo_manager::ownership::gui_process_running();
+                                                            if next == "singbox" && gui_running {
+                                                                app.status_msg = Some(
+                                                                    "a GUI instance is running — exit it before switching to sing-box"
+                                                                        .into(),
+                                                                );
+                                                            } else if next == "singbox"
                                                                 && crate::mihomo_manager::singbox_binary::candidate_without_install()
                                                                     .is_none()
                                                             {
@@ -1573,6 +1581,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         .into(),
                                                                 );
                                                             } else {
+                                                                if next == "singbox" {
+                                                                    let _ = crate::mihomo_manager::ownership::write_ownership_marker("singbox");
+                                                                } else {
+                                                                    crate::mihomo_manager::ownership::remove_ownership_marker();
+                                                                }
                                                                 let mut updated = app.gui_config.clone();
                                                                 updated.proxy_core = Some(next.into());
                                                                 match updated.save_file().await {
