@@ -16,8 +16,23 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(area);
 
+    // Task 4.2: sing-box's clash_api exposes no functional provider
+    // endpoints — show an explanatory notice instead of an empty list.
+    let singbox_active = app.gui_config.get_valid_proxy_core() == "singbox";
+    if singbox_active {
+        draw_providers_unsupported_notice(frame, rows[1]);
+        return;
+    }
+
     draw_rules_panel(frame, rows[0], app, content_focus && !app.rules_focus_providers);
-    draw_providers_panel(frame, rows[1], app, content_focus && app.rules_focus_providers);
+
+    // Task 4.2: sing-box's clash_api exposes no functional provider
+    // endpoints — show an explanatory notice instead of an empty list.
+    if app.gui_config.get_valid_proxy_core() == "singbox" {
+        draw_providers_unsupported_notice(frame, rows[1]);
+    } else {
+        draw_providers_panel(frame, rows[1], app, content_focus && app.rules_focus_providers);
+    }
 }
 
 fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -148,4 +163,27 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
 
     let list = List::new(items).block(block);
     frame.render_widget(list, area);
+}
+
+/// Task 4.2: explanatory notice shown instead of the providers panel while
+/// the sing-box core is active (its clash_api provider endpoints are empty
+/// stubs — hiding beats an empty list that looks broken).
+fn draw_providers_unsupported_notice(frame: &mut Frame<'_>, area: Rect) {
+    let block = theme::panel_block("Rule Providers", false);
+    let msg = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Rule providers are not available under sing-box",
+            Style::new().fg(theme::warn()),
+        )),
+        Line::from(Span::styled(
+            "sing-box's clash_api does not implement provider endpoints.",
+            Style::new().fg(theme::dim()),
+        )),
+        Line::from(Span::styled(
+            "Switch back to mihomo to manage rule providers.",
+            Style::new().fg(theme::dim()),
+        )),
+    ])
+    .block(block);
+    frame.render_widget(msg, area);
 }
