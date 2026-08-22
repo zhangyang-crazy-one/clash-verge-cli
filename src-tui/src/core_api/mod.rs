@@ -10,5 +10,5 @@
 // Consumed from group 3 of add-singbox-dual-core onward (SingboxApi
 // implementation and event-loop core swap); until then this is
 // scaffold plus its mihomo impl.
-#[allow(dead_code)]
 pub mod proxy_core;
+pub mod singbox;
