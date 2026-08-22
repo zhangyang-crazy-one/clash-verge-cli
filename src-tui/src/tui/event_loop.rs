@@ -1535,6 +1535,40 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 }
                                                 View::Settings => {
                                                     match app.settings_selected_index {
+                                                        7 => {
+                                                            // Proxy core toggle (add-singbox-dual-core).
+                                                            // Persisted here; takes effect at next core start.
+                                                            let next =
+                                                                if app.gui_config.get_valid_proxy_core() == "singbox" {
+                                                                    "mihomo"
+                                                                } else {
+                                                                    "singbox"
+                                                                };
+                                                            if next == "singbox"
+                                                                && crate::mihomo_manager::singbox_binary::candidate_without_install()
+                                                                    .is_none()
+                                                            {
+                                                                app.status_msg = Some(
+                                                                    "sing-box binary not found — install it or set PATH first"
+                                                                        .into(),
+                                                                );
+                                                            } else {
+                                                                let mut updated = app.gui_config.clone();
+                                                                updated.proxy_core = Some(next.into());
+                                                                match updated.save_file().await {
+                                                                    Ok(()) => {
+                                                                        app.gui_config = updated;
+                                                                        app.status_msg = Some(format!(
+                                                                            "Proxy core: {next} (applies at next core start)"
+                                                                        ));
+                                                                    }
+                                                                    Err(error) => {
+                                                                        app.status_msg =
+                                                                            Some(format!("save failed: {error}"));
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
                                                         0 => {
                                                             let next_language = app.language.next();
                                                             let mut updated_config = app.gui_config.clone();

@@ -7,7 +7,7 @@ use ratatui::widgets::{Padding, Paragraph, Wrap};
 use crate::app::App;
 use crate::ui::theme;
 
-pub const SETTINGS_ROW_COUNT: usize = 7;
+pub const SETTINGS_ROW_COUNT: usize = 8;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let rows = Layout::default()
@@ -109,6 +109,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 }
             ),
         ),
+        settings_row(app, 7, cursor, format!("Proxy Core: {}", app.gui_config.get_valid_proxy_core())),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),
@@ -199,9 +200,9 @@ mod tests {
 
     #[test]
     fn settings_rows_append_after_the_existing_five() {
-        // The two new rows (System service, Launch at login) are appended at
-        // indices 5 and 6 so the existing index handlers (0..4) never shift.
-        assert_eq!(SETTINGS_ROW_COUNT, 7, "new rows must append after the existing five");
+        // New rows are appended so existing index handlers (0..6) never
+        // shift: 5 service, 6 autostart, 7 proxy core (add-singbox-dual-core).
+        assert_eq!(SETTINGS_ROW_COUNT, 8, "new rows must append after the existing seven");
     }
 
     #[test]
@@ -213,8 +214,9 @@ mod tests {
         let prev = |index: usize| (index + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
         assert_eq!(next(4), 5, "service row follows the mode row");
         assert_eq!(next(5), 6, "autostart row follows the service row");
-        assert_eq!(next(6), 0, "navigation wraps past the last row");
-        assert_eq!(prev(0), 6, "navigation wraps back to the last row");
+        assert_eq!(next(6), 7, "proxy core row follows the autostart row");
+        assert_eq!(next(7), 0, "navigation wraps past the last row");
+        assert_eq!(prev(0), 7, "navigation wraps back to the last row");
         assert_eq!(prev(5), 4, "previous row from the service row is the mode row");
     }
 
