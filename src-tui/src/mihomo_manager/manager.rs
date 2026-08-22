@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -107,7 +107,10 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
         groups: Vec::new(),
         mixed_port: 7897,
         enable_tun: false,
-        tun: crate::singbox::TunSettings { stack: "gvisor".into(), mtu: 9000 },
+        tun: crate::singbox::TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        },
         clash_api: crate::singbox::ClashApiSettings {
             listen: "127.0.0.1:9090".parse().expect("static addr"),
             secret: String::new(),
@@ -115,6 +118,49 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
     serde_json::to_string_pretty(&config).map_err(Into::into)
+}
+
+/// Resource-release barrier (task 3.2, add-singbox-dual-core).
+///
+/// Called between stopping an old core and spawning the next one. Two jobs:
+/// 1. Remove a stale external-controller unix socket — dead processes do
+///    not clean it up on SIGKILL, and a leftover file blocks the rebind.
+///    Safe to remove unconditionally here: we only run after our own stop.
+/// 2. Poll until TUN devices from either core are gone. Both cores hijack
+///    the default route; overlapping TUN lifetimes can blackhole traffic.
+///
+/// Best-effort: logs a warning on timeout instead of failing — the spawn
+/// itself will surface a bind error if a resource really is still held.
+pub(super) async fn resource_barrier(socket_path: &Path, timeout: std::time::Duration) {
+    if socket_path.exists() {
+        match tokio::fs::remove_file(socket_path).await {
+            Ok(()) => tracing::info!(target: "mihomo", "removed stale controller socket {}", socket_path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(target: "mihomo", "could not remove stale socket {}: {error}", socket_path.display()),
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let tun0 = net_iface_exists("tun0");
+        let sb_tun0 = net_iface_exists("sb-tun0");
+        if !tun0 && !sb_tun0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                target: "mihomo",
+                "resource barrier timeout: tun device still present (tun0={tun0}, sb-tun0={sb_tun0})"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether a network interface is currently up, via the sysfs listing.
+fn net_iface_exists(name: &str) -> bool {
+    Path::new("/sys/class/net").join(name).exists()
 }
 
 impl ManagerInner {
@@ -221,6 +267,14 @@ impl ManagerInner {
         clash_verge_core::utils::dirs::ensure_standalone_socket_dir()
             .context("failed to prepare external-controller socket dir")?;
 
+        // Task 3.2: wait out TUN teardown and clear any stale controller
+        // socket left by a SIGKILLed predecessor before binding anew.
+        resource_barrier(
+            socket_path,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
         *inner.resolved_binary.lock() = Some(resolved_path.to_path_buf());
         let mut command = Command::new(resolved_path);
         match inner.core_kind() {
@@ -297,9 +351,16 @@ impl ManagerInner {
                     .await
                     .context("auto-restart: failed to resolve mihomo binary")?;
                 tracing::info!(target: "mihomo", "auto-restarting mihomo {}", resolved.version);
-                Self::spawn_and_watch(&resolved.path, &resolved.version, resolved.source.as_str(), config_dir, socket_path, Arc::clone(&inner))
-                    .await
-                    .context("auto-restart: failed to spawn mihomo")
+                Self::spawn_and_watch(
+                    &resolved.path,
+                    &resolved.version,
+                    resolved.source.as_str(),
+                    config_dir,
+                    socket_path,
+                    Arc::clone(&inner),
+                )
+                .await
+                .context("auto-restart: failed to spawn mihomo")
             }
             CoreKind::SingBox => {
                 let resolved = super::singbox_binary::resolve_or_install()
@@ -307,9 +368,17 @@ impl ManagerInner {
                     .context("auto-restart: failed to resolve sing-box binary")?;
                 tracing::info!(target: "singbox", "auto-restarting sing-box {}", resolved.version);
                 let config_path = Self::write_singbox_runtime_config(config_dir).await?;
-                Self::spawn_core(&resolved.path, &resolved.version, resolved.source.as_str(), config_dir, socket_path, Some(config_path), Arc::clone(&inner))
-                    .await
-                    .context("auto-restart: failed to spawn sing-box")
+                Self::spawn_core(
+                    &resolved.path,
+                    &resolved.version,
+                    resolved.source.as_str(),
+                    config_dir,
+                    socket_path,
+                    Some(config_path),
+                    Arc::clone(&inner),
+                )
+                .await
+                .context("auto-restart: failed to spawn sing-box")
             }
         }
     }
@@ -459,9 +528,10 @@ impl MihomoManager {
     pub fn api(&self) -> MihomoApi {
         let result = match self.core_kind {
             CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
-            CoreKind::SingBox => {
-                MihomoApi::with_transport(crate::mihomo_api::Transport::Tcp(self.singbox_controller), self.secret.clone())
-            }
+            CoreKind::SingBox => MihomoApi::with_transport(
+                crate::mihomo_api::Transport::Tcp(self.singbox_controller),
+                self.secret.clone(),
+            ),
         };
         result.expect("MihomoApi construction failed — secret may contain invalid header characters")
     }
@@ -702,6 +772,28 @@ pub struct CoreStatus {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn barrier_removes_stale_socket_file() {
+        let path = std::env::temp_dir().join(format!("barrier-test-{}.sock", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"").expect("create stale socket placeholder");
+        assert!(path.exists());
+
+        resource_barrier(&path, std::time::Duration::from_millis(50)).await;
+
+        assert!(!path.exists(), "stale socket must be removed by the barrier");
+    }
+
+    #[tokio::test]
+    async fn barrier_returns_quickly_when_no_tun_present() {
+        let started = std::time::Instant::now();
+        let missing = std::env::temp_dir().join(format!("barrier-none-{}.sock", uuid::Uuid::new_v4()));
+        resource_barrier(&missing, std::time::Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "no tun devices named tun0/sb-tun0: barrier must not wait out the timeout"
+        );
+    }
 
     // ---- TDD red: exit disposition (task 3.1, add-singbox-dual-core) ----
     // The old global `expected_exit` bool had a race: stop(old) set the
