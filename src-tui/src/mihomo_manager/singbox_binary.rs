@@ -312,6 +312,14 @@ fn linux_arch_name() -> Option<&'static str> {
 }
 
 #[cfg(test)]
+pub(crate) fn tests_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    match super::binary::tests::ENV_LOCK.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -343,6 +351,9 @@ mod tests {
 
     #[test]
     fn test_singbox_binary_path_uses_xdg_data_home() {
+        // Share the env-var lock with binary.rs tests — concurrent
+        // XDG_DATA_HOME mutation races other env-sensitive tests.
+        let _guard = super::tests_env_lock();
         let prev = std::env::var_os("XDG_DATA_HOME");
         // SAFETY: single-threaded mutation guarded by serial test runner.
         unsafe {
