@@ -109,7 +109,12 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 }
             ),
         ),
-        settings_row(app, 7, cursor, format!("Proxy Core: {}", app.gui_config.get_valid_proxy_core())),
+        settings_row(
+            app,
+            7,
+            cursor,
+            format!("Proxy Core: {}", app.gui_config.get_valid_proxy_core()),
+        ),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),

@@ -136,11 +136,13 @@ mod tests {
         // Proves Box<dyn ProxyCoreApi> is usable: the event loop will hold
         // the active core's API behind this indirection and swap it at
         // runtime when the user switches cores.
-        let api: Box<dyn ProxyCoreApi> = Box::new(MihomoApi::new(
-            std::path::PathBuf::from("/tmp/nonexistent-proxycore-trait-test.sock"),
-            "secret",
-        )
-        .expect("build"));
+        let api: Box<dyn ProxyCoreApi> = Box::new(
+            MihomoApi::new(
+                std::path::PathBuf::from("/tmp/nonexistent-proxycore-trait-test.sock"),
+                "secret",
+            )
+            .expect("build"),
+        );
 
         assert!(api.supports_providers(), "mihomo implements providers");
         assert!(api.capabilities().rule_providers);

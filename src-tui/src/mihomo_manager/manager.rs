@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -379,9 +379,7 @@ impl ManagerInner {
         let probe_api = crate::mihomo_api::MihomoApi::with_transport(
             match inner.core_kind() {
                 CoreKind::Mihomo => crate::mihomo_api::Transport::UnixSocket(socket_path.to_path_buf()),
-                CoreKind::SingBox => {
-                    crate::mihomo_api::Transport::Tcp(inner.singbox_controller())
-                }
+                CoreKind::SingBox => crate::mihomo_api::Transport::Tcp(inner.singbox_controller()),
             },
             String::new(),
         )
@@ -970,7 +968,10 @@ mod tests {
         let err = probe_readiness(&api, CoreKind::Mihomo, std::time::Duration::from_millis(300))
             .await
             .expect_err("no listener");
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "must not wait out a long timeout in tests");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must not wait out a long timeout in tests"
+        );
         assert!(err.to_string().contains("did not become ready"), "{err}");
     }
     #[test]
