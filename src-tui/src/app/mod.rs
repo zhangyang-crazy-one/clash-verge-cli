@@ -14,6 +14,8 @@ pub enum InputMode {
     Importing(String),
     /// Task 7.2: type a clash rule string to insert into the edit buffer.
     RuleInput(String),
+    /// Task 7.4: "tag|remote|url" or "tag|local|path".
+    RuleSetInput(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +246,8 @@ pub struct App {
     pub rules_edit_mode: bool,
     pub rules_edit_buffer: Vec<crate::routing::IRouteRule>,
     pub rules_edit_dirty: bool,
+    /// Task 7.4: rule-set definitions loaded with the edit buffer.
+    pub rule_sets_edit: Vec<serde_json::Value>,
     /// Whether the mihomo binary carries TUN capabilities (set after the
     /// one-time askpass setup).
     pub tun_privileged: bool,
@@ -317,6 +321,7 @@ impl App {
             rules_edit_mode: false,
             rules_edit_buffer: Vec::new(),
             rules_edit_dirty: false,
+            rule_sets_edit: Vec::new(),
             rules_selected_index: 0,
             tun_privileged: false,
             password_buffer: Vec::new(),

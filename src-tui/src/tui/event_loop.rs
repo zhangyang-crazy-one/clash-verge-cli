@@ -1103,6 +1103,61 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                         match &app.input_mode {
+                            InputMode::RuleSetInput(buffer) => {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Enter => {
+                                        let spec = buffer.trim().to_string();
+                                        let parts: Vec<&str> =
+                                            spec.split('|').map(str::trim).collect();
+                                        if parts.len() == 3 && app.rules_edit_mode {
+                                            let (tag, rtype, loc) =
+                                                (parts[0], parts[1], parts[2]);
+                                            let mut entry = serde_json::json!({
+                                                "type": rtype,
+                                                "tag": tag,
+                                            });
+                                            if rtype == "remote" {
+                                                entry["url"] = serde_json::json!(loc);
+                                                entry["format"] = serde_json::json!("binary");
+                                            } else {
+                                                entry["path"] = serde_json::json!(loc);
+                                            }
+                                            if let Some(home) =
+                                                clash_verge_core::utils::dirs::app_home_dir().ok()
+                                            {
+                                                let mut sets =
+                                                    crate::singbox::load_rule_sets(&home);
+                                                sets.push(entry);
+                                                let _ =
+                                                    crate::singbox::save_rule_sets(&home, &sets);
+                                                app.rule_sets_edit = sets;
+                                                app.rules_edit_dirty = true;
+                                                app.status_msg =
+                                                    Some(format!("rule-set added: {tag}"));
+                                            }
+                                        } else {
+                                            app.status_msg = Some(
+                                                "expected tag|remote|url or tag|local|path".into(),
+                                            );
+                                        }
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                    KeyCode::Backspace => {
+                                        let mut b = buffer.clone();
+                                        b.pop();
+                                        app.input_mode = InputMode::RuleSetInput(b);
+                                    }
+                                    KeyCode::Char(c) => {
+                                        let mut b = buffer.clone();
+                                        b.push(c);
+                                        app.input_mode = InputMode::RuleSetInput(b);
+                                    }
+                                    _ => {}
+                                }
+                            }
                             InputMode::RuleInput(buffer) => {
                                 match key.code {
                                     KeyCode::Esc => {
@@ -2649,6 +2704,12 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 Ok(yaml) => match crate::routing::load_profile_rules(&yaml) {
                                                     Ok(rules) => {
                                                         app.rules_edit_buffer = rules;
+                                                        if let Some(home) =
+                                                            clash_verge_core::utils::dirs::app_home_dir().ok()
+                                                        {
+                                                            app.rule_sets_edit =
+                                                                crate::singbox::load_rule_sets(&home);
+                                                        }
                                                         app.rules_selected_index = 0;
                                                         app.rules_edit_mode = true;
                                                         app.rules_edit_dirty = false;
@@ -2676,6 +2737,23 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     }
                     Some(Action::RulesEditAdd) if app.rules_edit_mode => {
                         app.input_mode = crate::app::InputMode::RuleInput(String::new());
+                    }
+                    Some(Action::RulesEditAddRuleSet) if app.rules_edit_mode => {
+                        app.input_mode = crate::app::InputMode::RuleSetInput(String::new());
+                    }
+                    Some(Action::RulesEditDeleteRuleSet) if app.rules_edit_mode => {
+                        if let Some(home) = clash_verge_core::utils::dirs::app_home_dir().ok() {
+                            let mut sets = crate::singbox::load_rule_sets(&home);
+                            let i = app.rules_selected_index.min(sets.len().saturating_sub(1));
+                            if !sets.is_empty() {
+                                sets.remove(i);
+                                let _ = crate::singbox::save_rule_sets(&home, &sets);
+                                app.rule_sets_edit = sets;
+                                app.status_msg = Some("rule-set removed".into());
+                            } else {
+                                app.status_msg = Some("no rule-sets defined".into());
+                            }
+                        }
                     }
                     Some(Action::RulesEditDelete) if app.rules_edit_mode
                         && app.rules_selected_index < app.rules_edit_buffer.len() => {

@@ -82,11 +82,18 @@ pub async fn apply_singbox_restart(
         Some(yaml) => Some(crate::singbox::convert::convert_profile(yaml)?),
         None => None,
     };
+    let rule_sets = clash_verge_core::utils::dirs::app_home_dir()
+        .map(|home| crate::singbox::load_rule_sets(&home))
+        .unwrap_or_default();
     match &conversion {
         Some(conversion) => {
-            crate::mihomo_manager::ManagerInner::write_singbox_conversion(manager.config_dir(), conversion)
-                .await
-                .map_err(|e| e.to_string())?;
+            crate::mihomo_manager::ManagerInner::write_singbox_conversion(
+                manager.config_dir(),
+                conversion,
+                &rule_sets,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         }
         None => {
             crate::mihomo_manager::ManagerInner::write_singbox_runtime_config(manager.config_dir())

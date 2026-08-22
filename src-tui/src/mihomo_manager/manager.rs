@@ -467,18 +467,25 @@ impl ManagerInner {
     /// which is a valid starting config; node outbounds are spliced in by
     /// the subscription converter from group 5.
     pub(crate) async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
-        Self::write_singbox_conversion(config_dir, &crate::singbox::convert::ProfileConversion::default()).await
+        Self::write_singbox_conversion(
+            config_dir,
+            &crate::singbox::convert::ProfileConversion::default(),
+            &[],
+        )
+        .await
     }
 
     /// Persist a sing-box runtime config built from converted profile nodes.
     pub(crate) async fn write_singbox_conversion(
         config_dir: &Path,
         conversion: &crate::singbox::convert::ProfileConversion,
+        rule_sets: &[serde_json::Value],
     ) -> anyhow::Result<PathBuf> {
         let _ = config_dir;
         let input = crate::singbox::ConfigInput {
             outbounds: conversion.outbounds.clone(),
             groups: conversion.groups.clone(),
+            rule_sets: rule_sets.to_vec(),
             mixed_port: 7897,
             enable_tun: false,
             tun: crate::singbox::TunSettings {
@@ -489,7 +496,6 @@ impl ManagerInner {
                 listen: "127.0.0.1:9090".parse().expect("static addr"),
                 secret: String::new(),
             },
-            rule_sets: Vec::new(),
         };
         let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;

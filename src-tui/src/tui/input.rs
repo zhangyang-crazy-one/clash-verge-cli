@@ -157,6 +157,8 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         // Rule editing (task 7.1) — shifted keys so navigation stays intact.
         KeyCode::Char('E') if context.view == View::Rules => Some(Action::RulesEditToggle),
         KeyCode::Char('a') if context.view == View::Rules => Some(Action::RulesEditAdd),
+        KeyCode::Char('r') if context.view == View::Rules => Some(Action::RulesEditAddRuleSet),
+        KeyCode::Char('x') if context.view == View::Rules => Some(Action::RulesEditDeleteRuleSet),
         KeyCode::Char('D') if context.view == View::Rules && context.focus == Focus::Content => {
             Some(Action::RulesEditDelete)
         }

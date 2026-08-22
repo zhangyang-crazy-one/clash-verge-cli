@@ -150,6 +150,9 @@ pub enum Action {
     RulesEditSave,
     /// Task 7.2: open the rule-string input inside edit mode.
     RulesEditAdd,
+    /// Task 7.4: open the rule-set definition input inside edit mode.
+    RulesEditAddRuleSet,
+    RulesEditDeleteRuleSet,
     /// Task 7.1: save outcome (status message) — exits edit mode on success.
     RulesEditSaved(String),
     RulesEditFailed(String),

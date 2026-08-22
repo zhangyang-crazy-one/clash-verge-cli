@@ -135,6 +135,18 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spans.push(Span::styled(app.tr("input.help_quit"), Style::new().fg(theme::dim())));
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
         }
+        InputMode::RuleSetInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("New rule-set ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " format: tag|remote|url or tag|local|path | Enter = add | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         InputMode::RuleInput(buffer) => {
             let line = Line::from(vec![
                 Span::styled("New rule ", Style::new().fg(theme::accent())),

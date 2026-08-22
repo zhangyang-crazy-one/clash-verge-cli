@@ -68,7 +68,6 @@ impl IRouteRule {
 
 // ---------- clash YAML rule strings ----------
 
-
 fn target_to_clash_str(target: &RuleTarget) -> String {
     match target {
         RuleTarget::Outbound(name) => name.clone(),
@@ -474,8 +473,14 @@ mod describe_tests {
         let rule = IRouteRule::Logical {
             op: LogicOp::Or,
             rules: vec![
-                IRouteRule::Simple { matches: vec![MatchField::Port(443)], target: RuleTarget::Direct },
-                IRouteRule::Simple { matches: vec![MatchField::Domain("a.com".into())], target: RuleTarget::Direct },
+                IRouteRule::Simple {
+                    matches: vec![MatchField::Port(443)],
+                    target: RuleTarget::Direct,
+                },
+                IRouteRule::Simple {
+                    matches: vec![MatchField::Domain("a.com".into())],
+                    target: RuleTarget::Direct,
+                },
             ],
             target: RuleTarget::Direct,
         };
