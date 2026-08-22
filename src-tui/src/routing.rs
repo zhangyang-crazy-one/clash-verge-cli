@@ -448,3 +448,37 @@ mod profile_rules_tests {
         assert!(load_profile_rules("mode: rule").expect("load").is_empty());
     }
 }
+
+/// Human-readable one-line description for list rendering (task 7.3).
+/// Logical rules have no clash string form, so they get a summary.
+pub fn describe(rule: &IRouteRule) -> String {
+    match rule {
+        IRouteRule::Logical { op, rules, target } => {
+            let op_str = match op {
+                LogicOp::And => "AND",
+                LogicOp::Or => "OR",
+            };
+            let target = target_to_clash_str(target);
+            format!("({op_str}: {} rules -> {target})", rules.len())
+        }
+        other => to_clash_rule_str(other),
+    }
+}
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    #[test]
+    fn logical_rules_describe_as_summary() {
+        let rule = IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![
+                IRouteRule::Simple { matches: vec![MatchField::Port(443)], target: RuleTarget::Direct },
+                IRouteRule::Simple { matches: vec![MatchField::Domain("a.com".into())], target: RuleTarget::Direct },
+            ],
+            target: RuleTarget::Direct,
+        };
+        assert_eq!(describe(&rule), "(OR: 2 rules -> DIRECT)");
+    }
+}

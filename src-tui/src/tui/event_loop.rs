@@ -1111,15 +1111,36 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     KeyCode::Enter => {
                                         let rule = buffer.trim().to_string();
                                         if !rule.is_empty() && app.rules_edit_mode {
-                                            let parsed =
-                                                crate::routing::from_clash_rule_str(&rule);
-                                            let at = (app.rules_selected_index + 1)
-                                                .min(app.rules_edit_buffer.len());
-                                            app.rules_edit_buffer.insert(at, parsed);
-                                            app.rules_edit_dirty = true;
-                                            app.rules_selected_index = at;
-                                            app.status_msg =
-                                                Some(format!("rule inserted: {rule}"));
+                                            // Task 7.3: a `{...}` payload is parsed as a
+                                            // sing-box native route rule (logical rules have
+                                            // no clash string form); anything else goes through
+                                            // the clash string parser.
+                                            let parsed = if rule.starts_with('{') {
+                                                serde_json::from_str::<serde_json::Value>(&rule)
+                                                    .ok()
+                                                    .as_ref()
+                                                    .and_then(crate::routing::from_singbox_json)
+                                                    .ok_or_else(|| {
+                                                        "invalid sing-box rule JSON".to_string()
+                                                    })
+                                            } else {
+                                                Ok(crate::routing::from_clash_rule_str(&rule))
+                                            };
+                                            match parsed {
+                                                Ok(parsed) => {
+                                                    let at = (app.rules_selected_index + 1)
+                                                        .min(app.rules_edit_buffer.len());
+                                                    app.rules_edit_buffer.insert(at, parsed);
+                                                    app.rules_edit_dirty = true;
+                                                    app.rules_selected_index = at;
+                                                    app.status_msg =
+                                                        Some(format!("rule inserted: {rule}"));
+                                                }
+                                                Err(e) => {
+                                                    app.status_msg =
+                                                        Some(format!("rule rejected: {e}"));
+                                                }
+                                            }
                                         }
                                         app.input_mode = InputMode::Normal;
                                     }
@@ -2656,14 +2677,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     Some(Action::RulesEditAdd) if app.rules_edit_mode => {
                         app.input_mode = crate::app::InputMode::RuleInput(String::new());
                     }
-                    Some(Action::RulesEditDelete) if app.rules_edit_mode => {
-                        if app.rules_selected_index < app.rules_edit_buffer.len() {
+                    Some(Action::RulesEditDelete) if app.rules_edit_mode
+                        && app.rules_selected_index < app.rules_edit_buffer.len() => {
                             app.rules_edit_buffer.remove(app.rules_selected_index);
                             app.rules_edit_dirty = true;
                             app.rules_selected_index =
                                 app.rules_selected_index.min(app.rules_edit_buffer.len().saturating_sub(1));
                         }
-                    }
                     Some(Action::RulesEditMoveUp) if app.rules_edit_mode => {
                         let i = app.rules_selected_index;
                         if i > 0 && i < app.rules_edit_buffer.len() {

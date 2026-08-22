@@ -62,10 +62,7 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
             .map(|(i, rule)| {
                 let is_selected = focused && i == app.rules_selected_index;
                 let prefix = if is_selected { ">" } else { " " };
-                let text = match rule {
-                    crate::routing::IRouteRule::Raw { clash_raw } => clash_raw.clone(),
-                    other => crate::routing::to_clash_rule_str(other),
-                };
+                let text = crate::routing::describe(rule);
                 let line = Line::from(vec![
                     Span::styled(
                         format!("{prefix} {text}"),
