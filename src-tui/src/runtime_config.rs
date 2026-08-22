@@ -55,6 +55,40 @@ pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::
     }
 }
 
+
+/// Sing-box ReloadStrategy application (task 3.4): regenerate the runtime
+/// config, prevalidate it while the old core is still serving, then restart
+/// through the manager (barrier + readiness probe inside). On a failed
+/// restart the previous config file is restored and one fallback restart
+/// is attempted.
+pub async fn apply_singbox_restart(
+    manager: &crate::mihomo_manager::MihomoManager,
+) -> Result<(), String> {
+    let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let config_path =
+        clash_verge_core::utils::dirs::singbox_config_path().map_err(|e| e.to_string())?;
+    let previous = tokio::fs::read(&config_path).await.ok();
+
+    crate::mihomo_manager::ManagerInner::write_singbox_runtime_config(manager.config_dir())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let Some(binary) = crate::mihomo_manager::singbox_binary::candidate_without_install() else {
+        return Err("sing-box binary not found".into());
+    };
+    // Reject bad configs BEFORE stopping the running core.
+    prevalidate_singbox_config(&binary, &config_path).await?;
+
+    if let Err(restart_error) = manager.restart().await {
+        if let Some(previous) = previous {
+            let _ = tokio::fs::write(&config_path, &previous).await;
+            let _ = manager.restart().await; // best-effort fallback to old config
+        }
+        return Err(restart_error.to_string());
+    }
+    Ok(())
+}
+
 pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {
     let config_path = path
         .to_str()

@@ -465,7 +465,7 @@ impl ManagerInner {
     /// Skeleton stage: empty outbound set (route falls back to `direct`),
     /// which is a valid starting config; node outbounds are spliced in by
     /// the subscription converter from group 5.
-    async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
+    pub(crate) async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
         let _ = config_dir;
         let body = build_singbox_skeleton_json()?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
@@ -694,6 +694,9 @@ impl MihomoManager {
     /// capability) returns explicit `tun setup` guidance and leaves the
     /// currently running core untouched. No sudo/setcap here.
     pub async fn restart(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        if self.inner.core_kind() == CoreKind::SingBox {
+            return self.restart_singbox().await;
+        }
         self.reset_restart_history();
         orchestrate_restart(
             || async {
@@ -736,6 +739,40 @@ resolved binary; the running core was left untouched",
             },
         )
         .await
+    }
+
+    /// Sing-box restart: resolve → preflight → stop → regenerate config →
+    /// spawn with readiness probe (task 3.4 ReloadStrategy::Restart).
+    async fn restart_singbox(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        use super::singbox_binary::SingboxBinarySource;
+        self.reset_restart_history();
+        let resolved = super::singbox_binary::resolve_or_install()
+            .await
+            .context("failed to resolve or auto-install sing-box core")?;
+        let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
+        preflight_tun_capability(&resolved.path, tun_enabled)?;
+        self.stop().await;
+        let config_path = ManagerInner::write_singbox_runtime_config(&self.config_dir).await?;
+        ManagerInner::spawn_core(
+            &resolved.path,
+            &resolved.version,
+            resolved.source.as_str(),
+            &self.config_dir,
+            &self.socket_path,
+            Some(config_path),
+            Arc::clone(&self.inner),
+        )
+        .await
+        .context("failed to spawn sing-box")?;
+        Ok(binary::ResolvedMihomo {
+            path: resolved.path,
+            source: match resolved.source {
+                SingboxBinarySource::System => binary::MihomoBinarySource::System,
+                SingboxBinarySource::ManagedCached => binary::MihomoBinarySource::ManagedCached,
+                SingboxBinarySource::Downloaded => binary::MihomoBinarySource::Downloaded,
+            },
+            version: resolved.version,
+        })
     }
 
     /// Return CoreStatus with live version info if mihomo is running.
