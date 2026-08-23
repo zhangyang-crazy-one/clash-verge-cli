@@ -14,5 +14,8 @@ pub mod signal;
 pub mod singbox_binary;
 pub mod ownership;
 pub mod watcher;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod singbox_e2e;
 
 pub use manager::{CoreKind, ManagerInner, MihomoManager};
