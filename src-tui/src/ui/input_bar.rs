@@ -145,7 +145,6 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 ),
             ]);
             frame.render_widget(Paragraph::new(line), area);
-            return;
         }
         InputMode::RuleInput(buffer) => {
             let line = Line::from(vec![

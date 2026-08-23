@@ -7,6 +7,8 @@ pub enum EditorTarget {
     Verge,
     #[allow(dead_code)]
     Dns,
+    /// Task 8.4: raw sing-box runtime config (singbox.json).
+    Singbox,
 }
 
 #[derive(Debug, Clone)]

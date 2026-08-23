@@ -66,3 +66,32 @@ pub fn snapshot(path: &Path) -> anyhow::Result<Vec<u8>> {
 pub fn restore_snapshot(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     std::fs::write(path, data).with_context(|| format!("failed to restore {}", path.display()))
 }
+
+/// Task 8.5: validate a JSON config file (sing-box runtime config).
+pub fn validate_json(path: &Path) -> anyhow::Result<()> {
+    let body = std::fs::read_to_string(path)?;
+    serde_json::from_str::<serde_json::Value>(&body)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("invalid JSON in {}: {e}", path.display()))
+}
+
+/// Task 8.5: prevalidate via `sing-box check -c` when a binary is
+/// available; falls back to pure JSON parsing otherwise.
+pub fn validate_singbox(path: &Path) -> anyhow::Result<()> {
+    validate_json(path)?;
+    if let Some(binary) =
+        crate::mihomo_manager::singbox_binary::candidate_without_install()
+    {
+        let output = std::process::Command::new(&binary)
+            .arg("check")
+            .arg("-c")
+            .arg(path)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run sing-box check: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("sing-box check rejected the config: {stderr}");
+        }
+    }
+    Ok(())
+}

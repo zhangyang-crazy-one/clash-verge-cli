@@ -1125,8 +1125,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             } else {
                                                 entry["path"] = serde_json::json!(loc);
                                             }
-                                            if let Some(home) =
-                                                clash_verge_core::utils::dirs::app_home_dir().ok()
+                                            if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir()
                                             {
                                                 let mut sets =
                                                     crate::singbox::load_rule_sets(&home);
@@ -2230,6 +2229,10 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                     clash_verge_core::utils::dirs::verge_path().ok()
                                                 }
                                                 EditorTarget::Dns => None,
+                                                // Task 8.4: raw sing-box runtime config.
+                                                EditorTarget::Singbox => {
+                                                    clash_verge_core::utils::dirs::singbox_config_path().ok()
+                                                }
                                             };
                                             if let Some(path) = config_path {
                                                 let snapshot = crate::editor::snapshot(&path).ok();
@@ -2237,7 +2240,14 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 let edit_result = crate::editor::edit_file_blocking(&mut guard, &path);
                                                 match edit_result {
                                                     Ok(()) => {
-                                                        match crate::editor::validate_yaml(&path) {
+                                                        // Task 8.5: sing-box configs get JSON parsing
+                                                        // plus `sing-box check` prevalidation; others stay YAML.
+                                                        let validation = if matches!(target, EditorTarget::Singbox)
+                                                        {
+                                                            crate::editor::validate_singbox(&path)} else {
+                                                            crate::editor::validate_yaml(&path)
+                                                        };
+                                                        match validation {
                                                             Ok(()) => {
                                                                 app.gui_config = clash_verge_core::config::IVerge::new().await;
                                                                 app.language = Language::from_config(app.gui_config.language.as_deref());
@@ -2704,8 +2714,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                 Ok(yaml) => match crate::routing::load_profile_rules(&yaml) {
                                                     Ok(rules) => {
                                                         app.rules_edit_buffer = rules;
-                                                        if let Some(home) =
-                                                            clash_verge_core::utils::dirs::app_home_dir().ok()
+                                                        if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir()
                                                         {
                                                             app.rule_sets_edit =
                                                                 crate::singbox::load_rule_sets(&home);
@@ -2742,7 +2751,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         app.input_mode = crate::app::InputMode::RuleSetInput(String::new());
                     }
                     Some(Action::RulesEditDeleteRuleSet) if app.rules_edit_mode => {
-                        if let Some(home) = clash_verge_core::utils::dirs::app_home_dir().ok() {
+                        if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
                             let mut sets = crate::singbox::load_rule_sets(&home);
                             let i = app.rules_selected_index.min(sets.len().saturating_sub(1));
                             if !sets.is_empty() {

@@ -34,9 +34,10 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
     let mut dropped: Vec<String> = Vec::new();
     for key in map.keys() {
         if let Yaml::String(k) = key
-            && !RESERVED_FIELDS.contains(&k.as_str()) {
-                dropped.push(format!("{name}.{k}"));
-            }
+            && !RESERVED_FIELDS.contains(&k.as_str())
+        {
+            dropped.push(format!("{name}.{k}"));
+        }
     }
 
     let server = as_str("server").ok_or_else(|| format!("node '{name}' missing server"))?;
@@ -206,9 +207,9 @@ fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: 
                 && let Some(service) = opts
                     .get(Yaml::String("grpc-service-name".into()))
                     .and_then(Yaml::as_str)
-                {
-                    transport["service_name"] = json!(service);
-                }
+            {
+                transport["service_name"] = json!(service);
+            }
             outbound["transport"] = transport;
         }
         other => dropped.push(format!("transport:{other}")),
