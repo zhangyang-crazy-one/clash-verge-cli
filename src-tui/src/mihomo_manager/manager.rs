@@ -467,10 +467,16 @@ impl ManagerInner {
     /// which is a valid starting config; node outbounds are spliced in by
     /// the subscription converter from group 5.
     pub(crate) async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
+        let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
+        let mixed_port = clash_verge_core::config::IClashTemp::new()
+            .await
+            .get_mixed_port();
         Self::write_singbox_conversion(
             config_dir,
             &crate::singbox::convert::ProfileConversion::default(),
             &[],
+            enable_tun,
+            mixed_port,
         )
         .await
     }
@@ -480,14 +486,16 @@ impl ManagerInner {
         config_dir: &Path,
         conversion: &crate::singbox::convert::ProfileConversion,
         rule_sets: &[serde_json::Value],
+        enable_tun: bool,
+        mixed_port: u16,
     ) -> anyhow::Result<PathBuf> {
         let _ = config_dir;
         let input = crate::singbox::ConfigInput {
             outbounds: conversion.outbounds.clone(),
             groups: conversion.groups.clone(),
             rule_sets: rule_sets.to_vec(),
-            mixed_port: 7897,
-            enable_tun: false,
+            mixed_port,
+            enable_tun,
             tun: crate::singbox::TunSettings {
                 stack: "gvisor".into(),
                 mtu: 9000,

@@ -69,7 +69,7 @@ pub async fn apply_singbox_restart(
     manager: &crate::mihomo_manager::MihomoManager,
     config_yaml: Option<&str>,
     // Threaded for future TUN-aware generation; skeleton keeps tun off.
-    _enable_tun: bool,
+    enable_tun: bool,
 ) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let config_path =
@@ -85,12 +85,19 @@ pub async fn apply_singbox_restart(
     let rule_sets = clash_verge_core::utils::dirs::app_home_dir()
         .map(|home| crate::singbox::load_rule_sets(&home))
         .unwrap_or_default();
+    // Task 8.2/8.3: honor the requested TUN state and the configured port
+    // instead of the hardcoded skeleton values.
+    let mixed_port = clash_verge_core::config::IClashTemp::new()
+        .await
+        .get_mixed_port();
     match &conversion {
         Some(conversion) => {
             crate::mihomo_manager::ManagerInner::write_singbox_conversion(
                 manager.config_dir(),
                 conversion,
                 &rule_sets,
+                enable_tun,
+                mixed_port,
             )
             .await
             .map_err(|e| e.to_string())?;
