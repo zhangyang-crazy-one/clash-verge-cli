@@ -20,8 +20,14 @@ fn write_probe_config(dir: &PathBuf, controller: SocketAddr) -> anyhow::Result<P
         groups: Vec::new(),
         mixed_port: controller.port() + 1,
         enable_tun: false,
-        tun: crate::singbox::TunSettings { stack: "gvisor".into(), mtu: 9000 },
-        clash_api: crate::singbox::ClashApiSettings { listen: controller, secret: "e2e-secret".into() },
+        tun: crate::singbox::TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        },
+        clash_api: crate::singbox::ClashApiSettings {
+            listen: controller,
+            secret: "e2e-secret".into(),
+        },
         rule_sets: Vec::new(),
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
@@ -55,7 +61,11 @@ async fn real_sing_box_spawns_and_answers_controller() {
         .arg(&config_path)
         .output()
         .expect("run sing-box check");
-    assert!(check.status.success(), "sing-box check failed: {}", String::from_utf8_lossy(&check.stderr));
+    assert!(
+        check.status.success(),
+        "sing-box check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
 
     // Layer 2: real spawn.
     let mut child = tokio::process::Command::new(&binary)
@@ -72,20 +82,17 @@ async fn real_sing_box_spawns_and_answers_controller() {
     // the child MUST be killed — a leaked orphan holds the ports and
     // poisons every later run.
     let api = MihomoApi::with_transport(Transport::Tcp(controller), "e2e-secret").expect("api");
-    let version = match super::manager::probe_readiness(
-        &api,
-        crate::mihomo_manager::CoreKind::SingBox,
-        Duration::from_secs(15),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(error) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            panic!("readiness probe failed: {error}");
-        }
-    };
+    let version =
+        match super::manager::probe_readiness(&api, crate::mihomo_manager::CoreKind::SingBox, Duration::from_secs(15))
+            .await
+        {
+            Ok(v) => v,
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("readiness probe failed: {error}");
+            }
+        };
     assert!(version.starts_with("sing-box"), "unexpected version: {version}");
 
     // Layer 4: monitoring endpoint answers through the same client.
