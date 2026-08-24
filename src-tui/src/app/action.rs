@@ -158,6 +158,25 @@ pub enum Action {
     /// Task 7.1: save outcome (status message) — exits edit mode on success.
     RulesEditSaved(String),
     RulesEditFailed(String),
+    /// Task 7.5: explicit confirm before saving under sing-box (core restart).
+    RulesEditSaveConfirmed,
+    RulesEditSaveCancelled,
+    /// Task 7.2: open the structured rule form input.
+    RuleFormAdd,
+    /// Task 8.1: structured sing-box DNS editor.
+    DnsEditToggle,
+    /// Switch DNS editor focus between servers and split rules.
+    DnsFocusToggle,
+    DnsAddServer,
+    /// Delete the entry at the cursor of the focused DNS list.
+    DnsDeleteEntry,
+    DnsAddRule,
+    /// Edit the bootstrap domain_resolver server tag.
+    DnsSetResolver,
+    /// Persist + regenerate config + restart sing-box.
+    DnsApply,
+    DnsApplied(String),
+    DnsApplyFailed(String),
     RulesFetched(Vec<Rule>),
     RulesFailed(String),
     RuleProvidersRefresh,

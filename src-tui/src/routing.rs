@@ -487,3 +487,111 @@ mod describe_tests {
         assert_eq!(describe(&rule), "(OR: 2 rules -> DIRECT)");
     }
 }
+
+// ---------- Task 7.2: structured rule form ----------
+
+/// Parse one `kind=value>target` spec from the rule editor form into a
+/// `Simple` rule. Kinds: `domain`/`suffix`/`keyword`/`ip`/`port`/`process`/
+/// `set`; target is `DIRECT`, `REJECT`, or an outbound group name.
+///
+/// This is the structured construction path (task 7.2): the user picks from
+/// validated match kinds instead of memorizing clash rule syntax. Raw clash
+/// strings and sing-box JSON remain available via the existing inputs.
+pub fn build_simple_rule(spec: &str) -> Result<IRouteRule, String> {
+    let spec = spec.trim();
+    let Some((left, target)) = spec.split_once('>') else {
+        return Err("expected kind=value>target (missing '>')".into());
+    };
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("empty target after '>'".into());
+    }
+    let target = match target {
+        "DIRECT" => RuleTarget::Direct,
+        "REJECT" => RuleTarget::Block,
+        other => RuleTarget::Outbound(other.to_string()),
+    };
+    let Some((kind, value)) = left.split_once('=') else {
+        return Err("expected kind=value>target (missing '=')".into());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("empty match value".into());
+    }
+    let field = match kind.trim() {
+        "domain" => MatchField::Domain(value.into()),
+        "suffix" => MatchField::DomainSuffix(value.into()),
+        "keyword" => MatchField::DomainKeyword(value.into()),
+        "ip" | "cidr" => MatchField::IpCidr(value.into()),
+        "port" => MatchField::Port(value.parse().map_err(|_| format!("invalid port: {value}"))?),
+        "process" => MatchField::Process(value.into()),
+        "set" => MatchField::RuleSet(value.into()),
+        other => {
+            return Err(format!(
+                "unknown kind '{other}' (use domain/suffix/keyword/ip/port/process/set)"
+            ));
+        }
+    };
+    Ok(IRouteRule::Simple {
+        matches: vec![field],
+        target,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod form_tests {
+    use super::*;
+
+    #[test]
+    fn builds_simple_rules_from_form_specs() {
+        let built = build_simple_rule("suffix=google.com > PROXY").expect("suffix");
+        assert_eq!(
+            built,
+            IRouteRule::Simple {
+                matches: vec![MatchField::DomainSuffix("google.com".into())],
+                target: RuleTarget::Outbound("PROXY".into()),
+            }
+        );
+
+        assert_eq!(
+            build_simple_rule("ip=10.0.0.0/8>DIRECT").expect("ip"),
+            IRouteRule::Simple {
+                matches: vec![MatchField::IpCidr("10.0.0.0/8".into())],
+                target: RuleTarget::Direct,
+            }
+        );
+        assert_eq!(
+            build_simple_rule("set=geoip>REJECT").expect("set"),
+            IRouteRule::Simple {
+                matches: vec![MatchField::RuleSet("geoip".into())],
+                target: RuleTarget::Block,
+            }
+        );
+        assert_eq!(
+            build_simple_rule("port=443>PROXY").expect("port"),
+            IRouteRule::Simple {
+                matches: vec![MatchField::Port(443)],
+                target: RuleTarget::Outbound("PROXY".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn form_specs_are_validated() {
+        assert!(build_simple_rule("no-separator").is_err());
+        assert!(build_simple_rule("domain=a.com>").is_err(), "empty target");
+        assert!(build_simple_rule("domain=>PROXY").is_err(), "empty value");
+        assert!(build_simple_rule("bogus=x>PROXY").is_err(), "unknown kind");
+        assert!(build_simple_rule("port=http>PROXY").is_err(), "bad port");
+    }
+
+    #[test]
+    fn form_rules_serialize_to_clash_and_singbox() {
+        let built = build_simple_rule("process=ssh>REJECT").expect("process");
+        assert_eq!(to_clash_rule_str(&built), "PROCESS-NAME,ssh,REJECT");
+        let json = to_singbox_json(&built).expect("singbox form");
+        assert_eq!(json["process_name"], json!(["ssh"]));
+        assert_eq!(json["outbound"], "block");
+    }
+}

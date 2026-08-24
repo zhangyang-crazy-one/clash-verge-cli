@@ -88,6 +88,13 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('N'))
             | (Overlay::ServiceUninstallConfirmation, KeyCode::Esc)
             | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('q')) => Some(Action::CancelServiceUninstall),
+            // Task 7.5: saving rules under sing-box restarts the core; the
+            // dialog makes that cost explicit before it happens.
+            (Overlay::RulesRestartConfirmation, KeyCode::Char('y'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Char('Y')) => Some(Action::RulesEditSaveConfirmed),
+            (Overlay::RulesRestartConfirmation, KeyCode::Char('n'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Char('N'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Esc) => Some(Action::RulesEditSaveCancelled),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -157,9 +164,7 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         // Rule editing (task 7.1) — shifted keys so navigation stays intact.
         KeyCode::Char('E') if context.view == View::Rules => Some(Action::RulesEditToggle),
         KeyCode::Char('a') if context.view == View::Rules => Some(Action::RulesEditAdd),
-        KeyCode::Char('O') if context.view == View::Rules => {
-            Some(Action::OpenEditor(EditorTarget::Singbox))
-        }
+        KeyCode::Char('O') if context.view == View::Rules => Some(Action::OpenEditor(EditorTarget::Singbox)),
         KeyCode::Char('r') if context.view == View::Rules => Some(Action::RulesEditAddRuleSet),
         KeyCode::Char('x') if context.view == View::Rules => Some(Action::RulesEditDeleteRuleSet),
         KeyCode::Char('D') if context.view == View::Rules && context.focus == Focus::Content => {
@@ -174,11 +179,22 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Char('W') if context.view == View::Rules && context.focus == Focus::Content => {
             Some(Action::RulesEditSave)
         }
+        // Task 7.2: structured rule form (guards live on the event-loop arm).
+        KeyCode::Char('f') if context.view == View::Rules => Some(Action::RuleFormAdd),
 
         // Settings editor
         KeyCode::Char('e') if context.view == View::Settings && context.focus == Focus::Content => {
             Some(Action::OpenEditor(EditorTarget::Verge))
         }
+
+        // Sing-box DNS editor (task 8.1) — guards live on the event-loop arms.
+        KeyCode::Char('d') if context.view == View::Settings => Some(Action::DnsEditToggle),
+        KeyCode::BackTab if context.view == View::Settings => Some(Action::DnsFocusToggle),
+        KeyCode::Char('a') if context.view == View::Settings => Some(Action::DnsAddServer),
+        KeyCode::Char('r') if context.view == View::Settings => Some(Action::DnsAddRule),
+        KeyCode::Char('R') if context.view == View::Settings => Some(Action::DnsSetResolver),
+        KeyCode::Char('x') if context.view == View::Settings => Some(Action::DnsDeleteEntry),
+        KeyCode::Char('w') if context.view == View::Settings => Some(Action::DnsApply),
 
         _ => None,
     }

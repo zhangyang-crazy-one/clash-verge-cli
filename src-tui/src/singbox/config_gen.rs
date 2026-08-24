@@ -9,9 +9,10 @@
 //! - `experimental.clash_api` bound to a local TCP address (sing-box's
 //!   clash_api does not support unix sockets)
 //!
-//! Intentionally minimal: DNS/rule-set/route rules are layered on by later
-//! work; unknown fields survive because generation starts from scratch each
-//! time the profile changes.
+//! Route rules and DNS arrive pre-built (`ConfigInput::route_rules` /
+//! `ConfigInput::dns`) so this module stays a pure shape assembler; unknown
+//! fields survive because generation starts from scratch each time the
+//! profile changes.
 
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -62,6 +63,11 @@ pub struct ConfigInput {
     /// Task 7.4: sing-box rule-set definitions emitted verbatim as the
     /// top-level `rule_set` section; rules reference them by tag.
     pub rule_sets: Vec<Value>,
+    /// Pre-converted sing-box route rule objects (task 7.5): profile rules
+    /// via `routing::to_singbox_json` plus stored logical rules.
+    pub route_rules: Vec<Value>,
+    /// Pre-built DNS section (task 8.1, 1.12+ new format); omitted when None.
+    pub dns: Option<Value>,
 }
 
 const TUN_INTERFACE_NAME: &str = "sb-tun0";
@@ -166,6 +172,12 @@ pub fn generate_config(input: &ConfigInput) -> Result<Value, String> {
     if !input.rule_sets.is_empty() {
         config["rule_set"] = Value::Array(input.rule_sets.clone());
     }
+    if !input.route_rules.is_empty() {
+        config["route"]["rules"] = Value::Array(input.route_rules.clone());
+    }
+    if let Some(dns) = &input.dns {
+        config["dns"] = dns.clone();
+    }
     Ok(config)
 }
 
@@ -203,6 +215,8 @@ mod tests {
                 secret: "s3cret".into(),
             },
             rule_sets: Vec::new(),
+            route_rules: Vec::new(),
+            dns: None,
         }
     }
 
@@ -323,5 +337,38 @@ mod tests {
         input.rule_sets.clear();
         let config = generate_config(&input).expect("config");
         assert!(config.get("rule_set").is_none(), "empty rule_sets must be omitted");
+    }
+    #[test]
+    fn route_rules_are_injected_into_route_section() {
+        let mut input = sample_input();
+        input.route_rules = vec![json!({ "domain_suffix": ["example.com"], "outbound": "PROXY" })];
+
+        let config = generate_config(&input).expect("config");
+        assert_eq!(
+            config["route"]["rules"],
+            json!([{ "domain_suffix": ["example.com"], "outbound": "PROXY" }])
+        );
+        // route.final coexists with injected rules.
+        assert_eq!(config["route"]["final"], "PROXY");
+
+        input.route_rules.clear();
+        let config = generate_config(&input).expect("config");
+        assert!(
+            config["route"].get("rules").is_none(),
+            "empty route_rules must be omitted"
+        );
+    }
+
+    #[test]
+    fn dns_section_is_emitted_when_present() {
+        let mut input = sample_input();
+        input.dns = Some(json!({ "servers": [{ "type": "local", "tag": "dns-local" }] }));
+
+        let config = generate_config(&input).expect("config");
+        assert_eq!(config["dns"]["servers"][0]["tag"], "dns-local");
+
+        input.dns = None;
+        let config = generate_config(&input).expect("config");
+        assert!(config.get("dns").is_none(), "absent dns must be omitted");
     }
 }

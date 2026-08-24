@@ -118,6 +118,8 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
             secret: String::new(),
         },
         rule_sets: Vec::new(),
+        route_rules: Vec::new(),
+        dns: None,
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
     serde_json::to_string_pretty(&config).map_err(Into::into)
@@ -445,7 +447,7 @@ impl ManagerInner {
                     .await
                     .context("auto-restart: failed to resolve sing-box binary")?;
                 tracing::info!(target: "singbox", "auto-restarting sing-box {}", resolved.version);
-                let config_path = Self::write_singbox_runtime_config(config_dir).await?;
+                let config_path = Self::write_singbox_full(config_dir).await?;
                 Self::spawn_core(
                     &resolved.path,
                     &resolved.version,
@@ -461,39 +463,44 @@ impl ManagerInner {
         }
     }
 
-    /// Generate and persist the sing-box runtime config (`singbox.json`).
-    ///
-    /// Skeleton stage: empty outbound set (route falls back to `direct`),
-    /// which is a valid starting config; node outbounds are spliced in by
-    /// the subscription converter from group 5.
-    pub(crate) async fn write_singbox_runtime_config(config_dir: &Path) -> anyhow::Result<PathBuf> {
-        let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
-        let mixed_port = clash_verge_core::config::IClashTemp::new()
-            .await
-            .get_mixed_port();
-        Self::write_singbox_conversion(
-            config_dir,
-            &crate::singbox::convert::ProfileConversion::default(),
-            &[],
-            enable_tun,
-            mixed_port,
-        )
-        .await
+    /// Read the active profile's YAML from disk, if one is selected and
+    /// readable. None means "generate the bare skeleton".
+    pub(crate) async fn active_profile_yaml() -> Option<String> {
+        let store = crate::profile_store::store::ProfileStore::snapshot().await.ok()?;
+        let uid = store.current_uid();
+        let item = store.items().into_iter().find(|i| i.uid == uid)?;
+        let file = item.file.as_deref()?;
+        let path = clash_verge_core::utils::dirs::app_profiles_dir().ok()?.join(file);
+        std::fs::read_to_string(path).ok()
     }
 
-    /// Persist a sing-box runtime config built from converted profile nodes.
-    pub(crate) async fn write_singbox_conversion(
+    /// Generate and persist the sing-box runtime config from whatever the
+    /// active profile currently holds (task 7.5): converted outbounds/groups,
+    /// route rules, stored logical rules, rule-sets and structured DNS.
+    pub(crate) async fn write_singbox_full(config_dir: &Path) -> anyhow::Result<PathBuf> {
+        let yaml = Self::active_profile_yaml().await;
+        let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
+        Ok(Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun)
+            .await?
+            .0)
+    }
+
+    /// Persist a sing-box runtime config assembled from the given profile
+    /// YAML (None → bare skeleton). Returns the written path plus the parts
+    /// so callers can build a degradation report without re-converting.
+    pub(crate) async fn write_singbox_assembled(
         config_dir: &Path,
-        conversion: &crate::singbox::convert::ProfileConversion,
-        rule_sets: &[serde_json::Value],
+        yaml: Option<&str>,
         enable_tun: bool,
-        mixed_port: u16,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<(PathBuf, SingboxParts)> {
         let _ = config_dir;
+        let parts = SingboxParts::assemble(yaml).await?;
+        let mixed_port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
         let input = crate::singbox::ConfigInput {
-            outbounds: conversion.outbounds.clone(),
-            groups: conversion.groups.clone(),
-            rule_sets: rule_sets.to_vec(),
+            outbounds: parts.conversion.outbounds.clone(),
+            groups: parts.conversion.groups.clone(),
+            rule_sets: parts.rule_sets.clone(),
+            route_rules: parts.route_rules.clone(),
             mixed_port,
             enable_tun,
             tun: crate::singbox::TunSettings {
@@ -504,8 +511,14 @@ impl ManagerInner {
                 listen: "127.0.0.1:9090".parse().expect("static addr"),
                 secret: String::new(),
             },
+            dns: parts.dns_section.clone(),
         };
-        let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
+        let mut config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
+        // 1.12+ bootstrap: tell the core which DNS server resolves outbound
+        // node domains (see D8).
+        if let Some(resolver) = &parts.default_domain_resolver {
+            config["route"]["default_domain_resolver"] = serde_json::json!(resolver);
+        }
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
@@ -515,7 +528,63 @@ impl ManagerInner {
         let tmp = path.with_extension("json.download");
         tokio::fs::write(&tmp, body).await?;
         tokio::fs::rename(&tmp, &path).await?;
-        Ok(path)
+        Ok((path, parts))
+    }
+}
+
+/// Everything assembled for one sing-box config generation pass.
+pub(crate) struct SingboxParts {
+    pub conversion: crate::singbox::convert::ProfileConversion,
+    /// Whether a profile document fed the conversion (drives the status
+    /// report wording).
+    pub profile_used: bool,
+    pub route_rules: Vec<serde_json::Value>,
+    pub rule_sets: Vec<serde_json::Value>,
+    pub dns_section: Option<serde_json::Value>,
+    pub default_domain_resolver: Option<String>,
+}
+
+impl SingboxParts {
+    async fn assemble(yaml: Option<&str>) -> anyhow::Result<Self> {
+        let (conversion, profile_used) = match yaml {
+            Some(y) => (
+                crate::singbox::convert::convert_profile(y).map_err(anyhow::Error::msg)?,
+                true,
+            ),
+            None => (crate::singbox::convert::ProfileConversion::default(), false),
+        };
+        // Clash-expressible rules convert through IRouteRule; raw clash
+        // fragments have no sing-box form and stay profile-only. Stored
+        // logical rules are appended after them (see LOGICAL_RULES_FILE).
+        let mut route_rules: Vec<serde_json::Value> = match yaml {
+            Some(y) => crate::routing::load_profile_rules(y)
+                .map_err(anyhow::Error::msg)?
+                .iter()
+                .filter_map(crate::routing::to_singbox_json)
+                .collect(),
+            None => Vec::new(),
+        };
+        let home = clash_verge_core::utils::dirs::app_home_dir().ok();
+        if let Some(logical) = home.as_ref().map(|home| crate::singbox::load_logical_rules(home)) {
+            route_rules.extend(logical.iter().filter_map(crate::routing::to_singbox_json));
+        }
+        let rule_sets = home
+            .as_ref()
+            .map(|home| crate::singbox::load_rule_sets(home))
+            .unwrap_or_default();
+        let dns_spec = home.as_deref().and_then(crate::singbox::load_dns_spec);
+        let default_domain_resolver = dns_spec.as_ref().and_then(crate::singbox::dns::default_domain_resolver);
+        let empty_dns = crate::singbox::dns::DnsConfigSpec::default();
+        let dns_section = crate::singbox::dns::build_dns_section(dns_spec.as_ref().unwrap_or(&empty_dns))
+            .map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            conversion,
+            profile_used,
+            route_rules,
+            rule_sets,
+            dns_section,
+            default_domain_resolver,
+        })
     }
 }
 
@@ -791,7 +860,7 @@ resolved binary; the running core was left untouched",
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
         preflight_tun_capability(&resolved.path, tun_enabled)?;
         self.stop().await.context("failed to stop running sing-box")?;
-        let config_path = ManagerInner::write_singbox_runtime_config(&self.config_dir).await?;
+        let config_path = ManagerInner::write_singbox_full(&self.config_dir).await?;
         ManagerInner::spawn_core(
             &resolved.path,
             &resolved.version,

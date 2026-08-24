@@ -202,6 +202,22 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 content,
             );
         }
+        Overlay::RulesRestartConfirmation => {
+            let content = vec![
+                Line::from(Span::styled(
+                    "Saving rules under sing-box restarts the core",
+                    theme::bold(theme::warn()),
+                )),
+                Line::from("sing-box has no hot reload for route rules - the"),
+                Line::from("whole profile is regenerated and applied in one restart."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "y = apply batch save | n/Esc = keep editing",
+                    Style::new().fg(theme::dim()),
+                )),
+            ];
+            dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Warn, "Save rules", content);
+        }
         Overlay::PasswordInput => {
             let prompt = app.password_prompt.as_deref().unwrap_or("sudo");
             let masked = dialog::mask_password(app.password_buffer.len());

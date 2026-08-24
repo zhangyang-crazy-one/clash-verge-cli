@@ -59,55 +59,28 @@ pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::
     }
 }
 
-
 /// Sing-box ReloadStrategy application (task 3.4): regenerate the runtime
 /// config, prevalidate it while the old core is still serving, then restart
 /// through the manager (barrier + readiness probe inside). On a failed
 /// restart the previous config file is restored and one fallback restart
 /// is attempted.
+///
+/// Task 7.5: a single assembled generation pass covers nodes/groups, route
+/// rules (profile rules + stored logical rules), rule-sets and structured
+/// DNS - every save lands in one restart instead of several.
 pub async fn apply_singbox_restart(
     manager: &crate::mihomo_manager::MihomoManager,
     config_yaml: Option<&str>,
-    // Threaded for future TUN-aware generation; skeleton keeps tun off.
     enable_tun: bool,
 ) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let config_path =
-        clash_verge_core::utils::dirs::singbox_config_path().map_err(|e| e.to_string())?;
+    let config_path = clash_verge_core::utils::dirs::singbox_config_path().map_err(|e| e.to_string())?;
     let previous = tokio::fs::read(&config_path).await.ok();
 
-    // Task 5.2: convert the active profile when its YAML is available;
-    // otherwise fall back to the empty skeleton.
-    let conversion = match config_yaml {
-        Some(yaml) => Some(crate::singbox::convert::convert_profile(yaml)?),
-        None => None,
-    };
-    let rule_sets = clash_verge_core::utils::dirs::app_home_dir()
-        .map(|home| crate::singbox::load_rule_sets(&home))
-        .unwrap_or_default();
-    // Task 8.2/8.3: honor the requested TUN state and the configured port
-    // instead of the hardcoded skeleton values.
-    let mixed_port = clash_verge_core::config::IClashTemp::new()
-        .await
-        .get_mixed_port();
-    match &conversion {
-        Some(conversion) => {
-            crate::mihomo_manager::ManagerInner::write_singbox_conversion(
-                manager.config_dir(),
-                conversion,
-                &rule_sets,
-                enable_tun,
-                mixed_port,
-            )
+    let (_path, parts) =
+        crate::mihomo_manager::ManagerInner::write_singbox_assembled(manager.config_dir(), config_yaml, enable_tun)
             .await
             .map_err(|e| e.to_string())?;
-        }
-        None => {
-            crate::mihomo_manager::ManagerInner::write_singbox_runtime_config(manager.config_dir())
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-    }
 
     let Some(binary) = crate::mihomo_manager::singbox_binary::candidate_without_install() else {
         return Err("sing-box binary not found".into());
@@ -124,16 +97,27 @@ pub async fn apply_singbox_restart(
     }
 
     // Human-readable degradation report for the status bar.
-    let report = match &conversion {
-        Some(c) => format!(
+    let report = if parts.profile_used {
+        format!(
             "sing-box: {} nodes, {} skipped, {} fields degraded",
-            c.outbounds.len(),
-            c.skipped.len(),
-            c.degraded.len()
-        ),
-        None => "sing-box: skeleton config applied".into(),
+            parts.conversion.outbounds.len(),
+            parts.conversion.skipped.len(),
+            parts.conversion.degraded.len()
+        )
+    } else {
+        "sing-box: skeleton config applied".into()
     };
     Ok(report)
+}
+
+/// Task 8.1/7.5 helper: regenerate from the ACTIVE profile (not a caller
+/// snapshot) and restart sing-box so DNS/rule-set edits take effect.
+pub async fn apply_singbox_active_reload(manager: &crate::mihomo_manager::MihomoManager) -> Result<String, String> {
+    let yaml = crate::mihomo_manager::ManagerInner::active_profile_yaml().await;
+    let enable_tun = crate::mihomo_manager::manager::runtime_tun_enabled()
+        .await
+        .unwrap_or(false);
+    apply_singbox_restart(manager, yaml.as_deref(), enable_tun).await
 }
 
 pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {

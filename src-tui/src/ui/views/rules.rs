@@ -63,16 +63,14 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
                 let is_selected = focused && i == app.rules_selected_index;
                 let prefix = if is_selected { ">" } else { " " };
                 let text = crate::routing::describe(rule);
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!("{prefix} {text}"),
-                        if is_selected {
-                            theme::bold(theme::accent())
-                        } else {
-                            Style::new().fg(theme::text())
-                        },
-                    ),
-                ]);
+                let line = Line::from(vec![Span::styled(
+                    format!("{prefix} {text}"),
+                    if is_selected {
+                        theme::bold(theme::accent())
+                    } else {
+                        Style::new().fg(theme::text())
+                    },
+                )]);
                 ListItem::new(line)
             })
             .collect();

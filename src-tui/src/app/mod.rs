@@ -16,6 +16,14 @@ pub enum InputMode {
     RuleInput(String),
     /// Task 7.4: "tag|remote|url" or "tag|local|path".
     RuleSetInput(String),
+    /// Task 7.2: structured rule form "kind=value>target".
+    RuleFormInput(String),
+    /// Task 8.1 DNS editor: "kind|tag|server|port|detour".
+    DnsServerInput(String),
+    /// Task 8.1 DNS editor: "tag|suffix=a,b|keyword=x|cidr=c".
+    DnsRuleInput(String),
+    /// Task 8.1 DNS editor: bootstrap resolver server tag (empty clears).
+    DnsResolverInput(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +113,10 @@ pub enum Overlay {
     /// The System service row is installed; uninstalling needs an explicit
     /// `y` before the password popup opens (`n`/Esc/q cancel).
     ServiceUninstallConfirmation,
+    /// Task 7.5: saving rules under sing-box restarts the core (`PUT
+    /// /configs` is a no-op there); explicit `y` applies the batch save,
+    /// `n`/Esc/q keeps editing without a restart.
+    RulesRestartConfirmation,
 }
 
 /// Pending SSRF trust confirmation for a subscription import or refresh.
@@ -248,6 +260,13 @@ pub struct App {
     pub rules_edit_dirty: bool,
     /// Task 7.4: rule-set definitions loaded with the edit buffer.
     pub rule_sets_edit: Vec<serde_json::Value>,
+    /// Task 8.1: structured sing-box DNS editor state (spec mirrors disk;
+    /// mutations persist immediately like rule-sets, apply is explicit).
+    pub dns_edit_mode: bool,
+    pub dns_spec_edit: crate::singbox::dns::DnsConfigSpec,
+    /// False = servers list focused, true = split rules list focused.
+    pub dns_focus_rules: bool,
+    pub dns_cursor: usize,
     /// Whether the mihomo binary carries TUN capabilities (set after the
     /// one-time askpass setup).
     pub tun_privileged: bool,
@@ -322,6 +341,10 @@ impl App {
             rules_edit_buffer: Vec::new(),
             rules_edit_dirty: false,
             rule_sets_edit: Vec::new(),
+            dns_edit_mode: false,
+            dns_spec_edit: crate::singbox::dns::DnsConfigSpec::default(),
+            dns_focus_rules: false,
+            dns_cursor: 0,
             rules_selected_index: 0,
             tun_privileged: false,
             password_buffer: Vec::new(),
