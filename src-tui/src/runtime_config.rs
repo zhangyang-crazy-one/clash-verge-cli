@@ -6,6 +6,8 @@ use std::sync::LazyLock;
 
 use tokio::sync::Mutex;
 
+use crate::chain::{apply_rules_fragment, parse_rules_fragment};
+
 /// Serializes all runtime-config read-modify-write sequences (mode switches,
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -141,20 +143,39 @@ pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::
     }
 }
 
-/// Regenerate the runtime config from a refreshed remote profile and reload it.
-pub async fn reload_remote_profile(
-    api: &crate::mihomo_api::MihomoApi,
+/// Read a remote profile's YAML from disk and compose its configured rules
+/// fragment (`option.rules`) before returning the parsed mapping.
+///
+/// Returns an error early when the fragment reference or file is broken, so
+/// callers never write or reload the runtime config on top of a silently
+/// discarded local override.
+pub async fn load_remote_profile_with_rules(
     item: &clash_verge_core::config::PrfItem,
-    enable_tun: bool,
-    core_running: bool,
-) -> Result<(), String> {
+) -> Result<serde_yaml_ng::Mapping, String> {
+    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| error.to_string())?;
+    let all_items = crate::profile_store::store::ProfileStore::snapshot()
+        .await
+        .map_err(|error| error.to_string())?
+        .all_items();
+    compose_remote_profile(item, &profiles_dir, &all_items).await
+}
+
+/// Compose the runtime mapping for a remote profile: the upstream profile
+/// with its configured rules fragment applied on top.
+///
+/// `all_items` resolves `option.rules` — a profile UID — to the fragment
+/// item carrying the on-disk `file` name. With no configured rules fragment
+/// the upstream profile is returned unchanged.
+async fn compose_remote_profile(
+    item: &clash_verge_core::config::PrfItem,
+    profiles_dir: &std::path::Path,
+    all_items: &[clash_verge_core::config::PrfItem],
+) -> Result<serde_yaml_ng::Mapping, String> {
     let file = item
         .file
         .as_deref()
         .ok_or_else(|| "remote profile is missing file".to_string())?;
-    let profile_path = clash_verge_core::utils::dirs::app_profiles_dir()
-        .map_err(|error| error.to_string())?
-        .join(file);
+    let profile_path = profiles_dir.join(file);
     if !profile_path.exists() {
         return Err(format!("profile file not found: {}", profile_path.display()));
     }
@@ -162,8 +183,41 @@ pub async fn reload_remote_profile(
     let raw = tokio::fs::read_to_string(&profile_path)
         .await
         .map_err(|error| format!("failed to read {}: {error}", profile_path.display()))?;
-    let profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
+    let mut profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
+
+    let Some(rules_uid) = item.option.as_ref().and_then(|option| option.rules.as_deref()) else {
+        return Ok(profile);
+    };
+
+    let fragment_item = all_items
+        .iter()
+        .find(|candidate| candidate.uid.as_deref() == Some(rules_uid))
+        .ok_or_else(|| format!("rules fragment profile not found for option.rules={rules_uid}"))?;
+    let fragment_file = fragment_item
+        .file
+        .as_deref()
+        .ok_or_else(|| format!("rules fragment profile {rules_uid} is missing file"))?;
+    let fragment_path = profiles_dir.join(fragment_file);
+    if !fragment_path.exists() {
+        return Err(format!("rules fragment file not found: {}", fragment_path.display()));
+    }
+    let fragment_raw = tokio::fs::read_to_string(&fragment_path)
+        .await
+        .map_err(|error| format!("failed to read {}: {error}", fragment_path.display()))?;
+    let fragment = parse_rules_fragment(&fragment_raw, &fragment_path).map_err(|error| error.to_string())?;
+    apply_rules_fragment(&mut profile, &fragment);
+    Ok(profile)
+}
+
+/// Regenerate the runtime config from a refreshed remote profile and reload it.
+pub async fn reload_remote_profile(
+    api: &crate::mihomo_api::MihomoApi,
+    item: &clash_verge_core::config::PrfItem,
+    enable_tun: bool,
+    core_running: bool,
+) -> Result<(), String> {
+    let profile = load_remote_profile_with_rules(item).await?;
 
     // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
     commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
@@ -294,8 +348,173 @@ pub async fn write_runtime_config_unlocked(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
-    use super::*;
 
+    use super::*;
+    use clash_verge_core::config::{PrfItem, PrfOption};
+    use serde_yaml_ng::{Mapping, Value};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// Unique temp profiles dir per test. `compose_remote_profile` takes the
+    /// profiles dir and the profile items explicitly, so tests need no global
+    /// app-home state or cross-test locking.
+    fn test_profiles_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "clash-verge-cli-rules-{}-{label}-{seq}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test profiles dir");
+        dir
+    }
+
+    fn write_file(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::write(dir.join(name), body).expect("write test file");
+    }
+
+    fn rules_strings(mapping: &Mapping) -> Vec<String> {
+        mapping
+            .get("rules")
+            .and_then(Value::as_sequence)
+            .expect("rules sequence")
+            .iter()
+            .filter_map(|entry| entry.as_str().map(str::to_owned))
+            .collect()
+    }
+
+    fn remote_item(file: &str, rules_uid: Option<&str>) -> PrfItem {
+        PrfItem {
+            uid: Some("Rremote01ab".into()),
+            itype: Some("remote".into()),
+            name: Some("demo".into()),
+            file: Some(file.into()),
+            option: rules_uid.map(|uid| PrfOption {
+                rules: Some(uid.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn rules_fragment_item(uid: &str, file: &str) -> PrfItem {
+        PrfItem {
+            uid: Some(uid.into()),
+            itype: Some("rules".into()),
+            file: Some(file.into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_composes_local_rules_with_fresh_upstream_rules() {
+        let dir = test_profiles_dir("compose");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n  - B\n  - C\n");
+        write_file(&dir, "rules.yaml", "prepend:\n  - P\nappend:\n  - Q\ndelete:\n  - B\n");
+        let item = remote_item("sub.yaml", Some("rFrag01"));
+        let all = vec![rules_fragment_item("rFrag01", "rules.yaml")];
+
+        let mapping = compose_remote_profile(&item, &dir, &all)
+            .await
+            .expect("fragment composes with fresh upstream rules");
+
+        assert_eq!(rules_strings(&mapping), vec!["P", "A", "C", "Q"]);
+    }
+
+    #[tokio::test]
+    async fn legacy_sequence_fragment_replaces_upstream_rules() {
+        let dir = test_profiles_dir("legacy");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n  - B\n");
+        write_file(&dir, "rules.yaml", "- X\n- Y\n");
+        let item = remote_item("sub.yaml", Some("rFrag01"));
+        let all = vec![rules_fragment_item("rFrag01", "rules.yaml")];
+
+        let mapping = compose_remote_profile(&item, &dir, &all)
+            .await
+            .expect("legacy fragment replaces upstream rules");
+
+        assert_eq!(rules_strings(&mapping), vec!["X", "Y"]);
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_with_no_rules_option_keeps_upstream_unchanged() {
+        let dir = test_profiles_dir("no-option");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n  - B\n");
+        let item = remote_item("sub.yaml", None);
+
+        let mapping = compose_remote_profile(&item, &dir, &[])
+            .await
+            .expect("no fragment keeps upstream rules");
+
+        assert_eq!(rules_strings(&mapping), vec!["A", "B"]);
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_rejects_malformed_fragment() {
+        let dir = test_profiles_dir("bad-fragment");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n  - B\n");
+        write_file(&dir, "rules.yaml", "prepend: []\nappends: []\n");
+        let item = remote_item("sub.yaml", Some("rFrag01"));
+        let all = vec![rules_fragment_item("rFrag01", "rules.yaml")];
+
+        let error = compose_remote_profile(&item, &dir, &all)
+            .await
+            .expect_err("malformed fragment must reject the reload");
+
+        assert!(
+            error.contains("appends") && error.contains("rules.yaml"),
+            "error cites the bad key and the fragment path: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_rejects_unknown_rules_uid() {
+        let dir = test_profiles_dir("unknown-uid");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n");
+        let item = remote_item("sub.yaml", Some("rMissing1"));
+
+        let error = compose_remote_profile(&item, &dir, &[])
+            .await
+            .expect_err("unresolvable rules uid must reject the reload");
+
+        assert!(error.contains("rMissing1"), "error names the uid: {error}");
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_rejects_missing_fragment_file() {
+        let dir = test_profiles_dir("missing-file");
+        write_file(&dir, "sub.yaml", "rules:\n  - A\n");
+        let item = remote_item("sub.yaml", Some("rFrag01"));
+        let all = vec![rules_fragment_item("rFrag01", "does-not-exist.yaml")];
+
+        let error = compose_remote_profile(&item, &dir, &all)
+            .await
+            .expect_err("missing fragment file must reject the reload");
+
+        assert!(
+            error.contains("does-not-exist.yaml"),
+            "error names the missing fragment: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_refresh_rejects_invalid_upstream_profile_yaml() {
+        let dir = test_profiles_dir("bad-profile");
+        write_file(&dir, "sub.yaml", "rules: [A, B\n");
+        let item = remote_item("sub.yaml", None);
+
+        let error = compose_remote_profile(&item, &dir, &[])
+            .await
+            .expect_err("invalid upstream YAML must reject the reload");
+
+        assert!(error.contains("invalid YAML"), "error names the parse failure: {error}");
+    }
     #[test]
     fn strategy_maps_from_core_kind() {
         assert_eq!(
