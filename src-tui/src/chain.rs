@@ -175,7 +175,6 @@ fn value_kind(value: &Value) -> &'static str {
     }
 }
 
-
 /// Apply a parsed fragment to a clash `Mapping`, replacing the `rules` key.
 ///
 /// For [`RulesFragment::Mapping`]: prepend rules come first, then every
