@@ -1559,14 +1559,29 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                             let tx = action_tx.clone();
                                             tokio::spawn(async move {
                                                 if enable_tun {
-                                                    match crate::mihomo_manager::binary::resolve_or_install()
-                                                        .await
-                                                    {
-                                                        Ok(resolved) => {
-                                                            let capable = crate::commands::privilege::has_tun_capability(
-                                                                &resolved.path,
-                                                            );
-                                                            let root = crate::commands::privilege::running_as_root();
+                                                    // Resolve the configured core's binary so the TUN
+                                                    // capability preflight (and its TUI-native setup
+                                                    // prompt) targets the binary the manager will spawn
+                                                    // next: sing-box when proxy_core is singbox, else
+                                                    // verge-mihomo.
+                                                    let resolved = match m.core_kind() {
+                                                        crate::mihomo_manager::CoreKind::SingBox => {
+                                                            crate::mihomo_manager::singbox_binary::resolve_or_install()
+                                                                .await
+                                                                .map(|r| (r.path, "sing-box core"))
+                                                                .map_err(|error| format!("failed to resolve sing-box core: {error}"))
+                                                        }
+                                                        _ => crate::mihomo_manager::binary::resolve_or_install()
+                                                            .await
+                                                            .map(|r| (r.path, "mihomo core"))
+                                                            .map_err(|error| format!("failed to resolve mihomo core: {error}")),
+                                                    };
+                                                    match resolved {
+                                                        Ok((binary, _core_label)) => {
+                                                            let capable =
+                                                                crate::commands::privilege::has_tun_capability(&binary);
+                                                            let root =
+                                                                crate::commands::privilege::running_as_root();
                                                             let needs_setup = tun_start_offers_setup(
                                                                 capable,
                                                                 root,
@@ -1583,7 +1598,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                     TunSetupReason::MissingCapability
                                                                 };
                                                                 let _ = tx.send(Action::TunSetupPrompt {
-                                                                    binary: resolved.path,
+                                                                    binary,
                                                                     enable_tun,
                                                                     reason,
                                                                 });
@@ -1591,9 +1606,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             }
                                                         }
                                                         Err(error) => {
-                                                            let _ = tx.send(Action::CoreError(
-                                                                error.to_string(),
-                                                            ));
+                                                            let _ = tx.send(Action::CoreError(error));
                                                             return;
                                                         }
                                                     }
@@ -1740,6 +1753,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         let itype = item.itype.clone().unwrap_or_default();
                                                         app.status_msg = Some(format!("Switching to {name}..."));
                                                         let api = manager.api();
+                                                        let m = manager.clone();
                                                         let tx = action_tx.clone();
                                                         let enable_tun =
                                                             app.gui_config.enable_tun_mode.unwrap_or(false);
@@ -1747,7 +1761,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                         if itype == "remote" {
                                                             let item = item.clone();
                                                             tokio::spawn(async move {
-                                                            let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
+                                                                let previous_uid = match crate::profile_store::store::ProfileStore::replace_current_locked(
                                                                     uid.as_str(),
                                                                 )
                                                                 .await
@@ -1760,28 +1774,58 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                                         return;
                                                                     }
                                                                 };
-                                                                match reload_remote_profile(
-                                                                    &api,
-                                                                    &item,
-                                                                    enable_tun,
-                                                                    core_running,
-                                                                )
-                                                                .await
-                                                                {
-                                                                    Ok(()) => {
-                                                                        if core_running {
-                                                                            let _ = tx.send(Action::ProxiesRefresh);
+                                                                if m.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+                                                                    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().unwrap_or_default();
+                                                                    let profile_doc = std::fs::read_to_string(
+                                                                        profiles_dir.join(item.file.as_deref().unwrap_or_default())
+                                                                    ).ok();
+                                                                    match crate::runtime_config::apply_singbox_restart(
+                                                                        &m,
+                                                                        profile_doc.as_deref(),
+                                                                        enable_tun,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        Ok(_report) => {
+                                                                            if core_running {
+                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                            }
+                                                                        }
+                                                                        Err(error) => {
+                                                                            let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                                uid.as_str(),
+                                                                                previous_uid.as_deref(),
+                                                                            )
+                                                                            .await;
+                                                                            let _ = tx.send(Action::CoreError(format!(
+                                                                                "sing-box reload: {error}"
+                                                                            )));
                                                                         }
                                                                     }
-                                                                    Err(error) => {
-                                                                        let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
-                                                                            uid.as_str(),
-                                                                            previous_uid.as_deref(),
-                                                                        )
-                                                                        .await;
-                                                                        let _ = tx.send(Action::CoreError(format!(
-                                                                            "profile reload: {error}"
-                                                                        )));
+                                                                } else {
+                                                                    match reload_remote_profile(
+                                                                        &api,
+                                                                        &item,
+                                                                        enable_tun,
+                                                                        core_running,
+                                                                    )
+                                                                    .await
+                                                                    {
+                                                                        Ok(()) => {
+                                                                            if core_running {
+                                                                                let _ = tx.send(Action::ProxiesRefresh);
+                                                                            }
+                                                                        }
+                                                                        Err(error) => {
+                                                                            let _ = crate::profile_store::store::ProfileStore::restore_current_if_matches(
+                                                                                uid.as_str(),
+                                                                                previous_uid.as_deref(),
+                                                                            )
+                                                                            .await;
+                                                                            let _ = tx.send(Action::CoreError(format!(
+                                                                                "profile reload: {error}"
+                                                                            )));
+                                                                        }
                                                                     }
                                                                 }
                                                             });
@@ -2705,7 +2749,24 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                     let should_start = !core_running;
                                     let manager = manager.clone();
                                     tokio::spawn(async move {
-                                        if let Err(error) = reload_remote_profile(
+                                        if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+                                            let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().unwrap_or_default();
+                                            let profile_doc = std::fs::read_to_string(
+                                                profiles_dir.join(item.file.as_deref().unwrap_or_default())
+                                            ).ok();
+                                            if let Err(error) = crate::runtime_config::apply_singbox_restart(
+                                                &manager,
+                                                profile_doc.as_deref(),
+                                                enable_tun,
+                                            )
+                                            .await
+                                            {
+                                                let _ = tx.send(Action::CoreError(format!(
+                                                    "sing-box reload: {error}"
+                                                )));
+                                                return;
+                                            }
+                                        } else if let Err(error) = reload_remote_profile(
                                             &api,
                                             &item,
                                             enable_tun,

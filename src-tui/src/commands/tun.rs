@@ -7,18 +7,18 @@
 
 use anyhow::Context;
 
-/// Resolve the mihomo binary and grant TUN capabilities if missing.
+/// Resolve the binary of the configured core (sing-box when `proxy_core:`
+/// is `singbox`, else verge-mihomo) and grant TUN capabilities if missing.
 ///
 /// Idempotent: when the binary is already capable the command succeeds
 /// without invoking sudo.
 pub async fn setup() -> anyhow::Result<()> {
-    let resolved = crate::mihomo_manager::binary::resolve_or_install()
-        .await
-        .context("failed to resolve mihomo binary")?;
-    println!("mihomo binary: {}", resolved.path.display());
-    println!("version:       {}", resolved.version);
+    let (path, version, core_label) = resolve_configured_core().await?;
+    println!("core binary: {}", path.display());
+    println!("core:        {core_label}");
+    println!("version:     {version}");
 
-    let applied = crate::commands::privilege::apply_tun_capability(&resolved.path)?;
+    let applied = crate::commands::privilege::apply_tun_capability(&path)?;
     if applied {
         println!("TUN capabilities applied ({}).", crate::commands::privilege::TUN_CAPS);
     } else {
@@ -38,16 +38,32 @@ pub async fn setup() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read-only report of the resolved binary's TUN capability state.
-pub async fn status() -> anyhow::Result<()> {
+/// Resolve the binary/version of whichever core `verge.yaml` selects,
+/// mirroring `commands::build_manager` so TUN setup targets exactly the
+/// binary the manager will spawn next.
+pub async fn resolve_configured_core() -> anyhow::Result<(std::path::PathBuf, String, &'static str)> {
+    let verge = clash_verge_core::config::IVerge::new().await;
+    if verge.get_valid_proxy_core() == "singbox" {
+        let resolved = crate::mihomo_manager::singbox_binary::resolve_or_install()
+            .await
+            .context("failed to resolve sing-box core")?;
+        return Ok((resolved.path, resolved.version, "sing-box"));
+    }
     let resolved = crate::mihomo_manager::binary::resolve_or_install()
         .await
-        .context("failed to resolve mihomo binary")?;
-    let privileged = crate::commands::privilege::has_tun_capability(&resolved.path);
+        .context("failed to resolve mihomo core")?;
+    Ok((resolved.path, resolved.version, "mihomo"))
+}
+
+/// Read-only report of the resolved binary's TUN capability state.
+pub async fn status() -> anyhow::Result<()> {
+    let (path, version, core_label) = resolve_configured_core().await?;
+    let privileged = crate::commands::privilege::has_tun_capability(&path);
     let root = crate::commands::privilege::running_as_root();
 
-    println!("mihomo binary: {}", resolved.path.display());
-    println!("version:       {}", resolved.version);
+    println!("core binary: {}", path.display());
+    println!("core:        {core_label}");
+    println!("version:     {version}");
     println!("TUN capability: {}", if privileged { "present" } else { "missing" });
     println!(
         "effective uid:  {}",

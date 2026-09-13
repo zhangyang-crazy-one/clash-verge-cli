@@ -31,9 +31,26 @@ pub async fn import(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("subscription URL must start with http:// or https://");
     }
+    let store = ProfileStore::snapshot().await.ok();
+    let mut trusted_hosts: Vec<smartstring::alias::String> = store
+        .map(|s| {
+            s.items()
+                .iter()
+                .filter_map(|it| it.option.as_ref()?.trusted_hosts.clone())
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+        && !trusted_hosts.iter().any(|h| h.as_str() == host)
+    {
+        trusted_hosts.push(host.into());
+    }
     let option = clash_verge_core::config::PrfOption {
         update_interval,
         allow_auto_update: no_auto_update.then_some(false),
+        trusted_hosts: (!trusted_hosts.is_empty()).then_some(trusted_hosts),
         ..Default::default()
     };
     let item = ProfileStore::import_url_locked(url, name, Some(&option)).await?;

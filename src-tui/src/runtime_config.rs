@@ -307,6 +307,9 @@ pub async fn write_runtime_config_unlocked(
     mut config: serde_yaml_ng::Mapping,
     enable_tun: bool,
 ) -> Result<std::path::PathBuf, String> {
+    // Honour the CLI's own verge.yaml port settings before the control plane
+    // is snapshotted, so a port chosen to avoid the Clash Verge GUI sticks.
+    crate::enhance::apply_verge_ports(&mut config).await;
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;

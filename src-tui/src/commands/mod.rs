@@ -16,6 +16,10 @@ use crate::mihomo_manager::manager::MihomoManager;
 use clash_verge_core::config::IClashTemp;
 
 /// Build a MihomoManager wired with config from the standalone config dir.
+///
+/// Honors `verge.yaml`'s `proxy_core` selection (`mihomo` or `singbox`) so
+/// the CLI matches the GUI's core switch: a stored `singbox` value makes the
+/// manager resolve and spawn the sing-box core instead of verge-mihomo.
 pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager> {
     let clash = IClashTemp::new().await;
     let _info = clash.get_client_info();
@@ -29,7 +33,16 @@ pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager>
         .unwrap_or_else(clash_verge_core::utils::dirs::standalone_socket_path);
     let secret = _info.secret.unwrap_or_default();
 
-    Ok(MihomoManager::new(config_dir)
+    let mut manager = MihomoManager::new(config_dir)
         .with_socket(socket_path)
-        .with_secret(secret))
+        .with_secret(secret);
+
+    // proxy_core: "singbox" switches the managed core from verge-mihomo to
+    // sing-box. IVerge validates the value (unknown degrades to mihomo).
+    let verge = clash_verge_core::config::IVerge::new().await;
+    if verge.get_valid_proxy_core() == "singbox" {
+        manager = manager.with_core_kind(crate::mihomo_manager::CoreKind::SingBox);
+    }
+
+    Ok(manager)
 }

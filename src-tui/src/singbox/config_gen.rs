@@ -106,22 +106,7 @@ pub fn generate_config(input: &ConfigInput) -> Result<Value, String> {
         .map(|g| g.name.as_str())
         .unwrap_or(DIRECT_TAG);
 
-    let mut inbounds = vec![json!({
-        "type": "mixed",
-        "tag": "mixed-in",
-        "listen": "127.0.0.1",
-        "listen_port": input.mixed_port,
-    })];
-    if input.enable_tun {
-        inbounds.push(json!({
-            "type": "tun",
-            "tag": "tun-in",
-            "interface_name": TUN_INTERFACE_NAME,
-            "stack": input.tun.stack,
-            "mtu": input.tun.mtu,
-            "auto_route": true,
-        }));
-    }
+    let inbounds = control_plane_inbounds(input.mixed_port, input.enable_tun, &input.tun);
 
     let mut outbounds: Vec<Value> = input.outbounds.clone();
     for group in &groups {
@@ -179,6 +164,58 @@ pub fn generate_config(input: &ConfigInput) -> Result<Value, String> {
         config["dns"] = dns.clone();
     }
     Ok(config)
+}
+
+/// The CLI-owned inbound list: a loopback mixed listener on the configured
+/// port, plus a TUN inbound when TUN mode is on. Shared by generated configs
+/// and the native-subscription passthrough so both bind identical listeners.
+pub fn control_plane_inbounds(mixed_port: u16, enable_tun: bool, tun: &TunSettings) -> Vec<Value> {
+    let mut inbounds = vec![json!({
+        "type": "mixed",
+        "tag": "mixed-in",
+        "listen": "127.0.0.1",
+        "listen_port": mixed_port,
+    })];
+    if enable_tun {
+        inbounds.push(json!({
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": TUN_INTERFACE_NAME,
+            "stack": tun.stack,
+            "mtu": tun.mtu,
+            "auto_route": true,
+        }));
+    }
+    inbounds
+}
+
+/// Force the CLI's own control plane onto an existing sing-box config,
+/// preserving the provider's `outbounds`, `route` and `dns`.
+///
+/// Used for native sing-box JSON subscriptions: the provider ships a complete
+/// sing-box document, and only the pieces this app owns (inbounds, clash_api,
+/// log) may be replaced — otherwise the core would not answer our controller or
+/// would bind a port the user did not choose.
+pub fn apply_control_plane(
+    config: &mut Value,
+    mixed_port: u16,
+    enable_tun: bool,
+    tun: &TunSettings,
+    clash_api: &ClashApiSettings,
+) {
+    config["log"] = json!({ "level": "info", "timestamp": true });
+    config["inbounds"] = Value::Array(control_plane_inbounds(mixed_port, enable_tun, tun));
+    if !config.get("experimental").is_some_and(Value::is_object) {
+        config["experimental"] = json!({});
+    }
+    config["experimental"]["clash_api"] = json!({
+        "external_controller": clash_api.listen.to_string(),
+        "secret": clash_api.secret,
+    });
+    if !config.get("route").is_some_and(Value::is_object) {
+        config["route"] = json!({});
+    }
+    config["route"]["auto_detect_interface"] = json!(true);
 }
 
 #[cfg(test)]
@@ -368,7 +405,38 @@ mod tests {
         assert_eq!(config["dns"]["servers"][0]["tag"], "dns-local");
 
         input.dns = None;
+        input.dns = None;
         let config = generate_config(&input).expect("config");
         assert!(config.get("dns").is_none(), "absent dns must be omitted");
+    }
+
+    #[test]
+    fn apply_control_plane_preserves_native_singbox_document() {
+        let mut native = json!({
+            "outbounds": [{ "type": "vless", "tag": "custom-node" }],
+            "route": { "rules": [{ "outbound": "custom-node" }] },
+            "dns": { "servers": [{ "tag": "remote", "type": "https" }] },
+            "inbounds": [{ "type": "mixed", "listen_port": 1234 }]
+        });
+        let tun = TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        };
+        let clash_api = ClashApiSettings {
+            listen: "127.0.0.1:9090".parse().expect("addr"),
+            secret: "my-secret".into(),
+        };
+        apply_control_plane(&mut native, 7897, true, &tun, &clash_api);
+
+        // Preserved original content
+        assert_eq!(native["outbounds"][0]["tag"], "custom-node");
+        assert_eq!(native["route"]["rules"][0]["outbound"], "custom-node");
+        assert_eq!(native["dns"]["servers"][0]["tag"], "remote");
+        assert_eq!(native["route"]["auto_detect_interface"], true);
+
+        // Injected CLI control plane
+        assert_eq!(native["inbounds"][0]["listen_port"], 7897);
+        assert_eq!(native["inbounds"][1]["type"], "tun");
+        assert_eq!(native["experimental"]["clash_api"]["secret"], "my-secret");
     }
 }

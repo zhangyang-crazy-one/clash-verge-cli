@@ -494,8 +494,58 @@ impl ManagerInner {
         enable_tun: bool,
     ) -> anyhow::Result<(PathBuf, SingboxParts)> {
         let _ = config_dir;
+        // Honour the CLI's own `verge_mixed_port` override so sing-box binds the
+        // same non-conflicting port as the mihomo runtime config.
+        let mixed_port = crate::enhance::effective_mixed_port().await;
+        let tun = crate::singbox::TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        };
+        let clash_api = crate::singbox::ClashApiSettings {
+            listen: "127.0.0.1:9090".parse().expect("static addr"),
+            secret: String::new(),
+        };
+
+        // Native sing-box JSON profile passthrough: preserve the provider's own
+        // outbounds, route, and dns, and only enforce the CLI-owned control plane
+        // (inbounds + clash_api + log). Avoids lossy conversion through the Clash model.
+        if let Some(text) = yaml
+            && crate::subscribe::from_url::is_singbox_json_profile(text)
+        {
+            let mut config: serde_json::Value =
+                serde_json::from_str(text).context("failed to parse native sing-box JSON profile")?;
+            crate::singbox::config_gen::apply_control_plane(&mut config, mixed_port, enable_tun, &tun, &clash_api);
+            let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.ok();
+            }
+            let body = serde_json::to_string_pretty(&config)?;
+            let tmp = path.with_extension("json.download");
+            tokio::fs::write(&tmp, body).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+
+            let outbounds = config
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let parts = SingboxParts {
+                conversion: crate::singbox::convert::ProfileConversion {
+                    outbounds,
+                    groups: vec![],
+                    skipped: vec![],
+                    degraded: vec![],
+                },
+                profile_used: true,
+                route_rules: vec![],
+                rule_sets: vec![],
+                dns_section: None,
+                default_domain_resolver: None,
+            };
+            return Ok((path, parts));
+        }
+
         let parts = SingboxParts::assemble(yaml).await?;
-        let mixed_port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
         let input = crate::singbox::ConfigInput {
             outbounds: parts.conversion.outbounds.clone(),
             groups: parts.conversion.groups.clone(),
@@ -503,14 +553,8 @@ impl ManagerInner {
             route_rules: parts.route_rules.clone(),
             mixed_port,
             enable_tun,
-            tun: crate::singbox::TunSettings {
-                stack: "gvisor".into(),
-                mtu: 9000,
-            },
-            clash_api: crate::singbox::ClashApiSettings {
-                listen: "127.0.0.1:9090".parse().expect("static addr"),
-                secret: String::new(),
-            },
+            tun,
+            clash_api,
             dns: parts.dns_section.clone(),
         };
         let mut config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
@@ -743,7 +787,23 @@ impl MihomoManager {
     /// Returns details about which binary was used so the UI/CLI can report
     /// install vs reuse clearly.
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        if self.core_kind() == CoreKind::SingBox {
+            return self.start_singbox().await;
+        }
+        // Resolve first so a resolve/preflight failure leaves any running
+        // core untouched; only then stop the tracked predecessor (re-pressing
+        // `s` must never stack a second child on the same ports/socket).
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
+
+        self.stop_tracked_predecessor().await?;
+
+        // With our own core stopped, any remaining holder of the mixed port is
+        // a foreign process (typically the Clash Verge GUI's root service on its
+        // own 7897 default). Fail with guidance instead of spawning a core that
+        // cannot bind and letting both sides flap.
+        crate::enhance::ensure_mixed_port_available()
+            .await
+            .map_err(anyhow::Error::msg)?;
 
         ManagerInner::spawn_and_watch(
             &resolved.path,
@@ -849,8 +909,61 @@ resolved binary; the running core was left untouched",
         .await
     }
 
-    /// Sing-box restart: resolve → preflight → stop → regenerate config →
-    /// spawn with readiness probe (task 3.4 ReloadStrategy::Restart).
+    /// Sing-box cold start: resolve → preflight → generate config → spawn.
+    /// Mirrors `restart_singbox` minus the stop (callers that need an
+    /// idempotent start handled the predecessor already).
+    async fn start_singbox(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        use super::singbox_binary::SingboxBinarySource;
+        self.reset_restart_history();
+        // Stop any core this manager still tracks before probing the port, so
+        // the only remaining holder would be a foreign process.
+        self.stop_tracked_predecessor().await?;
+        crate::enhance::ensure_mixed_port_available()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let resolved = super::singbox_binary::resolve_or_install()
+            .await
+            .context("failed to resolve or auto-install sing-box core")?;
+        let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
+        preflight_tun_capability(&resolved.path, tun_enabled)?;
+
+        let config_path = ManagerInner::write_singbox_full(&self.config_dir).await?;
+        ManagerInner::spawn_core(
+            &resolved.path,
+            &resolved.version,
+            resolved.source.as_str(),
+            &self.config_dir,
+            &self.socket_path,
+            Some(config_path),
+            Arc::clone(&self.inner),
+        )
+        .await
+        .context("failed to spawn sing-box")?;
+        Ok(binary::ResolvedMihomo {
+            path: resolved.path,
+            source: match resolved.source {
+                SingboxBinarySource::System => binary::MihomoBinarySource::System,
+                SingboxBinarySource::ManagedCached => binary::MihomoBinarySource::ManagedCached,
+                SingboxBinarySource::Downloaded => binary::MihomoBinarySource::Downloaded,
+            },
+            version: resolved.version,
+        })
+    }
+
+    /// Stop a core this manager tracks as running, when one exists.
+    /// `stop()` is idempotent when no pid is tracked.
+    async fn stop_tracked_predecessor(&self) -> anyhow::Result<()> {
+        if self.pid().is_some() {
+            tracing::warn!(
+                target: "mihomo",
+                "start: a core (pid {:?}) is already running — stopping it first",
+                self.pid()
+            );
+            self.stop().await?;
+        }
+        Ok(())
+    }
+
     async fn restart_singbox(&self) -> anyhow::Result<binary::ResolvedMihomo> {
         use super::singbox_binary::SingboxBinarySource;
         self.reset_restart_history();
@@ -860,6 +973,9 @@ resolved binary; the running core was left untouched",
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
         preflight_tun_capability(&resolved.path, tun_enabled)?;
         self.stop().await.context("failed to stop running sing-box")?;
+        crate::enhance::ensure_mixed_port_available()
+            .await
+            .map_err(anyhow::Error::msg)?;
         let config_path = ManagerInner::write_singbox_full(&self.config_dir).await?;
         ManagerInner::spawn_core(
             &resolved.path,
