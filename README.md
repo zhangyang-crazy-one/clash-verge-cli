@@ -27,6 +27,41 @@ On `start` (TUI `s` or `clash-verge-cli start`), the CLI resolves mihomo as foll
 
 No separate install step is required for normal use.
 
+## Install
+
+Each [release](https://github.com/zhangyang-crazy-one/clash-verge-cli/releases)
+publishes Linux builds for these targets:
+
+| Target | Runs on | Packages |
+| --- | --- | --- |
+| `x86_64-unknown-linux-musl` | any x86_64 Linux, including Alpine (static) | `.tar.gz`, `.deb` (amd64), `.rpm` (x86_64) |
+| `aarch64-unknown-linux-musl` | 64-bit ARM: Raspberry Pi 3/4/5, ARM servers (static) | `.tar.gz`, `.deb` (arm64), `.rpm` (aarch64) |
+| `armv7-unknown-linux-musleabihf` | 32-bit ARMv7 boards and routers (static) | `.tar.gz`, `.deb` (armhf), `.rpm` (armv7hl) |
+| `x86_64-unknown-linux-gnu` | x86_64 with glibc | `.tar.gz` |
+
+`SHA256SUMS` lists the checksum of every file.
+
+Debian/Ubuntu or Fedora/RHEL (installs the binary, completions, and man pages):
+
+```bash
+sudo apt install ./clash-verge-cli_0.1.0-1_amd64.deb
+sudo dnf install ./clash-verge-cli-0.1.0-1.x86_64.rpm
+```
+
+Any distribution, without root:
+
+```bash
+VERSION=v0.1.0 TARGET=aarch64-unknown-linux-musl
+BASE=https://github.com/zhangyang-crazy-one/clash-verge-cli/releases/download/$VERSION
+curl -LO "$BASE/clash-verge-cli-$VERSION-$TARGET.tar.gz" -LO "$BASE/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+mkdir -p clash-verge-cli && tar -xzf "clash-verge-cli-$VERSION-$TARGET.tar.gz" -C clash-verge-cli
+install -Dm755 clash-verge-cli/clash-verge-cli ~/.local/bin/clash-verge-cli
+```
+
+The archive also holds `completions/` and `man/` (see
+[Shell completions and man pages](#shell-completions-and-man-pages)).
+
 ## Build
 
 Rust 1.95 or newer is required.
