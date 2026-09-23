@@ -516,12 +516,14 @@ mod tests {
             ..Default::default()
         });
         app.selected_index = 1;
+        app.profiles[0].updated = Some(1_790_000_000);
 
         let (home, _) = render(&app, 160, 40);
         assert!(home.contains("Exit: Auto → Tokyo (88ms)"), "{home}");
-        assert!(home.contains("Sample Subscription"));
+        assert!(home.contains("Sample Subscription [remote]"));
         assert!(home.contains("Used: 2.0 GiB / 50.0 GiB"));
         assert!(home.contains("days left"));
+        assert!(home.contains("Updated: "), "all four profile rows fit: {home}");
         assert!(home.contains("↑ 41.0 KiB/s"));
         assert!(home.contains("Since start: ↑ 2.0 KiB  ↓ 3.0 MiB"));
         assert!(home.contains("System proxy: on · TUN: off"));

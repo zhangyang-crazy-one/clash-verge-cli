@@ -74,13 +74,11 @@ fn draw_profile(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = if let Some(profile) = app.current_profile() {
         let name = profile.name.as_deref().unwrap_or(app.tr("common.unknown"));
         let kind = profile.itype.as_deref().unwrap_or(app.tr("common.unknown"));
-        let mut lines = vec![
-            Line::from(Span::styled(
-                crate::ui::terminal_text::display(name),
-                theme::bold(theme::text()),
-            )),
-            Line::from(Span::styled(format!("type: {kind}"), Style::new().fg(theme::dim()))),
-        ];
+        // Name, usage, expiry, and update time fill the panel's four rows.
+        let mut lines = vec![Line::from(vec![
+            Span::styled(crate::ui::terminal_text::display(name), theme::bold(theme::text())),
+            Span::styled(format!(" [{kind}]"), Style::new().fg(theme::dim())),
+        ])];
         if let Some(extra) = profile.extra.as_ref() {
             let used = crate::commands::format_bytes(extra.upload.saturating_add(extra.download));
             let usage = if extra.total > 0 {
