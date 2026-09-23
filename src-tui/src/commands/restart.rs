@@ -1,8 +1,11 @@
 use crate::mihomo_manager::manager::MihomoManager;
 
+/// `clash-verge-cli restart`: stop the recorded core (its supervisor exits
+/// with it), then start a fresh supervised one.
 pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
-    manager.restart().await?;
-    super::wait_until_ready(&manager, super::start::READY_TIMEOUT).await?;
-    println!("mihomo restarted (pid {})", manager.pid().unwrap_or(0));
-    Ok(())
+    if let Some(pid) = manager.pid() {
+        manager.stop().await?;
+        println!("mihomo stopped (pid {pid})");
+    }
+    super::start::run(manager).await
 }

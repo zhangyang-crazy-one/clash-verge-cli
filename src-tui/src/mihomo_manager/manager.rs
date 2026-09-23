@@ -43,10 +43,9 @@ pub struct ManagerInner {
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart.
     pub expected_exit: AtomicBool,
-    /// Pipe the core's stdout/stderr into tracing instead of a log file.
-    /// Only for a supervisor (`start --foreground`) that outlives the core:
-    /// a pipe to a process that exits kills mihomo with SIGPIPE.
-    pub piped_output: AtomicBool,
+    /// True while this process's watcher supervises the core it spawned
+    /// (as opposed to a core adopted from another process's pid record).
+    pub owns_child: AtomicBool,
 }
 
 impl ManagerInner {
@@ -59,7 +58,7 @@ impl ManagerInner {
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
-            piped_output: AtomicBool::new(false),
+            owns_child: AtomicBool::new(false),
         }
     }
 
@@ -127,21 +126,17 @@ impl ManagerInner {
         {
             command.arg("-f").arg(config_path);
         }
+        // Output is piped into this process's tracing, so the spawner must
+        // stay alive as the core's supervisor (a pipe to an exited process
+        // kills mihomo with SIGPIPE). `clash-verge-cli start` therefore runs
+        // a detached `start --foreground` supervisor rather than spawning here.
         command
             .arg("-ext-ctl-unix")
             .arg(socket_path)
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(false);
-        if inner.piped_output.load(std::sync::atomic::Ordering::SeqCst) {
-            command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        } else {
-            // Outlive this process: output goes to a file (a pipe would kill
-            // mihomo with SIGPIPE once we exit) and a process group of its own
-            // keeps a terminal Ctrl-C aimed at the CLI away from the core.
-            let log = open_core_log(config_dir)?;
-            let log_err = log.try_clone().context("failed to duplicate the core log handle")?;
-            command.stdout(log).stderr(log_err).process_group(0);
-        }
         let child = command
             .spawn()
             .with_context(|| format!(
@@ -155,6 +150,7 @@ impl ManagerInner {
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
         *inner.started_at.lock() = Some(started_at);
+        inner.owns_child.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Err(error) = pidfile::write(
             &pidfile::path_for(socket_path),
             pidfile::CoreRecord::new(pid, started_at),
@@ -262,12 +258,9 @@ impl MihomoManager {
         }
     }
 
-    /// Keep the core's output on this process's tracing (see
-    /// [`ManagerInner::piped_output`]).
-    pub fn set_piped_output(&self, piped: bool) {
-        self.inner
-            .piped_output
-            .store(piped, std::sync::atomic::Ordering::SeqCst);
+    /// Whether this process spawned the core and supervises it.
+    pub fn owns_child(&self) -> bool {
+        self.inner.owns_child.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install the action channel sender. Called by the TUI after it has
@@ -364,6 +357,15 @@ impl MihomoManager {
         {
             anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
         }
+        if self.api().version().await.is_ok() {
+            // No usable pid record, but something already serves the
+            // controller: a second core would only fail its binds.
+            anyhow::bail!(
+                "a mihomo core already answers on {} without a clash-verge-cli pid record; \
+stop it where it was started",
+                self.socket_path.display()
+            );
+        }
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
 
         ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
@@ -388,7 +390,20 @@ impl MihomoManager {
         let pid = { *self.inner.pid.lock() };
 
         if let Some(pid) = pid {
-            signal::graceful_stop_by_pid(pid).await?;
+            // Tell a supervisor in another process (a TUI, `start
+            // --foreground`) that this exit is intended, so it does not
+            // auto-restart the core.
+            let intent = pidfile::stop_intent_path_for(&self.socket_path);
+            if !self.owns_child()
+                && let Err(error) = pidfile::mark_stop_intent(&intent, pid)
+            {
+                tracing::warn!(target: "mihomo", "failed to record the stop intent: {error}");
+            }
+            let stopped = signal::graceful_stop_by_pid(pid).await;
+            // Normally consumed by the supervisor's watcher; clear it when no
+            // supervisor was left to read it.
+            pidfile::take_stop_intent(&intent, pid);
+            stopped?;
             pidfile::remove_if(&pidfile::path_for(&self.socket_path), pid);
         }
         // No PID — already stopped or never started (idempotent).
@@ -561,24 +576,6 @@ pub struct CoreStatus {
     pub version: Option<String>,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
-}
-
-/// Open `<config-dir>/logs/mihomo.log` for a new core, keeping the previous
-/// run's output as `mihomo.log.old` (enough to diagnose a crash while
-/// bounding the files to two runs).
-fn open_core_log(config_dir: &Path) -> anyhow::Result<std::fs::File> {
-    let dir = config_dir.join("logs");
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    let path = core_log_path(config_dir);
-    if path.exists() {
-        let _ = std::fs::rename(&path, path.with_extension("log.old"));
-    }
-    std::fs::File::create(&path).with_context(|| format!("failed to create {}", path.display()))
-}
-
-/// Where a detached core writes its stdout/stderr.
-pub fn core_log_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("logs").join("mihomo.log")
 }
 
 #[cfg(test)]

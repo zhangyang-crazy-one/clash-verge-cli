@@ -1,8 +1,12 @@
-//! Foreground daemon mode for systemd / process supervisor.
+//! Foreground daemon mode: the core's supervisor under systemd, and the
+//! detached supervisor `clash-verge-cli start` launches.
 //!
 //! Starts mihomo and hosts the subscription auto-update scheduler (the same
 //! 30 s cadence the interactive TUI uses), then blocks on SIGTERM / SIGINT.
 //! On signal, any in-flight refresh is cancelled before mihomo stops cleanly.
+//! The daemon also exits when its core stops for good: stopped on purpose by
+//! another process (`clash-verge-cli stop`), or crashed past the auto-restart
+//! limit (then with an error, so systemd's restart policy applies).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,8 +21,8 @@ use crate::subscribe::scheduler::{AutoUpdateScheduler, reload_current_profile};
 
 pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
     let manager = commands::build_manager(config_dir).await?;
-    // The daemon outlives the core, so its output can go to journald.
-    manager.set_piped_output(true);
+    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+    manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
     manager.start().await?;
@@ -38,6 +42,22 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
+            Some(action) = lifecycle_rx.recv() => match action {
+                crate::app::Action::CoreExited(_) if manager.state() == crate::app::CoreState::Stopped => {
+                    tracing::info!(target: "daemon", "mihomo was stopped, exiting");
+                    if let Some(handle) = in_flight.take() {
+                        handle.abort();
+                    }
+                    return Ok(());
+                }
+                crate::app::Action::CoreError(error) => {
+                    if let Some(handle) = in_flight.take() {
+                        handle.abort();
+                    }
+                    anyhow::bail!("mihomo stopped: {error}");
+                }
+                _ => {}
+            },
             _ = term.recv() => {
                 tracing::info!(target: "daemon", "received SIGTERM, stopping");
                 break;

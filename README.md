@@ -90,11 +90,15 @@ headless machines use `clash-verge-cli sysproxy env` (or `--unset`) instead.
 
 ## Logs
 
-The core keeps running after `start` or the TUI exits; `stop`, `restart`,
-and `status` find it from any later invocation. Its own output goes to
-`<config-dir>/logs/mihomo.log` (the previous run is kept as
-`mihomo.log.old`), and `start` reports the last lines of it if the core
-fails to come up.
+`clash-verge-cli start` runs the core in the background under a detached
+supervisor (the same `start --foreground` process systemd runs). The
+supervisor restarts the core after a crash, releases the system proxy when
+the core stops for good, and runs subscription auto-updates. Its output and
+the core's go to `<config-dir>/logs/daemon.log` (the previous run is kept as
+`daemon.log.old`), and `start` shows the last lines of it if the core fails
+to come up. `stop`, `restart`, and `status` find the core from any later
+invocation. A core started from the TUI is supervised by the TUI and stops
+when you quit it; a core started with `start` keeps running.
 
 The TUI writes its own diagnostics to `<config-dir>/logs/clash-verge-cli-<date>.log`;
 `start --foreground` and one-shot commands log to stderr (journald under

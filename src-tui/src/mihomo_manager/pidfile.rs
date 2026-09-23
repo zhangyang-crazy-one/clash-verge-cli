@@ -45,6 +45,30 @@ pub fn write(path: &Path, record: CoreRecord) -> std::io::Result<()> {
     std::fs::write(path, json)
 }
 
+/// `mihomo.stopping` in the controller socket's directory: written by a
+/// process about to stop a core it did not spawn, so the process that did
+/// (a TUI or `start --foreground`) treats the exit as intended instead of
+/// auto-restarting the core.
+pub fn stop_intent_path_for(socket_path: &Path) -> PathBuf {
+    socket_path.with_file_name("mihomo.stopping")
+}
+
+pub fn mark_stop_intent(path: &Path, pid: u32) -> std::io::Result<()> {
+    std::fs::write(path, pid.to_string())
+}
+
+/// Consume a stop intent recorded for `pid`. True when one was present.
+pub fn take_stop_intent(path: &Path, pid: u32) -> bool {
+    let matches = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        == Some(pid);
+    if matches {
+        let _ = std::fs::remove_file(path);
+    }
+    matches
+}
+
 /// The recorded core if it is still alive and still serves `socket_path`.
 pub fn read_live(path: &Path, socket_path: &Path) -> Option<CoreRecord> {
     let record: CoreRecord = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
@@ -123,6 +147,22 @@ mod tests {
         assert!(path.exists(), "another pid must not remove the record");
         remove_if(&path, record.pid);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_intent_is_consumed_only_for_its_pid() {
+        let dir = std::env::temp_dir().join(format!("cv-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = stop_intent_path_for(&dir.join("external-controller.sock"));
+        assert!(path.ends_with("mihomo.stopping"));
+        assert!(!take_stop_intent(&path, 42), "no marker, no intent");
+
+        mark_stop_intent(&path, 42).unwrap();
+        assert!(!take_stop_intent(&path, 43), "another core's exit is not intended");
+        assert!(path.exists());
+        assert!(take_stop_intent(&path, 42));
+        assert!(!path.exists(), "the intent is consumed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

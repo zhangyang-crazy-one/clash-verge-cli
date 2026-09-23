@@ -43,35 +43,8 @@ pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager>
     Ok(manager)
 }
 
-/// Wait until a just-started core answers on its controller socket. When it
-/// exits instead (the watcher gave up restarting it) or never answers, the
-/// error carries the tail of its log so the cause is visible.
-pub async fn wait_until_ready(manager: &MihomoManager, timeout: std::time::Duration) -> anyhow::Result<()> {
-    let api = manager.api();
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if core_running(&api).await {
-            return Ok(());
-        }
-        let failure = match manager.state() {
-            crate::app::CoreState::Error(message) => Some(format!("mihomo exited: {message}")),
-            _ if tokio::time::Instant::now() >= deadline => Some(format!(
-                "mihomo did not answer on {} within {}s",
-                manager.socket_path().display(),
-                timeout.as_secs()
-            )),
-            _ => None,
-        };
-        if let Some(failure) = failure {
-            let log = crate::mihomo_manager::manager::core_log_path(manager.config_dir());
-            anyhow::bail!("{failure}\n{}", log_tail(&log, 10));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
 /// The last `lines` lines of `path`, for error messages.
-fn log_tail(path: &std::path::Path, lines: usize) -> String {
+pub fn log_tail(path: &std::path::Path, lines: usize) -> String {
     match std::fs::read_to_string(path) {
         Ok(text) if !text.trim().is_empty() => {
             let tail: Vec<&str> = text.lines().rev().take(lines).collect();
