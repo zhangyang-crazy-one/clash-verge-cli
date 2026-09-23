@@ -134,6 +134,9 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         }
         KeyCode::Char('t') if context.view == View::Proxies => Some(Action::NodeDelayTest),
 
+        // Unlock checks
+        KeyCode::Char('r') if context.view == View::Unlock => Some(Action::RunUnlockChecks),
+
         // Core log level
         KeyCode::Char('L') if context.view == View::Logs => Some(Action::CycleLogLevel),
 

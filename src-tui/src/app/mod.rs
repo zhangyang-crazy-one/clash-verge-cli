@@ -151,6 +151,14 @@ pub struct TunPending {
 }
 
 #[derive(Debug, Default)]
+pub struct UnlockState {
+    pub running: bool,
+    pub report: Option<crate::services::unlock::Report>,
+    pub checked_at: Option<chrono::DateTime<chrono::Local>>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Default)]
 pub struct RuntimeLoading {
     pub proxies: bool,
     pub traffic: bool,
@@ -227,6 +235,9 @@ pub struct App {
     // Chain proxy state
     pub chain_mode: bool,
     pub chain_nodes: Vec<String>,
+
+    /// Unlock view: the last report, and whether a run is in progress.
+    pub unlock: UnlockState,
 
     /// Settings list cursor (language / system proxy / TUN / mode).
     pub settings_selected_index: usize,
@@ -311,6 +322,7 @@ impl App {
             batch_delay: None,
             chain_mode: false,
             chain_nodes: Vec::new(),
+            unlock: UnlockState::default(),
             settings_selected_index: 0,
             clash_mode: "rule".into(),
             rules: Vec::new(),
@@ -365,52 +377,9 @@ impl App {
         self.profiles.iter().find(|profile| profile.uid.as_deref() == Some(uid))
     }
 
-    /// Where traffic goes by default: the group the mode starts from, then
-    /// each group's selection down to a real node, e.g.
-    /// `["Proxy", "Auto", "Tokyo 01"]`. `["DIRECT"]` in direct mode; empty
-    /// before the proxies are loaded.
+    /// Where traffic goes by default; see [`outbound_chain`].
     pub fn outbound_chain(&self) -> Vec<String> {
-        if self.clash_mode.eq_ignore_ascii_case("direct") {
-            return vec!["DIRECT".into()];
-        }
-        let is_group = |name: &str| {
-            self.proxy_groups
-                .get(name)
-                .is_some_and(|group| group.all.as_ref().is_some_and(|nodes| !nodes.is_empty()))
-        };
-        // Rule mode: the first group GLOBAL lists (the profile's main
-        // selector), as the GUI shows it.
-        let start = if self.clash_mode.eq_ignore_ascii_case("global") {
-            is_group("GLOBAL").then(|| "GLOBAL".to_string())
-        } else {
-            self.proxy_groups
-                .get("GLOBAL")
-                .and_then(|global| global.all.as_ref())
-                .and_then(|names| names.iter().find(|name| is_group(name)).cloned())
-        };
-        let Some(start) = start else {
-            return Vec::new();
-        };
-        let mut chain = vec![start];
-        // Bounded: a misconfigured profile could make groups select each other.
-        while chain.len() < 8 {
-            let Some(next) = chain
-                .last()
-                .and_then(|name| self.proxy_groups.get(name))
-                .and_then(|group| group.now.clone())
-            else {
-                break;
-            };
-            if chain.contains(&next) {
-                break;
-            }
-            let done = !is_group(&next);
-            chain.push(next);
-            if done {
-                break;
-            }
-        }
-        chain
+        outbound_chain(&self.proxy_groups, &self.clash_mode)
     }
 
     pub fn tr(&self, key: &'static str) -> &'static str {
@@ -472,6 +441,54 @@ pub fn first_selectable_proxy_group(groups: &HashMap<String, ProxyGroup>) -> Opt
         _ => left.cmp(right),
     });
     names.into_iter().next()
+}
+
+/// Where traffic goes by default: the group the mode starts from, then
+/// each group's selection down to a real node, e.g.
+/// `["Proxy", "Auto", "Tokyo 01"]`. `["DIRECT"]` in direct mode; empty
+/// before the proxies are loaded.
+pub fn outbound_chain(groups: &HashMap<String, ProxyGroup>, mode: &str) -> Vec<String> {
+    if mode.eq_ignore_ascii_case("direct") {
+        return vec!["DIRECT".into()];
+    }
+    let is_group = |name: &str| {
+        groups
+            .get(name)
+            .is_some_and(|group| group.all.as_ref().is_some_and(|nodes| !nodes.is_empty()))
+    };
+    // Rule mode: the first group GLOBAL lists (the profile's main
+    // selector), as the GUI shows it.
+    let start = if mode.eq_ignore_ascii_case("global") {
+        is_group("GLOBAL").then(|| "GLOBAL".to_string())
+    } else {
+        groups
+            .get("GLOBAL")
+            .and_then(|global| global.all.as_ref())
+            .and_then(|names| names.iter().find(|name| is_group(name)).cloned())
+    };
+    let Some(start) = start else {
+        return Vec::new();
+    };
+    let mut chain = vec![start];
+    // Bounded: a misconfigured profile could make groups select each other.
+    while chain.len() < 8 {
+        let Some(next) = chain
+            .last()
+            .and_then(|name| groups.get(name))
+            .and_then(|group| group.now.clone())
+        else {
+            break;
+        };
+        if chain.contains(&next) {
+            break;
+        }
+        let done = !is_group(&next);
+        chain.push(next);
+        if done {
+            break;
+        }
+    }
+    chain
 }
 
 /// Order of the nodes in the expanded proxy group.

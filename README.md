@@ -142,6 +142,48 @@ clash-verge-cli man | man -l -              # or: clash-verge-cli man --dir ~/.l
 
 Release archives include both under `completions/` and `man/`.
 
+## Unlock checks
+
+`clash-verge-cli unlock` (or `r` on the Unlock view) checks which services
+the current exit node reaches: Netflix, YouTube Premium, Disney+, ChatGPT,
+Claude, Gemini, and TikTok. Requests go through the running core's proxy
+port, so the result describes the exit node, which is shown alongside.
+
+```bash
+clash-verge-cli unlock                       # all services
+clash-verge-cli unlock --service netflix --service chatgpt
+clash-verge-cli --json unlock                # for scripts
+```
+
+Each service is *available*, *originals only* (Netflix), *unavailable*, or
+*failed* with the reason (unreachable, timed out, or a page the check does
+not recognize: sites change their pages, and a check says so instead of
+guessing).
+
+## Backups
+
+```bash
+clash-verge-cli backup create                # into <config-dir>/clash-verge-rev-backup/
+clash-verge-cli backup create --output ~/cv.zip --include-secrets
+clash-verge-cli backup list
+clash-verge-cli backup restore linux-backup-2026-09-23_12-00-00.zip
+```
+
+A backup is a zip of `config.yaml`, `verge.yaml`, `profiles.yaml`,
+`dns_config.yaml`, and `profiles/`, laid out like Clash Verge GUI backups.
+The controller `secret` and the WebDAV credentials are left out unless
+`--include-secrets` is given; subscription URLs are included, so the file
+(written mode 0600) is still private. Restoring validates the whole
+archive before writing anything, keeps the local secret and WebDAV
+credentials when the archive has none, and first saves the current state
+as a `pre-restore-*` backup. Run `clash-verge-cli restart` afterwards to
+apply it.
+
+With `webdav_url`, `webdav_username`, and `webdav_password` in
+`verge.yaml` (the GUI's settings; `e` on Settings opens the file), add
+`--webdav` to upload (`backup create --webdav`), list, or restore from the
+server's `clash-verge-rev-backup/` folder, the one the GUI uses.
+
 ## System proxy
 
 With *System proxy* enabled in Settings, the desktop proxy (GNOME, or KDE
@@ -196,6 +238,7 @@ The CLI never reads the GUI directory at runtime; migration is one-shot.
 | `c`, `a`, `x` | Toggle, apply, or clear proxy-chain editing |
 | `Shift+l` | Logs: switch mihomo's log level (debug, info, warning, error) until the next restart |
 | `Enter`, `r` | Rules: update the selected rule provider, refresh the rules |
+| `r` | Unlock: check which services the exit node reaches |
 
 Home shows the mode, the exit route (for example `Proxy → Auto → Tokyo 01`
 with its delay), the current subscription's usage and expiry, and the

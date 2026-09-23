@@ -167,8 +167,8 @@ impl MihomoApi {
         }
     }
 
-    /// Read clash mode from mihomo `/configs`, falling back to tolerant parse of `mode` only.
-    pub async fn get_mode(&self) -> Result<String, MihomoError> {
+    /// `GET /configs` — the running core's configuration, as JSON.
+    pub async fn get_configs(&self) -> Result<serde_json::Value, MihomoError> {
         let resp = self
             .client
             .get("http://localhost/configs")
@@ -184,14 +184,30 @@ impl MihomoApi {
                 body,
             });
         }
+        serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))
+    }
 
+    /// Read clash mode from mihomo `/configs`, falling back to tolerant parse of `mode` only.
+    pub async fn get_mode(&self) -> Result<String, MihomoError> {
         // Tolerant: accept non-standard payloads as long as `mode` is present.
-        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()))?;
-        value
+        self.get_configs()
+            .await?
             .get("mode")
             .and_then(|m| m.as_str())
             .map(str::to_string)
             .ok_or_else(|| MihomoError::Parse("configs response missing mode".into()))
+    }
+
+    /// The port the running core serves HTTP proxy requests on: `mixed-port`,
+    /// else `port`.
+    pub async fn http_proxy_port(&self) -> Result<u16, MihomoError> {
+        let configs = self.get_configs().await?;
+        ["mixed-port", "port"]
+            .iter()
+            .filter_map(|key| configs.get(key).and_then(serde_json::Value::as_u64))
+            .find(|port| *port > 0)
+            .and_then(|port| u16::try_from(port).ok())
+            .ok_or_else(|| MihomoError::Parse("the core has no mixed-port or port for HTTP proxying".into()))
     }
 
     /// `GET /proxies/:name/delay?timeout=N&url=U` — test delay for a node.

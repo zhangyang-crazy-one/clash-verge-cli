@@ -86,6 +86,18 @@ pub enum Command {
         #[command(subcommand)]
         action: TunCommand,
     },
+    /// Check which streaming and AI services the current exit node reaches
+    /// (core must be running)
+    Unlock {
+        /// Only these services (repeatable); all by default
+        #[arg(long = "service", value_enum, value_name = "SERVICE")]
+        services: Vec<crate::services::unlock::Service>,
+    },
+    /// Back up or restore profiles and settings, locally or over WebDAV
+    Backup {
+        #[command(subcommand)]
+        action: BackupCommand,
+    },
     /// Print a shell completion script: `clash-verge-cli completions bash`
     Completions {
         #[arg(value_enum)]
@@ -99,6 +111,35 @@ pub enum Command {
     /// Internal: sudo askpass helper (SUDO_ASKPASS target).
     #[command(hide = true)]
     Askpass,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum BackupCommand {
+    /// Write a backup archive of profiles and settings
+    Create {
+        /// Archive path (default: the backup directory, timestamped name)
+        #[arg(long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Also keep the controller secret and WebDAV credentials
+        #[arg(long)]
+        include_secrets: bool,
+        /// Also upload it to the WebDAV server set in verge.yaml
+        #[arg(long)]
+        webdav: bool,
+    },
+    /// List backups in the backup directory (or on the WebDAV server)
+    List {
+        #[arg(long)]
+        webdav: bool,
+    },
+    /// Restore profiles and settings from a backup
+    Restore {
+        /// A backup name from `backup list`, or a path to an archive
+        backup: String,
+        /// Download the backup from the WebDAV server first
+        #[arg(long)]
+        webdav: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -363,6 +404,37 @@ mod tests {
         let cli = parse(&exec.split_whitespace().skip(1).collect::<Vec<_>>()).expect("ExecStart parses");
         assert!(matches!(cli.command, Some(Command::Start { foreground: true })));
         assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
+    }
+
+    #[test]
+    fn unlock_takes_repeatable_services_and_backup_has_webdav_options() {
+        use crate::services::unlock::Service;
+
+        let cli = parse(&["unlock", "--service", "netflix", "--service", "chatgpt"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Unlock { services }) if services == [Service::Netflix, Service::ChatGpt]
+        ));
+        assert!(parse(&["unlock", "--service", "hulu"]).is_err());
+
+        let cli = parse(&["backup", "create", "--include-secrets", "--webdav"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Backup {
+                action: BackupCommand::Create {
+                    include_secrets: true,
+                    webdav: true,
+                    output: None
+                }
+            })
+        ));
+        let cli = parse(&["backup", "restore", "linux-backup-1.zip", "--webdav"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Backup {
+                action: BackupCommand::Restore { backup, webdav: true }
+            }) if backup == "linux-backup-1.zip"
+        ));
     }
 
     #[test]

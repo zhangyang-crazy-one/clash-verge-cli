@@ -69,6 +69,7 @@ serde_yaml_ng = { workspace = true }
 smartstring = { workspace = true }
 tempfile = "3"
 sha2 = "0.10"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 serde = { workspace = true }

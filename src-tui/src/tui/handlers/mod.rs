@@ -21,6 +21,7 @@ mod proxy;
 mod rules;
 mod settings;
 mod tun;
+mod unlock;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -298,6 +299,12 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::LogsFailed(error) => {
             app.runtime_loading.logs = false;
             app.runtime_errors.logs = Some(error);
+        }
+        Action::RunUnlockChecks => unlock::run(app, ctx),
+        Action::UnlockChecked(report) => unlock::note_report(app, report),
+        Action::UnlockFailed(error) => {
+            app.unlock.running = false;
+            app.unlock.error = Some(error);
         }
         Action::CycleLogLevel => connections::cycle_log_level(app, ctx),
         Action::LogLevelChanged(level) => connections::note_log_level(app, ctx, level),
@@ -664,5 +671,31 @@ mod tests {
         )
         .await;
         assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
+    }
+
+    #[tokio::test]
+    async fn unlock_checks_need_a_running_core_and_one_run_at_a_time() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Unlock;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('r'))).await;
+        assert!(!app.unlock.running);
+        assert_eq!(app.status_msg.as_deref(), Some("Start the core to run the checks"));
+
+        app.core_state = crate::app::CoreState::Running;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('r'))).await;
+        assert!(app.unlock.running);
+
+        handle_event(
+            &mut app,
+            &ctx,
+            Action::UnlockChecked(crate::services::unlock::Report {
+                exit: vec!["DIRECT".into()],
+                results: Vec::new(),
+            }),
+        )
+        .await;
+        assert!(!app.unlock.running);
+        assert!(app.unlock.checked_at.is_some());
     }
 }

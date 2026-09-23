@@ -163,6 +163,23 @@ async fn run() -> anyhow::Result<i32> {
                 }
             }
         }
+        Some(cli::Command::Unlock { services }) => {
+            let manager = commands::build_manager(config_dir).await?;
+            commands::unlock::run(&manager, &services, json).await?;
+        }
+        Some(cli::Command::Backup { action }) => match action {
+            cli::BackupCommand::Create {
+                output,
+                include_secrets,
+                webdav,
+            } => commands::backup::create(output.as_deref(), include_secrets, webdav, json).await?,
+            cli::BackupCommand::List { webdav } => commands::backup::list(webdav, json).await?,
+            cli::BackupCommand::Restore { backup, webdav } => {
+                let manager = commands::build_manager(config_dir).await?;
+                let running = commands::core_running(&manager.api()).await;
+                commands::backup::restore(&backup, webdav, running, json).await?;
+            }
+        },
         Some(cli::Command::Mode { mode }) => {
             let manager = commands::build_manager(config_dir).await?;
             commands::mode::run(&manager, mode, json).await?;
