@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, CoreState};
 use crate::mihomo_api::MihomoApi;
-use crate::mihomo_manager::{binary, signal, watcher::spawn_watcher};
+use crate::mihomo_manager::{binary, pidfile, signal, watcher::spawn_watcher};
 
 use std::process::Stdio;
 
@@ -43,6 +43,10 @@ pub struct ManagerInner {
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart.
     pub expected_exit: AtomicBool,
+    /// Pipe the core's stdout/stderr into tracing instead of a log file.
+    /// Only for a supervisor (`start --foreground`) that outlives the core:
+    /// a pipe to a process that exits kills mihomo with SIGPIPE.
+    pub piped_output: AtomicBool,
 }
 
 impl ManagerInner {
@@ -55,6 +59,7 @@ impl ManagerInner {
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
+            piped_output: AtomicBool::new(false),
         }
     }
 
@@ -122,13 +127,22 @@ impl ManagerInner {
         {
             command.arg("-f").arg(config_path);
         }
-        let child = command
+        command
             .arg("-ext-ctl-unix")
             .arg(socket_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(false)
+            .kill_on_drop(false);
+        if inner.piped_output.load(std::sync::atomic::Ordering::SeqCst) {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        } else {
+            // Outlive this process: output goes to a file (a pipe would kill
+            // mihomo with SIGPIPE once we exit) and a process group of its own
+            // keeps a terminal Ctrl-C aimed at the CLI away from the core.
+            let log = open_core_log(config_dir)?;
+            let log_err = log.try_clone().context("failed to duplicate the core log handle")?;
+            command.stdout(log).stderr(log_err).process_group(0);
+        }
+        let child = command
             .spawn()
             .with_context(|| format!(
                 "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
@@ -137,9 +151,16 @@ impl ManagerInner {
 
         let pid = child.id().expect("child must have PID after spawn");
 
+        let started_at = Utc::now();
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
-        *inner.started_at.lock() = Some(Utc::now());
+        *inner.started_at.lock() = Some(started_at);
+        if let Err(error) = pidfile::write(
+            &pidfile::path_for(socket_path),
+            pidfile::CoreRecord::new(pid, started_at),
+        ) {
+            tracing::warn!(target: "mihomo", "failed to record the core pid: {error}");
+        }
         inner.expected_exit.store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
@@ -224,6 +245,29 @@ impl MihomoManager {
     pub fn with_secret(mut self, secret: String) -> Self {
         self.secret = secret;
         self
+    }
+
+    /// Take over a core that another process started for this controller
+    /// socket (recorded in its pid file), so `stop`, `restart`, and `status`
+    /// work across CLI invocations. No-op when this manager already tracks a
+    /// core or none is running.
+    pub fn adopt_running_core(&self) {
+        if self.inner.pid.lock().is_some() {
+            return;
+        }
+        if let Some(record) = pidfile::read_live(&pidfile::path_for(&self.socket_path), &self.socket_path) {
+            *self.inner.pid.lock() = Some(record.pid);
+            *self.inner.started_at.lock() = record.started_at();
+            *self.inner.state.lock() = CoreState::Running;
+        }
+    }
+
+    /// Keep the core's output on this process's tracing (see
+    /// [`ManagerInner::piped_output`]).
+    pub fn set_piped_output(&self, piped: bool) {
+        self.inner
+            .piped_output
+            .store(piped, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the action channel sender. Called by the TUI after it has
@@ -315,6 +359,11 @@ impl MihomoManager {
     /// Returns details about which binary was used so the UI/CLI can report
     /// install vs reuse clearly.
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        if let Some(pid) = self.pid()
+            && pidfile::is_running(pid)
+        {
+            anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
+        }
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
 
         ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
@@ -340,6 +389,7 @@ impl MihomoManager {
 
         if let Some(pid) = pid {
             signal::graceful_stop_by_pid(pid).await?;
+            pidfile::remove_if(&pidfile::path_for(&self.socket_path), pid);
         }
         // No PID — already stopped or never started (idempotent).
 
@@ -511,6 +561,24 @@ pub struct CoreStatus {
     pub version: Option<String>,
     pub socket_path: PathBuf,
     pub config_dir: PathBuf,
+}
+
+/// Open `<config-dir>/logs/mihomo.log` for a new core, keeping the previous
+/// run's output as `mihomo.log.old` (enough to diagnose a crash while
+/// bounding the files to two runs).
+fn open_core_log(config_dir: &Path) -> anyhow::Result<std::fs::File> {
+    let dir = config_dir.join("logs");
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let path = core_log_path(config_dir);
+    if path.exists() {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    std::fs::File::create(&path).with_context(|| format!("failed to create {}", path.display()))
+}
+
+/// Where a detached core writes its stdout/stderr.
+pub fn core_log_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("logs").join("mihomo.log")
 }
 
 #[cfg(test)]

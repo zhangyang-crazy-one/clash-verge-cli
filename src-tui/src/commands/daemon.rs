@@ -17,6 +17,8 @@ use crate::subscribe::scheduler::{AutoUpdateScheduler, reload_current_profile};
 
 pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
     let manager = commands::build_manager(config_dir).await?;
+    // The daemon outlives the core, so its output can go to journald.
+    manager.set_piped_output(true);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
     manager.start().await?;

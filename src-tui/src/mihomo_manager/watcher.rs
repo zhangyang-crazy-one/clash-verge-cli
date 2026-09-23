@@ -46,7 +46,10 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
 
         tracing::info!("mihomo exited with code {exit_code}");
 
-        *inner.pid.lock() = None;
+        let exited_pid = inner.pid.lock().take();
+        if let Some(pid) = exited_pid {
+            crate::mihomo_manager::pidfile::remove_if(&crate::mihomo_manager::pidfile::path_for(&socket_path), pid);
+        }
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreExited(exit_code));

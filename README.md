@@ -90,6 +90,12 @@ headless machines use `clash-verge-cli sysproxy env` (or `--unset`) instead.
 
 ## Logs
 
+The core keeps running after `start` or the TUI exits; `stop`, `restart`,
+and `status` find it from any later invocation. Its own output goes to
+`<config-dir>/logs/mihomo.log` (the previous run is kept as
+`mihomo.log.old`), and `start` reports the last lines of it if the core
+fails to come up.
+
 The TUI writes its own diagnostics to `<config-dir>/logs/clash-verge-cli-<date>.log`;
 `start --foreground` and one-shot commands log to stderr (journald under
 systemd). Use `-v`/`-vv`/`-vvv` or `RUST_LOG` (e.g. `RUST_LOG=info,mihomo=debug`)
