@@ -49,7 +49,17 @@ pub struct TrafficData {
 /// Connections data: GET /connections
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionsData {
+    /// mihomo sends `null` rather than `[]` when nothing is connected.
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub connections: Vec<ConnectionInfo>,
+}
+
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +126,17 @@ pub struct RuleProvidersResponse {
 #[allow(clippy::panic, clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connections_accept_null_and_missing_lists() {
+        for body in [
+            r#"{"downloadTotal":0,"uploadTotal":0,"connections":null}"#,
+            r#"{"downloadTotal":0,"uploadTotal":0}"#,
+        ] {
+            let data: ConnectionsData = serde_json::from_str(body).unwrap();
+            assert!(data.connections.is_empty(), "{body}");
+        }
+    }
 
     #[test]
     fn test_version_deserialize() {

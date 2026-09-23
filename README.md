@@ -54,9 +54,31 @@ clash-verge-cli stop
 clash-verge-cli restart
 clash-verge-cli profile list
 clash-verge-cli profile import 'https://example.com/sub.yaml' --name my-sub
-clash-verge-cli profile update --all
+clash-verge-cli profile update --all --reload
+clash-verge-cli profile use my-sub           # uid or name
 eval "$(clash-verge-cli sysproxy env)"   # proxy the current shell
 ```
+
+Commands that talk to the running core (they fail with a hint when it is
+not running):
+
+```bash
+clash-verge-cli proxy list                   # groups; `proxy list Proxy` for members
+clash-verge-cli proxy select Proxy Tokyo
+clash-verge-cli proxy delay Proxy            # every real node in the group
+clash-verge-cli connections                  # `--json`, `close <ID>`, `close-all`
+clash-verge-cli provider update --all
+```
+
+Settings that apply to the running core, or are saved for the next start:
+
+```bash
+clash-verge-cli mode global                  # `mode` alone prints it
+clash-verge-cli tun on                       # after a one-time `tun setup`
+clash-verge-cli sysproxy on                  # `off`, `status`
+```
+
+List commands take `--json` for scripting.
 
 ## System proxy
 

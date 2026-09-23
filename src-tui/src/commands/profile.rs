@@ -1,5 +1,6 @@
 //! Non-interactive profile subscription commands.
 
+use crate::mihomo_manager::manager::MihomoManager;
 use crate::profile_store::store::ProfileStore;
 
 pub async fn list() -> anyhow::Result<()> {
@@ -43,33 +44,109 @@ pub async fn import(
     Ok(())
 }
 
-pub async fn update(uid: Option<&str>, all: bool) -> anyhow::Result<()> {
-    if all {
-        let currents = ProfileStore::update_all_remote_locked().await?;
-        println!("updated all remote profiles");
-        if let Some(uid) = currents.first() {
-            println!("current profile refreshed: {uid}");
-        }
-        return Ok(());
-    }
+/// Resolve a uid-or-name argument to a profile uid.
+async fn resolve_uid(query: &str) -> anyhow::Result<String> {
+    let store = ProfileStore::snapshot().await?;
+    let items = store.items();
+    let item = crate::services::profile::find_profile(&items, query)?;
+    item.uid
+        .as_deref()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("profile '{query}' has no uid"))
+}
 
-    let uid = uid.ok_or_else(|| anyhow::anyhow!("provide a profile uid or pass --all"))?;
-    let is_current = ProfileStore::update_remote_locked(uid, None).await?;
-    println!("updated {uid}");
-    if is_current {
-        println!("profile is current — restart or switch to reload the core config");
+/// `profile use`: make a profile current and apply it to the running core
+/// (or write it for the next start).
+pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result<()> {
+    let store = ProfileStore::snapshot().await?;
+    let items = store.items();
+    let item = crate::services::profile::find_profile(&items, query)?;
+    let api = manager.api();
+    let running = super::core_running(&api).await;
+    let enable_tun = clash_verge_core::config::IVerge::new()
+        .await
+        .enable_tun_mode
+        .unwrap_or(false);
+    crate::services::profile::switch_profile(&api, item, enable_tun, running)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let uid = item.uid.as_deref().unwrap_or("?");
+    let name = item.name.as_deref().unwrap_or("(unnamed)");
+    if running {
+        println!("switched to {uid} ({name})");
+    } else {
+        println!("switched to {uid} ({name}); core not running, used on next start");
     }
     Ok(())
 }
 
-pub async fn delete(uid: &str) -> anyhow::Result<()> {
-    ProfileStore::delete_locked(uid).await?;
+pub async fn update(manager: &MihomoManager, query: Option<&str>, all: bool, reload: bool) -> anyhow::Result<()> {
+    let (refreshed_current, failures) = if all {
+        // Per-profile outcomes: one broken subscription must not keep a
+        // refreshed current profile from being reloaded.
+        let uids: Vec<String> = ProfileStore::snapshot()
+            .await?
+            .items()
+            .into_iter()
+            .filter_map(|item| item.uid.map(|uid| uid.to_string()))
+            .collect();
+        let (updated, failed) = ProfileStore::update_remotes_locked(&uids).await?;
+        for (uid, _) in &updated {
+            println!("updated {uid}");
+        }
+        for (uid, error) in &failed {
+            eprintln!("failed to update {uid}: {error}");
+        }
+        let current = updated
+            .into_iter()
+            .find_map(|(uid, is_current)| is_current.then_some(uid));
+        (current, failed.len())
+    } else {
+        let query = query.ok_or_else(|| anyhow::anyhow!("provide a profile uid or name, or pass --all"))?;
+        let uid = resolve_uid(query).await?;
+        let is_current = ProfileStore::update_remote_locked(&uid, None).await?;
+        println!("updated {uid}");
+        (is_current.then_some(uid), 0)
+    };
+
+    if let Some(uid) = refreshed_current {
+        reload_if_requested(manager, &uid, reload).await?;
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} profile update(s) failed");
+    }
+    Ok(())
+}
+
+/// Apply a refreshed current profile to the running core when `--reload`
+/// was given; otherwise say how to apply it.
+async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -> anyhow::Result<()> {
+    let api = manager.api();
+    if !reload || !super::core_running(&api).await {
+        println!("current profile {uid} refreshed; pass --reload (or restart) to apply it to the running core");
+        return Ok(());
+    }
+    let enable_tun = clash_verge_core::config::IVerge::new()
+        .await
+        .enable_tun_mode
+        .unwrap_or(false);
+    crate::subscribe::scheduler::reload_current_profile(&api, uid, enable_tun, true)
+        .await
+        .map_err(|error| anyhow::anyhow!("profile reload: {error}"))?;
+    println!("reloaded the running core with {uid}");
+    Ok(())
+}
+
+pub async fn delete(query: &str) -> anyhow::Result<()> {
+    let uid = resolve_uid(query).await?;
+    ProfileStore::delete_locked(&uid).await?;
     println!("deleted {uid}");
     Ok(())
 }
 
-pub async fn rename(uid: &str, new_name: &str) -> anyhow::Result<()> {
-    ProfileStore::rename_locked(uid, new_name).await?;
+pub async fn rename(query: &str, new_name: &str) -> anyhow::Result<()> {
+    let uid = resolve_uid(query).await?;
+    ProfileStore::rename_locked(&uid, new_name).await?;
     println!("renamed {uid} → {new_name}");
     Ok(())
 }

@@ -38,6 +38,41 @@ pub async fn setup() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tun on|off`: persist the TUN flag, write the runtime config, and reload
+/// a running core. Turning TUN on first checks (read-only) that the binary
+/// carries the capability; nothing here ever asks for a password.
+pub async fn set_enabled(manager: &crate::mihomo_manager::manager::MihomoManager, enabled: bool) -> anyhow::Result<()> {
+    if enabled {
+        crate::services::tun::preflight_enable(manager)?;
+        if crate::commands::privilege::resolve1_rule_needed(true) {
+            eprintln!(
+                "warning: the systemd-resolved DNS polkit rule is missing, so starting with TUN may show \
+system dialogs; run `{}` once",
+                crate::commands::privilege::TUN_SETUP_COMMAND
+            );
+        }
+    }
+    let mut verge = clash_verge_core::config::IVerge::new().await;
+    verge.enable_tun_mode = Some(enabled);
+    verge.save_file().await?;
+
+    let state = if enabled { "on" } else { "off" };
+    if crate::commands::core_running(&manager.api()).await {
+        // This process never owns a core it did not spawn: reload the
+        // running one through its controller.
+        crate::services::tun::apply_tun_runtime(manager, false, enabled)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to apply TUN to the running core: {error}"))?;
+        println!("TUN {state}");
+    } else {
+        crate::services::tun::write_tun_runtime(enabled)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to write the runtime config: {error}"))?;
+        println!("TUN {state} (core not running; used on next start)");
+    }
+    Ok(())
+}
+
 /// Read-only report of the resolved binary's TUN capability state.
 pub async fn status() -> anyhow::Result<()> {
     let resolved = crate::mihomo_manager::binary::resolve_or_install()

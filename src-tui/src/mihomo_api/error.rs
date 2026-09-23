@@ -19,10 +19,10 @@ pub enum MihomoError {
     #[error("mihomo returned 401 Unauthorized — check secret in verge.yaml")]
     Unauthorized,
 
-    #[error("mihomo returned 404: {0}")]
+    #[error("mihomo returned 404: {}", .0.trim())]
     NotFound(String),
 
-    #[error("mihomo returned status {status}: {body}")]
+    #[error("mihomo returned status {status}: {}", .body.trim())]
     HttpStatus { status: u16, body: String },
 
     #[error("failed to parse mihomo response: {0}")]

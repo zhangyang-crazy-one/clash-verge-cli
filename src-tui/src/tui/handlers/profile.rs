@@ -5,9 +5,8 @@ use crossterm::event::KeyCode;
 use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, InputMode, Overlay, TrustPending};
-use crate::mihomo_api::client::MihomoApi;
 use crate::profile_store::store::ProfileStore;
-use crate::runtime_config::{commit_runtime_config, reload_remote_profile};
+use crate::runtime_config::reload_remote_profile;
 
 use super::Ctx;
 
@@ -46,7 +45,7 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
     ctx.spawn(|tx| async move {
-        match switch_profile(&api, &item, enable_tun, core_running).await {
+        match crate::services::profile::switch_profile(&api, &item, enable_tun, core_running).await {
             Ok(()) if core_running => {
                 let _ = tx.send(Action::ProxiesRefresh);
             }
@@ -56,45 +55,6 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
             }
         }
     });
-}
-
-/// Make `item` the current profile and apply it: remote subscriptions are
-/// reloaded as-is, local profiles get their chain fragments merged into the
-/// runtime config. On failure the previous current profile is restored (if
-/// nothing else changed it meanwhile) and a user-facing error is returned.
-pub(crate) async fn switch_profile(
-    api: &MihomoApi,
-    item: &clash_verge_core::config::PrfItem,
-    enable_tun: bool,
-    core_running: bool,
-) -> Result<(), String> {
-    let uid = item.uid.as_deref().ok_or("profile switch: profile has no uid")?;
-    let previous_uid = ProfileStore::replace_current_locked(uid)
-        .await
-        .map_err(|error| format!("profile switch: {error}"))?;
-
-    let applied = if item.itype.as_deref() == Some("remote") {
-        reload_remote_profile(api, item, enable_tun, core_running)
-            .await
-            .map_err(|error| format!("profile reload: {error}"))
-    } else {
-        let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().unwrap_or_default();
-        match crate::chain::resolve_chain(item, &profiles_dir).await {
-            Ok(chain) => commit_runtime_config(api, enable_tun, core_running, Some(item), |mut config| {
-                crate::chain::apply_chain_to_config(&mut config, &chain);
-                Ok(config)
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("config write: {error}")),
-            Err(error) => Err(format!("chain: {error}")),
-        }
-    };
-
-    if applied.is_err() {
-        let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
-    }
-    applied
 }
 
 /// `u` on Profiles: refresh the selected remote profile (or all of them).
