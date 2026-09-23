@@ -4,7 +4,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "clash-verge-cli", version, about = "Terminal-native proxy client for mihomo")]
 pub struct Cli {
-    #[arg(long, value_name = "PATH")]
+    /// Configuration directory (default: ~/.local/share/clash-verge-cli).
+    /// Accepted before or after the subcommand; the systemd unit passes it
+    /// after `start --foreground`.
+    #[arg(long, value_name = "PATH", global = true)]
     pub config_dir: Option<PathBuf>,
 
     /// Increase log verbosity (-v info, -vv debug, -vvv trace). `RUST_LOG`
@@ -328,6 +331,36 @@ mod tests {
                 action: TunCommand::Off
             })
         ));
+    }
+
+    #[test]
+    fn config_dir_is_accepted_before_and_after_the_subcommand() {
+        for args in [
+            &["--config-dir", "/cfg", "status"][..],
+            &["status", "--config-dir", "/cfg"][..],
+            &["start", "--foreground", "--config-dir", "/cfg"][..],
+        ] {
+            let cli = parse(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            assert_eq!(
+                cli.config_dir.as_deref(),
+                Some(std::path::Path::new("/cfg")),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_generated_systemd_unit_command_parses() {
+        // `service install` writes this ExecStart; it must be a valid command
+        // line for this CLI or the service can never start.
+        let unit = crate::service_cmd::unit_content("/usr/bin/clash-verge-cli", "/home/u/cfg");
+        let exec = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .expect("unit has an ExecStart line");
+        let cli = parse(&exec.split_whitespace().skip(1).collect::<Vec<_>>()).expect("ExecStart parses");
+        assert!(matches!(cli.command, Some(Command::Start { foreground: true })));
+        assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
     }
 
     #[test]
