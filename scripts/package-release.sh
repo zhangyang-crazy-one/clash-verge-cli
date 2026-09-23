@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package release binaries into dist/: one tarball per target, .deb and .rpm
+# Package release binaries into a fresh dist/: one tarball per target, .deb and .rpm
 # packages for the static (musl) targets, and SHA256SUMS.
 #
 # Usage: scripts/package-release.sh VERSION TARGET...
@@ -22,7 +22,9 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${root}"
 dist="${root}/dist"
 assets="${root}/build/release-assets"
-rm -rf "${assets}"
+# Start from an empty dist/: SHA256SUMS and the release upload take every
+# file in it, so artifacts of an earlier run must not linger.
+rm -rf "${assets}" "${dist}"
 mkdir -p "${dist}" "${assets}/completions"
 
 # Completions and man pages are the same for every target.
