@@ -12,17 +12,21 @@ pub async fn list(manager: &MihomoManager, json: bool) -> anyhow::Result<()> {
     }
     if providers.is_empty() {
         println!("(no rule providers)");
+        return Ok(());
     }
-    for provider in providers {
-        println!(
-            "{}\t{}\t{} rules\t{}\t{}",
-            provider.name,
-            provider.behavior,
-            provider.rule_count,
-            provider.vehicle_type,
-            provider.updated_at.as_deref().unwrap_or("-")
-        );
-    }
+    let rows = providers.iter().map(|provider| {
+        vec![
+            provider.name.clone(),
+            provider.behavior.clone(),
+            provider.rule_count.to_string(),
+            provider.vehicle_type.clone(),
+            provider.updated_at.clone().unwrap_or_else(|| "-".into()),
+        ]
+    });
+    print!(
+        "{}",
+        super::table(&["PROVIDER", "BEHAVIOR", "RULES", "VEHICLE", "UPDATED"], rows)
+    );
     Ok(())
 }
 

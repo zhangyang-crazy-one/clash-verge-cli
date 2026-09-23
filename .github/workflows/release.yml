@@ -46,11 +46,17 @@ jobs:
         shell: bash
         run: |
           archive="clash-verge-cli-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
-          install -Dm755 target/release/clash-verge-cli dist/clash-verge-cli
-          tar -czf "dist/${archive}" -C dist clash-verge-cli
+          stage="dist/stage"
+          install -Dm755 target/release/clash-verge-cli "${stage}/clash-verge-cli"
+          mkdir -p "${stage}/completions"
+          "${stage}/clash-verge-cli" completions bash > "${stage}/completions/clash-verge-cli.bash"
+          "${stage}/clash-verge-cli" completions zsh > "${stage}/completions/_clash-verge-cli"
+          "${stage}/clash-verge-cli" completions fish > "${stage}/completions/clash-verge-cli.fish"
+          "${stage}/clash-verge-cli" man --dir "${stage}/man"
+          tar -czf "dist/${archive}" -C "${stage}" .
+          rm -rf "${stage}"
           cd dist
           sha256sum "${archive}" > "${archive}.sha256"
-          rm clash-verge-cli
 
       - name: Publish GitHub release
         env:

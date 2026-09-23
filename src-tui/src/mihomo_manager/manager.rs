@@ -471,26 +471,26 @@ resolved binary; the running core was left untouched",
     }
 
     /// Return CoreStatus with live version info if mihomo is running.
-    pub async fn status(&self) -> CoreStatus {
-        let state = self.state();
-        let pid = self.pid();
-        let uptime_secs = self.uptime().map(|d| d.num_seconds());
-        let socket_path = self.socket_path.clone();
-        let config_dir = self.config_dir.clone();
+    /// Status from this process's own view, without probing the controller
+    /// (`version` is `None`).
+    pub fn local_status(&self) -> CoreStatus {
+        CoreStatus {
+            state: self.state(),
+            pid: self.pid(),
+            uptime_secs: self.uptime().map(|d| d.num_seconds()),
+            version: None,
+            socket_path: self.socket_path.clone(),
+            config_dir: self.config_dir.clone(),
+        }
+    }
 
-        let version = self.api().version().await.ok().map(|v| v.version);
+    pub async fn status(&self) -> CoreStatus {
+        let mut status = self.local_status();
+        status.version = self.api().version().await.ok().map(|v| v.version);
         // A GUI-owned Mihomo process is not a child of this manager, but its
         // configured controller is still authoritative for CLI status.
-        let state = observed_state(state, version.as_deref());
-
-        CoreStatus {
-            state,
-            pid,
-            uptime_secs,
-            version,
-            socket_path,
-            config_dir,
-        }
+        status.state = observed_state(status.state, status.version.as_deref());
+        status
     }
 }
 

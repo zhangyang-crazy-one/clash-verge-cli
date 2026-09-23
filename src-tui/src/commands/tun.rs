@@ -74,12 +74,26 @@ system dialogs; run `{}` once",
 }
 
 /// Read-only report of the resolved binary's TUN capability state.
-pub async fn status() -> anyhow::Result<()> {
+pub async fn status(json: bool) -> anyhow::Result<()> {
     let resolved = crate::mihomo_manager::binary::resolve_or_install()
         .await
         .context("failed to resolve mihomo binary")?;
     let privileged = crate::commands::privilege::has_tun_capability(&resolved.path);
     let root = crate::commands::privilege::running_as_root();
+
+    if json {
+        let payload = serde_json::json!({
+            "enabled": clash_verge_core::config::IVerge::new().await.enable_tun_mode.unwrap_or(false),
+            "binary": resolved.path,
+            "version": resolved.version,
+            "capability": privileged,
+            "root": root,
+            "resolve1_policy": crate::commands::privilege::resolved_policy_present(),
+            "dns_polkit_rule": crate::commands::privilege::resolve1_rule_installed(),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
 
     println!("mihomo binary: {}", resolved.path.display());
     println!("version:       {}", resolved.version);

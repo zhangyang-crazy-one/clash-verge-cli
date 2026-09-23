@@ -78,7 +78,34 @@ clash-verge-cli tun on                       # after a one-time `tun setup`
 clash-verge-cli sysproxy on                  # `off`, `status`
 ```
 
-List commands take `--json` for scripting.
+List and status commands (`status`, `profile list`, `proxy list`,
+`connections`, `provider list`, `mode`, `sysproxy status`, `tun status`,
+`service status`) print a table, or stable JSON with `--json`.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success; for `status`, the core is running |
+| 1 | Any other failure; for `status`, the core is in an error state |
+| 2 | Invalid command line |
+| 3 | The core is not running (`status` when stopped, or a command that needs it) |
+| 4 | Missing privilege (TUN capability; run `clash-verge-cli tun setup`) |
+| 5 | Network or subscription failure (fetch, DNS, blocked host, core download) |
+
+`clash-verge-cli status --wait [--timeout SECS]` waits until the core is
+running (exit 3 on timeout).
+
+### Shell completions and man pages
+
+```bash
+clash-verge-cli completions bash > ~/.local/share/bash-completion/completions/clash-verge-cli
+clash-verge-cli completions zsh > "${fpath[1]}/_clash-verge-cli"
+clash-verge-cli completions fish > ~/.config/fish/completions/clash-verge-cli.fish
+clash-verge-cli man | man -l -              # or: clash-verge-cli man --dir ~/.local/share/man/man1
+```
+
+Release archives include both under `completions/` and `man/`.
 
 ## System proxy
 

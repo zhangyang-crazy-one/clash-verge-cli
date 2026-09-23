@@ -398,7 +398,7 @@ fn require_capability_impl(binary: &Path, root: bool, probe: &dyn Fn(&Path) -> b
     if root || probe(binary) {
         return Ok(());
     }
-    anyhow::bail!("{}", missing_capability_error(binary))
+    Err(crate::exit::PermissionDenied(missing_capability_error(binary)).into())
 }
 
 /// Non-mutating preflight used by every TUN-enabled spawn path: resolves

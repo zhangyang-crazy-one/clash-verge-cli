@@ -1,6 +1,7 @@
 pub mod askpass;
 pub mod connections;
 pub mod daemon;
+pub mod docs;
 pub mod log_cleanup;
 pub mod mode;
 pub mod privilege;
@@ -18,6 +19,7 @@ pub mod tun;
 use std::path::PathBuf;
 
 use crate::mihomo_api::MihomoApi;
+use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_manager::manager::MihomoManager;
 use clash_verge_core::config::IClashTemp;
 
@@ -61,16 +63,58 @@ pub async fn core_running(api: &MihomoApi) -> bool {
 }
 
 /// The controller API of a running core, or an error pointing at `start`.
+/// Only an unreachable controller means "not running"; a controller that
+/// answers with an error (wrong secret, bad response) is reported as such.
 pub async fn running_api(manager: &MihomoManager) -> anyhow::Result<MihomoApi> {
     let api = manager.api();
-    if core_running(&api).await {
-        Ok(api)
-    } else {
-        anyhow::bail!(
+    match api.version().await {
+        Ok(_) => Ok(api),
+        Err(MihomoError::CoreDown { .. } | MihomoError::Io(_)) => Err(crate::exit::CoreNotRunning(format!(
             "mihomo is not running (controller {} not reachable); start it with `clash-verge-cli start`",
             manager.socket_path().display()
-        )
+        ))
+        .into()),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "mihomo controller {} answered with an error",
+            manager.socket_path().display()
+        ))),
     }
+}
+
+/// Left-aligned text table (header row, then one row per item), padded by
+/// display width so CJK names line up. Empty trailing padding is trimmed.
+pub fn table<I>(headers: &[&str], rows: I) -> String
+where
+    I: IntoIterator<Item = Vec<String>>,
+{
+    use unicode_width::UnicodeWidthStr as _;
+
+    let rows: Vec<Vec<String>> = std::iter::once(headers.iter().map(|h| (*h).to_string()).collect())
+        .chain(rows)
+        .collect();
+    let columns = headers.len();
+    let widths: Vec<usize> = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| cell.width())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut out = String::new();
+    for row in rows {
+        let mut line = String::new();
+        for (column, cell) in row.iter().enumerate() {
+            line.push_str(cell);
+            if column + 1 < columns {
+                line.push_str(&" ".repeat(widths[column] - cell.width() + 2));
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// `1.2 KiB`-style size for transfer counters.
@@ -101,6 +145,22 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         assert!(log_tail(&path, 2).starts_with("(no output"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn table_aligns_by_display_width() {
+        let out = table(
+            &["UID", "NAME", "URL"],
+            [
+                vec!["R1".into(), "家".into(), "a".into()],
+                vec!["R22".into(), "ab".into(), "b".into()],
+            ],
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "UID  NAME  URL");
+        // "家" is two columns wide, like "ab".
+        assert_eq!(lines[1], "R1   家    a");
+        assert_eq!(lines[2], "R22  ab    b");
     }
 
     #[test]

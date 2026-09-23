@@ -5,6 +5,7 @@ mod commands;
 mod config_dir;
 mod editor;
 mod enhance;
+mod exit;
 mod i18n;
 mod logging;
 mod mihomo_api;
@@ -21,7 +22,19 @@ mod ui;
 use clap::Parser as _;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    let code = match run().await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            exit::code_for(&error)
+        }
+    };
+    std::process::exit(code);
+}
+
+/// Run the command line; `Ok` carries the exit code (see [`exit`]).
+async fn run() -> anyhow::Result<i32> {
     color_eyre::install().map_err(|e| anyhow::anyhow!("color-eyre install failed: {e}"))?;
 
     // `sudo -A` runs the SUDO_ASKPASS program (us, during `tun setup`) with
@@ -29,12 +42,27 @@ async fn main() -> anyhow::Result<()> {
     // it before clap parses anything, and before any config resolution (the
     // environment is sudo's, maybe without a config dir).
     if is_askpass_invocation() {
-        return commands::askpass::run();
+        commands::askpass::run()?;
+        return Ok(exit::SUCCESS);
     }
     let cli = cli::Cli::parse();
-    if matches!(cli.command, Some(cli::Command::Askpass)) {
-        return commands::askpass::run();
+    // Commands that need no configuration at all.
+    match &cli.command {
+        Some(cli::Command::Askpass) => {
+            commands::askpass::run()?;
+            return Ok(exit::SUCCESS);
+        }
+        Some(cli::Command::Completions { shell }) => {
+            commands::docs::completions(*shell)?;
+            return Ok(exit::SUCCESS);
+        }
+        Some(cli::Command::Man { dir }) => {
+            commands::docs::man(dir.as_deref())?;
+            return Ok(exit::SUCCESS);
+        }
+        _ => {}
     }
+    let json = cli.json;
     let config_dir = config_dir::resolve(cli.config_dir)?;
     clash_verge_core::utils::dirs::set_app_home_dir(config_dir.clone());
     logging::init(
@@ -55,7 +83,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         None => tui::run(config_dir).await?,
-        Some(cli::Command::Askpass) => unreachable!("askpass handled before config resolution"),
+        Some(cli::Command::Askpass | cli::Command::Completions { .. } | cli::Command::Man { .. }) => {
+            unreachable!("handled before config resolution")
+        }
         Some(cli::Command::Start { foreground }) => {
             if foreground {
                 commands::daemon::run(config_dir).await?;
@@ -72,13 +102,13 @@ async fn main() -> anyhow::Result<()> {
             let manager = commands::build_manager(config_dir).await?;
             commands::restart::run(manager).await?;
         }
-        Some(cli::Command::Status { json }) => {
+        Some(cli::Command::Status { wait, timeout }) => {
             let manager = commands::build_manager(config_dir).await?;
-            let code = commands::status::run(manager, json).await?;
-            std::process::exit(code);
+            let wait = wait.then(|| std::time::Duration::from_secs(timeout));
+            return commands::status::run(manager, json, wait).await;
         }
         Some(cli::Command::Profile { action }) => match action {
-            cli::ProfileCommand::List => commands::profile::list().await?,
+            cli::ProfileCommand::List => commands::profile::list(json).await?,
             cli::ProfileCommand::Import {
                 url,
                 name,
@@ -119,12 +149,12 @@ async fn main() -> anyhow::Result<()> {
                 commands::service::install(bin, config, now)?;
             }
             cli::ServiceCommand::Uninstall => commands::service::uninstall()?,
-            cli::ServiceCommand::Status { json } => commands::service::status(json)?,
+            cli::ServiceCommand::Status => commands::service::status(json)?,
         },
         Some(cli::Command::Proxy { action }) => {
             let manager = commands::build_manager(config_dir).await?;
             match action {
-                cli::ProxyCommand::List { group, json } => {
+                cli::ProxyCommand::List { group } => {
                     commands::proxy::list(&manager, group.as_deref(), json).await?;
                 }
                 cli::ProxyCommand::Select { group, node } => commands::proxy::select(&manager, &group, &node).await?,
@@ -135,12 +165,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(cli::Command::Mode { mode }) => {
             let manager = commands::build_manager(config_dir).await?;
-            commands::mode::run(&manager, mode).await?;
+            commands::mode::run(&manager, mode, json).await?;
         }
         Some(cli::Command::Connections { action }) => {
             let manager = commands::build_manager(config_dir).await?;
-            match action.unwrap_or(cli::ConnectionsCommand::List { json: false }) {
-                cli::ConnectionsCommand::List { json } => commands::connections::list(&manager, json).await?,
+            match action.unwrap_or(cli::ConnectionsCommand::List) {
+                cli::ConnectionsCommand::List => commands::connections::list(&manager, json).await?,
                 cli::ConnectionsCommand::Close { id } => commands::connections::close(&manager, &id).await?,
                 cli::ConnectionsCommand::CloseAll => commands::connections::close_all(&manager).await?,
             }
@@ -148,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
         Some(cli::Command::Provider { action }) => {
             let manager = commands::build_manager(config_dir).await?;
             match action {
-                cli::ProviderCommand::List { json } => commands::provider::list(&manager, json).await?,
+                cli::ProviderCommand::List => commands::provider::list(&manager, json).await?,
                 cli::ProviderCommand::Update { name, all } => {
                     commands::provider::update(&manager, name.as_deref(), all).await?;
                 }
@@ -162,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
             cli::SysproxyCommand::Off => commands::sysproxy::off().await?,
             cli::SysproxyCommand::Status => {
                 let manager = commands::build_manager(config_dir).await?;
-                commands::sysproxy::status(&manager).await?;
+                commands::sysproxy::status(&manager, json).await?;
             }
             cli::SysproxyCommand::Env { unset } => commands::sysproxy::env(unset).await,
         },
@@ -172,11 +202,11 @@ async fn main() -> anyhow::Result<()> {
                 commands::tun::set_enabled(&manager, matches!(action, cli::TunCommand::On)).await?;
             }
             cli::TunCommand::Setup => commands::tun::setup().await?,
-            cli::TunCommand::Status => commands::tun::status().await?,
+            cli::TunCommand::Status => commands::tun::status(json).await?,
         },
     }
 
-    Ok(())
+    Ok(exit::SUCCESS)
 }
 
 /// Whether `sudo -A` started us as its askpass helper: sudo points
