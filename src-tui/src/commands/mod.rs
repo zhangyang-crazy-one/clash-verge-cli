@@ -19,6 +19,7 @@ pub mod tun;
 use std::path::PathBuf;
 
 use crate::mihomo_api::MihomoApi;
+use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_manager::manager::MihomoManager;
 use clash_verge_core::config::IClashTemp;
 
@@ -62,16 +63,21 @@ pub async fn core_running(api: &MihomoApi) -> bool {
 }
 
 /// The controller API of a running core, or an error pointing at `start`.
+/// Only an unreachable controller means "not running"; a controller that
+/// answers with an error (wrong secret, bad response) is reported as such.
 pub async fn running_api(manager: &MihomoManager) -> anyhow::Result<MihomoApi> {
     let api = manager.api();
-    if core_running(&api).await {
-        Ok(api)
-    } else {
-        Err(crate::exit::CoreNotRunning(format!(
+    match api.version().await {
+        Ok(_) => Ok(api),
+        Err(MihomoError::CoreDown { .. } | MihomoError::Io(_)) => Err(crate::exit::CoreNotRunning(format!(
             "mihomo is not running (controller {} not reachable); start it with `clash-verge-cli start`",
             manager.socket_path().display()
         ))
-        .into())
+        .into()),
+        Err(error) => Err(anyhow::Error::new(error).context(format!(
+            "mihomo controller {} answered with an error",
+            manager.socket_path().display()
+        ))),
     }
 }
 
