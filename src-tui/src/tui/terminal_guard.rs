@@ -4,6 +4,9 @@ use std::io::stdout;
 pub struct TerminalGuard {
     terminal: ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     suspended: bool,
+    /// Mouse reporting is on (`mouse: true` in tui.yaml); it is turned off
+    /// while suspended so an editor gets a normal terminal.
+    mouse: bool,
 }
 
 impl TerminalGuard {
@@ -14,6 +17,7 @@ impl TerminalGuard {
         Ok(Self {
             terminal,
             suspended: false,
+            mouse: false,
         })
     }
 
@@ -28,6 +32,7 @@ impl TerminalGuard {
         Self {
             terminal: ratatui::Terminal::with_options(backend, options).expect("fixed viewport needs no TTY"),
             suspended: true,
+            mouse: false,
         }
     }
 
@@ -50,11 +55,23 @@ impl TerminalGuard {
         &mut self.terminal
     }
 
+    /// Report mouse events (wheel, clicks) as input.
+    pub fn enable_mouse(&mut self) -> Result<()> {
+        if !self.suspended {
+            crossterm::execute!(self.terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
+        }
+        self.mouse = true;
+        Ok(())
+    }
+
     /// Disable raw mode and leave the alternate screen so an external editor
     /// can take over the terminal. Idempotent.
     pub fn suspend(&mut self) -> Result<()> {
         if self.suspended {
             return Ok(());
+        }
+        if self.mouse {
+            crossterm::execute!(self.terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
         }
         crossterm::execute!(
             self.terminal.backend_mut(),
@@ -76,6 +93,9 @@ impl TerminalGuard {
         let backend = ratatui::backend::CrosstermBackend::new(stdout());
         self.terminal = ratatui::Terminal::new(backend)?;
         self.suspended = false;
+        if self.mouse {
+            crossterm::execute!(self.terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
+        }
         Ok(())
     }
 }
@@ -96,6 +116,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.suspended {
             return;
+        }
+        if self.mouse {
+            let _ = crossterm::execute!(self.terminal.backend_mut(), crossterm::event::DisableMouseCapture);
         }
         let _ = crossterm::execute!(
             self.terminal.backend_mut(),

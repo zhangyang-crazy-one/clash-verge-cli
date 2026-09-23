@@ -27,6 +27,8 @@ pub(super) fn note_fetched(
 ) {
     app.runtime_loading.proxies = false;
     app.runtime_errors.proxies = None;
+    // Selections change which failed nodes are hidden: keep the cursor's row.
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.proxy_groups = groups;
     let expanded_is_available = app
         .expanded_proxy_group
@@ -34,12 +36,13 @@ pub(super) fn note_fetched(
         .and_then(|name| app.proxy_groups.get(name))
         .and_then(|group| group.all.as_ref())
         .is_some_and(|nodes| !nodes.is_empty());
-    if !expanded_is_available {
+    if expanded_is_available {
+        reselect(app, keep.as_ref());
+    } else {
         app.expanded_proxy_group = first_selectable_proxy_group(&app.proxy_groups);
         app.node_selected_index = 0;
     }
-    let rows = proxy_display_rows(&app.proxy_groups, app.expanded_proxy_group.as_deref());
-    app.node_selected_index = app.node_selected_index.min(rows.len().saturating_sub(1));
+    let rows = app.proxy_rows();
     let group_count = rows
         .iter()
         .filter(|row| matches!(row, ProxyDisplayRow::Group { .. }))
@@ -50,19 +53,20 @@ pub(super) fn note_fetched(
         .filter_map(|group| group.all.as_ref().filter(|nodes| !nodes.is_empty()))
         .map(Vec::len)
         .sum();
-    app.status_msg = Some(format!(
-        "{group_count} selectable groups, {choice_count} choices loaded"
-    ));
+    // Home refreshes proxies in the background; only report on Proxies.
+    if app.view == crate::app::View::Proxies {
+        app.status_msg = Some(format!(
+            "{group_count} selectable groups, {choice_count} choices loaded"
+        ));
+    }
 }
 
 /// `Enter` on Proxies: expand a group, add a node to the chain being edited,
 /// or select the node in its group.
 pub(super) fn activate_selected(app: &mut App, ctx: &Ctx) {
-    let selected_row = proxy_display_rows(&app.proxy_groups, app.expanded_proxy_group.as_deref())
-        .get(app.node_selected_index)
-        .cloned();
+    let selected_row = app.proxy_rows().get(app.node_selected_index).cloned();
     if let Some(ProxyDisplayRow::Group { name, node_count, .. }) = selected_row {
-        app.node_selected_index = proxy_display_rows(&app.proxy_groups, Some(&name))
+        app.node_selected_index = proxy_display_rows(&app.proxy_groups, Some(&name), &app.proxy_list_options())
             .iter()
             .position(|row| matches!(row, ProxyDisplayRow::Group { name: row_name, .. } if row_name == &name))
             .unwrap_or_default();
@@ -70,11 +74,7 @@ pub(super) fn activate_selected(app: &mut App, ctx: &Ctx) {
         app.expanded_proxy_group = Some(name);
         return;
     }
-    let Some((group, name)) = find_node_at_index(
-        &app.proxy_groups,
-        app.expanded_proxy_group.as_deref(),
-        app.node_selected_index,
-    ) else {
+    let Some((group, name)) = selected_node(app) else {
         return;
     };
     if app.chain_mode {
@@ -95,11 +95,7 @@ pub(super) fn activate_selected(app: &mut App, ctx: &Ctx) {
 
 /// `t`: delay-test the selected node.
 pub(super) fn test_selected_delay(app: &mut App, ctx: &Ctx) {
-    let Some((_, name)) = find_node_at_index(
-        &app.proxy_groups,
-        app.expanded_proxy_group.as_deref(),
-        app.node_selected_index,
-    ) else {
+    let Some((_, name)) = selected_node(app) else {
         return;
     };
     app.status_msg = Some(format!("Testing delay for {name}..."));
@@ -265,16 +261,56 @@ pub(super) async fn apply_chain_config(
     .await
 }
 
-/// Find the (group_name, node_name) at a flat index in proxy groups.
-pub(super) fn find_node_at_index(
-    groups: &std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>,
-    expanded_group: Option<&str>,
-    target: usize,
-) -> Option<(String, String)> {
-    proxy_display_rows(groups, expanded_group)
-        .get(target)
+/// The (group_name, node_name) under the cursor, if it is on a node.
+pub(super) fn selected_node(app: &App) -> Option<(String, String)> {
+    app.proxy_rows()
+        .get(app.node_selected_index)
         .and_then(|row| row.node_identity())
         .map(|(group, node)| (group.to_string(), node.to_string()))
+}
+
+/// `o`: cycle the node order, keeping the cursor on the same row.
+pub(super) fn cycle_sort(app: &mut App) {
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
+    app.proxy_sort = app.proxy_sort.next();
+    reselect(app, keep.as_ref());
+    app.status_msg = Some(format!(
+        "{}: {}",
+        app.tr("proxies.sort"),
+        app.tr(app.proxy_sort.label_key())
+    ));
+}
+
+/// `H`: hide or show nodes whose last delay test failed.
+pub(super) fn toggle_hide_failed(app: &mut App) {
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
+    app.hide_failed_proxies = !app.hide_failed_proxies;
+    reselect(app, keep.as_ref());
+    app.status_msg = Some(
+        app.tr(if app.hide_failed_proxies {
+            "proxies.hiding_failed"
+        } else {
+            "proxies.showing_failed"
+        })
+        .into(),
+    );
+}
+
+/// After the rows changed (sort, filter, hide), put the cursor back on
+/// `row` if it is still listed, else keep it in range.
+pub(super) fn reselect(app: &mut App, row: Option<&ProxyDisplayRow>) {
+    let rows = app.proxy_rows();
+    app.node_selected_index = row
+        .and_then(|row| rows.iter().position(|candidate| candidate_matches(candidate, row)))
+        .unwrap_or_else(|| app.node_selected_index.min(rows.len().saturating_sub(1)));
+}
+
+/// Same group header or same node (its `current` flag may have changed).
+fn candidate_matches(candidate: &ProxyDisplayRow, row: &ProxyDisplayRow) -> bool {
+    match (candidate, row) {
+        (ProxyDisplayRow::Group { name: left, .. }, ProxyDisplayRow::Group { name: right, .. }) => left == right,
+        _ => candidate.node_identity().is_some() && candidate.node_identity() == row.node_identity(),
+    }
 }
 
 /// Collect the deduplicated set of real leaf proxy targets for a batch delay
@@ -333,7 +369,10 @@ pub(super) fn advance_batch(app: &mut App) {
 /// Never touches batch progress: a single-node `t` result must not advance or
 /// clear the active batch.
 pub(super) fn note_delay_result(app: &mut App, name: String, delay: Option<u64>) {
+    // Sorted by delay, a new result can move rows: keep the cursor's node.
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.delay_map.insert(name, delay);
+    reselect(app, keep.as_ref());
     if let Some(delay) = delay {
         app.status_msg = Some(format!("Delay: {delay}ms"));
     }
@@ -341,7 +380,9 @@ pub(super) fn note_delay_result(app: &mut App, name: String, delay: Option<u64>)
 
 /// Record one single-node delay failure. Same contract as [`note_delay_result`].
 pub(super) fn note_delay_failed(app: &mut App, name: String, error: String) {
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.delay_map.insert(name.clone(), None);
+    reselect(app, keep.as_ref());
     app.status_msg = Some(format!("Delay failed for {name}: {error}"));
 }
 

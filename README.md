@@ -183,15 +183,48 @@ The CLI never reads the GUI directory at runtime; migration is one-shot.
 | Keys | Action |
 | --- | --- |
 | `1`–`8` | Switch views |
-| `Tab`, `h`, `l` | Move focus |
+| `Tab`, `h`, `l` | Move focus (`Tab` also switches the Rules/Providers panels) |
 | `j`, `k`, arrows | Move selection |
 | `?` | Toggle help |
-| `/` | Filter connections or logs |
+| `/` | Filter the list: proxies, profiles, rules, connections, or logs. Every word must appear (case-insensitive); submit an empty filter to clear it |
 | `q` | Quit or dismiss the current overlay |
 | `s`, `r`, `Shift+s` | Start, restart, or stop the core from Home |
 | `i`, `u`, `Enter` | Import, update, or switch profiles |
 | `t`, `Shift+t` | Test one or all proxy delays |
+| `o` | Proxies: order nodes by profile order, delay, or name |
+| `Shift+h` | Proxies: hide or show nodes whose delay test failed |
 | `c`, `a`, `x` | Toggle, apply, or clear proxy-chain editing |
+| `Shift+l` | Logs: switch mihomo's log level (debug, info, warning, error) until the next restart |
+| `Enter`, `r` | Rules: update the selected rule provider, refresh the rules |
+
+Home shows the mode, the exit route (for example `Proxy → Auto → Tokyo 01`
+with its delay), the current subscription's usage and expiry, and the
+traffic since the core started.
+
+### Remapping keys and the mouse
+
+Create `tui.yaml` in the configuration directory
+(`~/.local/share/clash-verge-cli/tui.yaml` by default):
+
+```yaml
+# Wheel scrolls the list under the pointer; a click on the menu switches
+# views. Hold Shift to select text in the terminal while this is on.
+mouse: true
+# The key on the left acts as the built-in key on the right, or does
+# nothing with "none". Built-in keys keep working unless remapped.
+keys:
+  "ctrl+n": "j"
+  "ctrl+p": "k"
+  "q": "none"
+  "ctrl+q": "q"
+```
+
+Keys are a single character (`j`, `T`, `/`) or `enter`, `esc`, `tab`,
+`backtab`, `backspace`, `space`, arrows (`up`, `down`, `left`, `right`),
+`pageup`, `pagedown`, `home`, `end`, `delete`, `insert`, `f1`–`f12`, with
+optional `ctrl+`, `alt+`, or `shift+` prefixes. Remaps never apply while
+typing a filter, a URL, or a password. A mistake in the file is shown on
+Home and the file is ignored.
 
 ## Development
 

@@ -28,23 +28,43 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.language = Language::from_config(app.gui_config.language.as_deref());
     app.core_config = clash_verge_core::config::IClashTemp::new().await;
     app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
+    app.log_level = app.configured_log_level();
 
     // Load profiles on start
     if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
         app.selected_index = store.selected_index();
-        app.profiles = store.items();
+        app.load_profiles(&store);
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
+    }
+
+    // Optional key remaps and mouse support; a broken file is reported and
+    // ignored rather than keeping the TUI from starting.
+    let tui_config = match crate::tui::keymap::TuiConfig::path().map(|path| crate::tui::keymap::TuiConfig::load(&path))
+    {
+        Some(Ok(config)) => config,
+        Some(Err(error)) => {
+            app.config_warning = Some(format!("{error:#} (ignored)"));
+            crate::tui::keymap::TuiConfig::default()
+        }
+        None => crate::tui::keymap::TuiConfig::default(),
+    };
+    if tui_config.mouse {
+        guard.lock().await.enable_mouse()?;
     }
 
     let ctx = Ctx {
         manager,
         tx: action_tx,
         guard,
+        keys: tui_config.keys,
     };
 
     let mut events = EventStream::new();
     let mut render_tick = time::interval(Duration::from_millis(100));
     let mut runtime_refresh_tick = time::interval(Duration::from_secs(1));
+    // Home's exit node and traffic totals: proxies and connections, slower.
+    let mut home_refresh_tick = time::interval(Duration::from_secs(5));
+    home_refresh_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_tick = time::interval(Duration::from_secs(30));
     auto_update_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_in_flight = false;
@@ -94,6 +114,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         tokio::select! {
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Resize(_, _))) => ctx.guard.lock().await.reset_screen()?,
+                Some(Ok(Event::Mouse(mouse))) => {
+                    let screen = ctx.guard.lock().await.terminal_mut().size()?;
+                    let screen = ratatui::layout::Rect::new(0, 0, screen.width, screen.height);
+                    handlers::handle_mouse(&mut app, &ctx, mouse, screen).await;
+                }
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     let flow = handlers::handle_key(&mut app, &ctx, key).await;
                     if flow == Flow::Quit {
@@ -139,6 +164,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 }
             }
 
+            _ = home_refresh_tick.tick(), if app.core_state == CoreState::Running && app.view == View::Home => {
+                let _ = ctx.tx.send(Action::ProxiesRefresh);
+                let _ = ctx.tx.send(Action::ConnectionsRefresh);
+            }
+
             _ = auto_update_tick.tick(), if !auto_update_in_flight => {
                 auto_update_in_flight = true;
                 handlers::spawn_auto_update(&app, &ctx, auto_update_scheduler.clone());
@@ -148,7 +178,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 // Re-read profiles.yaml so external interval edits (GUI/user)
                 // take effect without restarting the TUI.
                 if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
-                    app.profiles = store.items();
+                    app.load_profiles(&store);
                 }
             }
         }

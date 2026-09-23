@@ -13,30 +13,9 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
-    let connections = filtered_connections(app);
+    let connections = app.visible_connections();
     draw_list(frame, columns[0], app, &connections);
     draw_detail(frame, columns[1], app, &connections);
-}
-
-fn filtered_connections(app: &App) -> Vec<&ConnectionInfo> {
-    let Some(query) = app.connection_filter.as_deref().filter(|query| !query.is_empty()) else {
-        return app.connections.iter().collect();
-    };
-    let query = query.to_ascii_lowercase();
-    app.connections
-        .iter()
-        .filter(|connection| {
-            let host = connection
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.host.as_deref())
-                .unwrap_or_default();
-            let rule = connection.rule.as_deref().unwrap_or_default();
-            connection.id.to_ascii_lowercase().contains(&query)
-                || host.to_ascii_lowercase().contains(&query)
-                || rule.to_ascii_lowercase().contains(&query)
-        })
-        .collect()
 }
 
 fn draw_list(frame: &mut Frame<'_>, area: Rect, app: &App, connections: &[&ConnectionInfo]) {

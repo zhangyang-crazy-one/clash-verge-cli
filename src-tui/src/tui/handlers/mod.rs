@@ -25,7 +25,7 @@ mod tun;
 use std::future::Future;
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App, Focus, InputMode, Overlay, View};
@@ -33,6 +33,7 @@ use crate::mihomo_manager::manager::MihomoManager;
 use crate::tui::{TerminalGuard, input};
 
 use navigation::key_context;
+pub(crate) use navigation::view_filters;
 
 pub(super) use profile::spawn_auto_update;
 
@@ -48,6 +49,8 @@ pub(super) struct Ctx {
     pub manager: MihomoManager,
     pub tx: UnboundedSender<Action>,
     pub guard: Arc<tokio::sync::Mutex<TerminalGuard>>,
+    /// Key remaps from `tui.yaml`.
+    pub keys: crate::tui::keymap::KeyMap,
 }
 
 impl Ctx {
@@ -96,10 +99,58 @@ pub(super) async fn handle_key(app: &mut App, ctx: &Ctx, key: KeyEvent) -> Flow 
         navigation::filter_input(app, key);
         return Flow::Continue;
     }
+    // Remaps apply to commands, never to typed text such as a password.
+    let key = if app.overlay == Some(Overlay::PasswordInput) {
+        key
+    } else {
+        match ctx.keys.translate(key) {
+            Some(key) => key,
+            None => return Flow::Continue,
+        }
+    };
     match input::map_key(key, key_context(app)) {
         Some(action) => handle_intent(app, ctx, action).await,
         None => Flow::Continue,
     }
+}
+
+/// Handle a mouse event (only reported with `mouse: true` in tui.yaml) on a
+/// screen of `screen`: the wheel moves the selection of the pane under the
+/// pointer, a click on the menu switches views, a click elsewhere focuses
+/// the content.
+pub(super) async fn handle_mouse(app: &mut App, ctx: &Ctx, event: MouseEvent, screen: ratatui::layout::Rect) -> Flow {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // Dialogs and prompts are keyboard-only.
+    if app.overlay.is_some() || !matches!(app.input_mode, InputMode::Normal) {
+        return Flow::Continue;
+    }
+    let areas = crate::ui::shell_areas(app, screen);
+    let position = ratatui::layout::Position::new(event.column, event.row);
+    let on_menu = areas.menu.contains(position);
+    let on_content = areas.content.contains(position);
+    match event.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if on_menu || on_content => {
+            app.focus = if on_menu { Focus::Menu } else { Focus::Content };
+            let forward = event.kind == MouseEventKind::ScrollDown;
+            if on_menu {
+                // The menu follows the view, as j/k with the menu focused.
+                navigation::move_selection(app, forward);
+                navigation::switch_view(app, ctx, app.view);
+            } else {
+                navigation::move_selection(app, forward);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_menu => {
+            if let Some(view) = crate::ui::menu_view_at(app, screen, event.column, event.row) {
+                app.focus = Focus::Menu;
+                navigation::switch_view(app, ctx, view);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_content => app.focus = Focus::Content,
+        _ => {}
+    }
+    Flow::Continue
 }
 
 /// Handle a user intent produced by the key map.
@@ -123,6 +174,8 @@ async fn handle_intent(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
         Action::NodeDelayTest => proxy::test_selected_delay(app, ctx),
         Action::NodeDelayAll => proxy::test_all_delays(app, ctx),
         Action::ToggleChainMode => proxy::toggle_chain_mode(app),
+        Action::CycleProxySort => proxy::cycle_sort(app),
+        Action::ToggleHideFailedProxies => proxy::toggle_hide_failed(app),
         Action::ApplyChain => proxy::apply_chain(app, ctx),
         Action::ClearChain => proxy::clear_chain(app),
         Action::RequestCloseConnection => connections::begin_connection_close(app),
@@ -179,6 +232,12 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::ProfileImportFailed(error) => app.status_msg = Some(format!("Import failed: {error}")),
         Action::ProfileUpdated { uid, is_current } => profile::note_updated(app, ctx, uid, is_current).await,
         Action::ProfileUpdateFailed(error) => app.status_msg = Some(format!("Update failed: {error}")),
+        Action::ProfileSwitched(uid) => {
+            app.current_profile_uid = Some(uid);
+            if app.core_state == crate::app::CoreState::Running {
+                ctx.send(Action::ProxiesRefresh);
+            }
+        }
 
         // Proxies, delay tests, chains, and mode.
         Action::ProxiesRefresh if !app.runtime_loading.proxies => proxy::refresh(app, ctx),
@@ -210,7 +269,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             app.runtime_errors.traffic = Some(error);
         }
         Action::ConnectionsRefresh if !app.runtime_loading.connections => connections::refresh_connections(app, ctx),
-        Action::ConnectionsFetched(list) => connections::note_connections(app, list),
+        Action::ConnectionsFetched(data) => connections::note_connections(app, data),
         Action::ConnectionsFailed(error) => {
             app.runtime_loading.connections = false;
             app.runtime_errors.connections = Some(error);
@@ -239,6 +298,11 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::LogsFailed(error) => {
             app.runtime_loading.logs = false;
             app.runtime_errors.logs = Some(error);
+        }
+        Action::CycleLogLevel => connections::cycle_log_level(app, ctx),
+        Action::LogLevelChanged(level) => connections::note_log_level(app, ctx, level),
+        Action::LogLevelFailed(error) => {
+            app.status_msg = Some(format!("{}: {error}", app.tr("logs.level_failed")));
         }
 
         // Rules and rule providers.
@@ -298,6 +362,7 @@ mod tests {
             manager: MihomoManager::new(std::env::temp_dir()),
             tx,
             guard: Arc::new(tokio::sync::Mutex::new(TerminalGuard::detached())),
+            keys: crate::tui::keymap::KeyMap::default(),
         };
         (ctx, rx)
     }
@@ -375,5 +440,229 @@ mod tests {
         handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
         assert_eq!(app.log_filter.as_deref(), Some("err"));
         assert_eq!(app.overlay, None);
+    }
+
+    fn rule(payload: &str) -> crate::mihomo_api::types::Rule {
+        crate::mihomo_api::types::Rule {
+            rule_type: "DOMAIN".to_string(),
+            payload: payload.to_string(),
+            proxy: "Proxy".to_string(),
+            size: None,
+        }
+    }
+
+    async fn type_filter(app: &mut App, ctx: &Ctx, text: &str) {
+        handle_key(app, ctx, key(KeyCode::Char('/'))).await;
+        // Clear the prefilled filter first.
+        for _ in 0..app.filter.as_deref().map_or(0, str::len) {
+            handle_key(app, ctx, key(KeyCode::Backspace)).await;
+        }
+        for c in text.chars() {
+            handle_key(app, ctx, key(KeyCode::Char(c))).await;
+        }
+        handle_key(app, ctx, key(KeyCode::Enter)).await;
+    }
+
+    #[tokio::test]
+    async fn rules_view_moves_through_the_filtered_rules() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Rules;
+        app.focus = Focus::Content;
+        app.rules = vec![rule("a.example"), rule("b.test"), rule("c.example")];
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.rules_selected_index, 1, "j moves on Rules");
+
+        type_filter(&mut app, &ctx, "example").await;
+        assert_eq!(app.rule_filter.as_deref(), Some("example"));
+        assert_eq!(app.rules_selected_index, 0);
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.rules_selected_index, 0, "wraps within the 2 matches");
+        assert_eq!(app.visible_rules()[1].payload, "c.example");
+
+        // Reopening the prompt shows the current filter.
+        handle_key(&mut app, &ctx, key(KeyCode::Char('/'))).await;
+        assert_eq!(app.filter.as_deref(), Some("example"));
+    }
+
+    #[tokio::test]
+    async fn profile_filter_moves_over_matches_and_hides_the_selection_from_u() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Profiles;
+        app.focus = Focus::Content;
+        app.profiles = ["Work HK", "Home", "Work JP"]
+            .iter()
+            .map(|name| clash_verge_core::config::PrfItem {
+                uid: Some(format!("uid-{name}").into()),
+                name: Some((*name).into()),
+                ..Default::default()
+            })
+            .collect();
+        app.selected_index = 1;
+
+        type_filter(&mut app, &ctx, "work").await;
+        assert_eq!(app.selected_index, 0, "the hidden selection moves to the first match");
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.selected_index, 2, "skips the hidden profile");
+
+        type_filter(&mut app, &ctx, "nothing").await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('u'))).await;
+        assert_eq!(app.status_msg.as_deref(), Some("No profile selected"));
+    }
+
+    #[tokio::test]
+    async fn sorting_and_hiding_keep_the_cursor_on_the_same_node() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Proxies;
+        app.focus = Focus::Content;
+        app.proxy_groups.insert(
+            "Proxy".to_string(),
+            crate::mihomo_api::types::ProxyGroup {
+                group_type: "Selector".to_string(),
+                now: Some("b".to_string()),
+                all: Some(vec!["c".to_string(), "a".to_string(), "b".to_string()]),
+                history: None,
+            },
+        );
+        app.expanded_proxy_group = Some("Proxy".to_string());
+        app.delay_map.insert("a".to_string(), None);
+        app.node_selected_index = 3; // Group row, then c, a, b.
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("b"));
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('o'))).await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('o'))).await;
+        assert_eq!(app.proxy_sort, crate::app::ProxySort::Name);
+        assert_eq!(app.node_selected_index, 2, "a, b, c: b is second");
+
+        handle_key(
+            &mut app,
+            &ctx,
+            KeyEvent::new(KeyCode::Char('H'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+        assert!(app.hide_failed_proxies);
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("b"));
+        assert_eq!(app.proxy_rows().len(), 3, "the failed node a is hidden");
+    }
+
+    #[tokio::test]
+    async fn log_level_needs_a_running_core() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Logs;
+        handle_key(
+            &mut app,
+            &ctx,
+            KeyEvent::new(KeyCode::Char('L'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+        assert_eq!(app.log_level, "info");
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Start the core to change its log level")
+        );
+    }
+
+    fn mouse(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[tokio::test]
+    async fn mouse_clicks_the_menu_and_scrolls_the_pane_under_the_pointer() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        let screen = ratatui::layout::Rect::new(0, 0, 120, 32);
+        // Status bar (row 0), menu border (row 1), then one row per view.
+        handle_mouse(
+            &mut app,
+            &ctx,
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2 + 4),
+            screen,
+        )
+        .await;
+        assert_eq!(app.view, View::Rules);
+
+        app.rules = vec![rule("a"), rule("b"), rule("c")];
+        handle_mouse(&mut app, &ctx, mouse(MouseEventKind::ScrollDown, 60, 10), screen).await;
+        assert_eq!(app.focus, Focus::Content);
+        assert_eq!(app.rules_selected_index, 1);
+
+        handle_mouse(&mut app, &ctx, mouse(MouseEventKind::ScrollDown, 3, 10), screen).await;
+        assert_eq!(
+            (app.focus, app.view),
+            (Focus::Menu, View::Logs),
+            "wheel on the menu changes view"
+        );
+
+        // Dialogs are keyboard-only.
+        app.overlay = Some(Overlay::Help);
+        handle_mouse(
+            &mut app,
+            &ctx,
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2),
+            screen,
+        )
+        .await;
+        assert_eq!(app.view, View::Logs);
+    }
+
+    #[tokio::test]
+    async fn remapped_keys_act_as_their_target_but_not_while_typing_a_password() {
+        let (mut ctx, _rx) = ctx();
+        ctx.keys = crate::tui::keymap::TuiConfig::parse_for_test("keys:\n  x: j\n  q: none\n").keys;
+        let mut app = App::new();
+        app.focus = Focus::Menu;
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('x'))).await;
+        assert_eq!(app.view, View::Proxies, "x moved the menu like j");
+        assert_eq!(
+            handle_key(&mut app, &ctx, key(KeyCode::Char('q'))).await,
+            Flow::Continue
+        );
+
+        app.overlay = Some(Overlay::PasswordInput);
+        handle_key(&mut app, &ctx, key(KeyCode::Char('x'))).await;
+        assert_eq!(app.password_buffer, ['x']);
+    }
+
+    #[tokio::test]
+    async fn delay_results_do_not_move_the_cursor_to_another_node() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Proxies;
+        app.proxy_sort = crate::app::ProxySort::Delay;
+        app.proxy_groups.insert(
+            "Proxy".to_string(),
+            crate::mihomo_api::types::ProxyGroup {
+                group_type: "Selector".to_string(),
+                now: Some("a".to_string()),
+                all: Some(vec!["a".to_string(), "b".to_string()]),
+                history: None,
+            },
+        );
+        app.expanded_proxy_group = Some("Proxy".to_string());
+        app.node_selected_index = 1; // a (both untested: profile order)
+
+        // b becomes the fastest and moves to the top.
+        handle_event(&mut app, &ctx, Action::BatchDelayResult("b".to_string(), Some(10))).await;
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
+        handle_event(
+            &mut app,
+            &ctx,
+            Action::DelayFailed("a".to_string(), "timeout".to_string()),
+        )
+        .await;
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
     }
 }

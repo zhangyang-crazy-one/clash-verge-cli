@@ -109,7 +109,7 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Tab => Some(Action::CycleFocus),
         KeyCode::Char('h') | KeyCode::Left => Some(Action::FocusMenu),
         KeyCode::Char('l') | KeyCode::Right => Some(Action::FocusContent),
-        KeyCode::Char('/') if matches!(context.view, View::Connections | View::Logs) => Some(Action::StartFilter),
+        KeyCode::Char('/') if crate::tui::handlers::view_filters(context.view) => Some(Action::StartFilter),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
 
         // Movement and contextual activation
@@ -133,6 +133,13 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             Some(Action::NodeDelayAll)
         }
         KeyCode::Char('t') if context.view == View::Proxies => Some(Action::NodeDelayTest),
+
+        // Core log level
+        KeyCode::Char('L') if context.view == View::Logs => Some(Action::CycleLogLevel),
+
+        // Node order and failed-node visibility
+        KeyCode::Char('o') if context.view == View::Proxies => Some(Action::CycleProxySort),
+        KeyCode::Char('H') if context.view == View::Proxies => Some(Action::ToggleHideFailedProxies),
 
         // Chain proxy
         KeyCode::Char('c') if context.view == View::Proxies => Some(Action::ToggleChainMode),
@@ -349,7 +356,7 @@ mod tests {
         );
         assert_eq!(
             context_hint(View::Proxies, Focus::Content, Language::English),
-            "Enter group/node | t delay | T all | c chain"
+            "Enter select | t/T delay | o sort | H hide failed | / filter | c chain"
         );
     }
 

@@ -52,6 +52,11 @@ pub struct ConnectionsData {
     /// mihomo sends `null` rather than `[]` when nothing is connected.
     #[serde(default, deserialize_with = "null_as_empty")]
     pub connections: Vec<ConnectionInfo>,
+    /// Bytes through the core since it started.
+    #[serde(default, rename = "uploadTotal")]
+    pub upload_total: u64,
+    #[serde(default, rename = "downloadTotal")]
+    pub download_total: u64,
 }
 
 fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>

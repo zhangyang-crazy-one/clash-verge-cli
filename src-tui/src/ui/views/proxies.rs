@@ -4,13 +4,13 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Focus, ProxyDisplayRow, proxy_display_rows};
+use crate::app::{App, Focus, ProxyDisplayRow, ProxySort};
 use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let expanded_group = app.expanded_proxy_group.as_deref();
-    let rows = proxy_display_rows(&app.proxy_groups, expanded_group);
-    let left_title = expanded_group
+    let rows = app.proxy_rows();
+    let mut left_title = expanded_group
         .map(|group| {
             format!(
                 "{} / {} {}",
@@ -20,6 +20,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )
         })
         .unwrap_or_else(|| app.tr("proxies.proxy_groups").to_string());
+    left_title.push_str(&list_state_suffix(app));
     let panes = crate::ui::split_view::draw(
         frame,
         area,
@@ -119,6 +120,29 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// ` [filter: hk · delay · hiding failed]` for the non-default list settings.
+fn list_state_suffix(app: &App) -> String {
+    let mut parts = Vec::new();
+    if let Some(query) = crate::app::filter::active(app.proxy_filter.as_deref()) {
+        parts.push(format!(
+            "{}: {}",
+            app.tr("logs.filter"),
+            crate::ui::terminal_text::display(query)
+        ));
+    }
+    if app.proxy_sort != ProxySort::Config {
+        parts.push(app.tr(app.proxy_sort.label_key()).to_string());
+    }
+    if app.hide_failed_proxies {
+        parts.push(app.tr("proxies.hiding_failed").to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", parts.join(" · "))
+    }
 }
 
 fn chain_selection_label(app: &App) -> String {

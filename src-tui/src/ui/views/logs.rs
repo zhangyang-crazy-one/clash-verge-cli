@@ -5,11 +5,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::app::App;
-use crate::mihomo_api::types::LogEntry;
 use crate::ui::theme;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let logs = filtered_logs(app);
+    let logs = app.visible_logs();
     let mut items: Vec<ListItem<'_>> = logs
         .iter()
         .map(|entry| {
@@ -41,29 +40,19 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Some(app.log_selected_index.min(logs.len() - 1))
     };
     let mut state = ListState::default().with_selected(selection);
-    let title = app
-        .log_filter
-        .as_deref()
-        .map(|query| format!("{} [{}: {query}]", app.tr("logs.title"), app.tr("logs.filter")))
-        .unwrap_or_else(|| app.tr("logs.title").to_string());
+    let mut title = format!("{} [{}: {}]", app.tr("logs.title"), app.tr("logs.level"), app.log_level);
+    if let Some(query) = crate::app::filter::active(app.log_filter.as_deref()) {
+        title.push_str(&format!(
+            " [{}: {}]",
+            app.tr("logs.filter"),
+            crate::ui::terminal_text::display(query)
+        ));
+    }
     let list = List::new(items)
         .block(theme::panel_block(title, app.focus == crate::app::Focus::Content))
         .highlight_style(theme::highlight(true))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, area, &mut state);
-}
-
-fn filtered_logs(app: &App) -> Vec<&LogEntry> {
-    let Some(query) = app.log_filter.as_deref().filter(|query| !query.is_empty()) else {
-        return app.logs.iter().collect();
-    };
-    let query = query.to_ascii_lowercase();
-    app.logs
-        .iter()
-        .filter(|entry| {
-            entry.level.to_ascii_lowercase().contains(&query) || entry.payload.to_ascii_lowercase().contains(&query)
-        })
-        .collect()
 }
 
 /// Severity colors for log levels. Delegates to the semantic palette so the

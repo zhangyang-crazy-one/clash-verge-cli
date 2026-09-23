@@ -139,10 +139,20 @@ impl MihomoApi {
 
     /// `PATCH /configs` — set clash mode (`rule` / `global` / `direct`).
     pub async fn patch_mode(&self, mode: &str) -> Result<(), MihomoError> {
+        self.patch_configs(&serde_json::json!({ "mode": mode })).await
+    }
+
+    /// `PATCH /configs` — set the core's log level (`debug` / `info` /
+    /// `warning` / `error` / `silent`) until the next restart.
+    pub async fn patch_log_level(&self, level: &str) -> Result<(), MihomoError> {
+        self.patch_configs(&serde_json::json!({ "log-level": level })).await
+    }
+
+    async fn patch_configs(&self, body: &serde_json::Value) -> Result<(), MihomoError> {
         let resp = self
             .client
             .patch("http://localhost/configs")
-            .json(&serde_json::json!({ "mode": mode }))
+            .json(body)
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;

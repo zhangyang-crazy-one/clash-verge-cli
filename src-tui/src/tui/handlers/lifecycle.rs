@@ -104,6 +104,10 @@ pub(super) fn note_started(
 ) {
     app.core_state = CoreState::Running;
     app.core_pid = ctx.manager.pid();
+    // A core this TUI (re)started logs at its configured level again.
+    if binary_path.is_some() {
+        app.log_level = app.configured_log_level();
+    }
     // Keep the Settings capability state in sync with the binary that
     // actually got spawned (may have changed after an upgrade or a fresh
     // setup).

@@ -13,17 +13,34 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
 
+    let list_title = match crate::app::filter::active(app.profile_filter.as_deref()) {
+        Some(query) => format!(
+            "{} [{}: {}]",
+            app.tr("profiles.title"),
+            app.tr("logs.filter"),
+            crate::ui::terminal_text::display(query)
+        ),
+        None => app.tr("profiles.title").to_string(),
+    };
     let panes = crate::ui::split_view::draw(
         frame,
         rows[0],
         app.tr("profiles.title"),
-        app.tr("profiles.title"),
+        &list_title,
         app.tr("profiles.detail"),
         60,
         app.focus == Focus::Content,
     );
 
-    crate::ui::profile_list::draw(frame, panes.left, &app.profiles, app.selected_index, app.language);
+    let visible = app.visible_profile_indices();
+    crate::ui::profile_list::draw(
+        frame,
+        panes.left,
+        &app.profiles,
+        &visible,
+        app.selected_index,
+        app.language,
+    );
     draw_detail(frame, panes.right, app);
     draw_status(frame, rows[1], app);
 }
@@ -44,7 +61,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let lines = if let Some(profile) = app.profiles.get(app.selected_index) {
+    let selected = app
+        .visible_profile_indices()
+        .contains(&app.selected_index)
+        .then(|| app.profiles.get(app.selected_index))
+        .flatten();
+    let lines = if let Some(profile) = selected {
         let name = profile.name.as_deref().unwrap_or(app.tr("common.unknown"));
         let kind = profile.itype.as_deref().unwrap_or(app.tr("common.unknown"));
         let source = profile

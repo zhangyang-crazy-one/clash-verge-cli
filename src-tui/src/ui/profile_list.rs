@@ -8,10 +8,19 @@ use ratatui::widgets::{List, ListItem, ListState};
 use crate::i18n::{Language, tr};
 use crate::ui::theme;
 
-pub fn draw(frame: &mut Frame<'_>, area: Rect, profiles: &[PrfItem], selected_index: usize, language: Language) {
-    let mut items: Vec<ListItem<'_>> = profiles
+/// Draw the profiles at `visible` (indices into `profiles`), highlighting
+/// `selected_index` when it is one of them.
+pub fn draw(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    profiles: &[PrfItem],
+    visible: &[usize],
+    selected_index: usize,
+    language: Language,
+) {
+    let mut items: Vec<ListItem<'_>> = visible
         .iter()
-        .enumerate()
+        .filter_map(|index| profiles.get(*index).map(|profile| (*index, profile)))
         .map(|(index, profile)| {
             let name = profile.name.as_deref().unwrap_or(tr(language, "common.unknown"));
             let kind = profile.itype.as_deref().unwrap_or(tr(language, "common.unknown"));
@@ -27,16 +36,19 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, profiles: &[PrfItem], selected_in
         .collect();
     if items.is_empty() {
         items.push(ListItem::new(Span::styled(
-            tr(language, "profiles.none"),
+            tr(
+                language,
+                if profiles.is_empty() {
+                    "profiles.none"
+                } else {
+                    "common.no_matches"
+                },
+            ),
             Style::new().fg(theme::dim()),
         )));
     }
 
-    let selection = if profiles.is_empty() {
-        None
-    } else {
-        Some(selected_index.min(profiles.len() - 1))
-    };
+    let selection = visible.iter().position(|index| *index == selected_index);
     let mut state = ListState::default().with_selected(selection);
 
     let list = List::new(items)

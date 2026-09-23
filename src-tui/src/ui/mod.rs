@@ -15,22 +15,49 @@ use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::app::{App, Focus, Overlay, View};
 
-pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+/// Where the shell's parts go on a screen of `area`.
+pub struct ShellAreas {
+    pub status: Rect,
+    pub menu: Rect,
+    pub content: Rect,
+    pub input: Rect,
+}
+
+pub fn shell_areas(app: &App, area: Rect) -> ShellAreas {
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(frame.area());
-
-    status_bar::draw(frame, shell[0], app);
-
+        .split(area);
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
         .split(shell[1]);
+    ShellAreas {
+        status: shell[0],
+        menu: main[0],
+        content: main[1],
+        input: shell[2],
+    }
+}
 
-    draw_navigation(frame, main[0], app);
-    views::draw(frame, main[1], app);
-    input_bar::draw(frame, shell[2], app);
+/// The view whose menu entry is at (`column`, `row`), when every entry fits
+/// (the menu does not scroll then).
+pub fn menu_view_at(app: &App, area: Rect, column: u16, row: u16) -> Option<View> {
+    let menu = shell_areas(app, area).menu;
+    let inside = column > menu.x && column + 1 < menu.right() && row > menu.y && row + 1 < menu.bottom();
+    let fits = usize::from(menu.height.saturating_sub(2)) >= View::ALL.len();
+    if !inside || !fits {
+        return None;
+    }
+    View::ALL.get(usize::from(row - menu.y - 1)).copied()
+}
+
+pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let areas = shell_areas(app, frame.area());
+    status_bar::draw(frame, areas.status, app);
+    draw_navigation(frame, areas.menu, app);
+    views::draw(frame, areas.content, app);
+    input_bar::draw(frame, areas.input, app);
     draw_overlay(frame, app);
 }
 
@@ -249,11 +276,20 @@ mod tests {
         app.focus = Focus::Content;
         app.status_msg = Some("Connected to mihomo API".to_string());
         app.profiles.push(PrfItem {
+            uid: Some("S1".into()),
             name: Some("Sample Subscription".into()),
             itype: Some("remote".into()),
             url: Some("https://example.test/sub".into()),
+            extra: Some(clash_verge_core::config::PrfExtra {
+                upload: 1024 * 1024 * 1024,
+                download: 1024 * 1024 * 1024,
+                total: 50 * 1024 * 1024 * 1024,
+                // Far enough ahead to render as days left, in any time zone.
+                expire: u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 30 * 86_400,
+            }),
             ..Default::default()
         });
+        app.current_profile_uid = Some("S1".into());
         app.traffic = Some(TrafficData {
             up: 42_000,
             down: 81_000,
@@ -419,6 +455,11 @@ mod tests {
         app.view = View::Profiles;
         let (profiles, _) = render(&app, 160, 40);
         assert!(profiles.contains("Enter switch | u update | i add"));
+        app.profile_filter = Some("nothing-matches".to_string());
+        let (profiles, _) = render(&app, 160, 40);
+        assert!(profiles.contains("[filter: nothing-matches]"));
+        assert!(profiles.contains("no matches"));
+        app.profile_filter = None;
 
         app.view = View::Connections;
         app.overlay = Some(Overlay::CloseConfirmation);
@@ -431,7 +472,7 @@ mod tests {
         app.view = View::Logs;
         app.log_filter = Some("error".to_string());
         let (logs, _) = render(&app, 120, 32);
-        assert!(logs.contains("Logs [filter: error]"));
+        assert!(logs.contains("Logs [level: info] [filter: error]"));
         assert!(logs.contains("ERROR"));
 
         app.view = View::Rules;
@@ -453,10 +494,47 @@ mod tests {
     }
 
     #[test]
+    fn home_shows_the_exit_node_and_the_current_subscription() {
+        let mut app = representative_app();
+        app.view = View::Home;
+        app.clash_mode = "rule".into();
+        app.proxy_groups.insert(
+            "GLOBAL".to_string(),
+            ProxyGroup {
+                group_type: "Selector".to_string(),
+                now: Some("Auto".to_string()),
+                all: Some(vec!["Auto".to_string()]),
+                history: None,
+            },
+        );
+        app.delay_map.insert("Tokyo".to_string(), Some(88));
+        app.traffic_totals = Some((2048, 3 * 1024 * 1024));
+        // The Profiles cursor on another profile does not change Home.
+        app.profiles.push(PrfItem {
+            uid: Some("S2".into()),
+            name: Some("Other".into()),
+            ..Default::default()
+        });
+        app.selected_index = 1;
+        app.profiles[0].updated = Some(1_790_000_000);
+
+        let (home, _) = render(&app, 160, 40);
+        assert!(home.contains("Exit: Auto → Tokyo (88ms)"), "{home}");
+        assert!(home.contains("Sample Subscription [remote]"));
+        assert!(home.contains("Used: 2.0 GiB / 50.0 GiB"));
+        assert!(home.contains("days left"));
+        assert!(home.contains("Updated: "), "all four profile rows fit: {home}");
+        assert!(home.contains("↑ 41.0 KiB/s"));
+        assert!(home.contains("Since start: ↑ 2.0 KiB  ↓ 3.0 MiB"));
+        assert!(home.contains("System proxy: on · TUN: off"));
+    }
+
+    #[test]
     fn proxy_delay_failure_is_distinct_from_an_untested_node() {
         let mut app = representative_app();
         app.view = View::Proxies;
-        app.node_selected_index = 1;
+        // Rows: the Auto group, then its nodes in profile order.
+        app.node_selected_index = 2;
         app.delay_map.insert("Singapore".to_string(), None);
 
         let (rendered, _) = render(&app, 160, 40);
@@ -498,8 +576,12 @@ mod tests {
 
         app.focus = Focus::Content;
         app.view = View::Proxies;
-        let (proxies, _) = render(&app, 120, 32);
-        assert!(!proxies.contains("/ filter"));
+        let (proxies, _) = render(&app, 160, 32);
+        assert!(proxies.contains("/ filter"));
+
+        app.view = View::Home;
+        let (home, _) = render(&app, 120, 32);
+        assert!(!home.contains("/ filter"));
 
         app.view = View::Logs;
         let (logs, _) = render(&app, 120, 32);
