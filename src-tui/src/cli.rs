@@ -40,17 +40,38 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
+    /// Show or select proxies and test their delay (core must be running)
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyCommand,
+    },
+    /// Show or set the routing mode
+    Mode {
+        /// New mode; omit to print the current one
+        #[arg(value_enum)]
+        mode: Option<ClashMode>,
+    },
+    /// List or close active connections (core must be running)
+    Connections {
+        #[command(subcommand)]
+        action: Option<ConnectionsCommand>,
+    },
+    /// List or update rule providers (core must be running)
+    Provider {
+        #[command(subcommand)]
+        action: ProviderCommand,
+    },
     /// Manage systemd daemon service
     Service {
         #[command(subcommand)]
         action: ServiceCommand,
     },
-    /// Desktop/terminal system proxy helpers
+    /// Turn the desktop system proxy on or off, or print shell exports
     Sysproxy {
         #[command(subcommand)]
         action: SysproxyCommand,
     },
-    /// Manage TUN privileges for the resolved mihomo binary
+    /// Turn TUN mode on or off, or manage its one-time privileges
     Tun {
         #[command(subcommand)]
         action: TunCommand,
@@ -78,18 +99,34 @@ pub enum ProfileCommand {
         #[arg(long)]
         no_auto_update: bool,
     },
+    /// Make a profile current and apply it
+    Use {
+        /// Profile uid or name
+        profile: String,
+    },
     /// Update one remote profile or all of them
     Update {
-        /// Profile UID to update
-        uid: Option<String>,
+        /// Profile uid or name
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        profile: Option<String>,
         /// Update every remote profile
         #[arg(long)]
         all: bool,
+        /// Reload the running core when the current profile changed
+        #[arg(long)]
+        reload: bool,
     },
-    /// Delete a profile by UID (including its chain fragments)
-    Delete { uid: String },
+    /// Delete a profile (including its chain fragments)
+    Delete {
+        /// Profile uid or name
+        profile: String,
+    },
     /// Rename a profile
-    Rename { uid: String, new_name: String },
+    Rename {
+        /// Profile uid or name
+        profile: String,
+        new_name: String,
+    },
     /// One-shot import of a Clash Verge GUI profile set (subscriptions,
     /// chain fragments, settings) into the standalone directory
     Migrate {
@@ -103,7 +140,87 @@ pub enum ProfileCommand {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum ProxyCommand {
+    /// List proxy groups, or the members of one group
+    List {
+        /// Group to list members of
+        group: Option<String>,
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Select a member of a selector group
+    Select { group: String, node: String },
+    /// Test the delay of one proxy, or of every real proxy in a group
+    Delay {
+        /// Proxy or group name
+        target: String,
+        /// URL the test requests
+        #[arg(long, default_value = crate::services::proxy::DELAY_TEST_URL)]
+        url: String,
+        /// Timeout in milliseconds
+        #[arg(long, value_name = "MS", default_value_t = crate::services::proxy::DELAY_TEST_TIMEOUT_MS)]
+        timeout: u64,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClashMode {
+    Rule,
+    Global,
+    Direct,
+}
+
+impl ClashMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Global => "global",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConnectionsCommand {
+    /// List active connections (the default)
+    List {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close one connection by id
+    Close { id: String },
+    /// Close every connection
+    CloseAll,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ProviderCommand {
+    /// List rule providers
+    List {
+        /// Output machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update one rule provider or all of them
+    Update {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Update every rule provider
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum SysproxyCommand {
+    /// Enable the system proxy (applied now if the core runs, else on start)
+    On,
+    /// Disable the system proxy and restore the previous desktop settings
+    Off,
+    /// Show the system proxy setting and whether the desktop uses it
+    Status,
     /// Print shell exports for the proxy: eval "$(clash-verge-cli sysproxy env)"
     Env {
         /// Print `unset` commands instead
@@ -114,6 +231,10 @@ pub enum SysproxyCommand {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum TunCommand {
+    /// Enable TUN mode (reloads the running core)
+    On,
+    /// Disable TUN mode (reloads the running core)
+    Off,
     /// Grant TUN capabilities to the mihomo binary (one-time sudo; the only
     /// explicit privilege operation)
     Setup,
@@ -137,4 +258,83 @@ pub enum ServiceCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("clash-verge-cli").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        use clap::CommandFactory as _;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_the_new_commands() {
+        assert!(matches!(
+            parse(&["profile", "use", "Home"]).unwrap().command,
+            Some(Command::Profile { action: ProfileCommand::Use { profile } }) if profile == "Home"
+        ));
+        assert!(matches!(
+            parse(&["proxy", "select", "Proxy", "Tokyo"]).unwrap().command,
+            Some(Command::Proxy { action: ProxyCommand::Select { group, node } }) if group == "Proxy" && node == "Tokyo"
+        ));
+        assert!(matches!(
+            parse(&["proxy", "delay", "Proxy", "--timeout", "800"]).unwrap().command,
+            Some(Command::Proxy {
+                action: ProxyCommand::Delay { timeout: 800, .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["mode", "global"]).unwrap().command,
+            Some(Command::Mode {
+                mode: Some(ClashMode::Global)
+            })
+        ));
+        assert!(matches!(
+            parse(&["mode"]).unwrap().command,
+            Some(Command::Mode { mode: None })
+        ));
+        assert!(matches!(
+            parse(&["connections"]).unwrap().command,
+            Some(Command::Connections { action: None })
+        ));
+        assert!(matches!(
+            parse(&["connections", "close-all"]).unwrap().command,
+            Some(Command::Connections {
+                action: Some(ConnectionsCommand::CloseAll)
+            })
+        ));
+        assert!(matches!(
+            parse(&["provider", "update", "--all"]).unwrap().command,
+            Some(Command::Provider {
+                action: ProviderCommand::Update { name: None, all: true }
+            })
+        ));
+        assert!(matches!(
+            parse(&["sysproxy", "on"]).unwrap().command,
+            Some(Command::Sysproxy {
+                action: SysproxyCommand::On
+            })
+        ));
+        assert!(matches!(
+            parse(&["tun", "off"]).unwrap().command,
+            Some(Command::Tun {
+                action: TunCommand::Off
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_combinations() {
+        assert!(parse(&["mode", "script"]).is_err());
+        assert!(parse(&["profile", "update"]).is_err(), "needs a profile or --all");
+        assert!(parse(&["profile", "update", "R1", "--all"]).is_err());
+        assert!(parse(&["provider", "update"]).is_err());
+    }
 }

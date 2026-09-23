@@ -4,7 +4,7 @@ use crate::app::{Action, App, CoreState, EditorTarget};
 use crate::i18n::Language;
 
 use super::Ctx;
-use super::lifecycle::{apply_tun_runtime, write_tun_runtime};
+use crate::services::tun::{apply_tun_runtime, write_tun_runtime};
 
 /// `Enter` on a Settings row (order matches `ui::views::settings`).
 pub(super) async fn activate_row(app: &mut App, ctx: &Ctx) {
@@ -86,13 +86,7 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
         // that cannot run. Uses the already-resolved binary or the
         // no-download candidate; no sudo/setcap/askpass here — the spawn
         // preflight repeats the check authoritatively.
-        let known = ctx
-            .manager
-            .binary_path()
-            .or_else(crate::mihomo_manager::binary::candidate_without_install);
-        if let Some(binary) = known
-            && let Err(error) = crate::commands::privilege::require_tun_capability(&binary)
-        {
+        if let Err(error) = crate::services::tun::preflight_enable(&ctx.manager) {
             save_failed(app, error);
             return;
         }
@@ -130,9 +124,8 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
         app.core_state = CoreState::Starting;
     }
     let manager = ctx.manager.clone();
-    let guard = ctx.guard.clone();
     ctx.spawn(|tx| async move {
-        match apply_tun_runtime(&manager, guard, owns_core, enabled).await {
+        match apply_tun_runtime(&manager, owns_core, enabled).await {
             Ok(_) if !owns_core => {
                 let _ = tx.send(Action::ProxiesRefresh);
             }

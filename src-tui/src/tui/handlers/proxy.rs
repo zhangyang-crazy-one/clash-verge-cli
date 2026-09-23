@@ -4,12 +4,11 @@
 use serde_yaml_ng::Value;
 
 use crate::app::{Action, App, CoreState, ProxyDisplayRow, first_selectable_proxy_group, proxy_display_rows};
-use crate::runtime_config::{RUNTIME_CONFIG_IO, commit_runtime_config};
+use crate::runtime_config::commit_runtime_config;
+use crate::services::mode::{apply_clash_mode, next_clash_mode};
+use crate::services::proxy::{DELAY_TEST_TIMEOUT_MS, DELAY_TEST_URL, MAX_DELAY_CONCURRENCY};
 
 use super::Ctx;
-
-const DELAY_TEST_URL: &str = "http://www.gstatic.com/generate_204";
-const DELAY_TEST_TIMEOUT_MS: u64 = 5000;
 
 pub(super) fn refresh(app: &mut App, ctx: &Ctx) {
     app.runtime_loading.proxies = true;
@@ -115,7 +114,7 @@ pub(super) fn test_selected_delay(app: &mut App, ctx: &Ctx) {
     });
 }
 
-/// `T`: delay-test every real node, at most [`BATCH_MAX_CONCURRENCY`] at a
+/// `T`: delay-test every real node, at most [`MAX_DELAY_CONCURRENCY`] at a
 /// time.
 pub(super) fn test_all_delays(app: &mut App, ctx: &Ctx) {
     match begin_batch_delay(app) {
@@ -123,7 +122,7 @@ pub(super) fn test_all_delays(app: &mut App, ctx: &Ctx) {
             app.status_msg = Some(format!("{}: 0/{}", app.tr("proxies.batch_delay"), targets.len()));
             let api = std::sync::Arc::new(ctx.manager.api());
             ctx.spawn(|tx| async move {
-                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(BATCH_MAX_CONCURRENCY));
+                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DELAY_CONCURRENCY));
                 let mut handles = Vec::new();
                 for name in targets {
                     let permit = match semaphore.clone().acquire_owned().await {
@@ -223,45 +222,6 @@ pub(super) async fn note_mode_changed(app: &mut App, mode: String, announce: boo
     app.clash_mode = mode;
 }
 
-pub(super) fn next_clash_mode(current: &str) -> &'static str {
-    match current.to_ascii_lowercase().as_str() {
-        "global" => "direct",
-        "direct" => "rule",
-        _ => "global",
-    }
-}
-
-pub(super) async fn apply_clash_mode(
-    api: &crate::mihomo_api::MihomoApi,
-    mode: &str,
-    core_running: bool,
-) -> Result<String, String> {
-    // Serialize with runtime commits so a stale IClashTemp snapshot cannot
-    // overwrite a concurrent profile/TUN write to clash.yaml.
-    let previous_mode = {
-        let _guard = RUNTIME_CONFIG_IO.lock().await;
-        let mut clash = clash_verge_core::config::IClashTemp::new().await;
-        let previous = clash.get_mode().unwrap_or_else(|| "rule".into());
-        let mut patch = serde_yaml_ng::Mapping::new();
-        patch.insert("mode".into(), mode.into());
-        clash.patch_config(&patch);
-        clash.save_config().await.map_err(|error| error.to_string())?;
-        previous
-    };
-    if core_running && let Err(error) = api.patch_mode(mode).await {
-        // Keep disk aligned with the failed API update so the next Start does
-        // not silently adopt a mode the UI reported as failed.
-        let _guard = RUNTIME_CONFIG_IO.lock().await;
-        let mut clash = clash_verge_core::config::IClashTemp::new().await;
-        let mut patch = serde_yaml_ng::Mapping::new();
-        patch.insert("mode".into(), previous_mode.into());
-        clash.patch_config(&patch);
-        let _ = clash.save_config().await;
-        return Err(error.to_string());
-    }
-    Ok(mode.to_string())
-}
-
 pub(super) async fn apply_chain_config(
     api: &crate::mihomo_api::MihomoApi,
     chain_nodes: &[String],
@@ -317,12 +277,6 @@ pub(super) fn find_node_at_index(
         .map(|(group, node)| (group.to_string(), node.to_string()))
 }
 
-/// Policy pseudo-nodes that must never receive a delay test.
-pub(super) const BATCH_POLICY_PSEUDO_NODES: [&str; 5] = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
-
-/// Maximum number of concurrent delay requests for one batch.
-pub(super) const BATCH_MAX_CONCURRENCY: usize = 4;
-
 /// Collect the deduplicated set of real leaf proxy targets for a batch delay
 /// test. A name is a real leaf only if it is not a policy pseudo-node and it
 /// is not itself a proxy group (a group is a key whose `all` is present).
@@ -330,19 +284,7 @@ pub(super) const BATCH_MAX_CONCURRENCY: usize = 4;
 pub(super) fn batch_delay_targets(
     groups: &std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>,
 ) -> Vec<String> {
-    let mut targets: Vec<String> = groups
-        .values()
-        .filter_map(|group| group.all.as_ref().filter(|nodes| !nodes.is_empty()))
-        .flatten()
-        .filter(|name| {
-            let name = name.as_str();
-            !BATCH_POLICY_PSEUDO_NODES.contains(&name) && groups.get(name).is_none_or(|group| group.all.is_none())
-        })
-        .cloned()
-        .collect();
-    targets.sort_unstable();
-    targets.dedup();
-    targets
+    crate::services::proxy::leaf_targets(groups, None)
 }
 
 /// Outcome of deciding what to do when the user presses the batch-delay shortcut.

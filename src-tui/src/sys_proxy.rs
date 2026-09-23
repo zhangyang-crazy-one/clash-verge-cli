@@ -120,6 +120,18 @@ pub fn unset_system_proxy() -> anyhow::Result<()> {
 /// a core that died immediately can never interleave with its apply.
 static LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Whether a desktop proxy backend (GNOME or KDE tools) is available.
+pub fn backend_available() -> bool {
+    Gnome::available(&SystemRunner) || Kde::detect(&SystemRunner).is_some()
+}
+
+/// Whether the desktop currently routes through `settings`' endpoint.
+pub fn is_applied(settings: &ProxySettings) -> bool {
+    let runner = SystemRunner;
+    (Gnome::available(&runner) && Gnome::is_ours(&runner, settings))
+        || Kde::detect(&runner).is_some_and(|kde| kde.is_ours(&runner, settings))
+}
+
 /// Core started: publish the proxy when the user enabled it. Best effort.
 ///
 /// Callers run this before the exit watcher exists, so any release for this

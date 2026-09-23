@@ -1,9 +1,7 @@
 //! Core lifecycle: start / stop / restart and the manager's lifecycle notices.
 
 use crate::app::{Action, App, CoreState, TunSetupReason};
-use crate::runtime_config::{
-    RUNTIME_CONFIG_IO, reload_config_file, write_runtime_config, write_runtime_config_unlocked,
-};
+use crate::runtime_config::write_runtime_config;
 
 use super::Ctx;
 use super::tun::tun_start_offers_setup;
@@ -178,32 +176,6 @@ pub(super) fn note_error(app: &mut App, msg: String) {
     app.clear_runtime_caches();
 }
 
-/// Write TUN-enabled runtime config and apply it under one IO lock.
-///
-/// Re-reads `clash.yaml` inside the lock so a concurrent profile/mode commit is not
-/// overwritten by a stale pre-spawn snapshot. Owned cores restart (stop-by-pid works
-/// when the Child sits in the watcher); attached cores API-reload the written file.
-pub(super) async fn apply_tun_runtime(
-    manager: &crate::mihomo_manager::manager::MihomoManager,
-    _guard: std::sync::Arc<tokio::sync::Mutex<crate::tui::TerminalGuard>>,
-    owns_core: bool,
-    enable_tun: bool,
-) -> Result<bool, String> {
-    // TUN capability is ensured by the read-only preflight before this runs
-    // (Settings toggle checks the binary before persisting; the manager
-    // repeats the check before every TUN-enabled spawn). No askpass here:
-    // the password popup is only reachable from Settings → TUN setup.
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let config = clash_verge_core::config::IClashTemp::new().await.0;
-    let path = write_runtime_config_unlocked(config, enable_tun).await?;
-    if owns_core {
-        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())?;
-    } else {
-        reload_config_file(&manager.api(), &path).await?;
-    }
-    Ok(false)
-}
-
 /// Write the runtime config (with TUN flag) and start the core. Shared by
 /// the StartCore key path and the resolve-then-start path.
 pub(super) async fn start_core_with_tun(
@@ -213,11 +185,4 @@ pub(super) async fn start_core_with_tun(
     let config = clash_verge_core::config::IClashTemp::new().await.0;
     write_runtime_config(config, enable_tun).await?;
     manager.start().await.map(|_| ()).map_err(|error| error.to_string())
-}
-
-/// Persist TUN flag into a freshly loaded runtime config (core stopped path).
-pub(super) async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, String> {
-    let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let config = clash_verge_core::config::IClashTemp::new().await.0;
-    write_runtime_config_unlocked(config, enable_tun).await
 }

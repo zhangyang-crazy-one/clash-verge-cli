@@ -12,6 +12,7 @@ mod mihomo_manager;
 mod profile_store;
 mod runtime_config;
 mod service_cmd;
+mod services;
 mod subscribe;
 mod sys_proxy;
 mod tui;
@@ -98,14 +99,19 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 commands::profile::import(&url, name.as_deref(), update_interval, no_auto_update).await?;
             }
-            cli::ProfileCommand::Update { uid, all } => {
-                commands::profile::update(uid.as_deref(), all).await?;
+            cli::ProfileCommand::Use { profile } => {
+                let manager = commands::build_manager(config_dir).await?;
+                commands::profile::use_profile(&manager, &profile).await?;
             }
-            cli::ProfileCommand::Delete { uid } => {
-                commands::profile::delete(&uid).await?;
+            cli::ProfileCommand::Update { profile, all, reload } => {
+                let manager = commands::build_manager(config_dir).await?;
+                commands::profile::update(&manager, profile.as_deref(), all, reload).await?;
             }
-            cli::ProfileCommand::Rename { uid, new_name } => {
-                commands::profile::rename(&uid, &new_name).await?;
+            cli::ProfileCommand::Delete { profile } => {
+                commands::profile::delete(&profile).await?;
+            }
+            cli::ProfileCommand::Rename { profile, new_name } => {
+                commands::profile::rename(&profile, &new_name).await?;
             }
             cli::ProfileCommand::Migrate { from, force } => {
                 commands::profile::migrate(&from, force).await?;
@@ -127,13 +133,56 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Some(cli::Command::Sysproxy { action }) => match action {
-            cli::SysproxyCommand::Env { unset: false } => {
-                print!("{}", sys_proxy::env_exports(&sys_proxy::ProxySettings::load().await));
+        Some(cli::Command::Proxy { action }) => {
+            let manager = commands::build_manager(config_dir).await?;
+            match action {
+                cli::ProxyCommand::List { group, json } => {
+                    commands::proxy::list(&manager, group.as_deref(), json).await?;
+                }
+                cli::ProxyCommand::Select { group, node } => commands::proxy::select(&manager, &group, &node).await?,
+                cli::ProxyCommand::Delay { target, url, timeout } => {
+                    commands::proxy::delay(&manager, &target, &url, timeout).await?;
+                }
             }
-            cli::SysproxyCommand::Env { unset: true } => print!("{}", sys_proxy::env_unsets()),
+        }
+        Some(cli::Command::Mode { mode }) => {
+            let manager = commands::build_manager(config_dir).await?;
+            commands::mode::run(&manager, mode).await?;
+        }
+        Some(cli::Command::Connections { action }) => {
+            let manager = commands::build_manager(config_dir).await?;
+            match action.unwrap_or(cli::ConnectionsCommand::List { json: false }) {
+                cli::ConnectionsCommand::List { json } => commands::connections::list(&manager, json).await?,
+                cli::ConnectionsCommand::Close { id } => commands::connections::close(&manager, &id).await?,
+                cli::ConnectionsCommand::CloseAll => commands::connections::close_all(&manager).await?,
+            }
+        }
+        Some(cli::Command::Provider { action }) => {
+            let manager = commands::build_manager(config_dir).await?;
+            match action {
+                cli::ProviderCommand::List { json } => commands::provider::list(&manager, json).await?,
+                cli::ProviderCommand::Update { name, all } => {
+                    commands::provider::update(&manager, name.as_deref(), all).await?;
+                }
+            }
+        }
+        Some(cli::Command::Sysproxy { action }) => match action {
+            cli::SysproxyCommand::On => {
+                let manager = commands::build_manager(config_dir).await?;
+                commands::sysproxy::on(&manager).await?;
+            }
+            cli::SysproxyCommand::Off => commands::sysproxy::off().await?,
+            cli::SysproxyCommand::Status => {
+                let manager = commands::build_manager(config_dir).await?;
+                commands::sysproxy::status(&manager).await?;
+            }
+            cli::SysproxyCommand::Env { unset } => commands::sysproxy::env(unset).await,
         },
         Some(cli::Command::Tun { action }) => match action {
+            cli::TunCommand::On | cli::TunCommand::Off => {
+                let manager = commands::build_manager(config_dir).await?;
+                commands::tun::set_enabled(&manager, matches!(action, cli::TunCommand::On)).await?;
+            }
             cli::TunCommand::Setup => commands::tun::setup().await?,
             cli::TunCommand::Status => commands::tun::status().await?,
         },
