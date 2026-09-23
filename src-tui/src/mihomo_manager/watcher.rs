@@ -67,6 +67,7 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
                 // guidance when the preflight rejects the binary) so the
                 // user sees how to recover, not just the exit code.
                 let msg = auto_restart_failure_message(exit_code, &e);
+                crate::sys_proxy::release_on_core_stop().await;
                 *inner.state.lock() = CoreState::Error(msg.clone());
                 if let Some(tx) = inner.action_tx.lock().as_ref() {
                     let _ = tx.send(Action::CoreError(msg));
@@ -74,6 +75,7 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
             }
         } else {
             let msg = format!("exited {exit_code}");
+            crate::sys_proxy::release_on_core_stop().await;
             *inner.state.lock() = CoreState::Error(msg.clone());
             if let Some(tx) = inner.action_tx.lock().as_ref() {
                 let _ = tx.send(Action::CoreError(msg));
@@ -98,9 +100,13 @@ where
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => match level {
-                    tracing::Level::INFO => tracing::info!(target: "mihomo", "[{label}] {line}"),
-                    tracing::Level::WARN => tracing::warn!(target: "mihomo", "[{label}] {line}"),
-                    _ => tracing::debug!(target: "mihomo", "[{label}] {line}"),
+                    tracing::Level::INFO => {
+                        tracing::info!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}")
+                    }
+                    tracing::Level::WARN => {
+                        tracing::warn!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}")
+                    }
+                    _ => tracing::debug!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}"),
                 },
                 Ok(None) => break,
                 Err(_) => break,

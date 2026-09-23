@@ -6,6 +6,7 @@ mod config_dir;
 mod editor;
 mod enhance;
 mod i18n;
+mod logging;
 mod mihomo_api;
 mod mihomo_manager;
 mod profile_store;
@@ -53,6 +54,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let config_dir = config_dir::resolve(cli.config_dir)?;
     clash_verge_core::utils::dirs::set_app_home_dir(config_dir.clone());
+    logging::init(
+        logging::Mode::for_command(cli.command.as_ref()),
+        cli.verbose,
+        &config_dir,
+    );
 
     // Non-fatal: clean old log files on startup.
     let gui = clash_verge_core::config::IVerge::new().await;
@@ -121,6 +127,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Some(cli::Command::Sysproxy { action }) => match action {
+            cli::SysproxyCommand::Env { unset: false } => {
+                print!("{}", sys_proxy::env_exports(&sys_proxy::ProxySettings::load().await));
+            }
+            cli::SysproxyCommand::Env { unset: true } => print!("{}", sys_proxy::env_unsets()),
+        },
         Some(cli::Command::Tun { action }) => match action {
             cli::TunCommand::Setup => commands::tun::setup().await?,
             cli::TunCommand::Status => commands::tun::status().await?,

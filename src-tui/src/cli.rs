@@ -7,6 +7,12 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub config_dir: Option<PathBuf>,
 
+    /// Increase log verbosity (-v info, -vv debug, -vvv trace). `RUST_LOG`
+    /// overrides it. The TUI logs to <config-dir>/logs/, other commands to
+    /// stderr.
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
+    pub verbose: u8,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -38,6 +44,11 @@ pub enum Command {
     Service {
         #[command(subcommand)]
         action: ServiceCommand,
+    },
+    /// Desktop/terminal system proxy helpers
+    Sysproxy {
+        #[command(subcommand)]
+        action: SysproxyCommand,
     },
     /// Manage TUN privileges for the resolved mihomo binary
     Tun {
@@ -88,6 +99,16 @@ pub enum ProfileCommand {
         /// Overwrite an existing standalone profile set
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum SysproxyCommand {
+    /// Print shell exports for the proxy: eval "$(clash-verge-cli sysproxy env)"
+    Env {
+        /// Print `unset` commands instead
+        #[arg(long)]
+        unset: bool,
     },
 }
 
