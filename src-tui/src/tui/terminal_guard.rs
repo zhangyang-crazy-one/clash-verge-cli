@@ -17,6 +17,20 @@ impl TerminalGuard {
         })
     }
 
+    /// A guard that never touched the terminal (no raw mode, no alternate
+    /// screen, nothing restored on drop), for handler tests without a TTY.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        let backend = ratatui::backend::CrosstermBackend::new(stdout());
+        let options = ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+        };
+        Self {
+            terminal: ratatui::Terminal::with_options(backend, options).expect("fixed viewport needs no TTY"),
+            suspended: true,
+        }
+    }
+
     /// Clear stale cells and reset Ratatui's diff buffers before a full repaint.
     pub fn reset_screen(&mut self) -> Result<()> {
         crossterm::execute!(
