@@ -635,4 +635,34 @@ mod tests {
         handle_key(&mut app, &ctx, key(KeyCode::Char('x'))).await;
         assert_eq!(app.password_buffer, ['x']);
     }
+
+    #[tokio::test]
+    async fn delay_results_do_not_move_the_cursor_to_another_node() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Proxies;
+        app.proxy_sort = crate::app::ProxySort::Delay;
+        app.proxy_groups.insert(
+            "Proxy".to_string(),
+            crate::mihomo_api::types::ProxyGroup {
+                group_type: "Selector".to_string(),
+                now: Some("a".to_string()),
+                all: Some(vec!["a".to_string(), "b".to_string()]),
+                history: None,
+            },
+        );
+        app.expanded_proxy_group = Some("Proxy".to_string());
+        app.node_selected_index = 1; // a (both untested: profile order)
+
+        // b becomes the fastest and moves to the top.
+        handle_event(&mut app, &ctx, Action::BatchDelayResult("b".to_string(), Some(10))).await;
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
+        handle_event(
+            &mut app,
+            &ctx,
+            Action::DelayFailed("a".to_string(), "timeout".to_string()),
+        )
+        .await;
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
+    }
 }

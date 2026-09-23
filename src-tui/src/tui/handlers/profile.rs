@@ -152,14 +152,24 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
         if let Err(error) = reload_remote_profile(&api, &item, enable_tun, core_running).await {
             let _ = tx.send(Action::CoreError(format!("profile reload: {error}")));
             return;
         }
-        if core_running {
-            let _ = tx.send(Action::ProxiesRefresh);
-        } else {
+        // The core now runs the imported profile: record it as current so
+        // profiles.yaml, Home, and the status bar agree with the core.
+        match ProfileStore::replace_current_locked(&uid).await {
+            // Refreshes the proxies when the core is running.
+            Ok(_) => {
+                let _ = tx.send(Action::ProfileSwitched(uid));
+            }
+            Err(error) => {
+                let _ = tx.send(Action::CoreError(format!("profile switch: {error}")));
+            }
+        }
+        if !core_running {
             let _ = manager.start().await;
         }
     });

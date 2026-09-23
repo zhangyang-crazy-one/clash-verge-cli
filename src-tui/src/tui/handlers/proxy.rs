@@ -27,6 +27,8 @@ pub(super) fn note_fetched(
 ) {
     app.runtime_loading.proxies = false;
     app.runtime_errors.proxies = None;
+    // Selections change which failed nodes are hidden: keep the cursor's row.
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.proxy_groups = groups;
     let expanded_is_available = app
         .expanded_proxy_group
@@ -34,12 +36,13 @@ pub(super) fn note_fetched(
         .and_then(|name| app.proxy_groups.get(name))
         .and_then(|group| group.all.as_ref())
         .is_some_and(|nodes| !nodes.is_empty());
-    if !expanded_is_available {
+    if expanded_is_available {
+        reselect(app, keep.as_ref());
+    } else {
         app.expanded_proxy_group = first_selectable_proxy_group(&app.proxy_groups);
         app.node_selected_index = 0;
     }
     let rows = app.proxy_rows();
-    app.node_selected_index = app.node_selected_index.min(rows.len().saturating_sub(1));
     let group_count = rows
         .iter()
         .filter(|row| matches!(row, ProxyDisplayRow::Group { .. }))
@@ -366,7 +369,10 @@ pub(super) fn advance_batch(app: &mut App) {
 /// Never touches batch progress: a single-node `t` result must not advance or
 /// clear the active batch.
 pub(super) fn note_delay_result(app: &mut App, name: String, delay: Option<u64>) {
+    // Sorted by delay, a new result can move rows: keep the cursor's node.
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.delay_map.insert(name, delay);
+    reselect(app, keep.as_ref());
     if let Some(delay) = delay {
         app.status_msg = Some(format!("Delay: {delay}ms"));
     }
@@ -374,7 +380,9 @@ pub(super) fn note_delay_result(app: &mut App, name: String, delay: Option<u64>)
 
 /// Record one single-node delay failure. Same contract as [`note_delay_result`].
 pub(super) fn note_delay_failed(app: &mut App, name: String, error: String) {
+    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
     app.delay_map.insert(name.clone(), None);
+    reselect(app, keep.as_ref());
     app.status_msg = Some(format!("Delay failed for {name}: {error}"));
 }
 
