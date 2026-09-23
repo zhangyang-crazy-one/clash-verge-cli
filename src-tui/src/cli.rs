@@ -16,6 +16,10 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
 
+    /// Machine-readable JSON output for list and status commands.
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -32,11 +36,14 @@ pub enum Command {
     Stop,
     /// Restart the mihomo core
     Restart,
-    /// Show mihomo status
+    /// Show mihomo status (exit 0 running, 3 not running, 1 error)
     Status {
-        /// Output machine-readable JSON
+        /// Wait until the core is running (exit 3 on timeout)
         #[arg(long)]
-        json: bool,
+        wait: bool,
+        /// Seconds `--wait` waits
+        #[arg(long, value_name = "SECS", default_value_t = 15, requires = "wait")]
+        timeout: u64,
     },
     /// Manage subscription profiles
     Profile {
@@ -78,6 +85,16 @@ pub enum Command {
     Tun {
         #[command(subcommand)]
         action: TunCommand,
+    },
+    /// Print a shell completion script: `clash-verge-cli completions bash`
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page, or write pages for every command into DIR
+    Man {
+        #[arg(long, value_name = "DIR")]
+        dir: Option<PathBuf>,
     },
     /// Internal: sudo askpass helper (SUDO_ASKPASS target).
     #[command(hide = true)]
@@ -148,9 +165,6 @@ pub enum ProxyCommand {
     List {
         /// Group to list members of
         group: Option<String>,
-        /// Output machine-readable JSON
-        #[arg(long)]
-        json: bool,
     },
     /// Select a member of a selector group
     Select { group: String, node: String },
@@ -187,11 +201,7 @@ impl ClashMode {
 #[derive(clap::Subcommand, Debug)]
 pub enum ConnectionsCommand {
     /// List active connections (the default)
-    List {
-        /// Output machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Close one connection by id
     Close { id: String },
     /// Close every connection
@@ -201,11 +211,7 @@ pub enum ConnectionsCommand {
 #[derive(clap::Subcommand, Debug)]
 pub enum ProviderCommand {
     /// List rule providers
-    List {
-        /// Output machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
+    List,
     /// Update one rule provider or all of them
     Update {
         #[arg(required_unless_present = "all", conflicts_with = "all")]
@@ -256,11 +262,7 @@ pub enum ServiceCommand {
     /// Stop and remove the systemd service unit
     Uninstall,
     /// Show service active/enabled status
-    Status {
-        /// Output machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Status,
 }
 
 #[cfg(test)]
@@ -361,6 +363,24 @@ mod tests {
         let cli = parse(&exec.split_whitespace().skip(1).collect::<Vec<_>>()).expect("ExecStart parses");
         assert!(matches!(cli.command, Some(Command::Start { foreground: true })));
         assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
+    }
+
+    #[test]
+    fn json_is_global_and_status_can_wait() {
+        let cli = parse(&["proxy", "list", "Proxy", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(parse(&["--json", "connections"]).unwrap().json);
+        assert!(matches!(
+            parse(&["status", "--wait", "--timeout", "5"]).unwrap().command,
+            Some(Command::Status { wait: true, timeout: 5 })
+        ));
+        assert!(parse(&["status", "--timeout", "5"]).is_err(), "--timeout needs --wait");
+        assert!(matches!(
+            parse(&["completions", "zsh"]).unwrap().command,
+            Some(Command::Completions {
+                shell: clap_complete::Shell::Zsh
+            })
+        ));
     }
 
     #[test]

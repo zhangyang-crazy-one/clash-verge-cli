@@ -46,19 +46,27 @@ pub async fn list(manager: &MihomoManager, json: bool) -> anyhow::Result<()> {
     }
     if rows.is_empty() {
         println!("(no connections)");
+        return Ok(());
     }
-    for row in rows {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t↑{} ↓{}",
-            row.id,
-            row.network,
-            row.host,
-            row.rule,
-            if row.chains.is_empty() { "-" } else { &row.chains },
+    let cells = rows.iter().map(|row| {
+        vec![
+            row.id.to_string(),
+            row.network.to_string(),
+            row.host.to_string(),
+            row.rule.to_string(),
+            if row.chains.is_empty() {
+                "-".into()
+            } else {
+                row.chains.clone()
+            },
             super::format_bytes(row.upload),
-            super::format_bytes(row.download)
-        );
-    }
+            super::format_bytes(row.download),
+        ]
+    });
+    print!(
+        "{}",
+        super::table(&["ID", "NET", "HOST", "RULE", "CHAIN", "UP", "DOWN"], cells)
+    );
     Ok(())
 }
 

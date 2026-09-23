@@ -3,22 +3,91 @@
 use crate::mihomo_manager::manager::MihomoManager;
 use crate::profile_store::store::ProfileStore;
 
-pub async fn list() -> anyhow::Result<()> {
+/// One row of `profile list` (also its `--json` schema).
+#[derive(Debug, serde::Serialize)]
+struct ProfileRow {
+    uid: String,
+    name: String,
+    current: bool,
+    /// Subscription URL with credentials and query redacted.
+    url: String,
+    /// Last refresh, Unix seconds.
+    updated: Option<u64>,
+    upload: Option<u64>,
+    download: Option<u64>,
+    /// Quota in bytes; 0 means unlimited.
+    total: Option<u64>,
+    /// Expiry, Unix seconds; 0 means never.
+    expire: Option<u64>,
+}
+
+impl ProfileRow {
+    fn of(item: &clash_verge_core::config::PrfItem, current: Option<&str>) -> Self {
+        let uid = item.uid.as_deref().unwrap_or("-").to_string();
+        Self {
+            current: current == Some(uid.as_str()),
+            uid,
+            name: item.name.as_deref().unwrap_or("(unnamed)").to_string(),
+            url: crate::subscribe::fetch::redact_url(item.url.as_deref().unwrap_or("")),
+            updated: item.updated.map(|secs| secs as u64),
+            upload: item.extra.as_ref().map(|extra| extra.upload),
+            download: item.extra.as_ref().map(|extra| extra.download),
+            total: item.extra.as_ref().map(|extra| extra.total),
+            expire: item.extra.as_ref().map(|extra| extra.expire),
+        }
+    }
+
+    /// `1.2 GiB / 50.0 GiB`, `1.2 GiB` (unlimited), or `-` (unknown).
+    fn usage(&self) -> String {
+        let (Some(up), Some(down)) = (self.upload, self.download) else {
+            return "-".into();
+        };
+        let used = super::format_bytes(up.saturating_add(down));
+        match self.total {
+            Some(total) if total > 0 => format!("{used} / {}", super::format_bytes(total)),
+            _ => used,
+        }
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            if self.current { "*".into() } else { String::new() },
+            self.uid.clone(),
+            self.name.clone(),
+            local_time(self.updated, "%Y-%m-%d %H:%M"),
+            self.usage(),
+            match self.expire {
+                Some(0) | None => "-".into(),
+                expire => local_time(expire, "%Y-%m-%d"),
+            },
+            self.url.clone(),
+        ]
+    }
+}
+
+fn local_time(unix_secs: Option<u64>, format: &str) -> String {
+    unix_secs
+        .and_then(|secs| i64::try_from(secs).ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|time| time.with_timezone(&chrono::Local).format(format).to_string())
+        .unwrap_or_else(|| "-".into())
+}
+
+pub async fn list(json: bool) -> anyhow::Result<()> {
     let store = ProfileStore::snapshot().await?;
     let current = store.current_uid();
-    let items = store.items();
-    if items.is_empty() {
+    let rows: Vec<ProfileRow> = store
+        .items()
+        .iter()
+        .map(|item| ProfileRow::of(item, current.as_deref()))
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
         println!("(no profiles)");
-        return Ok(());
-    }
-    for item in items {
-        let uid = item.uid.as_deref().unwrap_or("-");
-        let name = item.name.as_deref().unwrap_or("(unnamed)");
-        let marker = if current.as_deref() == Some(uid) { "*" } else { " " };
-        let url = item.url.as_deref().unwrap_or("");
-        // Redact query strings and credentials from the URL in list output.
-        let redacted = crate::subscribe::fetch::redact_url(url);
-        println!("{marker} {uid}\t{name}\t{redacted}");
+    } else {
+        let headers = ["", "UID", "NAME", "UPDATED", "USAGE", "EXPIRES", "URL"];
+        print!("{}", super::table(&headers, rows.iter().map(ProfileRow::cells)));
     }
     Ok(())
 }
@@ -157,7 +226,7 @@ pub async fn rename(query: &str, new_name: &str) -> anyhow::Result<()> {
 pub async fn migrate(from: &std::path::Path, force: bool) -> anyhow::Result<()> {
     let home = clash_verge_core::utils::dirs::app_home_dir()?;
     migrate_files(from, &home, force)?;
-    list().await?;
+    list(false).await?;
     Ok(())
 }
 
@@ -247,6 +316,32 @@ mod tests {
             Ok(value) => value,
             Err(error) => panic!("{what}: {error}"),
         }
+    }
+
+    #[test]
+    fn profile_rows_show_usage_and_expiry() {
+        let mut item = clash_verge_core::config::PrfItem {
+            uid: Some("R1".into()),
+            name: Some("Home".into()),
+            url: Some("https://user:pw@example.com/sub?token=secret".into()),
+            ..Default::default()
+        };
+        let bare = ProfileRow::of(&item, Some("R1"));
+        assert!(bare.current);
+        assert!(!bare.url.contains("secret") && !bare.url.contains("pw"), "{}", bare.url);
+        assert_eq!(bare.usage(), "-");
+        assert_eq!(bare.cells()[5], "-");
+
+        item.extra = Some(clash_verge_core::config::PrfExtra {
+            upload: 1024,
+            download: 1024,
+            total: 4096,
+            expire: 0,
+        });
+        let row = ProfileRow::of(&item, None);
+        assert!(!row.current);
+        assert_eq!(row.usage(), "2.0 KiB / 4.0 KiB");
+        assert_eq!(row.cells()[5], "-", "0 means never expires");
     }
 
     #[test]

@@ -27,6 +27,9 @@ tokio = { workspace = true, features = [
   "process",
 ] }
 clap = { workspace = true }
+clap_complete = "4"
+clap_mangen = "0.2"
+unicode-width = "0.2"
 anyhow = { workspace = true }
 color-eyre = { workspace = true }
 dirs = { workspace = true }

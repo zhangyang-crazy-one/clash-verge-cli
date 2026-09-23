@@ -56,13 +56,27 @@ session (gsettings/kwriteconfig need the graphical session); run `clash-verge-cl
     Ok(())
 }
 
-pub async fn status(manager: &MihomoManager) -> anyhow::Result<()> {
+pub async fn status(manager: &MihomoManager, json: bool) -> anyhow::Result<()> {
     let verge = clash_verge_core::config::IVerge::new().await;
     let settings = ProxySettings::load().await;
     let backend = sys_proxy::backend_available();
     let probe = settings.clone();
     let applied = backend && tokio::task::spawn_blocking(move || sys_proxy::is_applied(&probe)).await?;
     let running = super::core_running(&manager.api()).await;
+
+    if json {
+        let payload = serde_json::json!({
+            "enabled": verge.enable_system_proxy.unwrap_or(false),
+            "host": settings.host,
+            "port": settings.port,
+            "bypass": settings.bypass,
+            "desktop_backend": backend,
+            "desktop_applied": applied,
+            "core_running": running,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
 
     println!(
         "setting:  {}",

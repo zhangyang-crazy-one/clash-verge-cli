@@ -37,15 +37,15 @@ pub async fn list(manager: &MihomoManager, group: Option<&str>, json: bool) -> a
             } else if summaries.is_empty() {
                 println!("(no proxy groups)");
             } else {
-                for summary in summaries {
-                    println!(
-                        "{}\t{}\t{}\t{} members",
-                        summary.name,
-                        summary.group_type,
-                        summary.now.unwrap_or("-"),
-                        summary.members
-                    );
-                }
+                let rows = summaries.iter().map(|summary| {
+                    vec![
+                        summary.name.to_string(),
+                        summary.group_type.to_string(),
+                        summary.now.unwrap_or("-").to_string(),
+                        summary.members.to_string(),
+                    ]
+                });
+                print!("{}", super::table(&["GROUP", "TYPE", "SELECTED", "MEMBERS"], rows));
             }
         }
         Some(name) => {
@@ -53,14 +53,14 @@ pub async fn list(manager: &MihomoManager, group: Option<&str>, json: bool) -> a
             if json {
                 println!("{}", serde_json::to_string_pretty(&members)?);
             } else {
-                for member in members {
-                    println!(
-                        "{} {}\t{}",
-                        if member.selected { "*" } else { " " },
-                        member.name,
-                        format_delay(member.delay)
-                    );
-                }
+                let rows = members.iter().map(|member| {
+                    vec![
+                        if member.selected { "*".into() } else { String::new() },
+                        member.name.to_string(),
+                        format_delay(member.delay),
+                    ]
+                });
+                print!("{}", super::table(&["", "PROXY", "DELAY"], rows));
             }
         }
     }
