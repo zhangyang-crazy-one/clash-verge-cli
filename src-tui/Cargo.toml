@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 edition.workspace = true
 rust-version.workspace = true
 default-run = "clash-verge-cli"
+publish = false
 
 [[bin]]
 name = "clash-verge-cli"
@@ -75,3 +76,39 @@ serde_yaml_ng = { workspace = true }
 
 [lints]
 workspace = true
+
+# Release packages (`scripts/package-release.sh`). Completions and man pages
+# are generated into build/release-assets before packaging.
+[package.metadata.deb]
+name = "clash-verge-cli"
+maintainer = "clash-verge-cli contributors"
+copyright = "clash-verge-cli contributors"
+license-file = ["../LICENSE", "0"]
+extended-description = """\
+Terminal client for the mihomo (clash meta) proxy core: an interactive TUI \
+and non-interactive commands. It downloads and manages its own mihomo core."""
+section = "net"
+priority = "optional"
+# Statically linked (musl): no shared library dependencies.
+depends = ""
+assets = [
+  ["target/release/clash-verge-cli", "usr/bin/", "755"],
+  ["../build/release-assets/completions/clash-verge-cli.bash", "usr/share/bash-completion/completions/clash-verge-cli", "644"],
+  ["../build/release-assets/completions/_clash-verge-cli", "usr/share/zsh/vendor-completions/", "644"],
+  ["../build/release-assets/completions/clash-verge-cli.fish", "usr/share/fish/vendor_completions.d/", "644"],
+  ["../build/release-assets/man/*.1", "usr/share/man/man1/", "644"],
+  ["../README.md", "usr/share/doc/clash-verge-cli/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "clash-verge-cli"
+summary = "Terminal client for the mihomo proxy core"
+assets = [
+  { source = "target/release/clash-verge-cli", dest = "/usr/bin/clash-verge-cli", mode = "755" },
+  { source = "../build/release-assets/completions/clash-verge-cli.bash", dest = "/usr/share/bash-completion/completions/clash-verge-cli", mode = "644" },
+  { source = "../build/release-assets/completions/_clash-verge-cli", dest = "/usr/share/zsh/site-functions/_clash-verge-cli", mode = "644" },
+  { source = "../build/release-assets/completions/clash-verge-cli.fish", dest = "/usr/share/fish/vendor_completions.d/clash-verge-cli.fish", mode = "644" },
+  { source = "../build/release-assets/man/*.1", dest = "/usr/share/man/man1/", mode = "644", doc = true },
+  { source = "../README.md", dest = "/usr/share/doc/clash-verge-cli/README.md", mode = "644", doc = true },
+  { source = "../LICENSE", dest = "/usr/share/licenses/clash-verge-cli/LICENSE", mode = "644", doc = true },
+]

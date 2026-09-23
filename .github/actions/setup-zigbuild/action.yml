@@ -1,0 +1,19 @@
+name: Set up cargo-zigbuild
+description: Install zig (from the ziglang Python package) and cargo-zigbuild for static cross builds.
+
+runs:
+  using: composite
+  steps:
+    - name: Install zig
+      shell: bash
+      run: |
+        # A venv: the runner's system Python is externally managed. Its
+        # `python3` goes first on PATH so cargo-zigbuild finds `python3 -m ziglang`.
+        python3 -m venv "${RUNNER_TEMP}/zig"
+        "${RUNNER_TEMP}/zig/bin/pip" install --quiet ziglang==0.16.0
+        echo "${RUNNER_TEMP}/zig/bin" >> "${GITHUB_PATH}"
+
+    - name: Install cargo-zigbuild
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-zigbuild@0.23.4

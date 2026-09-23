@@ -13,50 +13,109 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release-linux:
-    name: Build and publish Linux TUI
+  version:
+    name: Verify tag matches package version
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        run: rustup toolchain install 1.95.0 --profile minimal --component clippy,rustfmt
-
-      - name: Verify tag matches package version
+      - name: Compare tag and version
         shell: bash
         run: |
           package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "clash-verge-cli") | .version')"
           test "${GITHUB_REF_NAME}" = "v${package_version}"
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [version, ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Dynamically linked against glibc (the historical asset).
+          - target: x86_64-unknown-linux-gnu
+            zig: false
+          # Static builds: run on any distribution, including Alpine.
+          - target: x86_64-unknown-linux-musl
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            zig: true
+          - target: armv7-unknown-linux-musleabihf
+            zig: true
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --locked
+      - name: Install Rust toolchain and target
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Install zig and cargo-zigbuild
+        if: matrix.zig
+        uses: ./.github/actions/setup-zigbuild
 
       - name: Build release binary
-        run: cargo build --release --locked -p clash-verge-cli
-
-      - name: Package binary and checksum
         shell: bash
         run: |
-          archive="clash-verge-cli-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
-          stage="dist/stage"
-          install -Dm755 target/release/clash-verge-cli "${stage}/clash-verge-cli"
-          mkdir -p "${stage}/completions"
-          "${stage}/clash-verge-cli" completions bash > "${stage}/completions/clash-verge-cli.bash"
-          "${stage}/clash-verge-cli" completions zsh > "${stage}/completions/_clash-verge-cli"
-          "${stage}/clash-verge-cli" completions fish > "${stage}/completions/clash-verge-cli.fish"
-          "${stage}/clash-verge-cli" man --dir "${stage}/man"
-          tar -czf "dist/${archive}" -C "${stage}" .
-          rm -rf "${stage}"
-          cd dist
-          sha256sum "${archive}" > "${archive}.sha256"
+          if [[ "${{ matrix.zig }}" == "true" ]]; then
+            cargo zigbuild --release --locked -p clash-verge-cli --target ${{ matrix.target }}
+          else
+            cargo build --release --locked -p clash-verge-cli --target ${{ matrix.target }}
+          fi
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/clash-verge-cli
+          if-no-files-found: error
+
+  publish:
+    name: Package and publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain and targets
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf
+
+      - name: Install packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb@3.8.0,cargo-generate-rpm@0.21.0
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: artifacts
+
+      - name: Package binaries
+        shell: bash
+        run: |
+          targets=()
+          for dir in artifacts/bin-*; do
+            target="${dir#artifacts/bin-}"
+            install -Dm755 "${dir}/clash-verge-cli" "target/${target}/release/clash-verge-cli"
+            targets+=("${target}")
+          done
+          scripts/package-release.sh "${GITHUB_REF_NAME}" "${targets[@]}"
 
       - name: Publish GitHub release
         env:
