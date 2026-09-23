@@ -328,6 +328,11 @@ fn classify_chatgpt(web: &Page, ios: &Page, region: Option<String>) -> CheckResu
             .region(region)
             .detail("the exit IP is flagged as a VPN");
     }
+    // Without a marker, only clean answers count: an error page (rate limit,
+    // outage) says nothing about availability.
+    if web.status >= 400 || ios.status >= 400 {
+        return CheckResult::failed(service, format!("HTTP {}/{}", web.status, ios.status)).region(region);
+    }
     CheckResult::new(service, Verdict::Available).region(region)
 }
 
@@ -478,6 +483,19 @@ mod tests {
         let blocked = classify_chatgpt(&fine, &vpn, None);
         assert_eq!(blocked.verdict, Verdict::Unavailable);
         assert!(blocked.detail.as_deref().is_some_and(|detail| detail.contains("VPN")));
+        for status in [429, 451, 502] {
+            let error = page(status, "", "<html>error</html>");
+            assert_eq!(
+                classify_chatgpt(&error, &fine, None).verdict,
+                Verdict::Failed,
+                "{status}"
+            );
+            assert_eq!(
+                classify_chatgpt(&fine, &error, None).verdict,
+                Verdict::Failed,
+                "{status}"
+            );
+        }
     }
 
     #[test]

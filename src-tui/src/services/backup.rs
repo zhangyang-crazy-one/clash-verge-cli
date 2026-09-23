@@ -251,7 +251,8 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
             .take(MAX_UNPACKED_BYTES)
             .read_to_end(&mut data)
             .with_context(|| format!("cannot read {name} from the archive"))?;
-        if name.ends_with(".yaml") && !name.starts_with(PROFILES_DIR) {
+        // Profile scripts (`.js`) are not YAML; everything else must parse.
+        if name.ends_with(".yaml") || name.ends_with(".yml") {
             serde_yaml_ng::from_slice::<Value>(&data)
                 .with_context(|| format!("{name} in the archive is not valid YAML"))?;
         }
@@ -276,9 +277,11 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
         None
     };
 
-    for (name, data) in &files {
-        write_atomic(&home.join(name.as_str()), data)?;
-    }
+    let targets: Vec<(PathBuf, &[u8])> = files
+        .iter()
+        .map(|(name, data)| (home.join(name.as_str()), data.as_slice()))
+        .collect();
+    replace_all(&targets)?;
     Ok(Restored {
         files: files.into_iter().map(|(name, _)| name).collect(),
         skipped,
@@ -323,14 +326,54 @@ fn keep_local_secrets(name: &str, data: &[u8], local: &Path) -> anyhow::Result<O
         .transpose()?)
 }
 
-fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Replace every file in `targets` or none: all new contents are staged
+/// first (mode 0600: they hold secrets and subscription URLs), then swapped
+/// in; a failure part-way puts the originals back.
+fn replace_all(targets: &[(PathBuf, &[u8])]) -> anyhow::Result<()> {
+    let staged = |path: &Path| path.with_extension("restore.partial");
+    let kept = |path: &Path| path.with_extension("restore.orig");
+
+    let staging = targets.iter().try_for_each(|(path, data)| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_private(&staged(path), data).with_context(|| format!("cannot write {}", staged(path).display()))
+    });
+    if let Err(error) = staging {
+        for (path, _) in targets {
+            let _ = std::fs::remove_file(staged(path));
+        }
+        return Err(error);
     }
-    let partial = path.with_extension("restore.partial");
-    std::fs::write(&partial, data).with_context(|| format!("cannot write {}", partial.display()))?;
-    std::fs::rename(&partial, path).with_context(|| format!("cannot replace {}", path.display()))?;
-    Ok(())
+
+    // (path, whether an original was moved aside)
+    let mut swapped: Vec<(&Path, bool)> = Vec::new();
+    let mut swap = || -> anyhow::Result<()> {
+        for (path, _) in targets {
+            let had_original = path.exists();
+            if had_original {
+                std::fs::rename(path, kept(path)).with_context(|| format!("cannot move {} aside", path.display()))?;
+            }
+            swapped.push((path, had_original));
+            std::fs::rename(staged(path), path).with_context(|| format!("cannot replace {}", path.display()))?;
+        }
+        Ok(())
+    };
+    let result = swap();
+    if result.is_err() {
+        for (path, had_original) in swapped.iter().rev() {
+            if *had_original {
+                let _ = std::fs::rename(kept(path), path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    for (path, _) in targets {
+        let _ = std::fs::remove_file(staged(path));
+        let _ = std::fs::remove_file(kept(path));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -486,6 +529,54 @@ mod tests {
         assert_eq!(restored.skipped.len(), 3);
         assert!(!home.parent().unwrap().join("escape.yaml").exists());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn restored_files_are_private_and_profile_yaml_must_parse() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = sample_home("private");
+        let backups = home.join("backups");
+        let archive = backups.join("b.zip");
+        create(&home, &archive, false).unwrap();
+        restore(&home, &archive, &backups).unwrap();
+        for file in ["config.yaml", "verge.yaml", "profiles.yaml", "profiles/A.yaml"] {
+            let mode = std::fs::metadata(home.join(file)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{file}");
+        }
+        assert!(!home.join("config.restore.orig").exists(), "no leftovers");
+
+        let broken = backups.join("broken.zip");
+        write_zip(
+            &broken,
+            &[
+                ("profiles.yaml".to_string(), b"items: []\n".to_vec()),
+                ("profiles/A.yaml".to_string(), b"proxies: [unclosed\n".to_vec()),
+                ("profiles/s.js".to_string(), b"function main(c) { return c }".to_vec()),
+            ],
+        )
+        .unwrap();
+        let error = restore(&home, &broken, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("profiles/A.yaml"), "{error:#}");
+        assert_eq!(read(&home.join("profiles/A.yaml")), "proxies: []\n", "nothing written");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_failed_swap_puts_every_original_back() {
+        let dir = temp_dir("swap");
+        write(&dir.join("a.yaml"), "old a\n");
+        write(&dir.join("b.yaml"), "old b\n");
+        // A directory where b's original would be moved aside: that rename
+        // fails (for any user), after a has already been swapped in.
+        write(&dir.join("b.restore.orig/keep"), "x");
+        let targets: Vec<(PathBuf, &[u8])> = vec![(dir.join("a.yaml"), b"new a\n"), (dir.join("b.yaml"), b"new b\n")];
+
+        assert!(replace_all(&targets).is_err());
+        assert_eq!(read(&dir.join("a.yaml")), "old a\n", "a rolled back");
+        assert_eq!(read(&dir.join("b.yaml")), "old b\n");
+        assert!(!dir.join("a.restore.orig").exists());
+        assert!(!dir.join("a.restore.partial").exists() && !dir.join("b.restore.partial").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
