@@ -125,6 +125,12 @@ pub fn backend_available() -> bool {
     Gnome::available(&SystemRunner) || Kde::detect(&SystemRunner).is_some()
 }
 
+/// Whether this tool applied the desktop proxy and has not restored it yet
+/// (the snapshot marker exists).
+pub fn applied_by_us() -> bool {
+    snapshot_path().is_ok_and(|path| path.exists())
+}
+
 /// Whether the desktop currently routes through `settings`' endpoint.
 pub fn is_applied(settings: &ProxySettings) -> bool {
     let runner = SystemRunner;

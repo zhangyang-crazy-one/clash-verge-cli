@@ -81,21 +81,46 @@ pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result
 }
 
 pub async fn update(manager: &MihomoManager, query: Option<&str>, all: bool, reload: bool) -> anyhow::Result<()> {
-    let refreshed_current = if all {
-        let currents = ProfileStore::update_all_remote_locked().await?;
-        println!("updated all remote profiles");
-        currents.first().map(|uid| uid.to_string())
+    let (refreshed_current, failures) = if all {
+        // Per-profile outcomes: one broken subscription must not keep a
+        // refreshed current profile from being reloaded.
+        let uids: Vec<String> = ProfileStore::snapshot()
+            .await?
+            .items()
+            .into_iter()
+            .filter_map(|item| item.uid.map(|uid| uid.to_string()))
+            .collect();
+        let (updated, failed) = ProfileStore::update_remotes_locked(&uids).await?;
+        for (uid, _) in &updated {
+            println!("updated {uid}");
+        }
+        for (uid, error) in &failed {
+            eprintln!("failed to update {uid}: {error}");
+        }
+        let current = updated
+            .into_iter()
+            .find_map(|(uid, is_current)| is_current.then_some(uid));
+        (current, failed.len())
     } else {
         let query = query.ok_or_else(|| anyhow::anyhow!("provide a profile uid or name, or pass --all"))?;
         let uid = resolve_uid(query).await?;
         let is_current = ProfileStore::update_remote_locked(&uid, None).await?;
         println!("updated {uid}");
-        is_current.then_some(uid)
+        (is_current.then_some(uid), 0)
     };
 
-    let Some(uid) = refreshed_current else {
-        return Ok(());
-    };
+    if let Some(uid) = refreshed_current {
+        reload_if_requested(manager, &uid, reload).await?;
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} profile update(s) failed");
+    }
+    Ok(())
+}
+
+/// Apply a refreshed current profile to the running core when `--reload`
+/// was given; otherwise say how to apply it.
+async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -> anyhow::Result<()> {
     let api = manager.api();
     if !reload || !super::core_running(&api).await {
         println!("current profile {uid} refreshed; pass --reload (or restart) to apply it to the running core");
@@ -105,7 +130,7 @@ pub async fn update(manager: &MihomoManager, query: Option<&str>, all: bool, rel
         .await
         .enable_tun_mode
         .unwrap_or(false);
-    crate::subscribe::scheduler::reload_current_profile(&api, &uid, enable_tun, true)
+    crate::subscribe::scheduler::reload_current_profile(&api, uid, enable_tun, true)
         .await
         .map_err(|error| anyhow::anyhow!("profile reload: {error}"))?;
     println!("reloaded the running core with {uid}");
