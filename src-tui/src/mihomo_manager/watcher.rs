@@ -46,15 +46,27 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
 
         tracing::info!("mihomo exited with code {exit_code}");
 
-        *inner.pid.lock() = None;
+        let exited_pid = inner.pid.lock().take();
+        inner.owns_child.store(false, Ordering::SeqCst);
+        // Intended when this process's stop() asked for it, or when another
+        // process (`clash-verge-cli stop`, a TUI) recorded a stop intent for
+        // this pid before signalling it.
+        let mut expected = inner.expected_exit.swap(false, Ordering::SeqCst);
+        if let Some(pid) = exited_pid {
+            use crate::mihomo_manager::pidfile;
+            expected |= pidfile::take_stop_intent(&pidfile::stop_intent_path_for(&socket_path), pid);
+            pidfile::remove_if(&pidfile::path_for(&socket_path), pid);
+        }
+        if expected {
+            *inner.state.lock() = CoreState::Stopped;
+        }
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreExited(exit_code));
         }
 
-        // Skip auto-restart when stop() intentionally shut down the core.
-        if inner.expected_exit.swap(false, Ordering::SeqCst) {
-            *inner.state.lock() = CoreState::Stopped;
+        // Skip auto-restart when the core was shut down on purpose.
+        if expected {
             return;
         }
 

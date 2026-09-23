@@ -4,12 +4,14 @@
 //! - `signal` implements SIGTERM-then-SIGKILL graceful shutdown
 //! - `watcher` spawns the background task that monitors child exits
 //! - `binary` resolves the mihomo binary path and auto-installs when missing
+//! - `pidfile` records the running core so other CLI processes can adopt it
 
 // Foundation module — public surface wired up by Plan 02-03.
 #![allow(dead_code, unused_imports)]
 
 pub mod binary;
 pub mod manager;
+pub mod pidfile;
 pub mod signal;
 pub mod watcher;
 

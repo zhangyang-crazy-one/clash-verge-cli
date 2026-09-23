@@ -154,5 +154,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         }
     }
 
+    // A core this TUI spawned is supervised (and its output piped) by this
+    // process only: stop it cleanly rather than leave it unsupervised. A core
+    // adopted from `clash-verge-cli start` keeps running under its own
+    // supervisor.
+    if ctx.manager.owns_child() {
+        let _ = ctx.manager.stop().await;
+    }
+
     Ok(())
 }

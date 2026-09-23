@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, CoreState};
 use crate::mihomo_api::MihomoApi;
-use crate::mihomo_manager::{binary, signal, watcher::spawn_watcher};
+use crate::mihomo_manager::{binary, pidfile, signal, watcher::spawn_watcher};
 
 use std::process::Stdio;
 
@@ -43,6 +43,9 @@ pub struct ManagerInner {
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart.
     pub expected_exit: AtomicBool,
+    /// True while this process's watcher supervises the core it spawned
+    /// (as opposed to a core adopted from another process's pid record).
+    pub owns_child: AtomicBool,
 }
 
 impl ManagerInner {
@@ -55,6 +58,7 @@ impl ManagerInner {
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
+            owns_child: AtomicBool::new(false),
         }
     }
 
@@ -122,13 +126,18 @@ impl ManagerInner {
         {
             command.arg("-f").arg(config_path);
         }
-        let child = command
+        // Output is piped into this process's tracing, so the spawner must
+        // stay alive as the core's supervisor (a pipe to an exited process
+        // kills mihomo with SIGPIPE). `clash-verge-cli start` therefore runs
+        // a detached `start --foreground` supervisor rather than spawning here.
+        command
             .arg("-ext-ctl-unix")
             .arg(socket_path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(false)
+            .kill_on_drop(false);
+        let child = command
             .spawn()
             .with_context(|| format!(
                 "failed to spawn mihomo from '{}' — check that the file exists, is executable (chmod +x), and is a valid binary. Try: ls -la '{}'",
@@ -137,9 +146,17 @@ impl ManagerInner {
 
         let pid = child.id().expect("child must have PID after spawn");
 
+        let started_at = Utc::now();
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
-        *inner.started_at.lock() = Some(Utc::now());
+        *inner.started_at.lock() = Some(started_at);
+        inner.owns_child.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = pidfile::write(
+            &pidfile::path_for(socket_path),
+            pidfile::CoreRecord::new(pid, started_at),
+        ) {
+            tracing::warn!(target: "mihomo", "failed to record the core pid: {error}");
+        }
         inner.expected_exit.store(false, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
@@ -224,6 +241,26 @@ impl MihomoManager {
     pub fn with_secret(mut self, secret: String) -> Self {
         self.secret = secret;
         self
+    }
+
+    /// Take over a core that another process started for this controller
+    /// socket (recorded in its pid file), so `stop`, `restart`, and `status`
+    /// work across CLI invocations. No-op when this manager already tracks a
+    /// core or none is running.
+    pub fn adopt_running_core(&self) {
+        if self.inner.pid.lock().is_some() {
+            return;
+        }
+        if let Some(record) = pidfile::read_live(&pidfile::path_for(&self.socket_path), &self.socket_path) {
+            *self.inner.pid.lock() = Some(record.pid);
+            *self.inner.started_at.lock() = record.started_at();
+            *self.inner.state.lock() = CoreState::Running;
+        }
+    }
+
+    /// Whether this process spawned the core and supervises it.
+    pub fn owns_child(&self) -> bool {
+        self.inner.owns_child.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install the action channel sender. Called by the TUI after it has
@@ -315,6 +352,20 @@ impl MihomoManager {
     /// Returns details about which binary was used so the UI/CLI can report
     /// install vs reuse clearly.
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        if let Some(pid) = self.pid()
+            && pidfile::is_running(pid)
+        {
+            anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
+        }
+        if self.api().version().await.is_ok() {
+            // No usable pid record, but something already serves the
+            // controller: a second core would only fail its binds.
+            anyhow::bail!(
+                "a mihomo core already answers on {} without a clash-verge-cli pid record; \
+stop it where it was started",
+                self.socket_path.display()
+            );
+        }
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
 
         ManagerInner::spawn_and_watch(&resolved, &self.config_dir, &self.socket_path, Arc::clone(&self.inner))
@@ -339,7 +390,21 @@ impl MihomoManager {
         let pid = { *self.inner.pid.lock() };
 
         if let Some(pid) = pid {
-            signal::graceful_stop_by_pid(pid).await?;
+            // Tell a supervisor in another process (a TUI, `start
+            // --foreground`) that this exit is intended, so it does not
+            // auto-restart the core.
+            let intent = pidfile::stop_intent_path_for(&self.socket_path);
+            if !self.owns_child()
+                && let Err(error) = pidfile::mark_stop_intent(&intent, pid)
+            {
+                tracing::warn!(target: "mihomo", "failed to record the stop intent: {error}");
+            }
+            let stopped = signal::graceful_stop_by_pid(pid).await;
+            // Normally consumed by the supervisor's watcher; clear it when no
+            // supervisor was left to read it.
+            pidfile::take_stop_intent(&intent, pid);
+            stopped?;
+            pidfile::remove_if(&pidfile::path_for(&self.socket_path), pid);
         }
         // No PID — already stopped or never started (idempotent).
 
