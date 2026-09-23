@@ -405,6 +405,7 @@ dependencies = [
  "clap_mangen",
  "clash-verge-core",
  "color-eyre",
+ "compact_str",
  "crossterm",
  "dirs",
  "flate2",
@@ -418,7 +419,6 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2",
- "smartstring",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -439,6 +439,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "compact_str",
  "getrandom 0.4.3",
  "log",
  "nanoid",
@@ -446,7 +447,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "smartstring",
  "sys-locale",
  "tokio",
 ]
@@ -514,6 +514,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -2652,18 +2653,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "smartstring"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
-dependencies = [
- "autocfg",
- "serde",
- "static_assertions",
- "version_check",
-]
 
 [[package]]
 name = "socket2"

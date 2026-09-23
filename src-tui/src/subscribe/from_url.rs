@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use anyhow::{Context, bail};
 use clash_verge_core::config::{PrfExtra, PrfItem, PrfOption};
 use clash_verge_core::utils::help;
+use compact_str::CompactString;
 use serde_yaml_ng::Mapping;
-use smartstring::alias::String as SmartString;
 use url::Url;
 
 use super::fetch;
@@ -43,7 +43,7 @@ pub async fn from_url(
     let home = result
         .headers
         .get("profile-web-page-url")
-        .map(|s| SmartString::from(s.as_str()));
+        .map(|s| CompactString::from(s.as_str()));
 
     if update_interval.is_none()
         && let Some(raw) = result.headers.get("profile-update-interval")
@@ -57,8 +57,8 @@ pub async fn from_url(
         .unwrap_or_else(|| "Remote File".into());
 
     let resolved_name = name
-        .map(SmartString::from)
-        .unwrap_or_else(|| SmartString::from(filename.as_str()));
+        .map(CompactString::from)
+        .unwrap_or_else(|| CompactString::from(filename.as_str()));
 
     let data = result.body.trim_start_matches('\u{feff}');
     validate_clash_yaml(data)?;
@@ -70,16 +70,16 @@ pub async fn from_url(
     ensure_chain_uid("proxies", &mut proxies, PrfItem::from_proxies, &mut fragments)?;
     ensure_chain_uid("groups", &mut groups, PrfItem::from_groups, &mut fragments)?;
 
-    let uid = SmartString::from(help::get_uid("R"));
-    let file = SmartString::from(format!("{uid}.yaml"));
+    let uid = CompactString::from(help::get_uid("R"));
+    let file = CompactString::from(format!("{uid}.yaml"));
 
     let item = PrfItem {
         uid: Some(uid),
         itype: Some("remote".into()),
         name: Some(resolved_name),
-        desc: desc.map(SmartString::from),
+        desc: desc.map(CompactString::from),
         file: Some(file),
-        url: Some(SmartString::from(cleaned.as_str())),
+        url: Some(CompactString::from(cleaned.as_str())),
         selected: None,
         extra,
         option: Some(PrfOption {
@@ -100,7 +100,7 @@ pub async fn from_url(
         }),
         home,
         updated: Some(chrono::Local::now().timestamp() as usize),
-        file_data: Some(SmartString::from(data)),
+        file_data: Some(CompactString::from(data)),
     };
 
     Ok(RemoteProfileBundle { item, fragments })
@@ -190,7 +190,7 @@ pub fn parse_subscription_userinfo(headers: &HashMap<String, String>) -> Option<
 
 fn ensure_chain_uid<F>(
     _label: &str,
-    slot: &mut Option<SmartString>,
+    slot: &mut Option<CompactString>,
     factory: F,
     fragments: &mut Vec<PrfItem>,
 ) -> anyhow::Result<()>
@@ -247,7 +247,7 @@ pub fn normalize_trusted_host(raw: &str) -> Option<std::string::String> {
 /// profile's stored `option.trusted_hosts` without dropping hosts the user
 /// already trusted. Returns `None` when the entry does not normalize (the
 /// caller should not persist it). Accepts any string-ish element so both the
-/// stored `SmartString` option and the std-String allowlist can merge.
+/// stored `CompactString` option and the std-String allowlist can merge.
 pub fn merge_trusted_host<S: AsRef<str>>(existing: Option<&[S]>, raw: &str) -> Option<Vec<std::string::String>> {
     let host = normalize_trusted_host(raw)?;
     let mut hosts: Vec<std::string::String> = existing

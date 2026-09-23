@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 use anyhow::Context;
 use clash_verge_core::config::{IProfiles, PrfItem, PrfOption};
-use smartstring::alias::String as SmartString;
+use compact_str::CompactString;
 use tokio::sync::Mutex;
 
 use crate::subscribe::from_url::{self, RemoteProfileBundle};
@@ -70,7 +70,7 @@ impl ProfileStore {
     }
 
     /// Update every remote profile under the shared IO lock.
-    pub async fn update_all_remote_locked() -> anyhow::Result<Vec<SmartString>> {
+    pub async fn update_all_remote_locked() -> anyhow::Result<Vec<CompactString>> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
         store.update_all_remote().await
@@ -99,7 +99,7 @@ impl ProfileStore {
     pub async fn delete_locked(uid: &str) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        let uid_key = smartstring::alias::String::from(uid);
+        let uid_key = CompactString::from(uid);
         let was_current = store.profiles.delete_item(&uid_key).await?;
         let _ = was_current;
         Ok(())
@@ -127,7 +127,7 @@ impl ProfileStore {
     pub async fn add_trusted_host_locked(uid: &str, host: &str) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        let uid_key = SmartString::from(uid);
+        let uid_key = CompactString::from(uid);
         let existing = store.profiles.get_item(&uid_key).context("profile not found")?.clone();
         if existing.itype.as_deref() != Some("remote") {
             anyhow::bail!("profile {uid} is not a remote subscription");
@@ -135,7 +135,7 @@ impl ProfileStore {
         let mut option = existing.option.clone().unwrap_or_default();
         let merged = from_url::merge_trusted_host(option.trusted_hosts.as_deref(), host)
             .ok_or_else(|| anyhow::anyhow!("trusted host does not normalize: {host}"))?;
-        option.trusted_hosts = Some(merged.into_iter().map(SmartString::from).collect());
+        option.trusted_hosts = Some(merged.into_iter().map(CompactString::from).collect());
         let patch = PrfItem {
             option: Some(option),
             ..Default::default()
@@ -148,9 +148,9 @@ impl ProfileStore {
     pub async fn rename_locked(uid: &str, new_name: &str) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        let uid_key = smartstring::alias::String::from(uid);
+        let uid_key = CompactString::from(uid);
         let patch = PrfItem {
-            name: Some(smartstring::alias::String::from(new_name)),
+            name: Some(CompactString::from(new_name)),
             ..Default::default()
         };
         store.profiles.patch_item(&uid_key, &patch).await?;
@@ -195,13 +195,13 @@ impl ProfileStore {
             .unwrap_or_default()
     }
 
-    pub fn current_uid(&self) -> Option<SmartString> {
+    pub fn current_uid(&self) -> Option<CompactString> {
         self.profiles.get_current().cloned()
     }
 
     /// Persist the GUI `current` profile UID (used when switching in the TUI).
     pub async fn set_current(&mut self, uid: &str) -> anyhow::Result<()> {
-        let uid = SmartString::from(uid);
+        let uid = CompactString::from(uid);
         self.profiles.patch_config(&IProfiles {
             current: Some(uid),
             items: None,
@@ -258,7 +258,7 @@ impl ProfileStore {
 
     /// Update a remote profile by UID. Returns whether it is the current profile.
     pub async fn update_remote(&mut self, uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
-        let uid_key = SmartString::from(uid);
+        let uid_key = CompactString::from(uid);
         let existing = self.profiles.get_item(&uid_key).context("profile not found")?.clone();
 
         if existing.itype.as_deref() != Some("remote") {
@@ -287,8 +287,8 @@ impl ProfileStore {
     }
 
     /// Update every remote profile. Returns UIDs that are current (0 or 1).
-    pub async fn update_all_remote(&mut self) -> anyhow::Result<Vec<SmartString>> {
-        let remotes: Vec<(SmartString, Option<SmartString>)> = self
+    pub async fn update_all_remote(&mut self) -> anyhow::Result<Vec<CompactString>> {
+        let remotes: Vec<(CompactString, Option<CompactString>)> = self
             .items()
             .into_iter()
             .filter_map(|item| {
@@ -462,7 +462,7 @@ pub(crate) mod tests {
             .option
             .and_then(|option| option.trusted_hosts)
             .expect("trusted_hosts persisted");
-        let expected: Vec<SmartString> = vec!["existing.example.org".into(), "8ry1xfih.doggygosubs.com".into()];
+        let expected: Vec<CompactString> = vec!["existing.example.org".into(), "8ry1xfih.doggygosubs.com".into()];
         assert_eq!(hosts, expected);
 
         // A repeated confirm for the same host is idempotent: no duplicate entry.

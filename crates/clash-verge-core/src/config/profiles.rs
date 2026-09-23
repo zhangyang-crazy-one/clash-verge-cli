@@ -1,10 +1,10 @@
 use super::prfitem::PrfItem;
 use crate::utils::{dirs, help};
 use anyhow::{Context as _, Result, bail};
+use compact_str::CompactString as String;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
-use smartstring::alias::String;
 use std::collections::HashSet;
 use std::path::{Component, Path};
 use std::sync::OnceLock;
