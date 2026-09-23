@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use crate::app::{Action, App, Focus, Overlay, View, proxy_display_rows};
+use crate::app::{Action, App, Focus, Overlay, View};
 use crate::tui::input;
 
 use super::Ctx;
@@ -18,13 +18,25 @@ pub(super) fn move_selection(app: &mut App, forward: bool) {
         return;
     }
     match app.view {
-        View::Profiles if !app.profiles.is_empty() => {
-            app.selected_index = step(app.selected_index, app.profiles.len(), forward);
+        View::Profiles => {
+            let visible = app.visible_profile_indices();
+            if !visible.is_empty() {
+                let position = visible.iter().position(|index| *index == app.selected_index);
+                // Off the filtered list: start from its first entry.
+                let next = position.map_or(0, |position| step(position, visible.len(), forward));
+                app.selected_index = visible[next];
+            }
         }
         View::Proxies => {
-            let total = count_flat_nodes(&app.proxy_groups, app.expanded_proxy_group.as_deref());
+            let total = app.proxy_rows().len();
             if total > 0 {
                 app.node_selected_index = step(app.node_selected_index, total, forward);
+            }
+        }
+        View::Rules => {
+            let total = app.visible_rules_panel_len();
+            if total > 0 {
+                app.rules_selected_index = step(app.rules_selected_index, total, forward);
             }
         }
         View::Connections => move_connection_selection(app, forward),
@@ -82,10 +94,30 @@ pub(super) fn cycle_focus(app: &mut App) {
     }
 }
 
+/// `/`: open the filter prompt, prefilled with the view's current filter.
 pub(super) fn start_filter(app: &mut App) {
-    app.filter = Some(String::new());
+    app.filter = Some(view_filter(app).cloned().unwrap_or_default());
     app.overlay = Some(Overlay::Filter);
     app.focus = Focus::Content;
+}
+
+fn view_filter(app: &App) -> Option<&String> {
+    match app.view {
+        View::Connections => app.connection_filter.as_ref(),
+        View::Logs => app.log_filter.as_ref(),
+        View::Proxies => app.proxy_filter.as_ref(),
+        View::Profiles => app.profile_filter.as_ref(),
+        View::Rules => app.rule_filter.as_ref(),
+        _ => None,
+    }
+}
+
+/// Whether `/` filters the view.
+pub(crate) const fn view_filters(view: View) -> bool {
+    matches!(
+        view,
+        View::Connections | View::Logs | View::Proxies | View::Profiles | View::Rules
+    )
 }
 
 pub(super) fn toggle_help(app: &mut App) {
@@ -103,7 +135,28 @@ pub(super) fn filter_input(app: &mut App, key: KeyEvent) {
             let submitted = (!query.trim().is_empty()).then_some(query);
             match app.view {
                 View::Connections => app.connection_filter = submitted,
-                View::Logs => app.log_filter = submitted,
+                View::Logs => {
+                    app.log_filter = submitted;
+                    app.log_selected_index = 0;
+                }
+                View::Proxies => {
+                    let keep = app.proxy_rows().get(app.node_selected_index).cloned();
+                    app.proxy_filter = submitted;
+                    super::proxy::reselect(app, keep.as_ref());
+                }
+                View::Profiles => {
+                    app.profile_filter = submitted;
+                    let visible = app.visible_profile_indices();
+                    if !visible.contains(&app.selected_index)
+                        && let Some(first) = visible.first()
+                    {
+                        app.selected_index = *first;
+                    }
+                }
+                View::Rules => {
+                    app.rule_filter = submitted;
+                    app.rules_selected_index = 0;
+                }
                 view => {
                     app.status_msg = Some(format!("Filtering is not available in {} yet", view.label()));
                 }
@@ -143,14 +196,6 @@ pub(super) fn dismiss_overlay(app: &mut App) {
     app.pending_connection_close = None;
     app.pending_trust = None;
     app.focus = Focus::Menu;
-}
-
-/// Count total flat items in proxy groups: one per group header + one per node.
-pub(super) fn count_flat_nodes(
-    groups: &std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>,
-    expanded_group: Option<&str>,
-) -> usize {
-    proxy_display_rows(groups, expanded_group).len()
 }
 
 #[cfg(test)]

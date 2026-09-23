@@ -28,11 +28,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.language = Language::from_config(app.gui_config.language.as_deref());
     app.core_config = clash_verge_core::config::IClashTemp::new().await;
     app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
+    if let Some(level) = app.core_config.0.get("log-level").and_then(|level| level.as_str())
+        && crate::app::LOG_LEVELS.contains(&level)
+    {
+        app.log_level = level.to_string();
+    }
 
     // Load profiles on start
     if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
         app.selected_index = store.selected_index();
-        app.profiles = store.items();
+        app.load_profiles(&store);
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
     }
 
@@ -45,6 +50,9 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let mut events = EventStream::new();
     let mut render_tick = time::interval(Duration::from_millis(100));
     let mut runtime_refresh_tick = time::interval(Duration::from_secs(1));
+    // Home's exit node and traffic totals: proxies and connections, slower.
+    let mut home_refresh_tick = time::interval(Duration::from_secs(5));
+    home_refresh_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_tick = time::interval(Duration::from_secs(30));
     auto_update_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut auto_update_in_flight = false;
@@ -139,6 +147,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 }
             }
 
+            _ = home_refresh_tick.tick(), if app.core_state == CoreState::Running && app.view == View::Home => {
+                let _ = ctx.tx.send(Action::ProxiesRefresh);
+                let _ = ctx.tx.send(Action::ConnectionsRefresh);
+            }
+
             _ = auto_update_tick.tick(), if !auto_update_in_flight => {
                 auto_update_in_flight = true;
                 handlers::spawn_auto_update(&app, &ctx, auto_update_scheduler.clone());
@@ -148,7 +161,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 // Re-read profiles.yaml so external interval edits (GUI/user)
                 // take effect without restarting the TUI.
                 if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
-                    app.profiles = store.items();
+                    app.load_profiles(&store);
                 }
             }
         }

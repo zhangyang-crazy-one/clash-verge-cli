@@ -25,7 +25,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled(format!("● {state_text}"), Style::new().fg(color)),
     ];
 
-    if let Some(profile) = app.profiles.get(app.selected_index)
+    if let Some(profile) = app.current_profile()
         && let Some(name) = profile.name.as_deref()
     {
         spans.push(Span::styled(

@@ -31,9 +31,17 @@ pub(super) fn import_input(app: &mut App, ctx: &Ctx, mut buffer: String, code: K
     }
 }
 
+/// The profile under the cursor, unless a filter hides it.
+fn selected_profile(app: &App) -> Option<&clash_verge_core::config::PrfItem> {
+    app.visible_profile_indices()
+        .contains(&app.selected_index)
+        .then(|| app.profiles.get(app.selected_index))
+        .flatten()
+}
+
 /// `Enter` on Profiles: make the selected profile current.
 pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
-    let Some(item) = app.profiles.get(app.selected_index).cloned() else {
+    let Some(item) = selected_profile(app).cloned() else {
         return;
     };
     if item.uid.is_none() {
@@ -44,12 +52,12 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
     let api = ctx.manager.api();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
         match crate::services::profile::switch_profile(&api, &item, enable_tun, core_running).await {
-            Ok(()) if core_running => {
-                let _ = tx.send(Action::ProxiesRefresh);
+            Ok(()) => {
+                let _ = tx.send(Action::ProfileSwitched(uid));
             }
-            Ok(()) => {}
             Err(error) => {
                 let _ = tx.send(Action::CoreError(error));
             }
@@ -63,8 +71,14 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
 /// opens the same interactive trust prompt as import. Background/auto
 /// updates never route here, so they can never prompt.
 pub(super) fn update_selected(app: &mut App, ctx: &Ctx) {
-    let selected = app.profiles.get(app.selected_index);
-    if let Some((uid, host)) = selected.and_then(update_flow_decision) {
+    let selected = selected_profile(app).cloned();
+    if selected.is_none() && !app.profiles.is_empty() {
+        // Only an empty list means "update all"; a filter hiding the
+        // selection must not turn `u` into a bulk update.
+        app.status_msg = Some(app.tr("profiles.no_selection").into());
+        return;
+    }
+    if let Some((uid, host)) = selected.as_ref().and_then(update_flow_decision) {
         ctx.send(Action::UpdateNeedsTrust { uid, host });
         return;
     }
@@ -125,7 +139,7 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     let Ok(store) = ProfileStore::snapshot().await else {
         return;
     };
-    app.profiles = store.items();
+    app.load_profiles(&store);
     let Some(last) = app.profiles.len().checked_sub(1) else {
         return;
     };
@@ -160,7 +174,7 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
         format!("Updated profile {uid}")
     });
     if let Ok(store) = ProfileStore::snapshot().await {
-        app.profiles = store.items();
+        app.load_profiles(&store);
     }
     if !is_current {
         return;

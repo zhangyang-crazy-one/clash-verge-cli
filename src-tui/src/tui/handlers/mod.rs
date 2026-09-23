@@ -33,6 +33,7 @@ use crate::mihomo_manager::manager::MihomoManager;
 use crate::tui::{TerminalGuard, input};
 
 use navigation::key_context;
+pub(crate) use navigation::view_filters;
 
 pub(super) use profile::spawn_auto_update;
 
@@ -123,6 +124,8 @@ async fn handle_intent(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
         Action::NodeDelayTest => proxy::test_selected_delay(app, ctx),
         Action::NodeDelayAll => proxy::test_all_delays(app, ctx),
         Action::ToggleChainMode => proxy::toggle_chain_mode(app),
+        Action::CycleProxySort => proxy::cycle_sort(app),
+        Action::ToggleHideFailedProxies => proxy::toggle_hide_failed(app),
         Action::ApplyChain => proxy::apply_chain(app, ctx),
         Action::ClearChain => proxy::clear_chain(app),
         Action::RequestCloseConnection => connections::begin_connection_close(app),
@@ -179,6 +182,12 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::ProfileImportFailed(error) => app.status_msg = Some(format!("Import failed: {error}")),
         Action::ProfileUpdated { uid, is_current } => profile::note_updated(app, ctx, uid, is_current).await,
         Action::ProfileUpdateFailed(error) => app.status_msg = Some(format!("Update failed: {error}")),
+        Action::ProfileSwitched(uid) => {
+            app.current_profile_uid = Some(uid);
+            if app.core_state == crate::app::CoreState::Running {
+                ctx.send(Action::ProxiesRefresh);
+            }
+        }
 
         // Proxies, delay tests, chains, and mode.
         Action::ProxiesRefresh if !app.runtime_loading.proxies => proxy::refresh(app, ctx),
@@ -210,7 +219,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             app.runtime_errors.traffic = Some(error);
         }
         Action::ConnectionsRefresh if !app.runtime_loading.connections => connections::refresh_connections(app, ctx),
-        Action::ConnectionsFetched(list) => connections::note_connections(app, list),
+        Action::ConnectionsFetched(data) => connections::note_connections(app, data),
         Action::ConnectionsFailed(error) => {
             app.runtime_loading.connections = false;
             app.runtime_errors.connections = Some(error);
@@ -239,6 +248,11 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::LogsFailed(error) => {
             app.runtime_loading.logs = false;
             app.runtime_errors.logs = Some(error);
+        }
+        Action::CycleLogLevel => connections::cycle_log_level(app, ctx),
+        Action::LogLevelChanged(level) => connections::note_log_level(app, ctx, level),
+        Action::LogLevelFailed(error) => {
+            app.status_msg = Some(format!("{}: {error}", app.tr("logs.level_failed")));
         }
 
         // Rules and rule providers.
@@ -375,5 +389,130 @@ mod tests {
         handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
         assert_eq!(app.log_filter.as_deref(), Some("err"));
         assert_eq!(app.overlay, None);
+    }
+
+    fn rule(payload: &str) -> crate::mihomo_api::types::Rule {
+        crate::mihomo_api::types::Rule {
+            rule_type: "DOMAIN".to_string(),
+            payload: payload.to_string(),
+            proxy: "Proxy".to_string(),
+            size: None,
+        }
+    }
+
+    async fn type_filter(app: &mut App, ctx: &Ctx, text: &str) {
+        handle_key(app, ctx, key(KeyCode::Char('/'))).await;
+        // Clear the prefilled filter first.
+        for _ in 0..app.filter.as_deref().map_or(0, str::len) {
+            handle_key(app, ctx, key(KeyCode::Backspace)).await;
+        }
+        for c in text.chars() {
+            handle_key(app, ctx, key(KeyCode::Char(c))).await;
+        }
+        handle_key(app, ctx, key(KeyCode::Enter)).await;
+    }
+
+    #[tokio::test]
+    async fn rules_view_moves_through_the_filtered_rules() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Rules;
+        app.focus = Focus::Content;
+        app.rules = vec![rule("a.example"), rule("b.test"), rule("c.example")];
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.rules_selected_index, 1, "j moves on Rules");
+
+        type_filter(&mut app, &ctx, "example").await;
+        assert_eq!(app.rule_filter.as_deref(), Some("example"));
+        assert_eq!(app.rules_selected_index, 0);
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.rules_selected_index, 0, "wraps within the 2 matches");
+        assert_eq!(app.visible_rules()[1].payload, "c.example");
+
+        // Reopening the prompt shows the current filter.
+        handle_key(&mut app, &ctx, key(KeyCode::Char('/'))).await;
+        assert_eq!(app.filter.as_deref(), Some("example"));
+    }
+
+    #[tokio::test]
+    async fn profile_filter_moves_over_matches_and_hides_the_selection_from_u() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Profiles;
+        app.focus = Focus::Content;
+        app.profiles = ["Work HK", "Home", "Work JP"]
+            .iter()
+            .map(|name| clash_verge_core::config::PrfItem {
+                uid: Some(format!("uid-{name}").into()),
+                name: Some((*name).into()),
+                ..Default::default()
+            })
+            .collect();
+        app.selected_index = 1;
+
+        type_filter(&mut app, &ctx, "work").await;
+        assert_eq!(app.selected_index, 0, "the hidden selection moves to the first match");
+        handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await;
+        assert_eq!(app.selected_index, 2, "skips the hidden profile");
+
+        type_filter(&mut app, &ctx, "nothing").await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('u'))).await;
+        assert_eq!(app.status_msg.as_deref(), Some("No profile selected"));
+    }
+
+    #[tokio::test]
+    async fn sorting_and_hiding_keep_the_cursor_on_the_same_node() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Proxies;
+        app.focus = Focus::Content;
+        app.proxy_groups.insert(
+            "Proxy".to_string(),
+            crate::mihomo_api::types::ProxyGroup {
+                group_type: "Selector".to_string(),
+                now: Some("b".to_string()),
+                all: Some(vec!["c".to_string(), "a".to_string(), "b".to_string()]),
+                history: None,
+            },
+        );
+        app.expanded_proxy_group = Some("Proxy".to_string());
+        app.delay_map.insert("a".to_string(), None);
+        app.node_selected_index = 3; // Group row, then c, a, b.
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("b"));
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('o'))).await;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('o'))).await;
+        assert_eq!(app.proxy_sort, crate::app::ProxySort::Name);
+        assert_eq!(app.node_selected_index, 2, "a, b, c: b is second");
+
+        handle_key(
+            &mut app,
+            &ctx,
+            KeyEvent::new(KeyCode::Char('H'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+        assert!(app.hide_failed_proxies);
+        assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("b"));
+        assert_eq!(app.proxy_rows().len(), 3, "the failed node a is hidden");
+    }
+
+    #[tokio::test]
+    async fn log_level_needs_a_running_core() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Logs;
+        handle_key(
+            &mut app,
+            &ctx,
+            KeyEvent::new(KeyCode::Char('L'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+        assert_eq!(app.log_level, "info");
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("Start the core to change its log level")
+        );
     }
 }

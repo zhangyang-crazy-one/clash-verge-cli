@@ -28,16 +28,18 @@ pub(super) fn refresh_connections(app: &mut App, ctx: &Ctx) {
     let api = ctx.manager.api();
     ctx.spawn_result(
         async move { api.get_connections().await },
-        |data| Action::ConnectionsFetched(data.connections),
+        Action::ConnectionsFetched,
         |error| Action::ConnectionsFailed(error.to_string()),
     );
 }
 
 /// New connection list: keep the selection on the same connection when it
 /// is still open, otherwise fall back to the first visible one.
-pub(super) fn note_connections(app: &mut App, connections: Vec<crate::mihomo_api::types::ConnectionInfo>) {
+pub(super) fn note_connections(app: &mut App, data: crate::mihomo_api::types::ConnectionsData) {
     app.runtime_loading.connections = false;
     app.runtime_errors.connections = None;
+    app.traffic_totals = Some((data.upload_total, data.download_total));
+    let connections = data.connections;
     if app
         .selected_connection_id
         .as_ref()
@@ -111,11 +113,45 @@ pub(super) fn refresh_logs(app: &mut App, ctx: &Ctx) {
     app.runtime_loading.logs = true;
     app.runtime_errors.logs = None;
     let api = ctx.manager.api();
-    ctx.spawn(|tx| async move {
-        if let Err(error) = receive_log_stream(api, tx.clone()).await {
+    let tx = ctx.tx.clone();
+    let level = app.log_level.clone();
+    let task = tokio::spawn(async move {
+        if let Err(error) = receive_log_stream(api, &level, tx.clone()).await {
             let _ = tx.send(Action::LogsFailed(error));
         }
     });
+    if let Some(previous) = app.log_stream.replace(task.abort_handle()) {
+        previous.abort();
+    }
+}
+
+/// `L` on Logs: switch the running core to the next log level.
+pub(super) fn cycle_log_level(app: &mut App, ctx: &Ctx) {
+    if app.core_state != crate::app::CoreState::Running {
+        app.status_msg = Some(app.tr("logs.level_needs_core").into());
+        return;
+    }
+    let level = crate::app::next_log_level(&app.log_level).to_string();
+    let api = ctx.manager.api();
+    ctx.spawn_result(
+        async move { api.patch_log_level(&level).await.map(|()| level) },
+        Action::LogLevelChanged,
+        |error| Action::LogLevelFailed(error.to_string()),
+    );
+}
+
+/// The core now logs at `level`: resubscribe the stream at that level (the
+/// stream filters by level too, so the old one would miss debug lines).
+pub(super) fn note_log_level(app: &mut App, ctx: &Ctx, level: String) {
+    app.status_msg = Some(format!("{}: {level}", app.tr("logs.level")));
+    app.log_level = level;
+    if let Some(stream) = app.log_stream.take() {
+        stream.abort();
+    }
+    app.runtime_loading.logs = false;
+    if app.view == crate::app::View::Logs {
+        refresh_logs(app, ctx);
+    }
 }
 
 pub(super) fn note_log(app: &mut App, log: LogEntry) {
@@ -144,29 +180,11 @@ pub(super) fn close_confirmation_is_current(app: &App, id: &str) -> bool {
         && app.overlay == Some(Overlay::CloseConfirmation)
 }
 
-pub(super) fn connection_matches_filter(connection: &crate::mihomo_api::types::ConnectionInfo, query: &str) -> bool {
-    let query = query.to_ascii_lowercase();
-    let host = connection
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.host.as_deref())
-        .unwrap_or_default();
-    let rule = connection.rule.as_deref().unwrap_or_default();
-    connection.id.to_ascii_lowercase().contains(&query)
-        || host.to_ascii_lowercase().contains(&query)
-        || rule.to_ascii_lowercase().contains(&query)
-}
-
 pub(super) fn visible_connection_ids(app: &App) -> Vec<String> {
-    match app.connection_filter.as_deref() {
-        Some(query) if !query.is_empty() => app
-            .connections
-            .iter()
-            .filter(|connection| connection_matches_filter(connection, query))
-            .map(|connection| connection.id.clone())
-            .collect(),
-        _ => app.connections.iter().map(|connection| connection.id.clone()).collect(),
-    }
+    app.visible_connections()
+        .into_iter()
+        .map(|connection| connection.id.clone())
+        .collect()
 }
 
 pub(super) fn move_connection_selection(app: &mut App, forward: bool) {
@@ -191,19 +209,7 @@ pub(super) fn move_connection_selection(app: &mut App, forward: bool) {
 }
 
 pub(super) fn visible_log_count(app: &App) -> usize {
-    match app.log_filter.as_deref() {
-        Some(query) if !query.is_empty() => {
-            let query = query.to_ascii_lowercase();
-            app.logs
-                .iter()
-                .filter(|entry| {
-                    entry.level.to_ascii_lowercase().contains(&query)
-                        || entry.payload.to_ascii_lowercase().contains(&query)
-                })
-                .count()
-        }
-        _ => app.logs.len(),
-    }
+    app.visible_logs().len()
 }
 
 pub(super) fn move_log_selection(app: &mut App, forward: bool) {
@@ -264,9 +270,10 @@ pub(super) async fn receive_traffic_stream(
 
 pub(super) async fn receive_log_stream(
     api: crate::mihomo_api::client::MihomoApi,
+    level: &str,
     tx: mpsc::UnboundedSender<Action>,
 ) -> Result<(), String> {
-    let response = api.stream_logs("info").await.map_err(|error| error.to_string())?;
+    let response = api.stream_logs(level).await.map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
     let mut buffer = Vec::new();
 

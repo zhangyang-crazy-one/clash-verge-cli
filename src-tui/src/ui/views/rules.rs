@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::app::{App, Focus};
 use crate::ui::theme;
@@ -20,8 +20,42 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_providers_panel(frame, rows[1], app, content_focus && app.rules_focus_providers);
 }
 
+/// ` [filter: x]` while the rule filter is active.
+fn filter_suffix(app: &App) -> String {
+    crate::app::filter::active(app.rule_filter.as_deref())
+        .map(|query| {
+            format!(
+                " [{}: {}]",
+                app.tr("logs.filter"),
+                crate::ui::terminal_text::display(query)
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// "12" or "3/12" when a filter hides some.
+fn count(shown: usize, total: usize) -> String {
+    if shown == total {
+        total.to_string()
+    } else {
+        format!("{shown}/{total}")
+    }
+}
+
+/// Keep the cursor row on screen (the list scrolls with it).
+fn render_list(frame: &mut Frame<'_>, area: Rect, list: List<'_>, selected: Option<usize>) {
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let title = format!("{} ({})", app.tr("rules.title"), app.rules.len());
+    let rules = app.visible_rules();
+    let title = format!(
+        "{} ({}){}",
+        app.tr("rules.title"),
+        count(rules.len(), app.rules.len()),
+        filter_suffix(app)
+    );
     let block = theme::panel_block(title, focused);
 
     if app.rules_loading {
@@ -38,9 +72,13 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
         return;
     }
 
-    if app.rules.is_empty() {
+    if rules.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
-            app.tr("rules.empty"),
+            app.tr(if app.rules.is_empty() {
+                "rules.empty"
+            } else {
+                "common.no_matches"
+            }),
             Style::new().fg(theme::dim()),
         )))
         .block(block);
@@ -48,8 +86,7 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .rules
+    let items: Vec<ListItem> = rules
         .iter()
         .enumerate()
         .map(|(i, rule)| {
@@ -79,11 +116,16 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
         .collect();
 
     let list = List::new(items).block(block);
-    frame.render_widget(list, area);
+    render_list(frame, area, list, focused.then_some(app.rules_selected_index));
 }
 
 fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
-    let title = format!("Rule Providers ({})", app.rule_providers.len());
+    let providers = app.visible_rule_providers();
+    let title = format!(
+        "Rule Providers ({}){}",
+        count(providers.len(), app.rule_providers.len()),
+        filter_suffix(app)
+    );
     let block = theme::panel_block(title, focused);
 
     if app.rule_providers_loading {
@@ -100,9 +142,13 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
         return;
     }
 
-    if app.rule_providers.is_empty() {
+    if providers.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
-            "No rule providers",
+            if app.rule_providers.is_empty() {
+                "No rule providers"
+            } else {
+                app.tr("common.no_matches")
+            },
             Style::new().fg(theme::dim()),
         )))
         .block(block);
@@ -110,8 +156,7 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
         return;
     }
 
-    let items: Vec<ListItem> = app
-        .rule_providers
+    let items: Vec<ListItem> = providers
         .iter()
         .enumerate()
         .map(|(i, provider)| {
@@ -147,5 +192,5 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
         .collect();
 
     let list = List::new(items).block(block);
-    frame.render_widget(list, area);
+    render_list(frame, area, list, focused.then_some(app.rules_selected_index));
 }

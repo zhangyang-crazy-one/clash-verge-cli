@@ -1,5 +1,5 @@
 use super::{TunSetupReason, View};
-use crate::mihomo_api::types::{ConnectionInfo, LogEntry, Rule, RuleProvider, TrafficData};
+use crate::mihomo_api::types::{LogEntry, Rule, RuleProvider, TrafficData};
 
 /// What config file to open in `$EDITOR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +57,8 @@ pub enum Action {
         is_current: bool,
     },
     ProfileUpdateFailed(String),
+    /// The profile with this uid is now current.
+    ProfileSwitched(String),
 
     // Shell navigation
     SwitchView(View),
@@ -81,6 +83,10 @@ pub enum Action {
     /// advance or clear the active batch progress/guard.
     BatchDelayResult(String, Option<u64>),
     BatchDelayFailed(String, String),
+    /// `o`: next node order (profile / delay / name).
+    CycleProxySort,
+    /// `H`: hide or show nodes whose delay test failed.
+    ToggleHideFailedProxies,
 
     // Chain proxy
     ToggleChainMode,
@@ -95,11 +101,15 @@ pub enum Action {
     TrafficFetched(TrafficData),
     TrafficFailed(String),
     ConnectionsRefresh,
-    ConnectionsFetched(Vec<ConnectionInfo>),
+    ConnectionsFetched(crate::mihomo_api::types::ConnectionsData),
     ConnectionsFailed(String),
     LogsRefresh,
     LogReceived(LogEntry),
     LogsFailed(String),
+    /// `L` on Logs: switch mihomo's log level to the next one.
+    CycleLogLevel,
+    LogLevelChanged(String),
+    LogLevelFailed(String),
 
     // Connection close is a two-step flow. The event loop only sends the destructive
     // request after it has received ConfirmCloseConnection for the selected identity.
