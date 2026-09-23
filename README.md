@@ -18,8 +18,12 @@ A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo).
 On `start` (TUI `s` or `clash-verge-cli start`), the CLI resolves mihomo as follows:
 
 1. Use a system `verge-mihomo` if present
-2. Otherwise auto-download **v1.19.29** into `$XDG_DATA_HOME/clash-verge-cli/mihomo`
-   (or `~/.local/share/clash-verge-cli/mihomo`) and keep that managed binary in sync
+2. Otherwise auto-download the latest release (fallback **v1.19.29**) into
+   `$XDG_DATA_HOME/clash-verge-cli/mihomo` (or `~/.local/share/clash-verge-cli/mihomo`)
+   and keep that managed binary in sync. Downloads are checked against the
+   sha256 digest GitHub publishes for the asset, must be an ELF binary that
+   reports the expected version, and are installed atomically under a lock
+   shared by all running instances.
 
 No separate install step is required for normal use.
 
@@ -51,7 +55,23 @@ clash-verge-cli restart
 clash-verge-cli profile list
 clash-verge-cli profile import 'https://example.com/sub.yaml' --name my-sub
 clash-verge-cli profile update --all
+eval "$(clash-verge-cli sysproxy env)"   # proxy the current shell
 ```
+
+## System proxy
+
+With *System proxy* enabled in Settings, the desktop proxy (GNOME, or KDE
+Plasma 5/6) follows the core: it is applied when mihomo starts, with the
+default LAN/localhost bypass list plus `system_proxy_bypass`, and released
+when mihomo stops or exits, restoring the previous desktop settings. On
+headless machines use `clash-verge-cli sysproxy env` (or `--unset`) instead.
+
+## Logs
+
+The TUI writes its own diagnostics to `<config-dir>/logs/clash-verge-cli-<date>.log`;
+`start --foreground` and one-shot commands log to stderr (journald under
+systemd). Use `-v`/`-vv`/`-vvv` or `RUST_LOG` (e.g. `RUST_LOG=info,mihomo=debug`)
+for more detail.
 
 ## Migrating from Clash Verge Rev GUI
 

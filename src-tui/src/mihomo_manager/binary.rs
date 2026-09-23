@@ -4,11 +4,11 @@ use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
 
 use anyhow::Context;
+use sha2::Digest as _;
 use tokio::process::Command;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 /// Managed (auto-downloaded) mihomo stable version — compile-time fallback
 /// when GitHub API is unreachable.
@@ -16,9 +16,10 @@ pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.29";
 
 const MIHOMO_REPO: &str = "MetaCubeX/mihomo";
 
-/// Serialise concurrent `resolve_or_install` calls so two starts cannot
-/// overwrite the same `$dest.download` temporary and race on `rename(2)`.
-static DOWNLOAD_LOCK: Mutex<()> = Mutex::new(());
+/// Serialises the check-then-install sequence of `resolve_or_install`
+/// within this process. An async mutex so it is held across the download
+/// awaits; the cross-process half is the `flock` on [`install_lock_path`].
+static INSTALL_LOCK: Mutex<()> = Mutex::const_new(());
 
 static LATEST_VERSION: OnceCell<String> = OnceCell::const_new();
 
@@ -125,7 +126,6 @@ pub struct ResolvedMihomo {
 /// 1. System `verge-mihomo` (left untouched)
 /// 2. Managed data-dir binary at the detected latest version (download/upgrade as needed)
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
-    let target_version = latest_mihomo_version().await;
     if let Some(system) = system_mihomo() {
         let version = read_mihomo_version(&system).await?.unwrap_or_else(|| "unknown".into());
         return Ok(ResolvedMihomo {
@@ -135,11 +135,17 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
         });
     }
 
+    // Only the managed binary depends on the latest release; a system
+    // binary must not wait on the GitHub API.
+    let target_version = latest_mihomo_version().await;
     let managed = mihomo_binary_path();
-    if managed.exists()
-        && let Ok(Some(version)) = read_mihomo_version(&managed).await
-        && version_matches_target(&version, target_version)
-    {
+    // Hold both locks across check → download → install so concurrent
+    // starts (TUI + CLI + systemd service) never race on the managed path.
+    // The second caller re-checks after the lock and reuses the fresh install.
+    let _in_process = INSTALL_LOCK.lock().await;
+    let _cross_process = lock_install(&managed).await?;
+
+    if let Some(version) = managed_version_if_current(&managed, target_version).await {
         ensure_executable(&managed).await?;
         return Ok(ResolvedMihomo {
             path: managed,
@@ -149,12 +155,48 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     }
 
     download_managed_mihomo(&managed, target_version).await?;
-    ensure_executable(&managed).await?;
     Ok(ResolvedMihomo {
         path: managed,
         source: MihomoBinarySource::Downloaded,
         version: target_version.to_string(),
     })
+}
+
+async fn managed_version_if_current(managed: &Path, target_version: &str) -> Option<String> {
+    if !managed.exists() {
+        return None;
+    }
+    let version = read_mihomo_version(managed).await.ok().flatten()?;
+    version_matches_target(&version, target_version).then_some(version)
+}
+
+/// Lock file guarding the managed binary across processes.
+fn install_lock_path(managed: &Path) -> PathBuf {
+    managed.with_extension("lock")
+}
+
+/// Take an exclusive `flock` on the install lock file. The lock is released
+/// when the returned file is dropped (or the process dies).
+async fn lock_install(managed: &Path) -> anyhow::Result<std::fs::File> {
+    let lock_path = install_lock_path(managed);
+    if let Some(parent) = lock_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        file.lock()
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        Ok(file)
+    })
+    .await
+    .context("install lock task panicked")?
 }
 
 /// Set the executable bit on the binary. Idempotent — if the bits are
@@ -169,21 +211,22 @@ pub async fn ensure_executable(path: &Path) -> std::io::Result<()> {
     tokio::fs::set_permissions(path, target).await
 }
 
+/// Download, verify, and atomically install the managed mihomo build.
+///
+/// Callers must hold the install locks (see [`resolve_or_install`]).
+/// Verification, in order:
+/// 1. sha256 of the downloaded archive against the digest GitHub publishes
+///    for the release asset (skipped with a warning when the API is
+///    unreachable — the version check below still applies);
+/// 2. the decompressed payload is an ELF executable;
+/// 3. the staged binary runs and reports exactly `version`.
+///
+/// Only then is it renamed over `dest`, so a failed or tampered download
+/// never replaces a working binary.
 async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<()> {
     let asset = linux_asset_name().context("unsupported CPU architecture for auto-install")?;
-    // Serialise concurrent downloads — two starts racing on the same
-    // `$dest.download` temp file can cause a rename(2) to fail.
-    // Use a block so the MutexGuard is dropped before the first await,
-    // keeping the future `Send`.
-    {
-        let _guard = DOWNLOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Critical section: guard is dropped at the closing brace.
-    }
-    let url = format!(
-        "https://github.com/MetaCubeX/mihomo/releases/download/{version}/{asset}-{version}.gz",
-        version = version,
-        asset = asset
-    );
+    let asset_file = format!("{asset}-{version}.gz");
+    let url = format!("https://github.com/{MIHOMO_REPO}/releases/download/{version}/{asset_file}");
 
     tracing::info!(
         target: "mihomo",
@@ -207,28 +250,83 @@ async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<(
 
     let compressed = response.bytes().await.context("failed to read mihomo download body")?;
 
+    match crate::subscribe::client_meta::fetch_release_asset_digest(MIHOMO_REPO, version, &asset_file).await {
+        Some(expected) => {
+            verify_sha256(&compressed, &expected).with_context(|| format!("integrity check failed for {url}"))?;
+            tracing::info!(target: "mihomo", "verified sha256 of {asset_file}");
+        }
+        None => tracing::warn!(
+            target: "mihomo",
+            "no published sha256 digest for {asset_file} (GitHub API unreachable?); relying on the version check"
+        ),
+    }
+
     let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
     let mut binary = Vec::new();
     decoder
         .read_to_end(&mut binary)
         .context("failed to decompress mihomo gzip archive")?;
+    ensure_elf(&binary).with_context(|| format!("{url} did not contain a Linux executable"))?;
 
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    let parent = dest
+        .parent()
+        .with_context(|| format!("managed mihomo path {} has no parent", dest.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("failed to create {}", parent.display()))?;
+
+    // Stage under a unique name in the destination directory so the final
+    // rename is atomic and never collides with another process's staging.
+    let staged = tempfile::Builder::new()
+        .prefix(".mihomo-")
+        .suffix(".download")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create a staging file in {}", parent.display()))?;
+    tokio::fs::write(staged.path(), &binary)
+        .await
+        .with_context(|| format!("failed to write {}", staged.path().display()))?;
+    // Close the write handle before executing it (ETXTBSY otherwise); the
+    // TempPath still deletes the file if anything below fails.
+    let staged = staged.into_temp_path();
+    ensure_executable(&staged).await?;
+
+    let reported = read_mihomo_version(&staged)
+        .await
+        .context("downloaded mihomo failed to run")?
+        .unwrap_or_else(|| "unknown".into());
+    if !version_matches_target(&reported, version) {
+        anyhow::bail!("downloaded mihomo reports version {reported}, expected {version}; refusing to install");
     }
 
-    let tmp = dest.with_extension("download");
-    tokio::fs::write(&tmp, &binary)
-        .await
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, dest)
-        .await
+    staged
+        .persist(dest)
         .with_context(|| format!("failed to install mihomo to {}", dest.display()))?;
 
     tracing::info!(target: "mihomo", "installed mihomo {version}");
     Ok(())
+}
+
+/// Compare `data` against a GitHub asset digest (`sha256:<hex>`).
+fn verify_sha256(data: &[u8], expected: &str) -> anyhow::Result<()> {
+    let expected_hex = expected
+        .strip_prefix("sha256:")
+        .with_context(|| format!("unsupported digest format: {expected}"))?;
+    let actual_hex: String = sha2::Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        anyhow::bail!("sha256 mismatch: expected {expected_hex}, got {actual_hex}");
+    }
+    Ok(())
+}
+
+fn ensure_elf(binary: &[u8]) -> anyhow::Result<()> {
+    if binary.starts_with(b"\x7fELF") {
+        Ok(())
+    } else {
+        anyhow::bail!("payload is not an ELF binary ({} bytes)", binary.len())
+    }
 }
 
 fn linux_asset_name() -> Option<&'static str> {
@@ -395,6 +493,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn verify_sha256_accepts_matching_digest_and_rejects_others() {
+        // sha256("abc")
+        let digest = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(verify_sha256(b"abc", digest).is_ok());
+        assert!(verify_sha256(b"abc", &digest.to_uppercase().replace("SHA256:", "sha256:")).is_ok());
+        assert!(verify_sha256(b"abd", digest).is_err());
+        assert!(verify_sha256(b"abc", "md5:900150983cd24fb0d6963f7d28e17f72").is_err());
+    }
+
+    #[test]
+    fn ensure_elf_rejects_non_executables() {
+        assert!(ensure_elf(b"\x7fELF\x02\x01\x01").is_ok());
+        assert!(ensure_elf(b"<html>Not Found</html>").is_err());
+        assert!(ensure_elf(b"").is_err());
+    }
+
+    #[tokio::test]
+    async fn install_lock_is_exclusive_across_handles() {
+        let dir = std::env::temp_dir().join(format!("cv-lock-{}", uuid::Uuid::new_v4()));
+        let managed = dir.join("mihomo");
+        let first = lock_install(&managed).await.unwrap();
+
+        // A second, independent open of the lock file (as another process
+        // would do) must not acquire the lock while the first is held.
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(install_lock_path(&managed))
+            .unwrap();
+        assert!(other.try_lock().is_err(), "lock must be exclusive");
+
+        drop(first);
+        assert!(other.try_lock().is_ok(), "lock must release on drop");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

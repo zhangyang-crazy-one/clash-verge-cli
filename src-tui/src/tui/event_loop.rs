@@ -1288,15 +1288,19 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                                                             updated.enable_system_proxy = Some(enabled);
                                                             match updated.save_file().await {
                                                                 Ok(()) => {
-                                                                    let host = updated
-                                                                        .proxy_host
-                                                                        .as_deref()
-                                                                        .unwrap_or("127.0.0.1");
-                                                                    let port = app.core_config.get_mixed_port();
-                                                                    let apply_result = if enabled {
-                                                                        crate::sys_proxy::set_system_proxy(host, port)
-                                                                    } else {
+                                                                    let settings = crate::sys_proxy::ProxySettings::from_config(
+                                                                        &updated,
+                                                                        app.core_config.get_mixed_port(),
+                                                                    );
+                                                                    // With the core stopped, only persist the
+                                                                    // setting: it is applied when the core starts
+                                                                    // rather than pointing at a closed port.
+                                                                    let apply_result = if !enabled {
                                                                         crate::sys_proxy::unset_system_proxy()
+                                                                    } else if app.core_state == CoreState::Running {
+                                                                        crate::sys_proxy::set_system_proxy(&settings)
+                                                                    } else {
+                                                                        Ok(())
                                                                     };
                                                                     match apply_result {
                                                                         Ok(()) => {

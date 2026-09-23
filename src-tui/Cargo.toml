@@ -37,6 +37,12 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "std",
+  "registry",
+  "ansi",
+] }
 nix = { version = "0.31", default-features = false, features = [
   "signal",
   "process",
@@ -58,6 +64,7 @@ uuid = { version = "1", features = ["v4"] }
 serde_yaml_ng = { workspace = true }
 smartstring = { workspace = true }
 tempfile = "3"
+sha2 = "0.10"
 
 [dev-dependencies]
 serde = { workspace = true }

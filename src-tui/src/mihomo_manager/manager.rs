@@ -150,6 +150,10 @@ impl ManagerInner {
             });
         }
 
+        // The desktop proxy follows the core (no-op unless
+        // `enable_system_proxy` is on). Apply before the watcher exists so a
+        // core that exits immediately is released after this, never raced.
+        crate::sys_proxy::apply_on_core_start().await;
         spawn_watcher(child, inner, config_dir, socket_path);
         Ok(())
     }
@@ -344,6 +348,8 @@ impl MihomoManager {
             let mut state = self.inner.state.lock();
             *state = CoreState::Stopped;
         }
+        // Never leave the desktop pointing at the port we just closed.
+        crate::sys_proxy::release_on_core_stop().await;
 
         if let Some(tx) = self.inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreExited(0));
