@@ -28,11 +28,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     app.language = Language::from_config(app.gui_config.language.as_deref());
     app.core_config = clash_verge_core::config::IClashTemp::new().await;
     app.clash_mode = app.core_config.get_mode().unwrap_or_else(|| "rule".into());
-    if let Some(level) = app.core_config.0.get("log-level").and_then(|level| level.as_str())
-        && crate::app::LOG_LEVELS.contains(&level)
-    {
-        app.log_level = level.to_string();
-    }
+    app.log_level = app.configured_log_level();
 
     // Load profiles on start
     if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
@@ -41,10 +37,26 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         app.status_msg = Some(format!("{} profiles loaded", app.profiles.len()));
     }
 
+    // Optional key remaps and mouse support; a broken file is reported and
+    // ignored rather than keeping the TUI from starting.
+    let tui_config = match crate::tui::keymap::TuiConfig::path().map(|path| crate::tui::keymap::TuiConfig::load(&path))
+    {
+        Some(Ok(config)) => config,
+        Some(Err(error)) => {
+            app.config_warning = Some(format!("{error:#} (ignored)"));
+            crate::tui::keymap::TuiConfig::default()
+        }
+        None => crate::tui::keymap::TuiConfig::default(),
+    };
+    if tui_config.mouse {
+        guard.lock().await.enable_mouse()?;
+    }
+
     let ctx = Ctx {
         manager,
         tx: action_tx,
         guard,
+        keys: tui_config.keys,
     };
 
     let mut events = EventStream::new();
@@ -102,6 +114,11 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         tokio::select! {
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Resize(_, _))) => ctx.guard.lock().await.reset_screen()?,
+                Some(Ok(Event::Mouse(mouse))) => {
+                    let screen = ctx.guard.lock().await.terminal_mut().size()?;
+                    let screen = ratatui::layout::Rect::new(0, 0, screen.width, screen.height);
+                    handlers::handle_mouse(&mut app, &ctx, mouse, screen).await;
+                }
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     let flow = handlers::handle_key(&mut app, &ctx, key).await;
                     if flow == Flow::Quit {

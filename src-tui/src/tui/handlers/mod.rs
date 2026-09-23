@@ -25,7 +25,7 @@ mod tun;
 use std::future::Future;
 use std::sync::Arc;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{Action, App, Focus, InputMode, Overlay, View};
@@ -49,6 +49,8 @@ pub(super) struct Ctx {
     pub manager: MihomoManager,
     pub tx: UnboundedSender<Action>,
     pub guard: Arc<tokio::sync::Mutex<TerminalGuard>>,
+    /// Key remaps from `tui.yaml`.
+    pub keys: crate::tui::keymap::KeyMap,
 }
 
 impl Ctx {
@@ -97,10 +99,58 @@ pub(super) async fn handle_key(app: &mut App, ctx: &Ctx, key: KeyEvent) -> Flow 
         navigation::filter_input(app, key);
         return Flow::Continue;
     }
+    // Remaps apply to commands, never to typed text such as a password.
+    let key = if app.overlay == Some(Overlay::PasswordInput) {
+        key
+    } else {
+        match ctx.keys.translate(key) {
+            Some(key) => key,
+            None => return Flow::Continue,
+        }
+    };
     match input::map_key(key, key_context(app)) {
         Some(action) => handle_intent(app, ctx, action).await,
         None => Flow::Continue,
     }
+}
+
+/// Handle a mouse event (only reported with `mouse: true` in tui.yaml) on a
+/// screen of `screen`: the wheel moves the selection of the pane under the
+/// pointer, a click on the menu switches views, a click elsewhere focuses
+/// the content.
+pub(super) async fn handle_mouse(app: &mut App, ctx: &Ctx, event: MouseEvent, screen: ratatui::layout::Rect) -> Flow {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    // Dialogs and prompts are keyboard-only.
+    if app.overlay.is_some() || !matches!(app.input_mode, InputMode::Normal) {
+        return Flow::Continue;
+    }
+    let areas = crate::ui::shell_areas(app, screen);
+    let position = ratatui::layout::Position::new(event.column, event.row);
+    let on_menu = areas.menu.contains(position);
+    let on_content = areas.content.contains(position);
+    match event.kind {
+        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if on_menu || on_content => {
+            app.focus = if on_menu { Focus::Menu } else { Focus::Content };
+            let forward = event.kind == MouseEventKind::ScrollDown;
+            if on_menu {
+                // The menu follows the view, as j/k with the menu focused.
+                navigation::move_selection(app, forward);
+                navigation::switch_view(app, ctx, app.view);
+            } else {
+                navigation::move_selection(app, forward);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_menu => {
+            if let Some(view) = crate::ui::menu_view_at(app, screen, event.column, event.row) {
+                app.focus = Focus::Menu;
+                navigation::switch_view(app, ctx, view);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) if on_content => app.focus = Focus::Content,
+        _ => {}
+    }
+    Flow::Continue
 }
 
 /// Handle a user intent produced by the key map.
@@ -312,6 +362,7 @@ mod tests {
             manager: MihomoManager::new(std::env::temp_dir()),
             tx,
             guard: Arc::new(tokio::sync::Mutex::new(TerminalGuard::detached())),
+            keys: crate::tui::keymap::KeyMap::default(),
         };
         (ctx, rx)
     }
@@ -514,5 +565,74 @@ mod tests {
             app.status_msg.as_deref(),
             Some("Start the core to change its log level")
         );
+    }
+
+    fn mouse(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    #[tokio::test]
+    async fn mouse_clicks_the_menu_and_scrolls_the_pane_under_the_pointer() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        let screen = ratatui::layout::Rect::new(0, 0, 120, 32);
+        // Status bar (row 0), menu border (row 1), then one row per view.
+        handle_mouse(
+            &mut app,
+            &ctx,
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2 + 4),
+            screen,
+        )
+        .await;
+        assert_eq!(app.view, View::Rules);
+
+        app.rules = vec![rule("a"), rule("b"), rule("c")];
+        handle_mouse(&mut app, &ctx, mouse(MouseEventKind::ScrollDown, 60, 10), screen).await;
+        assert_eq!(app.focus, Focus::Content);
+        assert_eq!(app.rules_selected_index, 1);
+
+        handle_mouse(&mut app, &ctx, mouse(MouseEventKind::ScrollDown, 3, 10), screen).await;
+        assert_eq!(
+            (app.focus, app.view),
+            (Focus::Menu, View::Logs),
+            "wheel on the menu changes view"
+        );
+
+        // Dialogs are keyboard-only.
+        app.overlay = Some(Overlay::Help);
+        handle_mouse(
+            &mut app,
+            &ctx,
+            mouse(MouseEventKind::Down(MouseButton::Left), 3, 2),
+            screen,
+        )
+        .await;
+        assert_eq!(app.view, View::Logs);
+    }
+
+    #[tokio::test]
+    async fn remapped_keys_act_as_their_target_but_not_while_typing_a_password() {
+        let (mut ctx, _rx) = ctx();
+        ctx.keys = crate::tui::keymap::TuiConfig::parse_for_test("keys:\n  x: j\n  q: none\n").keys;
+        let mut app = App::new();
+        app.focus = Focus::Menu;
+
+        handle_key(&mut app, &ctx, key(KeyCode::Char('x'))).await;
+        assert_eq!(app.view, View::Proxies, "x moved the menu like j");
+        assert_eq!(
+            handle_key(&mut app, &ctx, key(KeyCode::Char('q'))).await,
+            Flow::Continue
+        );
+
+        app.overlay = Some(Overlay::PasswordInput);
+        handle_key(&mut app, &ctx, key(KeyCode::Char('x'))).await;
+        assert_eq!(app.password_buffer, ['x']);
     }
 }

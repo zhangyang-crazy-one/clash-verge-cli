@@ -182,6 +182,8 @@ pub struct App {
     pub selected_index: usize,
     pub input_mode: InputMode,
     pub status_msg: Option<String>,
+    /// A problem with `tui.yaml`, kept on Home (status messages get replaced).
+    pub config_warning: Option<String>,
     pub view: View,
     pub focus: Focus,
     pub overlay: Option<Overlay>,
@@ -277,6 +279,7 @@ impl App {
             selected_index: 0,
             input_mode: InputMode::Normal,
             status_msg: None,
+            config_warning: None,
             view: View::Home,
             focus: Focus::Menu,
             overlay: None,
@@ -336,6 +339,18 @@ impl App {
         self.pending_connection_close = None;
         self.runtime_loading = RuntimeLoading::default();
         self.runtime_errors = RuntimeErrors::default();
+    }
+
+    /// The log level the core starts with: `log-level` from the runtime
+    /// config (the `L` key only changes it until the core restarts).
+    pub fn configured_log_level(&self) -> String {
+        self.core_config
+            .0
+            .get("log-level")
+            .and_then(|level| level.as_str())
+            .filter(|level| LOG_LEVELS.contains(level))
+            .unwrap_or("info")
+            .to_string()
     }
 
     /// Take the profile list and the current profile from the store.

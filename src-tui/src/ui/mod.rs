@@ -15,22 +15,49 @@ use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::app::{App, Focus, Overlay, View};
 
-pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+/// Where the shell's parts go on a screen of `area`.
+pub struct ShellAreas {
+    pub status: Rect,
+    pub menu: Rect,
+    pub content: Rect,
+    pub input: Rect,
+}
+
+pub fn shell_areas(app: &App, area: Rect) -> ShellAreas {
     let shell = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
-        .split(frame.area());
-
-    status_bar::draw(frame, shell[0], app);
-
+        .split(area);
     let main = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(nav_width(app)), Constraint::Min(0)])
         .split(shell[1]);
+    ShellAreas {
+        status: shell[0],
+        menu: main[0],
+        content: main[1],
+        input: shell[2],
+    }
+}
 
-    draw_navigation(frame, main[0], app);
-    views::draw(frame, main[1], app);
-    input_bar::draw(frame, shell[2], app);
+/// The view whose menu entry is at (`column`, `row`), when every entry fits
+/// (the menu does not scroll then).
+pub fn menu_view_at(app: &App, area: Rect, column: u16, row: u16) -> Option<View> {
+    let menu = shell_areas(app, area).menu;
+    let inside = column > menu.x && column + 1 < menu.right() && row > menu.y && row + 1 < menu.bottom();
+    let fits = usize::from(menu.height.saturating_sub(2)) >= View::ALL.len();
+    if !inside || !fits {
+        return None;
+    }
+    View::ALL.get(usize::from(row - menu.y - 1)).copied()
+}
+
+pub fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let areas = shell_areas(app, frame.area());
+    status_bar::draw(frame, areas.status, app);
+    draw_navigation(frame, areas.menu, app);
+    views::draw(frame, areas.content, app);
+    input_bar::draw(frame, areas.input, app);
     draw_overlay(frame, app);
 }
 
