@@ -126,7 +126,6 @@ pub struct ResolvedMihomo {
 /// 1. System `verge-mihomo` (left untouched)
 /// 2. Managed data-dir binary at the detected latest version (download/upgrade as needed)
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
-    let target_version = latest_mihomo_version().await;
     if let Some(system) = system_mihomo() {
         let version = read_mihomo_version(&system).await?.unwrap_or_else(|| "unknown".into());
         return Ok(ResolvedMihomo {
@@ -136,6 +135,9 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
         });
     }
 
+    // Only the managed binary depends on the latest release; a system
+    // binary must not wait on the GitHub API.
+    let target_version = latest_mihomo_version().await;
     let managed = mihomo_binary_path();
     // Hold both locks across check → download → install so concurrent
     // starts (TUI + CLI + systemd service) never race on the managed path.

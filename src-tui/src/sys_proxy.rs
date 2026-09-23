@@ -116,13 +116,21 @@ pub fn unset_system_proxy() -> anyhow::Result<()> {
     disable_with(&SystemRunner, &snapshot_path()?)
 }
 
+/// Serialises lifecycle apply/release within the process so a release for
+/// a core that died immediately can never interleave with its apply.
+static LIFECYCLE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Core started: publish the proxy when the user enabled it. Best effort.
+///
+/// Callers run this before the exit watcher exists, so any release for this
+/// core is ordered after it.
 pub async fn apply_on_core_start() {
     let verge = clash_verge_core::config::IVerge::new().await;
     if !verge.enable_system_proxy.unwrap_or(false) {
         return;
     }
     let settings = ProxySettings::load().await;
+    let _lifecycle = LIFECYCLE_LOCK.lock().await;
     match tokio::task::spawn_blocking(move || set_system_proxy(&settings)).await {
         Ok(Ok(())) => tracing::info!(target: "sysproxy", "system proxy applied"),
         Ok(Err(error)) => tracing::warn!(target: "sysproxy", "failed to apply system proxy: {error}"),
@@ -137,6 +145,7 @@ pub async fn release_on_core_stop() {
     let Ok(snapshot) = snapshot_path() else {
         return;
     };
+    let _lifecycle = LIFECYCLE_LOCK.lock().await;
     match tokio::task::spawn_blocking(move || release_with(&SystemRunner, &snapshot, &settings)).await {
         Ok(Ok(true)) => tracing::info!(target: "sysproxy", "system proxy released"),
         Ok(Ok(false)) => {}
@@ -190,15 +199,45 @@ impl Runner for SystemRunner {
     }
 }
 
-/// Desktop settings captured before the first apply, per backend.
+/// Desktop settings captured before the first apply, per backend, plus the
+/// endpoint we last published.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Snapshot {
+    /// Endpoint written to the desktop by the last apply. Release matches the
+    /// desktop against this, not the current config, so editing
+    /// `proxy_host`/`mixed-port` while the core runs cannot orphan the proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied: Option<Endpoint>,
     /// `"<schema> <key>"` → raw `gsettings get` value (GVariant text).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     gnome: BTreeMap<String, String>,
     /// kioslaverc `Proxy Settings` key → value (empty = unset).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     kde: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+impl Endpoint {
+    fn of(settings: &ProxySettings) -> Self {
+        Self {
+            host: settings.host.clone(),
+            port: settings.port,
+        }
+    }
+
+    /// Settings carrying only this endpoint (all the ownership checks read).
+    fn as_settings(&self) -> ProxySettings {
+        ProxySettings {
+            host: self.host.clone(),
+            port: self.port,
+            bypass: Vec::new(),
+        }
+    }
 }
 
 fn read_snapshot(path: &Path) -> Snapshot {
@@ -408,15 +447,20 @@ fn enable_with(runner: &dyn Runner, snapshot_path: &Path, settings: &ProxySettin
     // The file is always written: its presence marks the desktop proxy as
     // applied by us, which `release_with` requires.
     let mut snapshot = read_snapshot(snapshot_path);
-    if gnome && snapshot.gnome.is_empty() && !Gnome::is_ours(runner, settings) {
+    // "Ours" is the endpoint being applied or the one applied last time
+    // (the config may have changed since).
+    let mut ours = vec![settings.clone()];
+    ours.extend(snapshot.applied.as_ref().map(Endpoint::as_settings));
+    if gnome && snapshot.gnome.is_empty() && !ours.iter().any(|s| Gnome::is_ours(runner, s)) {
         snapshot.gnome = Gnome::snapshot(runner);
     }
     if let Some(kde) = &kde
         && snapshot.kde.is_empty()
-        && !kde.is_ours(runner, settings)
+        && !ours.iter().any(|s| kde.is_ours(runner, s))
     {
         snapshot.kde = kde.snapshot(runner);
     }
+    snapshot.applied = Some(Endpoint::of(settings));
     write_snapshot(snapshot_path, &snapshot)?;
 
     let gnome_ok = gnome && Gnome::apply(runner, settings);
@@ -445,21 +489,26 @@ fn disable_with(runner: &dyn Runner, snapshot_path: &Path) -> anyhow::Result<()>
     }
 }
 
-/// Restore each backend that still points at `settings`; leave backends the
-/// user has since re-pointed alone. Only acts when we applied the proxy (the
-/// snapshot marker exists), so another client on the same endpoint — e.g. the
-/// Clash Verge GUI on 127.0.0.1:7897 — is never switched off. Returns
-/// whether anything was changed.
-fn release_with(runner: &dyn Runner, snapshot_path: &Path, settings: &ProxySettings) -> anyhow::Result<bool> {
+/// Restore each backend that still points at the endpoint we applied
+/// (`fallback` only for snapshots written before the endpoint was
+/// recorded); leave backends the user has since re-pointed alone. Only acts
+/// when we applied the proxy (the snapshot marker exists), so another client
+/// on the same endpoint — e.g. the Clash Verge GUI on 127.0.0.1:7897 — is
+/// never switched off. Returns whether anything was changed.
+fn release_with(runner: &dyn Runner, snapshot_path: &Path, fallback: &ProxySettings) -> anyhow::Result<bool> {
     if !snapshot_path.exists() {
         return Ok(false);
     }
-    let gnome_ours = Gnome::available(runner) && Gnome::is_ours(runner, settings);
-    let kde = Kde::detect(runner).filter(|kde| kde.is_ours(runner, settings));
+    let snapshot = read_snapshot(snapshot_path);
+    let settings = snapshot
+        .applied
+        .as_ref()
+        .map_or_else(|| fallback.clone(), Endpoint::as_settings);
+    let gnome_ours = Gnome::available(runner) && Gnome::is_ours(runner, &settings);
+    let kde = Kde::detect(runner).filter(|kde| kde.is_ours(runner, &settings));
     if !gnome_ours && kde.is_none() {
         return Ok(false);
     }
-    let snapshot = read_snapshot(snapshot_path);
     let gnome_ok = !gnome_ours || Gnome::restore(runner, &snapshot.gnome);
     let kde_ok = kde.as_ref().is_none_or(|kde| kde.restore(runner, &snapshot.kde));
     let _ = std::fs::remove_file(snapshot_path);
@@ -640,6 +689,32 @@ mod tests {
         assert!(!release_with(&desktop, &path, &settings()).unwrap());
         assert_eq!(desktop.g("org.gnome.system.proxy mode"), "'manual'");
         assert_eq!(desktop.g("org.gnome.system.proxy.http host"), "'10.0.0.2'");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn release_uses_the_applied_endpoint_after_a_config_change() {
+        let desktop = FakeDesktop::gnome();
+        let path = snapshot_file("moved");
+        enable_with(&desktop, &path, &settings()).unwrap();
+
+        // mixed-port edited while the core runs: release is called with the
+        // new config, but the desktop still carries the applied endpoint.
+        let moved = ProxySettings {
+            port: 7999,
+            ..settings()
+        };
+        assert!(release_with(&desktop, &path, &moved).unwrap());
+        assert_eq!(desktop.g("org.gnome.system.proxy mode"), "'auto'");
+
+        // Re-applying with a new endpoint over the old applied one must not
+        // snapshot our own old values.
+        enable_with(&desktop, &path, &settings()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        enable_with(&desktop, &path, &settings()).unwrap();
+        enable_with(&desktop, &path, &moved).unwrap();
+        assert!(read_snapshot(&path).gnome.is_empty());
+        assert_eq!(read_snapshot(&path).applied, Some(Endpoint::of(&moved)));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

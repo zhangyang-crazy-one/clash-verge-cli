@@ -150,10 +150,11 @@ impl ManagerInner {
             });
         }
 
-        spawn_watcher(child, inner, config_dir, socket_path);
-        // The desktop proxy follows the core: publish it now that mihomo is
-        // listening (no-op unless `enable_system_proxy` is on).
+        // The desktop proxy follows the core (no-op unless
+        // `enable_system_proxy` is on). Apply before the watcher exists so a
+        // core that exits immediately is released after this, never raced.
         crate::sys_proxy::apply_on_core_start().await;
+        spawn_watcher(child, inner, config_dir, socket_path);
         Ok(())
     }
 
