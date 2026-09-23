@@ -1,0 +1,379 @@
+//! Action handlers for the interactive TUI, split by domain.
+//!
+//! The event loop owns the terminal and the `select!`; everything that turns
+//! an input or a background result into a state change lives here:
+//!
+//! - [`handle_key`]: a terminal key press (text input, filter overlay, then
+//!   the key map) becomes an intent;
+//! - [`handle_intent`]: a user intent from the key map;
+//! - [`handle_event`]: an action received on the action channel — results of
+//!   spawned work, lifecycle notices from the mihomo manager, and intents the
+//!   key path hands over.
+//!
+//! Handlers never block the loop on mihomo I/O: they spawn the work through
+//! [`Ctx`] and receive its result as another action.
+
+mod connections;
+mod lifecycle;
+mod navigation;
+mod profile;
+mod proxy;
+mod rules;
+mod settings;
+mod tun;
+
+use std::future::Future;
+use std::sync::Arc;
+
+use crossterm::event::KeyEvent;
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::app::{Action, App, Focus, InputMode, Overlay, View};
+use crate::mihomo_manager::manager::MihomoManager;
+use crate::tui::{TerminalGuard, input};
+
+use navigation::key_context;
+
+pub(super) use profile::spawn_auto_update;
+
+/// What the event loop does after a handler returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Flow {
+    Continue,
+    Quit,
+}
+
+/// Shared handles every handler needs.
+pub(super) struct Ctx {
+    pub manager: MihomoManager,
+    pub tx: UnboundedSender<Action>,
+    pub guard: Arc<tokio::sync::Mutex<TerminalGuard>>,
+}
+
+impl Ctx {
+    /// Queue an action for the next loop iteration.
+    fn send(&self, action: Action) {
+        let _ = self.tx.send(action);
+    }
+
+    /// Run `task` in the background with its own sender.
+    fn spawn<F, Fut>(&self, task: F)
+    where
+        F: FnOnce(UnboundedSender<Action>) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        tokio::spawn(task(self.tx.clone()));
+    }
+
+    /// Run `work` in the background and report its outcome as one action.
+    fn spawn_result<T, E, Fut>(
+        &self,
+        work: Fut,
+        on_ok: impl FnOnce(T) -> Action + Send + 'static,
+        on_err: impl FnOnce(E) -> Action + Send + 'static,
+    ) where
+        Fut: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Send + 'static,
+    {
+        self.spawn(|tx| async move {
+            let _ = tx.send(match work.await {
+                Ok(value) => on_ok(value),
+                Err(error) => on_err(error),
+            });
+        });
+    }
+}
+
+/// Handle one key press.
+pub(super) async fn handle_key(app: &mut App, ctx: &Ctx, key: KeyEvent) -> Flow {
+    if let InputMode::Importing(buffer) = &app.input_mode {
+        let buffer = buffer.clone();
+        profile::import_input(app, ctx, buffer, key.code);
+        return Flow::Continue;
+    }
+    if app.overlay == Some(Overlay::Filter) {
+        navigation::filter_input(app, key);
+        return Flow::Continue;
+    }
+    match input::map_key(key, key_context(app)) {
+        Some(action) => handle_intent(app, ctx, action).await,
+        None => Flow::Continue,
+    }
+}
+
+/// Handle a user intent produced by the key map.
+async fn handle_intent(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
+    match action {
+        Action::Quit => return Flow::Quit,
+        Action::StartCore => lifecycle::start(app, ctx),
+        Action::StopCore => lifecycle::stop(ctx),
+        Action::RestartCore => lifecycle::restart(app, ctx),
+        Action::StartImport => app.input_mode = InputMode::Importing(String::new()),
+        Action::MoveNext => navigation::move_selection(app, true),
+        Action::MovePrevious => navigation::move_selection(app, false),
+        Action::Activate => activate(app, ctx).await,
+        Action::SwitchView(view) => navigation::switch_view(app, ctx, view),
+        Action::CycleFocus => navigation::cycle_focus(app),
+        Action::FocusMenu => app.focus = Focus::Menu,
+        Action::FocusContent => app.focus = Focus::Content,
+        Action::StartFilter => navigation::start_filter(app),
+        Action::ToggleHelp => navigation::toggle_help(app),
+        Action::DismissOverlay => navigation::dismiss_overlay(app),
+        Action::NodeDelayTest => proxy::test_selected_delay(app, ctx),
+        Action::NodeDelayAll => proxy::test_all_delays(app, ctx),
+        Action::ToggleChainMode => proxy::toggle_chain_mode(app),
+        Action::ApplyChain => proxy::apply_chain(app, ctx),
+        Action::ClearChain => proxy::clear_chain(app),
+        Action::RequestCloseConnection => connections::begin_connection_close(app),
+        Action::RequestCloseAllConnections => connections::request_close_all(app),
+        Action::ConfirmCloseConnection(id) => connections::confirm_close_from_key(app, ctx, id),
+        Action::UpdateProfile => profile::update_selected(app, ctx),
+        Action::OpenEditor(target) => settings::open_editor(app, ctx, target).await,
+        // Everything else (password and prompt keys, mode cycling, the
+        // close-all confirmation, rules refresh) is handled exactly like the
+        // same action arriving on the channel.
+        other => return handle_event(app, ctx, other).await,
+    }
+    Flow::Continue
+}
+
+/// `Enter`: act on the selection of the focused view.
+async fn activate(app: &mut App, ctx: &Ctx) {
+    if app.focus == Focus::Menu {
+        app.focus = Focus::Content;
+        return;
+    }
+    match app.view {
+        View::Profiles => profile::switch_selected(app, ctx),
+        View::Proxies => proxy::activate_selected(app, ctx),
+        View::Connections => connections::begin_connection_close(app),
+        View::Rules => rules::update_selected_provider(app, ctx),
+        View::Settings => settings::activate_row(app, ctx).await,
+        _ => {}
+    }
+}
+
+/// Handle an action received on the action channel.
+pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
+    match action {
+        Action::Quit => return Flow::Quit,
+
+        // Core lifecycle.
+        Action::CoreStarted {
+            version,
+            binary_path,
+            binary_source,
+        } => lifecycle::note_started(app, ctx, version, binary_path, binary_source),
+        Action::CoreExited(0) => lifecycle::note_stopped(app),
+        Action::CoreError(msg) => lifecycle::note_error(app, msg),
+        Action::ResumeCoreStart { enable_tun } => lifecycle::resume_start(ctx, enable_tun),
+
+        // Profiles and subscriptions.
+        Action::ConfirmImport(url) => profile::confirm_import(ctx, url),
+        Action::ImportNeedsTrust { url, host } => profile::begin_import_trust(app, url, host),
+        Action::UpdateNeedsTrust { uid, host } => profile::begin_update_trust(app, uid, host),
+        Action::ConfirmTrustImport => profile::handle_confirm_trust(app, &ctx.tx),
+        Action::CancelTrustImport => profile::handle_cancel_trust(app),
+        Action::ProfileImported => profile::note_imported(app, ctx).await,
+        Action::ProfileImportFailed(error) => app.status_msg = Some(format!("Import failed: {error}")),
+        Action::ProfileUpdated { uid, is_current } => profile::note_updated(app, ctx, uid, is_current).await,
+        Action::ProfileUpdateFailed(error) => app.status_msg = Some(format!("Update failed: {error}")),
+
+        // Proxies, delay tests, chains, and mode.
+        Action::ProxiesRefresh if !app.runtime_loading.proxies => proxy::refresh(app, ctx),
+        Action::ProxiesFetched(groups) => proxy::note_fetched(app, groups),
+        Action::ProxiesFailed(error) => {
+            app.runtime_loading.proxies = false;
+            app.runtime_errors.proxies = Some(error);
+        }
+        Action::DelayResult(name, delay) => proxy::note_delay_result(app, name, delay),
+        Action::DelayFailed(name, error) => proxy::note_delay_failed(app, name, error),
+        Action::BatchDelayResult(name, delay) => proxy::note_batch_delay_result(app, name, delay),
+        Action::BatchDelayFailed(name, error) => proxy::note_batch_delay_failed(app, name, error),
+        Action::ChainApplied(nodes) => proxy::note_chain_applied(app, nodes),
+        Action::ChainFailed(error) => app.status_msg = Some(format!("Chain not applied: {error}")),
+        Action::CycleClashMode => proxy::cycle_clash_mode(app, ctx),
+        Action::ModeChanged { mode, announce } => proxy::note_mode_changed(app, mode, announce).await,
+        Action::ModeChangeFailed(error) => {
+            app.status_msg = Some(format!("{}: {error}", app.tr("common.failed")));
+        }
+
+        // Traffic, connections, and logs.
+        Action::TrafficRefresh if !app.runtime_loading.traffic => connections::refresh_traffic(app, ctx),
+        Action::TrafficFetched(traffic) => {
+            app.runtime_errors.traffic = None;
+            app.traffic = Some(traffic);
+        }
+        Action::TrafficFailed(error) => {
+            app.runtime_loading.traffic = false;
+            app.runtime_errors.traffic = Some(error);
+        }
+        Action::ConnectionsRefresh if !app.runtime_loading.connections => connections::refresh_connections(app, ctx),
+        Action::ConnectionsFetched(list) => connections::note_connections(app, list),
+        Action::ConnectionsFailed(error) => {
+            app.runtime_loading.connections = false;
+            app.runtime_errors.connections = Some(error);
+        }
+        Action::ConfirmCloseConnection(id) if connections::close_confirmation_is_current(app, &id) => {
+            connections::close_connection(app, ctx, id);
+        }
+        Action::ConnectionClosed(id) => {
+            app.status_msg = Some(format!("Closed connection {id}"));
+            app.selected_connection_id = None;
+            ctx.send(Action::ConnectionsRefresh);
+        }
+        Action::CloseConnectionFailed { id, error } => {
+            app.runtime_errors.connections = Some(format!("Could not close {id}: {error}"));
+        }
+        Action::ConfirmCloseAllConnections if app.overlay == Some(Overlay::CloseAllConnectionsConfirmation) => {
+            connections::close_all(app, ctx);
+        }
+        Action::AllConnectionsClosed => {
+            app.status_msg = Some("All connections closed".into());
+            ctx.send(Action::ConnectionsRefresh);
+        }
+        Action::CloseAllConnectionsFailed(error) => app.status_msg = Some(format!("Close all failed: {error}")),
+        Action::LogsRefresh if !app.runtime_loading.logs => connections::refresh_logs(app, ctx),
+        Action::LogReceived(log) => connections::note_log(app, log),
+        Action::LogsFailed(error) => {
+            app.runtime_loading.logs = false;
+            app.runtime_errors.logs = Some(error);
+        }
+
+        // Rules and rule providers.
+        Action::RulesRefresh if !app.rules_loading => rules::refresh_rules(app, ctx),
+        Action::RulesFetched(list) => rules::note_rules(app, list),
+        Action::RulesFailed(error) => {
+            app.rules_loading = false;
+            app.rules_error = Some(error);
+        }
+        Action::RuleProvidersRefresh if !app.rule_providers_loading => rules::refresh_providers(app, ctx),
+        Action::RuleProvidersFetched(providers) => rules::note_providers(app, providers),
+        Action::RuleProvidersFailed(error) => {
+            app.rule_providers_loading = false;
+            app.rule_providers_error = Some(error);
+        }
+        Action::RuleProviderUpdated(name) => {
+            app.status_msg = Some(format!("Rule provider updated: {name}"));
+            ctx.send(Action::RuleProvidersRefresh);
+        }
+        Action::RuleProviderUpdateFailed { name, error } => {
+            app.status_msg = Some(format!("Failed to update {name}: {error}"));
+        }
+
+        // TUN setup and the password popup.
+        Action::TunSetupPrompt {
+            binary,
+            enable_tun,
+            reason,
+        } => tun::begin_tun_setup_confirm(app, binary, enable_tun, reason),
+        Action::ConfirmTunSetup => tun::confirm_tun_setup(app),
+        Action::SkipTunSetupStart => tun::skip_tun_setup_start(app, &ctx.tx),
+        Action::TunSetupSucceeded { resume_start } => tun::note_tun_setup_succeeded(app, resume_start, &ctx.tx),
+        Action::TunCapabilityState(privileged) => app.tun_privileged = privileged,
+        Action::TunSetupRequested(binary) => tun::open_password_prompt(app, binary),
+        Action::PasswordChar(c) => app.password_buffer.push(c),
+        Action::PasswordBackspace => {
+            app.password_buffer.pop();
+        }
+        Action::PasswordCancel => tun::handle_password_cancel(app),
+        Action::PasswordSubmit => tun::handle_password_submit(app, &ctx.tx),
+
+        Action::ProbeNotice(message) => app.status_msg = Some(message),
+        _ => {}
+    }
+    Flow::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::KeyCode;
+
+    use super::*;
+
+    fn ctx() -> (Ctx, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Ctx {
+            manager: MihomoManager::new(std::env::temp_dir()),
+            tx,
+            guard: Arc::new(tokio::sync::Mutex::new(TerminalGuard::detached())),
+        };
+        (ctx, rx)
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn quit_key_ends_the_loop_and_other_keys_continue() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        assert_eq!(
+            handle_key(&mut app, &ctx, key(KeyCode::Char('j'))).await,
+            Flow::Continue
+        );
+        assert_eq!(handle_key(&mut app, &ctx, key(KeyCode::Char('q'))).await, Flow::Quit);
+    }
+
+    #[tokio::test]
+    async fn close_all_confirmation_key_starts_closing() {
+        // Enter on the close-all overlay used to be dropped by the key path.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Connections;
+        app.focus = Focus::Content;
+        handle_key(
+            &mut app,
+            &ctx,
+            KeyEvent::new(KeyCode::Char('D'), crossterm::event::KeyModifiers::SHIFT),
+        )
+        .await;
+        assert_eq!(app.overlay, Some(Overlay::CloseAllConnectionsConfirmation));
+
+        handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
+        assert_eq!(app.overlay, None);
+        assert_eq!(app.status_msg.as_deref(), Some("Closing all connections..."));
+    }
+
+    #[tokio::test]
+    async fn rules_refresh_key_starts_loading() {
+        // `r` on the Rules view used to be dropped by the key path.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Rules;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('r'))).await;
+        assert!(app.rules_loading);
+    }
+
+    #[tokio::test]
+    async fn import_mode_edits_the_buffer_and_enter_queues_the_import() {
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.input_mode = InputMode::Importing(String::new());
+        for c in "ab".chars() {
+            handle_key(&mut app, &ctx, key(KeyCode::Char(c))).await;
+        }
+        handle_key(&mut app, &ctx, key(KeyCode::Backspace)).await;
+        assert!(matches!(&app.input_mode, InputMode::Importing(buffer) if buffer == "a"));
+
+        handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
+        assert!(matches!(app.input_mode, InputMode::Normal));
+        assert!(matches!(rx.try_recv(), Ok(Action::ConfirmImport(url)) if url == "a"));
+    }
+
+    #[tokio::test]
+    async fn filter_overlay_collects_text_and_submit_applies_it() {
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.view = View::Logs;
+        handle_key(&mut app, &ctx, key(KeyCode::Char('/'))).await;
+        for c in "err".chars() {
+            handle_key(&mut app, &ctx, key(KeyCode::Char(c))).await;
+        }
+        handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
+        assert_eq!(app.log_filter.as_deref(), Some("err"));
+        assert_eq!(app.overlay, None);
+    }
+}
