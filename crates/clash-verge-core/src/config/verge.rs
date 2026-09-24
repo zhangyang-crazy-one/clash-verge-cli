@@ -1,9 +1,9 @@
 use crate::config::DEFAULT_PAC;
 use crate::utils::{dirs, help};
 use anyhow::Result;
+use compact_str::CompactString as String;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
-use smartstring::alias::String;
 
 /// ### `verge.yaml` schema
 #[derive(Default, Debug, Clone, Deserialize, Serialize)]

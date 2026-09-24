@@ -1,7 +1,7 @@
 use crate::utils::{dirs, help, tmpl};
 use anyhow::{Context as _, Result, bail};
+use compact_str::CompactString as String;
 use serde::{Deserialize, Serialize};
-use smartstring::alias::String;
 use tokio::fs;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

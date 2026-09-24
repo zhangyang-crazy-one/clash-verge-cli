@@ -3,13 +3,6 @@
 [graph]
 all-features = true
 
-[advisories]
-ignore = [
-  # smartstring is unmaintained (no fix exists). It has no known
-  # vulnerability; replacing it with compact_str is tracked in #37.
-  { id = "RUSTSEC-2026-0249", reason = "unmaintained, no known vulnerability; replacement tracked in #37" },
-]
-
 [licenses]
 # Licenses compatible with distributing the GPL-3.0-only binary.
 allow = [
