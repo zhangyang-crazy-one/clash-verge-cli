@@ -346,13 +346,18 @@ pub(crate) mod tests {
         std::env::temp_dir().join("clash-verge-cli-tui-tests")
     }
 
-    /// Claim the global app home dir for this test. Returns a guard that must
-    /// be held (in scope) until the test finishes so no other disk-backed test
-    /// can run while this one is using the shared root.
+    /// Overrides the process-global app home under `TEST_APP_HOME_DIR_LOCK` via
+    /// the core crate's re-settable test seam so the canonical test root wins
+    /// regardless of which test ran first. A test that bypasses this lock (e.g.
+    /// the settings row-5 test calling `set_app_home_dir` directly with its own
+    /// tempdir) can otherwise leave `app_home_dir()` pointing at a path the
+    /// claiming test never wrote to, surfacing as "profile X not found after
+    /// refresh" inside the dispatcher tests that go through
+    /// `reload_current_profile_for_core` / `switch_profile_for_core`.
     pub(crate) async fn claim_test_app_home(root: std::path::PathBuf) -> tokio::sync::MutexGuard<'static, ()> {
         let guard = TEST_APP_HOME_DIR_LOCK.lock().await;
         let _ = std::fs::create_dir_all(root.join("profiles"));
-        dirs::set_app_home_dir(root);
+        dirs::set_app_home_dir_for_tests(root);
         guard
     }
 

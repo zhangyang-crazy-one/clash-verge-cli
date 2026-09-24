@@ -58,6 +58,22 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 frame.render_widget(Paragraph::new(line), area);
                 return;
             }
+            // The service-uninstall confirm mirrors the tun confirm: dialog
+            // renders the warning, the input bar hints at the choice keys.
+            Overlay::ServiceUninstallConfirmation => {
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!("{} ", app.tr("dialog.service_uninstall")),
+                        Style::new().fg(theme::danger()),
+                    ),
+                    Span::styled(
+                        app.tr("dialog.service_uninstall_confirm"),
+                        Style::new().fg(theme::dim()),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+                return;
+            }
             // The canonical password dialog (rounded, localized) renders the
             // prompt and masked buffer; the input bar only hints at the keys.
             Overlay::PasswordInput => {
@@ -93,6 +109,17 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 frame.render_widget(Paragraph::new(line), area);
                 return;
             }
+            Overlay::RulesRestartConfirmation => {
+                let line = Line::from(vec![
+                    Span::styled("Save & restart sing-box core? ", Style::new().fg(theme::warn())),
+                    Span::styled(
+                        "y = apply batch save | n/Esc = keep editing",
+                        Style::new().fg(theme::dim()),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(line), area);
+                return;
+            }
             Overlay::Help => {}
         }
     }
@@ -118,6 +145,72 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
             spans.push(Span::styled(app.tr("input.help_quit"), Style::new().fg(theme::dim())));
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        }
+        InputMode::RuleSetInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("New rule-set ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " format: tag|remote|url or tag|local|path | Enter = add | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::RuleInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("New rule ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " e.g. DOMAIN-SUFFIX,x.com,PROXY | Enter = insert | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::RuleFormInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("Rule form ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " kind=value>target | kinds: domain suffix keyword ip port process set | targets: DIRECT REJECT <outbound> | Enter = insert | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::DnsServerInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("DNS server ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " format: kind|tag|server|port|detour (kinds: udp tls https quic local fakeip) | Enter = add | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::DnsRuleInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("DNS rule ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " format: server-tag|suffix=a.com,b|keyword=x|cidr=10.0.0.0/8 | Enter = add | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+        }
+        InputMode::DnsResolverInput(buffer) => {
+            let line = Line::from(vec![
+                Span::styled("domain_resolver ", Style::new().fg(theme::accent())),
+                Span::styled(buffer.clone(), Style::new().fg(theme::text())),
+                Span::styled(
+                    " server tag that resolves remote server/node domains | empty clears | Enter = save | Esc = cancel",
+                    Style::new().fg(theme::dim()),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
         }
         InputMode::Importing(buffer) => {
             let line = Line::from(vec![

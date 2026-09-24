@@ -333,6 +333,30 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             app.status_msg = Some(format!("Failed to update {name}: {error}"));
         }
 
+        // Rule / DNS editing flows.
+        Action::RulesEditToggle => rules::toggle_edit_mode(app).await,
+        Action::RulesEditAdd => rules::open_rule_input(app),
+        Action::RulesEditAddRuleSet => rules::open_rule_set_input(app),
+        Action::RulesEditDeleteRuleSet => rules::delete_rule_set(app),
+        Action::RulesEditDelete => rules::delete_selected_rule(app),
+        Action::RulesEditMoveUp => rules::move_rule_up(app),
+        Action::RulesEditMoveDown => rules::move_rule_down(app),
+        Action::RulesEditSave => rules::save_rules(app, ctx),
+        Action::RulesEditSaveConfirmed => rules::confirm_save_rules(app, ctx),
+        Action::RulesEditSaveCancelled => rules::cancel_save_rules(app),
+        Action::RuleFormAdd => rules::open_rule_form(app),
+        Action::RulesEditSaved(message) => rules::note_rules_saved(app, ctx, message),
+        Action::RulesEditFailed(error) => rules::note_rules_failed(app, error),
+        Action::DnsEditToggle => rules::toggle_dns_edit(app),
+        Action::DnsFocusToggle => rules::toggle_dns_focus(app),
+        Action::DnsAddServer => rules::open_dns_server_input(app),
+        Action::DnsAddRule => rules::open_dns_rule_input(app),
+        Action::DnsSetResolver => rules::open_dns_resolver_input(app),
+        Action::DnsDeleteEntry => rules::delete_dns_entry(app),
+        Action::DnsApply => rules::apply_dns_edit(app, ctx),
+        Action::DnsApplied(message) => rules::note_dns_applied(app, message),
+        Action::DnsApplyFailed(error) => rules::note_dns_failed(app, error),
+
         // TUN setup and the password popup.
         Action::TunSetupPrompt {
             binary,
@@ -351,10 +375,102 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::PasswordCancel => tun::handle_password_cancel(app),
         Action::PasswordSubmit => tun::handle_password_submit(app, &ctx.tx),
 
+        // Service install / uninstall share the password popup with TUN
+        // setup: routing these actions here is what guarantees the password
+        // flow never falls back to a silent drop. Without these arms the
+        // existing `_ => {}` would swallow the action and the popup would
+        // never open.
+        Action::ConfirmServiceUninstall => tun::confirm_service_uninstall(app),
+        Action::CancelServiceUninstall => tun::cancel_service_uninstall(app),
+        Action::ServiceInstalled => {
+            app.status_msg = Some(app.tr("settings.service_installed").into());
+        }
+        Action::ServiceUninstalled => {
+            app.status_msg = Some(app.tr("settings.service_uninstalled").into());
+        }
+        Action::ServiceActionFailed(error) => {
+            app.status_msg = Some(format!("{}: {error}", app.tr("settings.service_failed")));
+        }
+        Action::ServiceStatusRefresh => refresh_service_status(ctx),
+        Action::ServiceStatus {
+            active,
+            enabled,
+            installed,
+            auto_launch,
+        } => {
+            app.service_active = active;
+            app.service_enabled = enabled;
+            app.service_installed = installed;
+            app.auto_launch_enabled = auto_launch;
+        }
+        Action::AutoLaunchChanged { enabled } => {
+            // Sync TUI runtime state with the persisted config (verge.yaml
+            // was already written by `toggle_autostart` before the unit
+            // apply succeeded). The cached display flag follows the real
+            // systemd state — never a write that never took effect.
+            app.gui_config.enable_auto_launch = Some(enabled);
+            app.auto_launch_enabled = enabled;
+            app.status_msg = Some(if enabled {
+                app.tr("settings.auto_launch_on_msg").into()
+            } else {
+                app.tr("settings.auto_launch_off_msg").into()
+            });
+        }
+        Action::AutoLaunchFailed(error) => {
+            app.status_msg = Some(format!("{}: {error}", app.tr("settings.auto_launch_failed")));
+            // The unit apply failed: re-probe the cached systemd state so
+            // the row reflects reality (the failed apply means nothing
+            // actually changed on disk and the persisted verge.yaml was
+            // already rolled back by `toggle_autostart`).
+            refresh_service_status(ctx);
+        }
+
         Action::ProbeNotice(message) => app.status_msg = Some(message),
+        Action::SysProxyReassert => {
+            // Final decision on the event loop against LIVE state: a toggle
+            // processed before this action can never be clobbered by a
+            // deferred task (the readiness probe only arms this action;
+            // the probe task itself never touches the desktop), and the
+            // mixed port is re-read so external config edits between core
+            // starts are honored. `app.gui_config` is the cached snapshot
+            // the probe saw at CoreStarted time and is intentionally NOT
+            // consulted here — re-reading `verge.yaml` is what makes the
+            // protection above a *user-toggle* protection: a flip
+            // processed AFTER the probe but BEFORE this arm must not be
+            // silently overridden. PAC mode never gets downgraded to
+            // manual mode.
+            let live = clash_verge_core::config::IVerge::new().await;
+            if live.enable_system_proxy.unwrap_or(false) && !live.proxy_auto_config.unwrap_or(false) {
+                let port = clash_verge_core::config::IClashTemp::new().await.get_mixed_port();
+                let settings = crate::sys_proxy::ProxySettings::from_config(&live, port);
+                if let Err(error) = crate::sys_proxy::set_system_proxy(&settings) {
+                    app.status_msg = Some(format!("system proxy re-apply failed: {error}"));
+                }
+            }
+        }
         _ => {}
     }
     Flow::Continue
+}
+
+/// Refresh the cached `service_installed` / `service_active` /
+/// `service_enabled` / `auto_launch_enabled` probes. Runs the
+/// `systemctl`/`list-unit-files` invocations on a background task so the
+/// event loop never blocks on subprocess I/O, and emits the result as a
+/// `ServiceStatus` action that the match arm above stores back into `app`.
+fn refresh_service_status(ctx: &Ctx) {
+    ctx.spawn(|tx| async move {
+        let active = crate::service_cmd::service_active_state();
+        let enabled = crate::service_cmd::service_enabled_state();
+        let installed = crate::service_cmd::service_installed_state();
+        let auto_launch = crate::autostart::is_enabled();
+        let _ = tx.send(Action::ServiceStatus {
+            active,
+            enabled,
+            installed,
+            auto_launch,
+        });
+    });
 }
 
 #[cfg(test)]
@@ -697,5 +813,138 @@ mod tests {
         .await;
         assert!(!app.unlock.running);
         assert!(app.unlock.checked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn auto_launch_changed_syncs_state_and_announces() {
+        // The Settings row 6 toggle is fire-and-forget: the activation fn
+        // spawns the task; the eventual AutoLaunchChanged action updates
+        // BOTH the persisted config (gui_config.enable_auto_launch) and
+        // the cached display flag (auto_launch_enabled). The status
+        // message names the new state.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        assert_eq!(app.gui_config.enable_auto_launch, None);
+        assert!(!app.auto_launch_enabled);
+
+        handle_event(&mut app, &ctx, Action::AutoLaunchChanged { enabled: true }).await;
+        assert_eq!(app.gui_config.enable_auto_launch, Some(true));
+        assert!(app.auto_launch_enabled);
+        let on_msg = app.status_msg.as_deref().expect("status on enable");
+        assert!(
+            on_msg.contains("login") || on_msg.contains("autostart") || on_msg.contains("Autostart"),
+            "enable status must announce the new state: {on_msg}"
+        );
+
+        handle_event(&mut app, &ctx, Action::AutoLaunchChanged { enabled: false }).await;
+        assert_eq!(app.gui_config.enable_auto_launch, Some(false));
+        assert!(!app.auto_launch_enabled);
+        let off_msg = app.status_msg.as_deref().expect("status on disable");
+        assert!(
+            off_msg.contains("disabled") || off_msg.contains("off"),
+            "disable status must announce the new state: {off_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_launch_failed_reports_error_and_schedules_resync() {
+        // AutoLaunchFailed must NOT silently drop. The user sees the error
+        // text verbatim (systemctl stderr / "Failed to connect to bus" on
+        // a headless session). The cached probes are scheduled to re-run
+        // so the row reflects reality: the persisted verge.yaml was
+        // already rolled back by `toggle_autostart`, and the systemd state
+        // hasn't changed, so the row must re-resync.
+        //
+        // The actual refresh spawns a background task that does
+        // `systemctl` subprocess I/O; we don't try to await it here (the
+        // production event loop owns that scheduling). We do verify the
+        // status bar surfaces the error verbatim.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            &ctx,
+            Action::AutoLaunchFailed("Failed to connect to bus: No such file or directory".to_string()),
+        )
+        .await;
+        let message = app.status_msg.as_deref().expect("status message set on failure");
+        assert!(
+            message.contains("Failed to connect to bus"),
+            "systemctl stderr must surface verbatim: {message}"
+        );
+        // The cached display flag stays at the pre-toggle value — the
+        // failed apply means reality (systemd state) hasn't moved.
+        assert_eq!(
+            app.auto_launch_enabled, false,
+            "a failed toggle must NOT flip the cached display flag"
+        );
+        assert_eq!(
+            app.gui_config.enable_auto_launch, None,
+            "the persisted flag is owned by `toggle_autostart`'s rollback; the loop only mirrors success here"
+        );
+    }
+
+    #[tokio::test]
+    async fn sysproxy_reassert_skips_apply_when_live_toggle_was_disabled() {
+        // The readiness probe scheduled by `note_started` snapshots the
+        // toggle at CoreStarted time. By the time the probe completes
+        // (and arms this reassert), the user may already have flipped the
+        // toggle off via Settings. The apply MUST honor the live
+        // `verge.yaml` instead of the cached gui_config, otherwise a
+        // deferred task silently re-enables what the user just turned
+        // off. Default `IVerge::new()` (no `set_app_home_dir` was called
+        // in this test) returns template defaults with
+        // `enable_system_proxy: Some(false)` and `proxy_auto_config:
+        // Some(false)`, which is exactly the off state we want to
+        // simulate.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        // Cached value says on — what the readiness probe saw at the
+        // CoreStarted snapshot. The handler must NOT trust this.
+        app.gui_config.enable_system_proxy = Some(true);
+        app.gui_config.proxy_auto_config = Some(false);
+
+        handle_event(&mut app, &ctx, Action::SysProxyReassert).await;
+
+        // No re-apply failure status was set: the live re-read
+        // short-circuited before the apply. A status set by some
+        // earlier handler is allowed to remain (it just must not be the
+        // re-apply failure line).
+        if let Some(message) = app.status_msg.as_deref() {
+            assert!(
+                !message.contains("system proxy re-apply"),
+                "user-disabled toggle must NOT trigger an apply: {message:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sysproxy_reassert_does_not_touch_cached_proxy_state() {
+        // The reassert handler is read-only with respect to `app`: it
+        // re-reads verge.yaml from disk, applies (or skips), and only
+        // writes back a status message on failure. It must never mutate
+        // `app.gui_config` — the cached snapshot is the probe's
+        // evidence and the Settings row uses its own refresh path. A
+        // regression here would re-introduce the clobber bug by letting
+        // the apply path overwrite the cached toggle state on disk
+        // reads that are not user-initiated.
+        let (ctx, _rx) = ctx();
+        let mut app = App::new();
+        app.gui_config.enable_system_proxy = Some(true);
+        app.gui_config.proxy_auto_config = Some(true);
+        app.gui_config.proxy_host = Some("10.0.0.99".into());
+        let host_before = app.gui_config.proxy_host.clone();
+        let enabled_before = app.gui_config.enable_system_proxy;
+
+        handle_event(&mut app, &ctx, Action::SysProxyReassert).await;
+
+        assert_eq!(
+            app.gui_config.enable_system_proxy, enabled_before,
+            "cached toggle must be left untouched"
+        );
+        assert_eq!(
+            app.gui_config.proxy_host, host_before,
+            "cached host must be left untouched"
+        );
     }
 }

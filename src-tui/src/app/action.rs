@@ -7,6 +7,8 @@ pub enum EditorTarget {
     Verge,
     #[allow(dead_code)]
     Dns,
+    /// Task 8.4: raw sing-box runtime config (singbox.json).
+    Singbox,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +158,39 @@ pub enum Action {
 
     // Rules
     RulesRefresh,
+    /// Task 7.1: enter/exit profile rule edit mode.
+    RulesEditToggle,
+    RulesEditDelete,
+    RulesEditMoveUp,
+    RulesEditMoveDown,
+    RulesEditSave,
+    /// Task 7.2: open the rule-string input inside edit mode.
+    RulesEditAdd,
+    /// Task 7.4: open the rule-set definition input inside edit mode.
+    RulesEditAddRuleSet,
+    RulesEditDeleteRuleSet,
+    /// Task 7.1: save outcome (status message) — exits edit mode on success.
+    RulesEditSaved(String),
+    RulesEditFailed(String),
+    /// Task 7.5: explicit confirm before saving under sing-box (core restart).
+    RulesEditSaveConfirmed,
+    RulesEditSaveCancelled,
+    /// Task 7.2: open the structured rule form input.
+    RuleFormAdd,
+    /// Task 8.1: structured sing-box DNS editor.
+    DnsEditToggle,
+    /// Switch DNS editor focus between servers and split rules.
+    DnsFocusToggle,
+    DnsAddServer,
+    /// Delete the entry at the cursor of the focused DNS list.
+    DnsDeleteEntry,
+    DnsAddRule,
+    /// Edit the bootstrap domain_resolver server tag.
+    DnsSetResolver,
+    /// Persist + regenerate config + restart sing-box.
+    DnsApply,
+    DnsApplied(String),
+    DnsApplyFailed(String),
     RulesFetched(Vec<Rule>),
     RulesFailed(String),
     RuleProvidersRefresh,
@@ -209,6 +244,45 @@ pub enum Action {
     /// The user chose the explicit Settings → TUN setup action and the
     /// resolved binary needs capabilities; open the popup.
     TunSetupRequested(std::path::PathBuf),
+
+    // System service + login autostart (Settings rows 5 and 6)
+    /// Refresh the cached read-only service/autostart probes
+    /// (`systemctl is-active/is-enabled`, `systemctl --user is-enabled`).
+    ServiceStatusRefresh,
+    /// Result of the refresh probe: cached values for the Settings rows.
+    ServiceStatus {
+        active: String,
+        enabled: String,
+        /// Whether the system service unit file is installed (unit presence
+        /// probe, not `is-enabled` — an installed-but-disabled unit must
+        /// still offer uninstall).
+        installed: bool,
+        auto_launch: bool,
+    },
+    /// User pressed `y` on the service-uninstall confirm: open the password
+    /// popup with a `ServiceUninstall` pending action.
+    ConfirmServiceUninstall,
+    /// User pressed `n`/Esc/q on the service-uninstall confirm: cancel.
+    CancelServiceUninstall,
+    /// The sudo -S service install transaction succeeded.
+    ServiceInstalled,
+    /// The sudo -S service uninstall transaction succeeded.
+    ServiceUninstalled,
+    /// A service install/uninstall transaction failed (`sudo`/`systemctl`
+    /// stderr is the payload).
+    ServiceActionFailed(String),
+    /// The core's controller answered after CoreStarted; the event loop
+    /// should now re-read the live toggle/port and re-assert the GNOME/KDE
+    /// system proxy. The apply happens on the loop (never in the detached
+    /// probe task) so it stays serialized with the user's proxy toggle.
+    SysProxyReassert,
+    /// The login-autostart toggle succeeded; `enabled` is the new state.
+    AutoLaunchChanged {
+        enabled: bool,
+    },
+    /// The login-autostart toggle failed (`systemctl --user` error text is
+    /// the payload — headless/no-user-session surfaces verbatim).
+    AutoLaunchFailed(String),
 }
 
 const fn _assert_send_sync() {
@@ -253,6 +327,20 @@ mod tests {
         let _ = Action::ConfirmTunSetup;
         let _ = Action::SkipTunSetupStart;
         let _ = Action::ResumeCoreStart { enable_tun: true };
+        let _ = Action::ServiceStatusRefresh;
+        let _ = Action::ServiceStatus {
+            active: "active".to_string(),
+            enabled: "enabled".to_string(),
+            installed: true,
+            auto_launch: true,
+        };
+        let _ = Action::ConfirmServiceUninstall;
+        let _ = Action::CancelServiceUninstall;
+        let _ = Action::ServiceInstalled;
+        let _ = Action::ServiceUninstalled;
+        let _ = Action::ServiceActionFailed("sudo: no tty".to_string());
+        let _ = Action::AutoLaunchChanged { enabled: true };
+        let _ = Action::AutoLaunchFailed("systemctl --user enable failed".to_string());
     }
 
     fn assert_send_sync<T: Send + Sync>() {}

@@ -61,7 +61,13 @@ pub async fn from_url(
         .unwrap_or_else(|| CompactString::from(filename.as_str()));
 
     let data = result.body.trim_start_matches('\u{feff}');
-    validate_clash_yaml(data)?;
+    // A native sing-box JSON profile (top-level `outbounds`) is stored
+    // verbatim as `.json` so the sing-box core can run the provider's own
+    // config; every other subscription must be Clash YAML.
+    let native_singbox = is_singbox_json_profile(data);
+    if !native_singbox {
+        validate_clash_yaml(data)?;
+    }
 
     let mut fragments = Vec::new();
     ensure_chain_uid("merge", &mut merge, || PrfItem::from_merge(None), &mut fragments)?;
@@ -71,7 +77,7 @@ pub async fn from_url(
     ensure_chain_uid("groups", &mut groups, PrfItem::from_groups, &mut fragments)?;
 
     let uid = CompactString::from(help::get_uid("R"));
-    let file = CompactString::from(format!("{uid}.yaml"));
+    let file = CompactString::from(format!("{uid}.{}", if native_singbox { "json" } else { "yaml" }));
 
     let item = PrfItem {
         uid: Some(uid),
@@ -168,6 +174,21 @@ pub fn validate_clash_yaml(data: &str) -> anyhow::Result<Mapping> {
         bail!("profile does not contain `proxies` or `proxy-providers`");
     }
     Ok(yaml)
+}
+
+/// Whether the body is a native sing-box JSON profile: a JSON object carrying
+/// a non-empty `outbounds` array. Clash subscriptions are YAML, so a parse
+/// succeeding as JSON *with* `outbounds` is unambiguous.
+pub fn is_singbox_json_profile(data: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("outbounds")
+                .and_then(serde_json::Value::as_array)
+                .map(|outbounds| !outbounds.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 pub fn parse_subscription_userinfo(headers: &HashMap<String, String>) -> Option<PrfExtra> {
@@ -319,6 +340,18 @@ mod tests {
         assert!(validate_clash_yaml("proxy-providers: {}\n").is_ok());
         assert!(validate_clash_yaml("port: 7890\n").is_err());
         assert!(validate_clash_yaml("not: [yaml").is_err());
+    }
+
+    #[test]
+    fn detects_native_singbox_json_profile() {
+        let valid = r#"{"outbounds":[{"type":"vless","tag":"node1"}]}"#;
+        assert!(is_singbox_json_profile(valid));
+        let empty = r#"{"outbounds":[]}"#;
+        assert!(!is_singbox_json_profile(empty));
+        let clash = "proxies:\n  - name: node1\n";
+        assert!(!is_singbox_json_profile(clash));
+        let malformed = "{not valid json";
+        assert!(!is_singbox_json_profile(malformed));
     }
 
     #[test]

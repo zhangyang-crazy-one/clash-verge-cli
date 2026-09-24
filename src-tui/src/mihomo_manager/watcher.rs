@@ -9,6 +9,7 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 
+use super::manager::{ExitDisposition, classify_exit};
 use crate::app::{Action, CoreState};
 use crate::mihomo_manager::manager::ManagerInner;
 
@@ -20,7 +21,13 @@ use crate::mihomo_manager::manager::ManagerInner;
 /// `ManagerInner::try_auto_restart` after a small backoff. Otherwise
 /// the manager state is transitioned to `Error` and a
 /// `Action::CoreError` is sent.
-pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, socket_path: &Path) -> JoinHandle<()> {
+pub fn spawn_watcher(
+    child: Child,
+    inner: Arc<ManagerInner>,
+    config_dir: &Path,
+    socket_path: &Path,
+    spawned_gen: u64,
+) -> JoinHandle<()> {
     // The auto-restart path outlives this function, so own the paths.
     let config_dir = config_dir.to_path_buf();
     let socket_path = socket_path.to_path_buf();
@@ -65,9 +72,33 @@ pub fn spawn_watcher(child: Child, inner: Arc<ManagerInner>, config_dir: &Path, 
             let _ = tx.send(Action::CoreExited(exit_code));
         }
 
-        // Skip auto-restart when the core was shut down on purpose.
+        // Combined exit classification: owner main's legacy `expected_exit`
+        // bool + cross-process pidfile intent (already set state to
+        // Stopped above when `expected` is true) is merged with the
+        // sing-box branch's generation-race classifier (task 3.1). Either
+        // path that says "intentional" must skip the auto-restart; the
+        // classifier additionally guards against a stale watcher from a
+        // superseded spawn resurrecting itself.
         if expected {
+            // Legacy path: this process's stop() set the bool, or another
+            // process (a TUI, `clash-verge-cli stop`) wrote a stop intent
+            // matching this pid. State was already set to Stopped above.
             return;
+        }
+        match super::manager::classify_exit(
+            spawned_gen,
+            inner.generation.load(Ordering::SeqCst),
+            inner.expected_exit_gen.load(Ordering::SeqCst),
+        ) {
+            ExitDisposition::StaleWatchedOver => return,
+            ExitDisposition::IntentionalStop => {
+                // Generation-only intentional (our own stop() armed
+                // expected_exit_gen but no bool/pidfile path matched this
+                // exit). The state was NOT set above.
+                *inner.state.lock() = CoreState::Stopped;
+                return;
+            }
+            ExitDisposition::Crash => {}
         }
 
         if inner.should_auto_restart() {

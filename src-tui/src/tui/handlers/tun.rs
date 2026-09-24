@@ -1,14 +1,21 @@
 //! TUN setup flow: the core-start setup confirm and the password popup.
+//!
+//! The same password popup is reused by the service install / uninstall
+//! flows: each spawns exactly one `sudo -S` transaction whose contents come
+//! from `PendingSudoAction`. The TUI-native setup confirm is still owned by
+//! `begin_tun_setup_confirm` / `skip_tun_setup_start`; the service path
+//! opens the password popup directly through `begin_service_install` and
+//! `confirm_service_uninstall`.
 
 use tokio::sync::mpsc;
 
-use crate::app::{Action, App, CoreState, Focus, Overlay, TunPending, TunSetupReason};
+use crate::app::{Action, App, CoreState, Focus, Overlay, PendingSudoAction, TunSetupReason};
 
 /// Settings → TUN setup found an uncapped binary: ask for the sudo password.
 pub(super) fn open_password_prompt(app: &mut App, binary: std::path::PathBuf) {
     app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
     app.password_buffer.clear();
-    app.pending_tun = Some(TunPending {
+    app.pending_sudo = Some(PendingSudoAction::TunSetup {
         binary,
         resume_start: None,
         reason: TunSetupReason::MissingCapability,
@@ -16,53 +23,130 @@ pub(super) fn open_password_prompt(app: &mut App, binary: std::path::PathBuf) {
     app.overlay = Some(Overlay::PasswordInput);
 }
 
-/// Handle a submitted password for the TUN setup transaction.
+/// Open the password popup with a `ServiceInstall` pending action. The
+/// transaction writes the systemd unit using the captured password
+/// (`sudo -S`, no askpass) and starts the service in the same boundary.
+pub(super) fn begin_service_install(app: &mut App, binary_path: String, config_dir: String) {
+    app.password_prompt = Some(app.tr("settings.service_install_prompt").into());
+    app.password_buffer.clear();
+    app.pending_sudo = Some(PendingSudoAction::ServiceInstall {
+        binary_path,
+        config_dir,
+    });
+    app.overlay = Some(Overlay::PasswordInput);
+}
+
+/// `y` on the `ServiceUninstallConfirmation` overlay: open the password
+/// popup with a `ServiceUninstall` pending action. The transaction runs the
+/// whole uninstall (stop + disable + remove unit + reload systemd) under a
+/// single `sudo -S` boundary.
+pub(super) fn confirm_service_uninstall(app: &mut App) {
+    app.password_prompt = Some(app.tr("settings.service_uninstall_prompt").into());
+    app.password_buffer.clear();
+    app.pending_sudo = Some(PendingSudoAction::ServiceUninstall);
+    app.overlay = Some(Overlay::PasswordInput);
+}
+
+/// `n` / Esc / `q` on the `ServiceUninstallConfirmation` overlay: cancel.
+/// The pending state was never opened (the service uninstall confirmation
+/// does not pre-stage a transaction), so dropping the overlay is enough —
+/// no transaction runs, no service state is touched.
+pub(super) fn cancel_service_uninstall(app: &mut App) {
+    app.overlay = None;
+    app.status_msg = Some(app.tr("settings.service_uninstall_cancelled").into());
+}
+
+/// Handle a submitted password for the active `PendingSudoAction`. The
+/// popup is shared by three flows — TUN capability setup, service install,
+/// service uninstall — and dispatches exactly one transaction:
 ///
-/// A submit with no pending setup is a stale duplicate Enter (e.g. the
-/// second Enter of a double-press after the popup already closed): it is
-/// ignored instead of aborting the TUI event loop. The spawned task only
-/// runs when a pending setup actually exists.
-///
-/// On success the resume context (`resume_start`, set when the setup was
-/// offered from the core-start prompt) travels with `TunSetupSucceeded` so
-/// the pending core start resumes automatically; the explicit Settings flow
-/// passes `None`.
+/// - A submit with no pending action is a stale duplicate Enter (e.g. the
+///   second Enter of a double-press after the popup already closed): it is
+///   ignored instead of aborting the TUI event loop. The spawned task only
+///   runs when a pending action actually exists.
+/// - On success the resume context (`resume_start`, set when the TUN setup
+///   was offered from the core-start prompt) travels with
+///   `TunSetupSucceeded` so the pending core start resumes automatically;
+///   the explicit Settings flow passes `None`. Service install / uninstall
+///   surface their own terminal actions so the Settings row can refresh
+///   its cached `service_installed` probe.
 pub(super) fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
-    let Some(pending) = app.pending_tun.take() else {
+    let Some(pending) = app.pending_sudo.take() else {
         return;
     };
-    let resume_start = pending.resume_start;
     let password: String = app.password_buffer.drain(..).collect();
     app.overlay = None;
     let tx = action_tx.clone();
-    tokio::spawn(async move {
-        match crate::commands::privilege::apply_tun_capability_with_password(&pending.binary, &password) {
-            Ok(()) => {
-                let _ = tx.send(Action::TunSetupSucceeded { resume_start });
-            }
-            Err(error) => {
-                let _ = tx.send(Action::CoreError(error.to_string()));
-            }
+    match pending {
+        PendingSudoAction::TunSetup {
+            binary,
+            resume_start,
+            reason: _,
+        } => {
+            tokio::spawn(async move {
+                match crate::commands::privilege::apply_tun_capability_with_password(&binary, &password) {
+                    Ok(()) => {
+                        let _ = tx.send(Action::TunSetupSucceeded { resume_start });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Action::CoreError(error.to_string()));
+                    }
+                }
+            });
         }
-    });
+        PendingSudoAction::ServiceInstall {
+            binary_path,
+            config_dir,
+        } => {
+            tokio::spawn(async move {
+                match crate::service_cmd::install_service_with_password(&binary_path, &config_dir, true, &password) {
+                    Ok(()) => {
+                        let _ = tx.send(Action::ServiceInstalled);
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                    }
+                }
+            });
+        }
+        PendingSudoAction::ServiceUninstall => {
+            tokio::spawn(async move {
+                match crate::service_cmd::uninstall_service_with_password(&password) {
+                    Ok(()) => {
+                        let _ = tx.send(Action::ServiceUninstalled);
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Cancel the password popup. When a core start depended on this setup, the
 /// start is abandoned: the transient `Starting` state is reset to `Stopped`
-/// and nothing stale remains (no resume can fire).
+/// and nothing stale remains (no resume can fire). Service install /
+/// uninstall pipelines abandon cleanly — no transaction runs, the cached
+/// service probe stays at its pre-action value, and the status bar reports
+/// the cancellation localized through `settings.service_cancelled`.
 pub(super) fn handle_password_cancel(app: &mut App) {
-    let resume_pending = app
-        .pending_tun
-        .as_ref()
-        .is_some_and(|pending| pending.resume_start.is_some());
+    let pending = app.pending_sudo.take();
     app.overlay = None;
-    app.pending_tun = None;
     app.password_buffer.clear();
-    if resume_pending {
-        app.core_state = CoreState::Stopped;
-        app.status_msg = Some("TUN setup cancelled — core not started".into());
-    } else {
-        app.status_msg = Some("TUN setup cancelled".into());
+    match pending {
+        Some(PendingSudoAction::TunSetup {
+            resume_start: Some(_), ..
+        }) => {
+            app.core_state = CoreState::Stopped;
+            app.status_msg = Some("TUN setup cancelled — core not started".into());
+        }
+        Some(PendingSudoAction::ServiceInstall { .. } | PendingSudoAction::ServiceUninstall) => {
+            app.status_msg = Some(app.tr("settings.service_cancelled").into());
+        }
+        _ => {
+            app.status_msg = Some("TUN setup cancelled".into());
+        }
     }
 }
 
@@ -86,7 +170,7 @@ pub(super) fn begin_tun_setup_confirm(
     enable_tun: bool,
     reason: TunSetupReason,
 ) {
-    app.pending_tun = Some(TunPending {
+    app.pending_sudo = Some(PendingSudoAction::TunSetup {
         binary,
         resume_start: Some(enable_tun),
         reason,
@@ -114,9 +198,9 @@ pub(super) fn confirm_tun_setup(app: &mut App) {
 /// - missing DNS polkit rule only (soft gate, capability present): skip
 ///   starts anyway, preserving the passive DNS-rule warning.
 pub(super) fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
-    let pending = app.pending_tun.take();
+    let pending = app.pending_sudo.take();
     app.overlay = None;
-    let Some(TunPending {
+    let Some(PendingSudoAction::TunSetup {
         resume_start, reason, ..
     }) = pending
     else {
@@ -180,12 +264,12 @@ mod tests {
         let mut app = App::new();
         app.overlay = Some(Overlay::PasswordInput); // stale overlay from a closed popup
         app.password_buffer = vec!['x'];
-        app.pending_tun = None;
+        app.pending_sudo = None;
 
         let (tx, _rx) = mpsc::unbounded_channel::<Action>();
         handle_password_submit(&mut app, &tx);
 
-        assert!(app.pending_tun.is_none(), "nothing may be created by a stale submit");
+        assert!(app.pending_sudo.is_none(), "nothing may be created by a stale submit");
         assert_eq!(
             app.overlay,
             Some(Overlay::PasswordInput),
@@ -220,18 +304,21 @@ mod tests {
         );
 
         assert_eq!(app.overlay, Some(Overlay::TunSetupConfirmation));
-        let pending = app.pending_tun.as_ref().expect("pending setup must be set");
+        let pending = match app.pending_sudo.as_ref() {
+            Some(PendingSudoAction::TunSetup {
+                binary,
+                resume_start,
+                reason,
+            }) => (binary.clone(), *resume_start, *reason),
+            other => panic!("pending setup must be a TunSetup variant, got {other:?}"),
+        };
+        assert_eq!(pending.1, Some(true), "confirm must carry enable_tun for the resume");
         assert_eq!(
-            pending.resume_start,
-            Some(true),
-            "confirm must carry enable_tun for the resume"
-        );
-        assert_eq!(
-            pending.reason,
+            pending.2,
             TunSetupReason::MissingCapability,
             "confirm must carry the gate that fired"
         );
-        assert_eq!(pending.binary, std::path::PathBuf::from("/fake/mihomo"));
+        assert_eq!(pending.0, std::path::PathBuf::from("/fake/mihomo"));
         assert_eq!(
             app.status_msg.as_deref(),
             Some(app.tun_setup_confirm_hint()),
@@ -242,7 +329,7 @@ mod tests {
     #[test]
     fn confirm_tun_setup_opens_the_password_popup_keeping_resume_context() {
         // `y` on the confirm reuses the existing password popup; the resume
-        // context stays in pending_tun so the submit can resume the start.
+        // context stays in pending_sudo so the submit can resume the start.
         let mut app = App::new();
         begin_tun_setup_confirm(
             &mut app,
@@ -254,11 +341,11 @@ mod tests {
 
         assert_eq!(app.overlay, Some(Overlay::PasswordInput));
         assert!(app.password_prompt.is_some(), "prompt label must be set");
-        assert_eq!(
-            app.pending_tun.as_ref().map(|pending| pending.resume_start),
-            Some(Some(true)),
-            "password popup must keep the pending resume"
-        );
+        let resume = match app.pending_sudo.as_ref() {
+            Some(PendingSudoAction::TunSetup { resume_start, .. }) => *resume_start,
+            other => panic!("pending must remain a TunSetup variant, got {other:?}"),
+        };
+        assert_eq!(resume, Some(true), "password popup must keep the pending resume");
     }
 
     #[test]
@@ -299,7 +386,7 @@ mod tests {
         skip_tun_setup_start(&mut app, &tx);
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
-        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");
         match rx.try_recv() {
             Ok(Action::ResumeCoreStart { enable_tun }) => assert!(enable_tun),
             other => panic!("expected ResumeCoreStart, got {other:?}"),
@@ -324,7 +411,7 @@ mod tests {
         skip_tun_setup_start(&mut app, &tx);
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
-        assert!(app.pending_tun.is_none(), "skip must drop the pending setup");
+        assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");
         assert!(
             rx.try_recv().is_err(),
             "capability-missing skip must NOT resume the start"
@@ -377,7 +464,7 @@ mod tests {
         // is reset — no stale flag can fire a resume later.
         let mut app = App::new();
         app.core_state = CoreState::Starting;
-        app.pending_tun = Some(TunPending {
+        app.pending_sudo = Some(PendingSudoAction::TunSetup {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: Some(true),
             reason: TunSetupReason::MissingCapability,
@@ -387,7 +474,7 @@ mod tests {
 
         handle_password_cancel(&mut app);
 
-        assert!(app.pending_tun.is_none());
+        assert!(app.pending_sudo.is_none());
         assert_eq!(app.overlay, None);
         assert!(app.password_buffer.is_empty());
         assert_eq!(
@@ -404,7 +491,7 @@ mod tests {
         // the popup with the plain message and no state reset.
         let mut app = App::new();
         app.core_state = CoreState::Stopped;
-        app.pending_tun = Some(TunPending {
+        app.pending_sudo = Some(PendingSudoAction::TunSetup {
             binary: std::path::PathBuf::from("/fake/mihomo"),
             resume_start: None,
             reason: TunSetupReason::MissingCapability,
@@ -413,8 +500,130 @@ mod tests {
 
         handle_password_cancel(&mut app);
 
-        assert!(app.pending_tun.is_none());
+        assert!(app.pending_sudo.is_none());
         assert_eq!(app.overlay, None);
         assert_eq!(app.status_msg.as_deref(), Some("TUN setup cancelled"));
+    }
+
+    // --- Service install / uninstall password flow ----------------------
+
+    fn begin_service_install_bare(app: &mut App) {
+        begin_service_install(
+            app,
+            "/usr/bin/clash-verge-cli".to_string(),
+            "/home/u/.config/clash-verge-cli".to_string(),
+        );
+    }
+
+    #[test]
+    fn begin_service_install_opens_password_popup_with_pending_install() {
+        // Settings row 5 (service, not installed) → `Enter` must stage the
+        // password popup with the ServiceInstall pending action. No
+        // transaction has run yet (the popup hasn't been submitted), so the
+        // service probe is unchanged.
+        let mut app = App::new();
+        begin_service_install_bare(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::PasswordInput));
+        assert!(app.password_prompt.is_some(), "prompt label must be set");
+        let pending = match app.pending_sudo.as_ref() {
+            Some(PendingSudoAction::ServiceInstall {
+                binary_path,
+                config_dir,
+            }) => (binary_path.clone(), config_dir.clone()),
+            other => panic!("pending must be a ServiceInstall variant, got {other:?}"),
+        };
+        assert_eq!(pending.0, "/usr/bin/clash-verge-cli");
+        assert_eq!(pending.1, "/home/u/.config/clash-verge-cli");
+    }
+
+    #[test]
+    fn confirm_service_uninstall_opens_password_popup_with_pending_uninstall() {
+        // `y` on ServiceUninstallConfirmation → password popup with the
+        // ServiceUninstall pending action. The pre-action service probe is
+        // preserved so the row's status text stays honest about what changed.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+        app.service_installed = true;
+        confirm_service_uninstall(&mut app);
+
+        assert_eq!(app.overlay, Some(Overlay::PasswordInput));
+        assert!(app.password_prompt.is_some(), "prompt label must be set");
+        assert!(
+            matches!(app.pending_sudo.as_ref(), Some(PendingSudoAction::ServiceUninstall)),
+            "pending action must be ServiceUninstall"
+        );
+        assert!(app.service_installed, "probe is only refreshed on success");
+    }
+
+    #[test]
+    fn cancel_service_uninstall_drops_the_overlay_without_touching_state() {
+        // `n`/Esc/q on the uninstall confirmation drops the overlay and
+        // reports the localized cancellation. No password popup was opened
+        // (cancel happens before y), so pending_sudo stays empty.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+        app.service_installed = true;
+        cancel_service_uninstall(&mut app);
+
+        assert_eq!(app.overlay, None, "cancel must dismiss the confirm overlay");
+        assert!(app.pending_sudo.is_none(), "cancel never pre-stages a transaction");
+        assert!(app.service_installed, "probe stays at the pre-action value");
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some(app.tr("settings.service_uninstall_cancelled")),
+            "cancel must report the localized uninstall-cancelled message"
+        );
+    }
+
+    #[test]
+    fn password_cancel_during_service_install_uses_service_message() {
+        // Esc on the password popup while a ServiceInstall is pending: the
+        // cancel path must use the localized service-cancelled message and
+        // must NOT reset core_state (no resume was ever started).
+        let mut app = App::new();
+        app.core_state = CoreState::Stopped;
+        begin_service_install_bare(&mut app);
+        app.password_buffer = vec!['x'];
+
+        handle_password_cancel(&mut app);
+
+        assert!(app.pending_sudo.is_none(), "pending action is dropped on cancel");
+        assert_eq!(app.overlay, None);
+        assert!(app.password_buffer.is_empty());
+        assert_eq!(
+            app.core_state,
+            CoreState::Stopped,
+            "service-install cancel must NOT reset core_state"
+        );
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some(app.tr("settings.service_cancelled")),
+            "cancel must use the localized service-cancelled message"
+        );
+    }
+
+    #[test]
+    fn password_cancel_during_service_uninstall_uses_service_message() {
+        // Esc on the password popup while a ServiceUninstall is pending:
+        // cancel must drop the pending action, leave the service probe at
+        // its pre-action value, and report the localized cancellation.
+        let mut app = App::new();
+        app.overlay = Some(Overlay::ServiceUninstallConfirmation);
+        app.service_installed = true;
+        confirm_service_uninstall(&mut app);
+        app.password_buffer = vec!['x'];
+
+        handle_password_cancel(&mut app);
+
+        assert!(app.pending_sudo.is_none(), "pending action is dropped on cancel");
+        assert_eq!(app.overlay, None);
+        assert!(app.password_buffer.is_empty());
+        assert!(app.service_installed, "probe stays at the pre-action value");
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some(app.tr("settings.service_cancelled")),
+            "cancel must use the localized service-cancelled message"
+        );
     }
 }

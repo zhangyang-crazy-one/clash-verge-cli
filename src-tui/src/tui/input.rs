@@ -79,6 +79,22 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             | (Overlay::TunSetupConfirmation, KeyCode::Char('N'))
             | (Overlay::TunSetupConfirmation, KeyCode::Esc)
             | (Overlay::TunSetupConfirmation, KeyCode::Char('q')) => Some(Action::SkipTunSetupStart),
+            // Service uninstall confirm is an explicit opt-in: `y` opens the
+            // existing password popup (uninstall runs after the sudo -S
+            // submit); `n`/Esc/`q` cancel without a transaction.
+            (Overlay::ServiceUninstallConfirmation, KeyCode::Char('y'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('Y')) => Some(Action::ConfirmServiceUninstall),
+            (Overlay::ServiceUninstallConfirmation, KeyCode::Char('n'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('N'))
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Esc)
+            | (Overlay::ServiceUninstallConfirmation, KeyCode::Char('q')) => Some(Action::CancelServiceUninstall),
+            // Task 7.5: saving rules under sing-box restarts the core; the
+            // dialog makes that cost explicit before it happens.
+            (Overlay::RulesRestartConfirmation, KeyCode::Char('y'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Char('Y')) => Some(Action::RulesEditSaveConfirmed),
+            (Overlay::RulesRestartConfirmation, KeyCode::Char('n'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Char('N'))
+            | (Overlay::RulesRestartConfirmation, KeyCode::Esc) => Some(Action::RulesEditSaveCancelled),
             (_, KeyCode::Esc | KeyCode::Char('q')) => Some(Action::DismissOverlay),
             (Overlay::Help, KeyCode::Char('?')) => Some(Action::DismissOverlay),
             _ => None,
@@ -155,11 +171,40 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
             // Update the selected rule provider.
             None // handled by event loop's Activate/Update on Rules
         }
+        // Rule editing (task 7.1) — shifted keys so navigation stays intact.
+        KeyCode::Char('E') if context.view == View::Rules => Some(Action::RulesEditToggle),
+        KeyCode::Char('a') if context.view == View::Rules => Some(Action::RulesEditAdd),
+        KeyCode::Char('O') if context.view == View::Rules => Some(Action::OpenEditor(EditorTarget::Singbox)),
+        KeyCode::Char('r') if context.view == View::Rules => Some(Action::RulesEditAddRuleSet),
+        KeyCode::Char('x') if context.view == View::Rules => Some(Action::RulesEditDeleteRuleSet),
+        KeyCode::Char('D') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditDelete)
+        }
+        KeyCode::Char('J') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditMoveDown)
+        }
+        KeyCode::Char('K') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditMoveUp)
+        }
+        KeyCode::Char('W') if context.view == View::Rules && context.focus == Focus::Content => {
+            Some(Action::RulesEditSave)
+        }
+        // Task 7.2: structured rule form (guards live on the event-loop arm).
+        KeyCode::Char('f') if context.view == View::Rules => Some(Action::RuleFormAdd),
 
         // Settings editor
         KeyCode::Char('e') if context.view == View::Settings && context.focus == Focus::Content => {
             Some(Action::OpenEditor(EditorTarget::Verge))
         }
+
+        // Sing-box DNS editor (task 8.1) — guards live on the event-loop arms.
+        KeyCode::Char('d') if context.view == View::Settings => Some(Action::DnsEditToggle),
+        KeyCode::BackTab if context.view == View::Settings => Some(Action::DnsFocusToggle),
+        KeyCode::Char('a') if context.view == View::Settings => Some(Action::DnsAddServer),
+        KeyCode::Char('r') if context.view == View::Settings => Some(Action::DnsAddRule),
+        KeyCode::Char('R') if context.view == View::Settings => Some(Action::DnsSetResolver),
+        KeyCode::Char('x') if context.view == View::Settings => Some(Action::DnsDeleteEntry),
+        KeyCode::Char('w') if context.view == View::Settings => Some(Action::DnsApply),
 
         _ => None,
     }
@@ -390,6 +435,15 @@ mod tests {
         }
     }
 
+    fn service_uninstall_context() -> KeyContext<'static> {
+        KeyContext {
+            view: View::Settings,
+            focus: Focus::Content,
+            overlay: Some(Overlay::ServiceUninstallConfirmation),
+            pending_connection_close: None,
+        }
+    }
+
     #[test]
     fn tun_setup_confirm_y_opens_setup_and_n_escalates() {
         // `y` opens the password popup (setup then resumes the start); `n`,
@@ -429,6 +483,47 @@ mod tests {
             assert!(
                 map_key(event(code), tun_setup_confirm_context()).is_none(),
                 "key {code:?} must not confirm or skip the setup"
+            );
+        }
+    }
+
+    #[test]
+    fn service_uninstall_confirm_y_opens_password_and_n_escalates() {
+        // `y` opens the password popup (uninstall pending); `n`, `N`, Esc,
+        // and `q` all cancel — no key may fall through to the generic
+        // dismiss that would strand a stale pending action.
+        assert!(matches!(
+            map_key(event(KeyCode::Char('y')), service_uninstall_context()),
+            Some(Action::ConfirmServiceUninstall)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('Y')), service_uninstall_context()),
+            Some(Action::ConfirmServiceUninstall)
+        ));
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(
+                matches!(
+                    map_key(event(code), service_uninstall_context()),
+                    Some(Action::CancelServiceUninstall)
+                ),
+                "key {code:?} must cancel the uninstall"
+            );
+        }
+    }
+
+    #[test]
+    fn service_uninstall_confirm_does_not_swallow_other_keys_as_confirmation() {
+        // No other key may confirm the uninstall: accidental keystrokes must
+        // not open the password popup.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Char(' '),
+            KeyCode::Backspace,
+        ] {
+            assert!(
+                map_key(event(code), service_uninstall_context()).is_none(),
+                "key {code:?} must not confirm the uninstall"
             );
         }
     }

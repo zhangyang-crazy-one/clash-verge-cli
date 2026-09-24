@@ -13,6 +13,18 @@ use std::collections::HashMap;
 pub enum InputMode {
     Normal,
     Importing(String),
+    /// Task 7.2: type a clash rule string to insert into the edit buffer.
+    RuleInput(String),
+    /// Task 7.4: "tag|remote|url" or "tag|local|path".
+    RuleSetInput(String),
+    /// Task 7.2: structured rule form "kind=value>target".
+    RuleFormInput(String),
+    /// Task 8.1 DNS editor: "kind|tag|server|port|detour".
+    DnsServerInput(String),
+    /// Task 8.1 DNS editor: "tag|suffix=a,b|keyword=x|cidr=c".
+    DnsRuleInput(String),
+    /// Task 8.1 DNS editor: bootstrap resolver server tag (empty clears).
+    DnsResolverInput(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +111,13 @@ pub enum Overlay {
     /// and/or the systemd-resolved DNS polkit rule); explicit `y` opens the
     /// password popup, `n`/Esc/q starts without setup.
     TunSetupConfirmation,
+    /// The System service row is installed; uninstalling needs an explicit
+    /// `y` before the password popup opens (`n`/Esc/q cancel).
+    ServiceUninstallConfirmation,
+    /// Task 7.5: saving rules under sing-box restarts the core (`PUT
+    /// /configs` is a no-op there); explicit `y` applies the batch save,
+    /// `n`/Esc/q keeps editing without a restart.
+    RulesRestartConfirmation,
 }
 
 /// Pending SSRF trust confirmation for a subscription import or refresh.
@@ -135,19 +154,29 @@ pub enum TunSetupReason {
     MissingDnsRule,
 }
 
-/// Context for a TUN setup waiting on password input (or the inline confirm
-/// dialog on core start).
-#[derive(Debug, Clone)]
-pub struct TunPending {
-    pub binary: std::path::PathBuf,
-    /// Resume a pending core start after the transaction succeeds:
-    /// `Some(enable_tun)` when the setup was offered from the core-start
-    /// prompt, `None` for the explicit Settings → TUN setup action (nothing
-    /// to resume).
-    pub resume_start: Option<bool>,
-    /// Which gate prompted the setup; only meaningful for the core-start
-    /// confirm (the explicit Settings flow has nothing to skip).
-    pub reason: TunSetupReason,
+/// One-time sudo action waiting on the password popup. Generalized over the
+/// TUN capability setup, service install, and service uninstall so all three
+/// share ONE password flow (the popup renders the same way; only the pending
+/// action — and the spawned transaction — differs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSudoAction {
+    /// TUN capability + DNS polkit rule setup for `binary`.
+    TunSetup {
+        binary: std::path::PathBuf,
+        /// Resume a pending core start after the transaction succeeds:
+        /// `Some(enable_tun)` when the setup was offered from the core-start
+        /// prompt, `None` for the explicit Settings → TUN setup action
+        /// (nothing to resume).
+        resume_start: Option<bool>,
+        /// Which gate prompted the setup; only meaningful for the core-start
+        /// confirm (the explicit Settings flow has nothing to skip).
+        reason: TunSetupReason,
+    },
+    /// Install the systemd service (unit copy + enable + start). Carries the
+    /// resolved binary and config dir for the unit `ExecStart=`.
+    ServiceInstall { binary_path: String, config_dir: String },
+    /// Uninstall the systemd service.
+    ServiceUninstall,
 }
 
 #[derive(Debug, Default)]
@@ -254,6 +283,19 @@ pub struct App {
     /// Tab between Rules and Providers panels.
     pub rules_focus_providers: bool,
     pub rules_selected_index: usize,
+    /// Task 7.1: profile rule editing buffer (loaded on entering edit mode).
+    pub rules_edit_mode: bool,
+    pub rules_edit_buffer: Vec<crate::routing::IRouteRule>,
+    pub rules_edit_dirty: bool,
+    /// Task 7.4: rule-set definitions loaded with the edit buffer.
+    pub rule_sets_edit: Vec<serde_json::Value>,
+    /// Task 8.1: structured sing-box DNS editor state (spec mirrors disk;
+    /// mutations persist immediately like rule-sets, apply is explicit).
+    pub dns_edit_mode: bool,
+    pub dns_spec_edit: crate::singbox::dns::DnsConfigSpec,
+    /// False = servers list focused, true = split rules list focused.
+    pub dns_focus_rules: bool,
+    pub dns_cursor: usize,
     /// Whether the mihomo binary carries TUN capabilities (set after the
     /// one-time askpass setup).
     pub tun_privileged: bool,
@@ -261,8 +303,22 @@ pub struct App {
     pub password_buffer: Vec<char>,
     /// Prompt label shown in the password popup.
     pub password_prompt: Option<String>,
-    /// TUN-enable action waiting on password input.
-    pub pending_tun: Option<TunPending>,
+    /// One-time sudo action waiting on password input (TUN setup / service
+    /// install / service uninstall).
+    pub pending_sudo: Option<PendingSudoAction>,
+    /// Cached `systemctl is-active clash-verge-cli` output for the Settings
+    /// service row (read-only probe, refreshed on Settings entry).
+    pub service_active: String,
+    /// Cached `systemctl is-enabled clash-verge-cli` output for the Settings
+    /// service row.
+    pub service_enabled: String,
+    /// Whether the system service unit file is installed (unit presence
+    /// probe, refreshed on Settings entry; `is-enabled` alone would
+    /// misclassify an installed-but-disabled unit as not-installed).
+    pub service_installed: bool,
+    /// Whether the systemd `--user` autostart unit is enabled
+    /// (`systemctl --user is-enabled`).
+    pub auto_launch_enabled: bool,
 }
 
 /// Log levels `L` cycles through, most verbose first.
@@ -332,11 +388,23 @@ impl App {
             rule_providers_loading: false,
             rule_providers_error: None,
             rules_focus_providers: false,
+            rules_edit_mode: false,
+            rules_edit_buffer: Vec::new(),
+            rules_edit_dirty: false,
+            rule_sets_edit: Vec::new(),
+            dns_edit_mode: false,
+            dns_spec_edit: crate::singbox::dns::DnsConfigSpec::default(),
+            dns_focus_rules: false,
+            dns_cursor: 0,
             rules_selected_index: 0,
             tun_privileged: false,
             password_buffer: Vec::new(),
             password_prompt: None,
-            pending_tun: None,
+            pending_sudo: None,
+            service_active: String::new(),
+            service_enabled: String::new(),
+            service_installed: false,
+            auto_launch_enabled: false,
         }
     }
 
@@ -391,11 +459,14 @@ impl App {
     /// cancels the start; only the DNS rule missing → dismissing starts
     /// without setup.
     pub fn tun_setup_confirm_hint(&self) -> &'static str {
-        if self
-            .pending_tun
-            .as_ref()
-            .is_some_and(|pending| pending.reason == TunSetupReason::MissingCapability)
-        {
+        let hard_gate = matches!(
+            self.pending_sudo.as_ref(),
+            Some(PendingSudoAction::TunSetup {
+                reason: TunSetupReason::MissingCapability,
+                ..
+            })
+        );
+        if hard_gate {
             self.tr("dialog.tun_setup_confirm_hard")
         } else {
             self.tr("dialog.tun_setup_confirm")

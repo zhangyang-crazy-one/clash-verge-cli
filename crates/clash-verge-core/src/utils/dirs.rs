@@ -12,6 +12,18 @@ pub fn set_app_home_dir(path: PathBuf) {
     let _ = APP_HOME_DIR.set(path);
 }
 
+/// Test-only seam: re-settable override consulted by `app_home_dir` before the
+/// one-shot `APP_HOME_DIR` OnceLock. Tests must serialize via a shared lock
+/// (e.g. `TEST_APP_HOME_DIR_LOCK`) and set this to the canonical test root.
+static APP_HOME_DIR_TEST_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Test-only: point `app_home_dir` at `path`, overriding the OnceLock.
+/// Re-settable across tests, unlike `set_app_home_dir`.
+#[doc(hidden)]
+pub fn set_app_home_dir_for_tests(path: PathBuf) {
+    *APP_HOME_DIR_TEST_OVERRIDE.write().unwrap() = Some(path);
+}
+
 pub fn set_portable_flag(flag: bool) {
     let _ = PORTABLE_FLAG.set(flag);
 }
@@ -20,9 +32,16 @@ pub static CLASH_CONFIG: &str = "config.yaml";
 pub static GUI_CLASH_CONFIG: &str = "clash-verge.yaml";
 pub static VERGE_CONFIG: &str = "verge.yaml";
 pub static PROFILE_YAML: &str = "profiles.yaml";
+/// Runtime config for the sing-box core (add-singbox-dual-core).
+/// Kept separate from `config.yaml` so the mihomo path and the GUI stay
+/// untouched while sing-box mode is active.
+pub static SINGBOX_CONFIG: &str = "singbox.json";
 
 /// get the verge app home dir
 pub fn app_home_dir() -> Result<PathBuf> {
+    if let Some(path) = APP_HOME_DIR_TEST_OVERRIDE.read().unwrap().as_ref() {
+        return Ok(path.clone());
+    }
     APP_HOME_DIR
         .get()
         .cloned()
@@ -61,6 +80,11 @@ pub fn clash_path() -> Result<PathBuf> {
     } else {
         app_dir.join(CLASH_CONFIG)
     })
+}
+
+/// Runtime config path for the sing-box core (`singbox.json`).
+pub fn singbox_config_path() -> Result<PathBuf> {
+    Ok(app_home_dir()?.join(SINGBOX_CONFIG))
 }
 
 pub fn verge_path() -> Result<PathBuf> {

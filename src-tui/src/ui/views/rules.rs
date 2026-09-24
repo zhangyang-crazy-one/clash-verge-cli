@@ -17,7 +17,14 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .split(area);
 
     draw_rules_panel(frame, rows[0], app, content_focus && !app.rules_focus_providers);
-    draw_providers_panel(frame, rows[1], app, content_focus && app.rules_focus_providers);
+
+    // Task 4.2: sing-box's clash_api exposes no functional provider
+    // endpoints — show an explanatory notice instead of an empty list.
+    if app.gui_config.get_valid_proxy_core() == "singbox" {
+        draw_providers_unsupported_notice(frame, rows[1]);
+    } else {
+        draw_providers_panel(frame, rows[1], app, content_focus && app.rules_focus_providers);
+    }
 }
 
 /// ` [filter: x]` while the rule filter is active.
@@ -49,6 +56,13 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, list: List<'_>, selected: Opti
 }
 
 fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    // Task 7.1: edit mode renders the profile-rule buffer instead of the
+    // runtime-expanded rule list.
+    if app.rules_edit_mode {
+        draw_edit_buffer(frame, area, app, focused);
+        return;
+    }
+
     let rules = app.visible_rules();
     let title = format!(
         "{} ({}){}",
@@ -117,6 +131,50 @@ fn draw_rules_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
 
     let list = List::new(items).block(block);
     render_list(frame, area, list, focused.then_some(app.rules_selected_index));
+}
+
+/// Task 7.1: render the in-memory edit buffer (and the `*` dirty marker).
+fn draw_edit_buffer(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
+    let title = format!(
+        "{} [EDIT{}] ({})",
+        app.tr("rules.title"),
+        if app.rules_edit_dirty { "*" } else { "" },
+        app.rules_edit_buffer.len()
+    );
+    let block = theme::panel_block(title, focused);
+
+    if app.rules_edit_buffer.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "No rules - W saves, E exits",
+            Style::new().fg(theme::dim()),
+        )))
+        .block(block);
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .rules_edit_buffer
+        .iter()
+        .enumerate()
+        .map(|(i, rule)| {
+            let is_selected = focused && i == app.rules_selected_index;
+            let prefix = if is_selected { ">" } else { " " };
+            let text = crate::routing::describe(rule);
+            let line = Line::from(Span::styled(
+                format!("{prefix} {text}"),
+                if is_selected {
+                    theme::bold(theme::accent())
+                } else {
+                    Style::new().fg(theme::text())
+                },
+            ));
+            ListItem::new(line)
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    frame.render_widget(list, area);
 }
 
 fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
@@ -193,4 +251,27 @@ fn draw_providers_panel(frame: &mut Frame<'_>, area: Rect, app: &App, focused: b
 
     let list = List::new(items).block(block);
     render_list(frame, area, list, focused.then_some(app.rules_selected_index));
+}
+
+/// Task 4.2: explanatory notice shown instead of the providers panel while
+/// the sing-box core is active (its clash_api provider endpoints are empty
+/// stubs — hiding beats an empty list that looks broken).
+fn draw_providers_unsupported_notice(frame: &mut Frame<'_>, area: Rect) {
+    let block = theme::panel_block("Rule Providers", false);
+    let msg = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Rule providers are not available under sing-box",
+            Style::new().fg(theme::warn()),
+        )),
+        Line::from(Span::styled(
+            "sing-box's clash_api does not implement provider endpoints.",
+            Style::new().fg(theme::dim()),
+        )),
+        Line::from(Span::styled(
+            "Switch back to mihomo to manage rule providers.",
+            Style::new().fg(theme::dim()),
+        )),
+    ])
+    .block(block);
+    frame.render_widget(msg, area);
 }

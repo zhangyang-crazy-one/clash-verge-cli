@@ -7,13 +7,20 @@ use ratatui::widgets::{Padding, Paragraph, Wrap};
 use crate::app::App;
 use crate::ui::theme;
 
-pub const SETTINGS_ROW_COUNT: usize = 5;
+pub const SETTINGS_ROW_COUNT: usize = 8;
 
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(6)])
-        .split(area);
+    let rows = if app.dns_edit_mode {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(10), Constraint::Length(15)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(6)])
+            .split(area)
+    };
     let mode = if app.clash_mode.is_empty() {
         app.core_config
             .get_mode()
@@ -89,6 +96,32 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ),
         ),
         settings_row(app, 4, cursor, format!("{}: {mode}", app.tr("settings.mihomo_mode"))),
+        settings_row(
+            app,
+            5,
+            cursor,
+            format!("{}: {}", app.tr("settings.service"), service_status(app)),
+        ),
+        settings_row(
+            app,
+            6,
+            cursor,
+            format!(
+                "{}: {}",
+                app.tr("settings.auto_launch"),
+                if app.auto_launch_enabled {
+                    app.tr("settings.on")
+                } else {
+                    app.tr("settings.off")
+                }
+            ),
+        ),
+        settings_row(
+            app,
+            7,
+            cursor,
+            format!("Proxy Core: {}", app.gui_config.get_valid_proxy_core()),
+        ),
         Line::from(format!(
             "{}: {}",
             app.tr("settings.proxy_host"),
@@ -102,13 +135,16 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Style::new().fg(theme::dim()),
         )),
         Line::from(Span::styled(
-            "TUN setup = the only action that asks for sudo; start/toggle never prompt.",
+            app.tr("settings.sudo_hint"),
             Style::new().fg(theme::dim()),
         )),
     ])
     .block(theme::panel_block(app.tr("settings.system"), false).padding(Padding::horizontal(1)))
     .wrap(Wrap { trim: true });
     frame.render_widget(support, rows[1]);
+    if app.dns_edit_mode {
+        draw_dns_panel(frame, rows[2], app);
+    }
 }
 
 fn settings_row(app: &App, index: usize, cursor: usize, text: String) -> Line<'static> {
@@ -147,9 +183,130 @@ fn core_state_label(app: &App) -> String {
     }
 }
 
+/// Human-readable status for the 'System service' row, derived from the
+/// cached read-only probes: installed (unit-file presence, NOT `is-enabled`
+/// — an installed-but-disabled unit must still render as installed) +
+/// enabled + running, installed + enabled + stopped, installed + running +
+/// not enabled, installed + not enabled + stopped, or not installed.
+fn service_status(app: &App) -> &'static str {
+    if !app.service_installed {
+        return app.tr("settings.service_status_not_installed");
+    }
+    match (app.service_enabled.as_str(), app.service_active.as_str()) {
+        ("enabled", "active") => app.tr("settings.service_status_running"),
+        ("enabled", _) => app.tr("settings.service_status_enabled_stopped"),
+        (_, "active") => app.tr("settings.service_status_running_disabled"),
+        _ => app.tr("settings.service_status_installed_disabled"),
+    }
+}
+
+/// Task 8.1: structured sing-box DNS editor panel. Servers and split rules
+/// share one cursor; Tab switches which list is focused. Mutations persist
+/// immediately (`singbox-dns.json`); `w` regenerates the runtime config and
+/// restarts sing-box so the section actually takes effect.
+fn draw_dns_panel(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let dim = Style::new().fg(theme::dim());
+    let mut lines = vec![Line::from(Span::styled("sing-box DNS", theme::bold(theme::accent())))];
+
+    let servers_focus = !app.dns_focus_rules;
+    let cursor = app.dns_cursor;
+
+    lines.push(Line::from(Span::styled(
+        if servers_focus {
+            "servers (Tab to switch)"
+        } else {
+            "servers"
+        },
+        theme::bold(theme::text()),
+    )));
+    if app.dns_spec_edit.servers.is_empty() {
+        lines.push(Line::from(Span::styled("  (none - press a)", dim)));
+    }
+    for (index, server) in app.dns_spec_edit.servers.iter().enumerate() {
+        let selected = servers_focus && index == cursor;
+        let addr = match (&server.server, server.kind) {
+            (Some(addr), _) => {
+                let port = server.server_port.map(|p| format!(":{p}")).unwrap_or_default();
+                format!("{addr}{port}")
+            }
+            (None, crate::singbox::dns::DnsServerKind::Fakeip) => format!(
+                "fakeip pool {}",
+                server.inet4_range.as_deref().unwrap_or("198.18.0.0/15")
+            ),
+            _ => "system resolver".to_string(),
+        };
+        let detour = server
+            .detour
+            .as_deref()
+            .map(|d| format!(" detour={d}"))
+            .unwrap_or_default();
+        let text = format!(
+            "  {}{} [{}] {addr}{detour}",
+            if selected { "> " } else { "  " },
+            server.tag,
+            server.kind.as_str(),
+        );
+        let style = if selected {
+            theme::highlight(true)
+        } else {
+            Style::new().fg(theme::text())
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(Span::styled(
+        if app.dns_focus_rules {
+            "split rules (Tab to switch)"
+        } else {
+            "split rules"
+        },
+        theme::bold(theme::text()),
+    )));
+    if app.dns_spec_edit.rules.is_empty() {
+        lines.push(Line::from(Span::styled("  (none - press r)", dim)));
+    }
+    for (index, rule) in app.dns_spec_edit.rules.iter().enumerate() {
+        let selected = app.dns_focus_rules && index == cursor;
+        let mut conditions = Vec::new();
+        if !rule.domain_suffix.is_empty() {
+            conditions.push(format!("suffix={}", rule.domain_suffix.join(",")));
+        }
+        if !rule.domain_keyword.is_empty() {
+            conditions.push(format!("keyword={}", rule.domain_keyword.join(",")));
+        }
+        if !rule.ip_cidr.is_empty() {
+            conditions.push(format!("cidr={}", rule.ip_cidr.join(",")));
+        }
+        let text = format!("  -> {} : {}", rule.server, conditions.join(" | "));
+        let style = if selected {
+            theme::highlight(true)
+        } else {
+            Style::new().fg(theme::text())
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+
+    lines.push(Line::from(format!(
+        "  domain_resolver: {}",
+        app.dns_spec_edit
+            .domain_resolver
+            .as_deref()
+            .unwrap_or("(unset - press R)")
+    )));
+    lines.push(Line::from(Span::styled(
+        "a server · r rule · R resolver · x delete · Tab lists · j/k move · w apply(restart) · d exit",
+        dim,
+    )));
+
+    let panel = Paragraph::new(lines)
+        .block(theme::panel_block("Sing-box DNS editor", true).padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(panel, area);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::core_owner_label;
+    use super::{SETTINGS_ROW_COUNT, core_owner_label, service_status};
     use crate::app::{App, CoreState};
 
     #[test]
@@ -158,5 +315,57 @@ mod tests {
         app.core_state = CoreState::Running;
 
         assert_eq!(core_owner_label(&app), "GUI-managed");
+    }
+
+    #[test]
+    fn settings_rows_append_after_the_existing_five() {
+        // New rows are appended so existing index handlers (0..6) never
+        // shift: 5 service, 6 autostart, 7 proxy core (add-singbox-dual-core).
+        assert_eq!(SETTINGS_ROW_COUNT, 8, "new rows must append after the existing seven");
+    }
+
+    #[test]
+    fn settings_navigation_wraps_within_the_new_row_count() {
+        // Mirrors the event loop's MoveNext/MovePrevious math for Settings:
+        // indices wrap within SETTINGS_ROW_COUNT, so the two appended rows
+        // (5, 6) are reachable and the existing rows never shift.
+        let next = |index: usize| (index + 1) % SETTINGS_ROW_COUNT;
+        let prev = |index: usize| (index + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+        assert_eq!(next(4), 5, "service row follows the mode row");
+        assert_eq!(next(5), 6, "autostart row follows the service row");
+        assert_eq!(next(6), 7, "proxy core row follows the autostart row");
+        assert_eq!(next(7), 0, "navigation wraps past the last row");
+        assert_eq!(prev(0), 7, "navigation wraps back to the last row");
+        assert_eq!(prev(5), 4, "previous row from the service row is the mode row");
+    }
+
+    #[test]
+    fn service_status_covers_all_probe_states() {
+        let mut app = App::new();
+        app.service_installed = true;
+        app.service_enabled = "enabled".into();
+        app.service_active = "active".into();
+        assert_eq!(service_status(&app), "installed · enabled · running");
+
+        app.service_active = "inactive".into();
+        assert_eq!(service_status(&app), "installed · enabled · stopped");
+
+        app.service_enabled = "disabled".into();
+        app.service_active = "active".into();
+        assert_eq!(service_status(&app), "installed · running · not enabled");
+
+        // P2b regression: installed-but-disabled/inactive must NOT render as
+        // "not installed" (is-enabled alone would say 'disabled').
+        app.service_active = "inactive".into();
+        assert_eq!(service_status(&app), "installed · not enabled · stopped");
+
+        // Not installed (no unit file): the fallback state.
+        app.service_installed = false;
+        assert_eq!(service_status(&app), "not installed");
+
+        // Unknown probes (systemctl missing) render as not installed.
+        app.service_enabled = "unknown".into();
+        app.service_active = "unknown".into();
+        assert_eq!(service_status(&app), "not installed");
     }
 }

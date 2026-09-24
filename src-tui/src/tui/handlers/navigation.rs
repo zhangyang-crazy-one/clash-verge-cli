@@ -79,6 +79,13 @@ pub(super) fn switch_view(app: &mut App, ctx: &Ctx, view: View) {
                 ctx.send(Action::RuleProvidersRefresh);
             }
         }
+        // Settings rows 5 (service) and 6 (autostart) display cached
+        // `systemctl is-active/is-enabled` probes that only refresh when
+        // the row's actions run or the user comes back into Settings;
+        // a freshly-entered Settings view must re-probe so an external
+        // `systemctl … enable|disable` (or a previous TUI install/uninstall
+        // still settling on the bus) is not displayed as a stale state.
+        View::Settings => ctx.send(Action::ServiceStatusRefresh),
         _ => {}
     }
 }
