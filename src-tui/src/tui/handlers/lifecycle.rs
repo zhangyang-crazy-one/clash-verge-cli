@@ -1,5 +1,7 @@
 //! Core lifecycle: start / stop / restart and the manager's lifecycle notices.
 
+use std::time::Duration;
+
 use crate::app::{Action, App, CoreState, TunSetupReason};
 use crate::runtime_config::write_runtime_config;
 
@@ -104,6 +106,46 @@ pub(super) fn note_started(
 ) {
     app.core_state = CoreState::Running;
     app.core_pid = ctx.manager.pid();
+    // Re-assert the system proxy once the controller actually answers: the
+    // GNOME setting is global and can be clobbered by other tools (e.g.
+    // the GUI's sysproxy guard restoring state on exit), leaving
+    // verge.yaml enabled while the OS mode is 'none'. CoreStarted fires
+    // right after spawn() — before the API/listeners are fully up for an
+    // attached core, or right after the manager's readiness probe for a
+    // spawned core — so the apply must wait for a second readiness
+    // probe; otherwise a failed launch would point the OS at a dead
+    // port. PAC setups are never downgraded to manual mode. The probe
+    // only ARMS `Action::SysProxyReassert`; the event loop itself
+    // performs the final live re-read of `verge.yaml` and the apply
+    // (see the handler in `super`), so a user toggle off during the
+    // probe window can never get clobbered by a deferred task.
+    if app.gui_config.enable_system_proxy.unwrap_or(false) && !app.gui_config.proxy_auto_config.unwrap_or(false) {
+        let api = ctx.manager.api();
+        let probe_manager = ctx.manager.clone();
+        ctx.spawn(|tx| async move {
+            // Attached cores (no managed pid — started by an earlier CLI
+            // run) are probed once: their CoreStarted only fires after the
+            // controller already answered, so a miss here means it just
+            // died and there is nothing to wait for. Spawned cores are
+            // probed for as long as they live: a fixed attempt cap would
+            // silently drop the apply whenever initialization outlasts it
+            // (large configs), leaving the persisted setting enabled
+            // while the OS proxy stays off. `ctx.manager.api()` returns
+            // the platform-correct transport (Unix for mihomo, TCP for
+            // sing-box), so the probe hits whichever controller actually
+            // owns this core.
+            loop {
+                if api.version().await.is_ok() {
+                    let _ = tx.send(Action::SysProxyReassert);
+                    break;
+                }
+                if probe_manager.pid().is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
     // A core this TUI (re)started logs at its configured level again.
     if binary_path.is_some() {
         app.log_level = app.configured_log_level();

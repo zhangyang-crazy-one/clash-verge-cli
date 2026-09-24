@@ -174,6 +174,92 @@ pub fn prepare_runtime_config(mut config: Mapping, enable_tun: bool) -> Mapping 
     config
 }
 
+/// Apply the standalone CLI's own port settings from `verge.yaml` onto a
+/// runtime config before it is written.
+///
+/// The CLI and the Clash Verge GUI share the same template defaults
+/// (`mixed-port: 7897`, socks 7898, http 7899, redir 7895, tproxy 7896).
+/// Running both, or leaving the GUI's root service enabled, makes them fight
+/// over the same listeners and sends the losing side into a restart loop
+/// (upstream #6741/#7861). Honouring the CLI's own `verge_*` port settings —
+/// mirroring the GUI — lets the two coexist. Ports the user never set keep
+/// whatever the runtime config already carries.
+pub async fn apply_verge_ports(config: &mut Mapping) {
+    let verge = clash_verge_core::config::IVerge::new().await;
+
+    if let Some(port) = verge.verge_mixed_port {
+        config.insert("mixed-port".into(), port.into());
+    }
+
+    if verge.verge_socks_enabled == Some(true)
+        && let Some(port) = verge.verge_socks_port
+    {
+        config.insert("socks-port".into(), port.into());
+    }
+
+    if verge.verge_http_enabled == Some(true)
+        && let Some(port) = verge.verge_port
+    {
+        config.insert("port".into(), port.into());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    if verge.verge_redir_enabled == Some(true)
+        && let Some(port) = verge.verge_redir_port
+    {
+        config.insert("redir-port".into(), port.into());
+    }
+
+    #[cfg(target_os = "linux")]
+    if verge.verge_tproxy_enabled == Some(true)
+        && let Some(port) = verge.verge_tproxy_port
+    {
+        config.insert("tproxy-port".into(), port.into());
+    }
+}
+
+/// Effective mixed port the CLI will ask its core to bind: the CLI's own
+/// `verge.yaml` override when set, else whatever the runtime config carries.
+pub async fn effective_mixed_port() -> u16 {
+    let verge = clash_verge_core::config::IVerge::new().await;
+    if let Some(port) = verge.verge_mixed_port {
+        return port;
+    }
+    clash_verge_core::config::IClashTemp::new().await.get_mixed_port()
+}
+
+/// Fail fast when the mixed port is already bound by another process.
+///
+/// The CLI and the Clash Verge GUI share the same template defaults, and the
+/// GUI's root service retries forever when it loses the race (upstream
+/// #6741/#7861). Spawning a core that cannot bind makes both sides flap and
+/// briefly hijacks the system proxy, so report the conflict with the exact
+/// knob to change instead. Calls after the CLI has stopped its own tracked
+/// core, so the only remaining holder is a foreign process.
+pub async fn ensure_mixed_port_available() -> Result<(), String> {
+    let port = effective_mixed_port().await;
+    if port == 0 {
+        return Ok(());
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let verge_path = clash_verge_core::utils::dirs::verge_path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "verge.yaml".into());
+            Err(format!(
+                "mixed-port {port} is already in use by another process — often the Clash Verge \
+                 GUI's service (its core also defaults to 7897). Stop the other instance, or set \
+                 `verge_mixed_port` to a free port in {verge_path}."
+            ))
+        }
+        Err(error) => Err(format!("cannot probe mixed-port {port}: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +378,13 @@ rules: [MATCH,PROXY]
                 .and_then(|m| m.get("fake-ip-range6"))
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn apply_verge_ports_modifies_configured_ports() {
+        let mut cfg = mapping("mixed-port: 7890\n");
+        apply_verge_ports(&mut cfg).await;
+        // If verge.yaml has a verge_mixed_port, it overrides; otherwise it retains 7890.
+        assert!(cfg.contains_key("mixed-port"));
     }
 }

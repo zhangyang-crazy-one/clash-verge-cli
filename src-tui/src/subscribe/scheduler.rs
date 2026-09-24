@@ -21,7 +21,34 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::ProxyDelay;
+use crate::mihomo_manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
+
+/// Strategy the auto-update scheduler uses to push a freshly refreshed
+/// remote profile to the running core.
+///
+/// Hot reload is the mihomo path (`PUT /configs?force=true` against the
+/// clash-api controller). Sing-box's controller accepts the request but
+/// ignores the payload — every config change must go through
+/// [`crate::runtime_config::apply_singbox_restart`], which regenerates
+/// the JSON config, prevalidates with `sing-box check`, and restarts
+/// the process. Used by the manager-aware wrappers in this module; the
+/// mihomo-only `probe` / `reload_current_profile` / `force_refresh`
+/// entry points are kept for the headless daemon and CLI commands
+/// (out-of-scope here; they remain sing-box-broken — see `notes` in the
+/// public function doc-comments).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshPath {
+    HotReload,
+    SingboxRestart,
+}
+
+pub(crate) fn decide_refresh_path(kind: CoreKind) -> RefreshPath {
+    match kind {
+        CoreKind::Mihomo => RefreshPath::HotReload,
+        CoreKind::SingBox => RefreshPath::SingboxRestart,
+    }
+}
 
 /// Minimum time between attempts of the same profile after a refresh failure.
 /// At least the profile's `update_interval` is enforced by `due_remote_uids`
@@ -205,6 +232,11 @@ impl AutoUpdateScheduler {
     /// dies. Returns notices for the caller to surface. No-op unless
     /// `probe_enabled` is set (default on), the core is running, and a
     /// current profile with a delay-testable exit node exists.
+    ///
+    /// **Mihomo-only entry point.** A sing-box forced refresh also needs
+    /// the manager (to restart the process). Use [`probe_with_manager`]
+    /// for the dispatching path used by the TUI; the headless daemon still
+    /// calls this and remains sing-box-broken (out of scope here).
     pub async fn probe(&mut self, api: &MihomoApi, enable_tun: bool, core_running: bool) -> ProbeOutcome {
         let gui = clash_verge_core::config::IVerge::new().await;
         if !gui.probe_enabled.unwrap_or(true) {
@@ -241,6 +273,65 @@ impl AutoUpdateScheduler {
             ProbeVerdict::Dead => {
                 if self.record_probe_failure(unix_now_secs()) {
                     Self::force_refresh(api, &current, &node, enable_tun, core_running).await
+                } else {
+                    ProbeOutcome::default()
+                }
+            }
+        }
+    }
+
+    /// Probe the current exit node and, on a sustained failure, force a
+    /// subscription refresh that dispatches by [`CoreKind`]. The
+    /// controller transport is reached through `manager.api()`; the
+    /// forced-refresh path additionally takes the manager so sing-box can
+    /// restart through [`crate::runtime_config::apply_singbox_restart`]
+    /// instead of `reload_current_profile` (a no-op for sing-box).
+    ///
+    /// Used by the TUI's auto-update tick (`spawn_auto_update`). The
+    /// headless daemon still calls [`probe`](Self::probe) and stays on
+    /// the mihomo-only path.
+    pub async fn probe_with_manager(
+        &mut self,
+        manager: &MihomoManager,
+        enable_tun: bool,
+        core_running: bool,
+    ) -> ProbeOutcome {
+        let gui = clash_verge_core::config::IVerge::new().await;
+        if !gui.probe_enabled.unwrap_or(true) {
+            return ProbeOutcome::default();
+        }
+        if !core_running {
+            return ProbeOutcome::default();
+        }
+
+        let api = manager.api();
+        let store = match ProfileStore::snapshot().await {
+            Ok(store) => store,
+            Err(error) => {
+                return ProbeOutcome {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                };
+            }
+        };
+        let Some(current) = store.current_uid() else {
+            return ProbeOutcome::default();
+        };
+        let items = store.items();
+        let Some(node) = current_exit_node(&api, &items, &current).await else {
+            return ProbeOutcome::default();
+        };
+
+        let verdict = classify_delay(&api.delay_test(&node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
+        match verdict {
+            ProbeVerdict::Alive => {
+                self.probe_failures = 0;
+                ProbeOutcome::default()
+            }
+            ProbeVerdict::ApiIssue => ProbeOutcome::default(),
+            ProbeVerdict::Dead => {
+                if self.record_probe_failure(unix_now_secs()) {
+                    Self::force_refresh_with_manager(manager, &current, &node, enable_tun, core_running).await
                 } else {
                     ProbeOutcome::default()
                 }
@@ -334,6 +425,82 @@ impl AutoUpdateScheduler {
             },
         }
     }
+
+    /// Force-refresh the current profile, dispatching the post-refresh
+    /// config application by [`CoreKind`]. Same fixed-exit rollback as
+    /// [`force_refresh`](Self::force_refresh); the sing-box branch routes
+    /// through [`reload_current_profile_for_core`] so the JSON config is
+    /// regenerated and the core restarted instead of issuing a no-op
+    /// `PUT /configs`.
+    async fn force_refresh_with_manager(
+        manager: &MihomoManager,
+        uid: &str,
+        node: &str,
+        enable_tun: bool,
+        core_running: bool,
+    ) -> ProbeOutcome {
+        let api = manager.api();
+        let items = match ProfileStore::snapshot().await {
+            Ok(store) => store.items(),
+            Err(error) => {
+                return ProbeOutcome {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                };
+            }
+        };
+        let Some((old_bytes, old_updated)) = profile_snapshot(&items, uid).await else {
+            return ProbeOutcome {
+                error: Some(format!("profile {uid} file unavailable for snapshot")),
+                ..Default::default()
+            };
+        };
+
+        match ProfileStore::update_remotes_locked(&[uid.to_string()]).await {
+            Ok((updated, _failed)) if !updated.is_empty() => {
+                if refreshed_config_has_node(uid, node).await {
+                    match reload_current_profile_for_core(manager, uid, enable_tun, core_running).await {
+                        Ok(()) => {
+                            let verdict = classify_delay(&api.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
+                            ProbeOutcome {
+                                forced_refresh: true,
+                                may_be_down: verdict != ProbeVerdict::Alive,
+                                ..Default::default()
+                            }
+                        }
+                        Err(error) => ProbeOutcome {
+                            forced_refresh: true,
+                            error: Some(format!("reload after forced refresh: {error}")),
+                            ..Default::default()
+                        },
+                    }
+                } else {
+                    let file = items
+                        .iter()
+                        .find(|item| item.uid.as_deref() == Some(uid))
+                        .and_then(|item| item.file.clone());
+                    if let Some(file) = file {
+                        restore_profile_snapshot(uid, &file, &old_bytes, old_updated).await;
+                    }
+                    let _ = reload_current_profile_for_core(manager, uid, enable_tun, core_running).await;
+                    ProbeOutcome {
+                        forced_refresh: true,
+                        rolled_back: true,
+                        ..Default::default()
+                    }
+                }
+            }
+            Ok(_) => ProbeOutcome {
+                forced_refresh: true,
+                error: Some(format!("forced refresh of {uid} produced no update")),
+                ..Default::default()
+            },
+            Err(error) => ProbeOutcome {
+                error: Some(format!("forced refresh failed: {error}")),
+                ..Default::default()
+            },
+        }
+    }
 }
 
 /// Resolve the current exit node: the live `GLOBAL` group selection from the
@@ -400,6 +567,12 @@ async fn refreshed_config_has_node(uid: &str, node: &str) -> bool {
 /// Reload the running core from a freshly refreshed current profile.
 /// Shared by the TUI (which sends `ProxiesRefresh` after success) and the
 /// daemon (which logs the outcome).
+///
+/// **Mihomo-only entry point.** Sing-box's `PUT /configs` is a no-op, so
+/// calling this against a sing-box controller silently leaves the running
+/// config unchanged. The TUI uses [`reload_current_profile_for_core`]
+/// instead; the headless daemon and CLI `profile update --reload` still
+/// call this function and remain sing-box-broken (out of scope here).
 pub async fn reload_current_profile(
     api: &MihomoApi,
     uid: &str,
@@ -413,6 +586,70 @@ pub async fn reload_current_profile(
         .find(|item| item.uid.as_deref() == Some(uid))
         .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
     crate::runtime_config::reload_remote_profile(api, &item, enable_tun, core_running).await
+}
+
+/// Reload the running core from a freshly refreshed current profile,
+/// dispatching by [`CoreKind`]. Mirrors [`reload_current_profile`] but
+/// additionally handles sing-box, whose controller does not honour
+/// `PUT /configs` — the sing-box path regenerates the JSON config from
+/// the on-disk profile YAML and restarts the core (with prevalidation +
+/// rollback inside [`crate::runtime_config::apply_singbox_restart`]).
+///
+/// Used by the TUI (`tui/handlers/profile.rs::note_updated`). The
+/// scheduler's probe path uses [`AutoUpdateScheduler::probe_with_manager`]
+/// to forward the manager through to a forced refresh.
+pub async fn reload_current_profile_for_core(
+    manager: &MihomoManager,
+    uid: &str,
+    enable_tun: bool,
+    core_running: bool,
+) -> Result<(), String> {
+    match decide_refresh_path(manager.core_kind()) {
+        RefreshPath::HotReload => reload_current_profile(&manager.api(), uid, enable_tun, core_running).await,
+        RefreshPath::SingboxRestart => {
+            // The refresh already wrote the new YAML to disk via
+            // `ProfileStore::update_remote_locked`; read it back so the
+            // sing-box pipeline regenerates from the post-refresh body.
+            let store = ProfileStore::snapshot().await.map_err(|error| error.to_string())?;
+            let item = store
+                .items()
+                .into_iter()
+                .find(|item| item.uid.as_deref() == Some(uid))
+                .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
+            let yaml = read_profile_yaml(&item).await?;
+            crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
+                .await
+                .map(|_report| ())
+        }
+    }
+}
+
+/// Read a profile's on-disk YAML body. The sing-box path needs the raw
+/// upstream YAML because the sing-box pipeline (`write_singbox_assembled`)
+/// runs its own conversion; pulling from the in-memory store would skip
+/// any post-refresh writes that the caller flushed just before calling.
+///
+/// Returns an error early when the profile has no `file` reference or
+/// the file is missing — the sing-box path would otherwise fall back to
+/// the skeleton config, which silently produces an empty outbound set.
+async fn read_profile_yaml(item: &PrfItem) -> Result<String, String> {
+    let file = item
+        .file
+        .as_deref()
+        .ok_or_else(|| format!("profile {} has no file", item.uid.as_deref().unwrap_or("?")))?;
+    let profiles_dir =
+        clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| format!("profiles dir: {error}"))?;
+    read_profile_yaml_from(&profiles_dir, file).await
+}
+
+/// Test seam: read a profile file from an explicit directory. The caller-
+/// facing wrapper resolves `app_profiles_dir()` so production code keeps
+/// one path; this lets unit tests avoid the global app-home OnceLock.
+async fn read_profile_yaml_from(profiles_dir: &std::path::Path, file: &str) -> Result<String, String> {
+    let path = profiles_dir.join(file);
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|error| format!("failed to read profile {}: {error}", path.display()))
 }
 
 fn unix_now_secs() -> u64 {
@@ -439,6 +676,79 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn decide_refresh_path_picks_hot_reload_for_mihomo() {
+        // The dispatcher lives in `subscribe::scheduler`; this is the one
+        // assertion all three TUI callsites rely on. Mihomo must stay on
+        // `reload_current_profile` (PUT /configs hot reload) so the
+        // existing rule-fragment composition keeps applying.
+        assert_eq!(decide_refresh_path(CoreKind::Mihomo), RefreshPath::HotReload);
+    }
+
+    #[test]
+    fn decide_refresh_path_picks_singbox_restart_for_singbox() {
+        // sing-box's controller does NOT honour `PUT /configs` — every
+        // profile refresh must regenerate the JSON config and restart
+        // the process through `apply_singbox_restart`.
+        assert_eq!(decide_refresh_path(CoreKind::SingBox), RefreshPath::SingboxRestart);
+    }
+
+    #[test]
+    fn manager_core_kind_propagates_to_dispatch_decision() {
+        // The dispatcher is invoked from `reload_current_profile_for_core`
+        // and `force_refresh_with_manager`; both reach the manager via
+        // `&MihomoManager`. Confirm `core_kind()` round-trips so the
+        // dispatcher sees the value the manager was built with.
+        let mgr = MihomoManager::new(std::path::PathBuf::from("/tmp/cfg"));
+        assert_eq!(decide_refresh_path(mgr.core_kind()), RefreshPath::HotReload);
+        let mgr = mgr.with_core_kind(CoreKind::SingBox);
+        assert_eq!(decide_refresh_path(mgr.core_kind()), RefreshPath::SingboxRestart);
+    }
+
+    #[tokio::test]
+    async fn read_profile_yaml_from_returns_file_contents() {
+        // The sing-box path reads the post-refresh YAML straight from disk
+        // (the refresh wrote it via `update_remote_locked`); the helper
+        // must surface the raw body for `apply_singbox_restart` to feed
+        // into the sing-box pipeline.
+        let dir = std::env::temp_dir().join(format!(
+            "clash-verge-sched-yaml-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join("sub.yaml"), "proxies: []\n").expect("write");
+
+        let body = read_profile_yaml_from(&dir, "sub.yaml").await.expect("read");
+        assert_eq!(body, "proxies: []\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_profile_yaml_from_surfaces_missing_file_error() {
+        // A vanished file must not silently fall through to the skeleton
+        // config (which would produce an empty outbound set and a
+        // confusing "skeleton applied" report). The helper must reject
+        // before `apply_singbox_restart` is reached.
+        let dir = std::env::temp_dir().join(format!(
+            "clash-verge-sched-yaml-missing-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let error = read_profile_yaml_from(&dir, "nope.yaml")
+            .await
+            .expect_err("missing file must error");
+        assert!(
+            error.contains("nope.yaml") && error.contains("failed to read"),
+            "error names the missing file: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -494,7 +804,7 @@ mod tests {
 
         assert_eq!(
             classify_delay(&Err(MihomoError::CoreDown {
-                path: "/tmp/x.sock".into()
+                endpoint: "/tmp/x.sock".into()
             })),
             ProbeVerdict::ApiIssue
         );

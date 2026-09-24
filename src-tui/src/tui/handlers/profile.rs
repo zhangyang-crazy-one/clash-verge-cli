@@ -5,6 +5,7 @@ use crossterm::event::KeyCode;
 use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, InputMode, Overlay, TrustPending};
+use crate::mihomo_manager::CoreKind;
 use crate::profile_store::store::ProfileStore;
 use crate::runtime_config::reload_remote_profile;
 
@@ -49,12 +50,18 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
     }
     let name = item.name.clone().unwrap_or_default();
     app.status_msg = Some(format!("Switching to {name}..."));
-    let api = ctx.manager.api();
+    let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
-        match crate::services::profile::switch_profile(&api, &item, enable_tun, core_running).await {
+        // Dispatch on the manager's core kind: `switch_profile` is the
+        // mihomo PUT /configs path, which sing-box's controller silently
+        // ignores. `switch_profile_for_core` routes the sing-box branch
+        // through `apply_singbox_restart` (regenerate JSON config,
+        // prevalidate, restart) so the running core actually picks up
+        // the switch.
+        match crate::services::profile::switch_profile_for_core(&manager, &item, enable_tun, core_running).await {
             Ok(()) => {
                 let _ = tx.send(Action::ProfileSwitched(uid));
             }
@@ -154,8 +161,20 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     let core_running = app.core_state == CoreState::Running;
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
-        if let Err(error) = reload_remote_profile(&api, &item, enable_tun, core_running).await {
-            let _ = tx.send(Action::CoreError(format!("profile reload: {error}")));
+        // Dispatch on the manager's core kind. The mihomo path keeps
+        // its PUT /configs hot reload; sing-box's controller would
+        // silently accept the request and drop the payload, so we route
+        // through `apply_singbox_restart`, which writes the JSON config,
+        // prevalidates with `sing-box check`, and restarts the process.
+        // For sing-box we read the imported YAML from disk — the import
+        // path (`append_bundle` → `append_item` → `fs::write`) already
+        // persisted it before this action fires.
+        let apply_result = match manager.core_kind() {
+            CoreKind::Mihomo => reload_remote_profile(&api, &item, enable_tun, core_running).await,
+            CoreKind::SingBox => apply_imported_profile_to_singbox(&manager, &item, enable_tun).await,
+        };
+        if let Err(error) = apply_result {
+            let _ = tx.send(Action::CoreError(error));
             return;
         }
         // The core now runs the imported profile: record it as current so
@@ -175,6 +194,32 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     });
 }
 
+/// Apply a freshly imported profile to a sing-box core: read the body
+/// the import just wrote and regenerate the JSON runtime config through
+/// [`crate::runtime_config::apply_singbox_restart`]. Extracted so the
+/// `note_imported` branch reads at a glance.
+async fn apply_imported_profile_to_singbox(
+    manager: &crate::mihomo_manager::MihomoManager,
+    item: &clash_verge_core::config::PrfItem,
+    enable_tun: bool,
+) -> Result<(), String> {
+    let file = item.file.as_deref().ok_or_else(|| {
+        format!(
+            "profile reload: imported profile {} has no file",
+            item.uid.as_deref().unwrap_or("?")
+        )
+    })?;
+    let dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| format!("profile reload: {error}"))?;
+    let path = dir.join(file);
+    let yaml = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|error| format!("profile reload: failed to read {}: {error}", path.display()))?;
+    crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
+        .await
+        .map(|_report| ())
+        .map_err(|error| format!("profile reload: {error}"))
+}
+
 /// A profile refresh finished: re-read the list and reload the core when the
 /// current profile changed.
 pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_current: bool) {
@@ -189,11 +234,16 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
     if !is_current {
         return;
     }
-    let api = ctx.manager.api();
+    let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
     ctx.spawn(|tx| async move {
-        match crate::subscribe::scheduler::reload_current_profile(&api, &uid, enable_tun, core_running).await {
+        // Use the dispatching wrapper so a sing-box subscription refresh
+        // regenerates the JSON config and restarts the core instead of
+        // issuing a no-op `PUT /configs` against sing-box's controller.
+        match crate::subscribe::scheduler::reload_current_profile_for_core(&manager, &uid, enable_tun, core_running)
+            .await
+        {
             Ok(()) if core_running => {
                 let _ = tx.send(Action::ProxiesRefresh);
             }
@@ -213,7 +263,7 @@ pub(in crate::tui) fn spawn_auto_update(
     ctx: &Ctx,
     scheduler: std::sync::Arc<tokio::sync::Mutex<crate::subscribe::scheduler::AutoUpdateScheduler>>,
 ) {
-    let api = ctx.manager.api();
+    let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
     ctx.spawn(|tx| async move {
@@ -221,7 +271,11 @@ pub(in crate::tui) fn spawn_auto_update(
             let mut scheduler = scheduler.lock().await;
             (
                 scheduler.tick().await,
-                scheduler.probe(&api, enable_tun, core_running).await,
+                // `probe_with_manager` dispatches the forced refresh by
+                // core kind: the old `probe` only knew the API and would
+                // hand sing-box a no-op `PUT /configs` on a sustained
+                // node failure.
+                scheduler.probe_with_manager(&manager, enable_tun, core_running).await,
             )
         };
         for (uid, is_current) in outcome.updated {

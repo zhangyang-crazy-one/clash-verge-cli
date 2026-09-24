@@ -1,6 +1,6 @@
 //! Non-interactive profile subscription commands.
 
-use crate::mihomo_manager::manager::MihomoManager;
+use crate::mihomo_manager::manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
 
 /// One row of `profile list` (also its `--json` schema).
@@ -101,9 +101,26 @@ pub async fn import(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         anyhow::bail!("subscription URL must start with http:// or https://");
     }
+    let store = ProfileStore::snapshot().await.ok();
+    let mut trusted_hosts: Vec<compact_str::CompactString> = store
+        .map(|s| {
+            s.items()
+                .iter()
+                .filter_map(|it| it.option.as_ref()?.trusted_hosts.clone())
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(parsed) = url::Url::parse(url)
+        && let Some(host) = parsed.host_str()
+        && !trusted_hosts.iter().any(|h| h.as_str() == host)
+    {
+        trusted_hosts.push(host.into());
+    }
     let option = clash_verge_core::config::PrfOption {
         update_interval,
         allow_auto_update: no_auto_update.then_some(false),
+        trusted_hosts: (!trusted_hosts.is_empty()).then_some(trusted_hosts),
         ..Default::default()
     };
     let item = ProfileStore::import_url_locked(url, name, Some(&option)).await?;
@@ -126,6 +143,22 @@ async fn resolve_uid(query: &str) -> anyhow::Result<String> {
 
 /// `profile use`: make a profile current and apply it to the running core
 /// (or write it for the next start).
+///
+/// Dispatches by [`CoreKind`] so sing-box does not get issued a
+/// `PUT /configs` (which sing-box's controller silently ignores):
+/// - mihomo uses [`crate::services::profile::switch_profile`] which honours
+///   `core_running` — when the core is down, the mihomo runtime config is
+///   staged on disk for the next start and no API call is made.
+/// - sing-box, when the core is running, uses
+///   [`crate::services::profile::switch_profile_for_core`] to regenerate the
+///   JSON config and restart the core (sing-box's controller does not honour
+///   `PUT /configs`).
+/// - sing-box, when the core is **not** running, only updates `current`. The
+///   next `start` reads `current_uid` via
+///   `ManagerInner::active_profile_yaml`, so calling the helper here would
+///   route through `apply_singbox_restart` → `manager.restart()` and start a
+///   core the user never asked for. See the `core_not_running → no_restart`
+///   note in the per-call site tests below.
 pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result<()> {
     let store = ProfileStore::snapshot().await?;
     let items = store.items();
@@ -136,9 +169,40 @@ pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result
         .await
         .enable_tun_mode
         .unwrap_or(false);
-    crate::services::profile::switch_profile(&api, item, enable_tun, running)
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+    match manager.core_kind() {
+        CoreKind::Mihomo => {
+            // mihomo: `switch_profile` already honours `core_running` —
+            // with `running=false`, it writes the runtime config to disk for
+            // the next start and skips the doomed `PUT /configs`.
+            crate::services::profile::switch_profile(&api, item, enable_tun, running)
+                .await
+                .map_err(|error| anyhow::anyhow!(error))?;
+        }
+        CoreKind::SingBox => {
+            if running {
+                // sing-box's controller ignores `PUT /configs`; route through
+                // the manager-aware switch helper so the JSON config is
+                // regenerated and the core restarts.
+                crate::services::profile::switch_profile_for_core(manager, item, enable_tun, true)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            } else {
+                // No core is running — only update `current`. The next
+                // `start` reads `current_uid` via `active_profile_yaml`
+                // and assembles the sing-box config from it; calling
+                // `switch_profile_for_core` here would route through
+                // `apply_singbox_restart` → `manager.restart()` and start
+                // a core the user never asked for.
+                let uid = item
+                    .uid
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("profile switch: profile has no uid"))?;
+                ProfileStore::replace_current_locked(uid)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("profile switch: {error}"))?;
+            }
+        }
+    }
     let uid = item.uid.as_deref().unwrap_or("?");
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     if running {
@@ -189,6 +253,15 @@ pub async fn update(manager: &MihomoManager, query: Option<&str>, all: bool, rel
 
 /// Apply a refreshed current profile to the running core when `--reload`
 /// was given; otherwise say how to apply it.
+///
+/// Uses the manager-aware
+/// [`crate::subscribe::scheduler::reload_current_profile_for_core`] so
+/// sing-box's controller does not get a `PUT /configs` (which it would
+/// silently ignore). The function already bails when the core is not
+/// running, so by the time we reach the helper `running=true` is
+/// guaranteed — `reload_current_profile_for_core` therefore never takes
+/// the sing-box branch with `core_running=false`, and the brief's
+/// "don't start a core when not running" rule is preserved.
 async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -> anyhow::Result<()> {
     let api = manager.api();
     if !reload || !super::core_running(&api).await {
@@ -199,7 +272,7 @@ async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -
         .await
         .enable_tun_mode
         .unwrap_or(false);
-    crate::subscribe::scheduler::reload_current_profile(&api, uid, enable_tun, true)
+    crate::subscribe::scheduler::reload_current_profile_for_core(manager, uid, enable_tun, true)
         .await
         .map_err(|error| anyhow::anyhow!("profile reload: {error}"))?;
     println!("reloaded the running core with {uid}");
@@ -423,5 +496,246 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    // ---- Dispatcher tests for the sing-box-aware `use_profile` /
+    //      `reload_if_requested` rewiring. Each test asserts on the
+    //      helper-level error signature: the mihomo branch
+    //      (`switch_profile` → `reload_remote_profile` →
+    //      `compose_remote_profile`) reports "profile file not found",
+    //      the sing-box branch (`switch_profile_for_core` →
+    //      `read_profile_yaml`) reports "failed to read". The
+    //      discriminator is stable across minor refactors of either
+    //      helper because it comes from a different file: the mihomo
+    //      helper reads through `app_profiles_dir()` while the sing-box
+    //      helper calls `tokio::fs::read_to_string` directly.
+    use crate::subscribe::from_url::RemoteProfileBundle;
+
+    /// Seed a single remote profile whose on-disk body is intentionally
+    /// missing. The store knows the file's name (so `compose_remote_profile`
+    /// / `read_profile_yaml` get a non-empty `Item.file`) but the test never
+    /// writes the file, so any branch touching the body errors before
+    /// reaching the controller.
+    async fn seed_missing_remote_profile(uid: &str, name: &str) {
+        let mut store = crate::profile_store::store::tests::empty_store();
+        let bundle = RemoteProfileBundle {
+            item: clash_verge_core::config::PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                name: Some(name.into()),
+                file: Some(format!("{uid}.yaml").into()),
+                ..Default::default()
+            },
+            fragments: vec![match clash_verge_core::config::PrfItem::from_merge(None) {
+                Ok(item) => item,
+                Err(error) => panic!("merge fragment: {error}"),
+            }],
+        };
+        must(store.append_bundle(bundle).await, "append bundle");
+    }
+
+    /// Bind a fake sing-box controller on a free localhost port and answer
+    /// one `GET /version` with a minimal valid JSON body. Returns the
+    /// bound address so the caller can wire it into
+    /// `MihomoManager::with_singbox_controller`. The spawned task lives
+    /// for the duration of the test (held by the handle in the caller).
+    async fn fake_singbox_controller() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 512];
+                // Best-effort drain; reqwest sends the headers in one go.
+                let _ = stream.read(&mut buf).await;
+                let body = r#"{"version":"sing-box 1.13.12"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn use_profile_dispatches_to_mihomo_branch_via_switch_profile() {
+        // mihomo manager + missing file → mihomo's
+        // `compose_remote_profile` reports "profile file not found".
+        // The mihomo branch of `use_profile` calls `switch_profile` which
+        // routes through `load_remote_profile_with_rules`, so seeing this
+        // message proves the dispatcher took the mihomo branch.
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        let uid = "Rcmd-mihomo-missing";
+        seed_missing_remote_profile(uid, "mihomo-missing").await;
+
+        let bogus_socket = std::env::temp_dir().join(format!("cv-no-sock-{}.sock", uuid::Uuid::new_v4()));
+        let mgr = MihomoManager::new(root.clone()).with_socket(bogus_socket);
+
+        let error = use_profile(&mgr, uid)
+            .await
+            .expect_err("missing profile file must surface as an error");
+        let text = error.to_string();
+        assert!(
+            text.contains("profile file not found"),
+            "mihomo branch surfaces load_remote_profile_with_rules' error: {text}"
+        );
+        assert!(
+            !text.contains("failed to read"),
+            "must NOT route through the sing-box branch: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn use_profile_dispatches_to_singbox_branch_via_switch_profile_for_core() {
+        // sing-box manager with a reachable fake controller (running=true)
+        // + missing file → sing-box's `read_profile_yaml` reports
+        // "failed to read <path>". Seeing this message proves the
+        // dispatcher routed through `switch_profile_for_core` instead of
+        // the mihomo-only `switch_profile`.
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        let uid = "Rcmd-singbox-missing";
+        seed_missing_remote_profile(uid, "singbox-missing").await;
+
+        let (addr, _handle) = fake_singbox_controller().await;
+        let mgr = MihomoManager::new(root.clone())
+            .with_core_kind(CoreKind::SingBox)
+            .with_singbox_controller(addr);
+
+        let error = use_profile(&mgr, uid)
+            .await
+            .expect_err("missing profile file must surface as an error");
+        let text = error.to_string();
+        assert!(
+            text.contains("failed to read") && text.contains(&format!("{uid}.yaml")),
+            "sing-box branch surfaces read_profile_yaml's error: {text}"
+        );
+        assert!(
+            !text.contains("profile file not found"),
+            "must NOT route through the mihomo branch: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn use_profile_skips_singbox_restart_when_core_is_not_running() {
+        // sing-box manager with an UNREACHABLE controller (running=false)
+        // + missing file → must SUCCEED. The sing-box branch's helper
+        // would route through `apply_singbox_restart` → `manager.restart()`,
+        // which either tries to start a fresh core (forbidden by the
+        // brief: "不在未运行时启动一个 core") or errors with "sing-box
+        // binary not found" in the test environment. Neither should
+        // happen: only `current_uid` gets updated so the next `start`
+        // assembles the sing-box config from the active profile.
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        let uid = "Rcmd-singbox-not-running";
+        seed_missing_remote_profile(uid, "singbox-not-running").await;
+
+        // 127.0.0.1:1 — well-known port nobody binds, TCP connect fails fast.
+        let unreachable: std::net::SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let mgr = MihomoManager::new(root.clone())
+            .with_core_kind(CoreKind::SingBox)
+            .with_singbox_controller(unreachable);
+
+        use_profile(&mgr, uid)
+            .await
+            .expect("sing-box + !running must skip restart");
+
+        // The next `start` reads `current_uid` via
+        // `ManagerInner::active_profile_yaml`; confirm the seeded profile
+        // is now the active one (no file rewrite was attempted, no
+        // sing-box config was generated, no controller was contacted).
+        let snapshot = ProfileStore::snapshot().await.expect("snapshot");
+        assert_eq!(
+            snapshot.current_uid().as_deref(),
+            Some(uid),
+            "current_uid must be set so the next start picks this profile up"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reload_if_requested_dispatches_to_singbox_branch_via_reload_current_profile_for_core() {
+        // `reload_if_requested` already bails when `!reload` or
+        // `!core_running`; only the `reload=true && running=true` arm
+        // reaches the helper. A sing-box manager + a fake reachable
+        // controller + a missing profile file should therefore surface
+        // sing-box's `read_profile_yaml` error ("failed to read ..."),
+        // proving the helper called is `reload_current_profile_for_core`
+        // (the manager-aware one), not `reload_current_profile`
+        // (mihomo-only). The mihomo-only helper would never reach the
+        // sing-box branch and would surface a different signature.
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        let uid = "Rcmd-reload-singbox";
+        seed_missing_remote_profile(uid, "reload-singbox").await;
+
+        let (addr, _handle) = fake_singbox_controller().await;
+        let mgr = MihomoManager::new(root.clone())
+            .with_core_kind(CoreKind::SingBox)
+            .with_singbox_controller(addr);
+
+        let error = reload_if_requested(&mgr, uid, true)
+            .await
+            .expect_err("missing file must surface as an error");
+        let text = error.to_string();
+        assert!(
+            text.contains("failed to read") && text.contains(&format!("{uid}.yaml")),
+            "reload helper must take the sing-box branch: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reload_if_requested_bails_when_core_not_running() {
+        // The brief's "don't start a core when not running" rule applies
+        // to reload too: `reload_if_requested` must short-circuit before
+        // `reload_current_profile_for_core` is reached, otherwise the
+        // sing-box branch's `apply_singbox_restart` would start a core
+        // the user never asked for. The current contract is
+        // "reload=true && running=true reaches the helper; otherwise
+        // the function returns Ok without touching the helper". Lock
+        // that in here so a future refactor cannot silently widen the
+        // helper call to also fire when the core is down.
+        let root = crate::profile_store::store::tests::test_app_home_root();
+        let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
+
+        let uid = "Rcmd-reload-not-running";
+        seed_missing_remote_profile(uid, "reload-not-running").await;
+
+        let bogus_socket = std::env::temp_dir().join(format!("cv-no-sock-{}.sock", uuid::Uuid::new_v4()));
+        let mgr = MihomoManager::new(root.clone())
+            .with_core_kind(CoreKind::SingBox)
+            .with_singbox_controller("127.0.0.1:1".parse().expect("addr"))
+            .with_socket(bogus_socket);
+
+        // reload=false → early return, no error even with a missing file.
+        must(
+            reload_if_requested(&mgr, uid, false).await,
+            "reload=false must short-circuit",
+        );
+        // running=false → early return, no error even with a missing file.
+        must(
+            reload_if_requested(&mgr, uid, true).await,
+            "running=false must short-circuit",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
