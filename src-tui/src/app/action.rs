@@ -106,6 +106,10 @@ pub enum Action {
     LogsRefresh,
     LogReceived(LogEntry),
     LogsFailed(String),
+    /// `r` on Unlock: check every service through the core.
+    RunUnlockChecks,
+    UnlockChecked(crate::services::unlock::Report),
+    UnlockFailed(String),
     /// `L` on Logs: switch mihomo's log level to the next one.
     CycleLogLevel,
     LogLevelChanged(String),

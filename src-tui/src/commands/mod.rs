@@ -1,4 +1,5 @@
 pub mod askpass;
+pub mod backup;
 pub mod connections;
 pub mod daemon;
 pub mod docs;
@@ -15,6 +16,7 @@ pub mod status;
 pub mod stop;
 pub mod sysproxy;
 pub mod tun;
+pub mod unlock;
 
 use std::path::PathBuf;
 

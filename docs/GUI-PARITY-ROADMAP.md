@@ -34,13 +34,18 @@ Tray, global hotkeys, and lightweight window mode are explicitly out of scope.
 
 - **Phase 4 — Proxies / Rules / observability**: proxies view, rules +
   rule-provider panels with provider update, close connection /
-  close-all-connections, live traffic/connection/log streams. Log level is
-  fixed at `info` (filtering is client-side).
+  close-all-connections, live traffic/connection/log streams, `/` filters on
+  every list, node sort/hide, and a runtime log level switch (`L`).
 - **Phase 5 — Settings / DNS / runtime**: settings view with `$EDITOR` for
   verge config / DNS / runtime YAML, port display.
 
+- **Phase 6 — Unlock / media tests**: Netflix, YouTube Premium, Disney+,
+  ChatGPT, Claude, Gemini, and TikTok through the core's proxy port
+  (`unlock`, Unlock view `r`).
+- **Phase 7 — Backup / WebDAV**: `backup create|list|restore`, locally and
+  with `--webdav`, in the GUI's archive layout and folder.
+
 ## Remaining
 
-- **Phase 6 — Unlock / media tests**: `unlock` view is a placeholder ("use
-  the GUI workflow"); real media-unlock checks are not wired.
-- **Phase 7 — Backup / WebDAV**: not started.
+- Scheduled automatic backups (`enable_auto_backup_schedule`) are not run by
+  the CLI yet; `backup create` can be scheduled with a systemd timer or cron.

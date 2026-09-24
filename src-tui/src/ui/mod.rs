@@ -389,7 +389,7 @@ mod tests {
             (View::Connections, "Connection Detail"),
             (View::Rules, "Rule Providers"),
             (View::Logs, "ERROR"),
-            (View::Unlock, "Limited support"),
+            (View::Unlock, "Press r to check"),
             (View::Settings, "Runtime Settings"),
         ];
 
@@ -481,7 +481,35 @@ mod tests {
 
         app.view = View::Unlock;
         let (unlock, _) = render(&app, 120, 32);
-        assert!(unlock.contains("Media unlock checks are not wired"));
+        assert!(unlock.contains("Press r to check"));
+
+        use crate::services::unlock::{CheckResult, Report, Service, Verdict};
+        app.unlock.report = Some(Report {
+            exit: vec!["Auto".into(), "Tokyo".into()],
+            results: vec![
+                CheckResult {
+                    service: Service::Netflix,
+                    verdict: Verdict::OriginalsOnly,
+                    region: Some("JP".into()),
+                    detail: None,
+                },
+                CheckResult {
+                    service: Service::ChatGpt,
+                    verdict: Verdict::Failed,
+                    region: None,
+                    detail: Some("timed out".into()),
+                },
+            ],
+        });
+        let (unlock, _) = render(&app, 120, 32);
+        assert!(unlock.contains("Exit: Auto → Tokyo"), "{unlock}");
+        assert!(unlock.contains("originals only"));
+        assert!(unlock.contains("timed out"));
+        assert!(unlock.contains("Disney+"), "services without a result are still listed");
+        app.unlock.running = true;
+        let (unlock, _) = render(&app, 120, 32);
+        assert!(unlock.contains("checking..."));
+        app.unlock.running = false;
 
         app.view = View::Settings;
         let (settings, _) = render(&app, 120, 32);
