@@ -69,6 +69,9 @@ pub struct ManagerInner {
     pub core_kind: AtomicU8,
     /// TCP port of the sing-box clash_api controller (fixed loopback host).
     pub singbox_port: AtomicU16,
+    /// Secret the sing-box controller requires (see
+    /// [`crate::singbox::ControllerSettings`]).
+    pub singbox_secret: Mutex<String>,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -303,6 +306,7 @@ impl ManagerInner {
             expected_exit_gen: AtomicU64::new(u64::MAX),
             core_kind: AtomicU8::new(0),
             singbox_port: AtomicU16::new(9090),
+            singbox_secret: Mutex::new(String::new()),
         }
     }
 
@@ -357,6 +361,28 @@ impl ManagerInner {
             CoreKind::SingBox => 1,
         };
         self.core_kind.store(v, Ordering::SeqCst);
+        if kind == CoreKind::SingBox {
+            self.load_singbox_controller();
+        }
+    }
+
+    /// Take the controller port and secret from the configuration
+    /// directory, the same place the config generator reads them.
+    fn load_singbox_controller(&self) {
+        let settings = clash_verge_core::utils::dirs::app_home_dir()
+            .map_err(|error| error.to_string())
+            .and_then(|home| crate::singbox::controller_settings(&home).map_err(|error| error.to_string()));
+        match settings {
+            Ok(settings) => {
+                self.set_singbox_port(settings.port);
+                *self.singbox_secret.lock() = settings.secret;
+            }
+            Err(error) => tracing::warn!(target: "singbox", "controller settings unavailable: {error}"),
+        }
+    }
+
+    pub fn singbox_secret(&self) -> String {
+        self.singbox_secret.lock().clone()
     }
 
     /// Spawn a mihomo child from a resolved binary, wire up the watcher,
@@ -487,7 +513,10 @@ impl ManagerInner {
                 CoreKind::Mihomo => crate::mihomo_api::Transport::UnixSocket(socket_path.to_path_buf()),
                 CoreKind::SingBox => crate::mihomo_api::Transport::Tcp(inner.singbox_controller()),
             },
-            String::new(),
+            match core_kind {
+                CoreKind::Mihomo => String::new(),
+                CoreKind::SingBox => inner.singbox_secret(),
+            },
         )
         .map_err(|e| anyhow::anyhow!("readiness probe client build failed: {e}"))?;
         let mut child = child;
@@ -620,9 +649,11 @@ impl ManagerInner {
             stack: "gvisor".into(),
             mtu: 9000,
         };
+        let controller = crate::singbox::controller_settings(&clash_verge_core::utils::dirs::app_home_dir()?)
+            .context("cannot prepare the sing-box controller settings")?;
         let clash_api = crate::singbox::ClashApiSettings {
-            listen: "127.0.0.1:9090".parse().expect("static addr"),
-            secret: String::new(),
+            listen: controller.addr(),
+            secret: controller.secret,
         };
 
         // Native sing-box JSON profile passthrough: preserve the provider's own
@@ -640,7 +671,8 @@ impl ManagerInner {
             }
             let body = serde_json::to_string_pretty(&config)?;
             let tmp = path.with_extension("json.download");
-            tokio::fs::write(&tmp, body).await?;
+            // Private: it holds the controller secret and node credentials.
+            crate::services::backup::write_private(&tmp, body.as_bytes())?;
             tokio::fs::rename(&tmp, &path).await?;
 
             let outbounds = config
@@ -698,7 +730,8 @@ impl ManagerInner {
         let body = serde_json::to_string_pretty(&config)?;
         // Write-then-rename so a crash mid-write never leaves a truncated config.
         let tmp = path.with_extension("json.download");
-        tokio::fs::write(&tmp, body).await?;
+        // Private: it holds the controller secret and node credentials.
+        crate::services::backup::write_private(&tmp, body.as_bytes())?;
         tokio::fs::rename(&tmp, &path).await?;
         Ok((path, parts))
     }
@@ -798,9 +831,6 @@ pub struct MihomoManager {
     config_dir: PathBuf,
     socket_path: PathBuf,
     secret: String,
-    core_kind: CoreKind,
-    /// sing-box clash_api TCP endpoint (used when `core_kind == SingBox`).
-    singbox_controller: std::net::SocketAddr,
 }
 
 impl MihomoManager {
@@ -815,27 +845,33 @@ impl MihomoManager {
             config_dir,
             socket_path,
             secret: String::new(),
-            core_kind: CoreKind::default(),
-            singbox_controller: "127.0.0.1:9090".parse().expect("static addr"),
         }
     }
 
     /// Select which core this manager owns. Must be set before `start()`.
-    pub fn with_core_kind(mut self, kind: CoreKind) -> Self {
-        self.core_kind = kind;
+    pub fn with_core_kind(self, kind: CoreKind) -> Self {
         self.inner.set_core_kind(kind);
         self
     }
 
+    /// Switch the core this manager (and every clone of it) starts next.
+    /// The running core, if any, must be stopped first.
+    pub fn set_core_kind(&self, kind: CoreKind) {
+        self.inner.set_core_kind(kind);
+    }
+
     /// Override the sing-box clash_api TCP endpoint.
-    pub fn with_singbox_controller(mut self, addr: std::net::SocketAddr) -> Self {
-        self.singbox_controller = addr;
+    pub fn with_singbox_controller(self, addr: std::net::SocketAddr) -> Self {
         self.inner.set_singbox_port(addr.port());
         self
     }
 
-    pub const fn core_kind(&self) -> CoreKind {
-        self.core_kind
+    pub fn core_kind(&self) -> CoreKind {
+        self.inner.core_kind()
+    }
+
+    fn singbox_controller(&self) -> std::net::SocketAddr {
+        self.inner.singbox_controller()
     }
 
     pub fn with_socket(mut self, socket_path: PathBuf) -> Self {
@@ -865,7 +901,7 @@ impl MihomoManager {
         let kind = self.core_kind();
         let singbox_endpoint = match kind {
             CoreKind::Mihomo => None,
-            CoreKind::SingBox => Some(self.singbox_controller),
+            CoreKind::SingBox => Some(self.singbox_controller()),
         };
         if let Some(record) = pidfile::read_live_for_kind(
             &pidfile::path_for(&self.socket_path),
@@ -948,11 +984,11 @@ impl MihomoManager {
     /// Build a MihomoApi client targeting this manager's socket with
     /// bearer auth from the configured secret.
     pub fn api(&self) -> MihomoApi {
-        let result = match self.core_kind {
+        let result = match self.core_kind() {
             CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
             CoreKind::SingBox => MihomoApi::with_transport(
-                crate::mihomo_api::Transport::Tcp(self.singbox_controller),
-                self.secret.clone(),
+                crate::mihomo_api::Transport::Tcp(self.singbox_controller()),
+                self.inner.singbox_secret(),
             ),
         };
         result.expect("MihomoApi construction failed — secret may contain invalid header characters")
@@ -1179,7 +1215,7 @@ resolved binary; the running core was left untouched",
                     anyhow::bail!(
                         "a sing-box core already answers on {} without a clash-verge-cli pid record; \
 stop it where it was started",
-                        self.singbox_controller
+                        self.singbox_controller()
                     );
                 }
                 Ok(())
@@ -1588,7 +1624,8 @@ mod tests {
 
         let mgr = mgr.with_core_kind(CoreKind::SingBox);
         match mgr.api().transport() {
-            Transport::Tcp(addr) => assert_eq!(addr.to_string(), "127.0.0.1:9090"),
+            // Loopback only; the port comes from the controller settings.
+            Transport::Tcp(addr) => assert!(addr.ip().is_loopback() && addr.port() != 0, "{addr}"),
             other => panic!("sing-box api must use tcp, got {other:?}"),
         }
     }

@@ -32,6 +32,67 @@ pub const LOGICAL_RULES_FILE: &str = "singbox-rules.json";
 /// Task 8.1: structured DNS settings (1.12+ new format), TUI-owned.
 pub const DNS_CONFIG_FILE: &str = "singbox-dns.json";
 
+/// The controller's port and secret, chosen once per configuration
+/// directory (mode 0600).
+pub const CONTROLLER_FILE: &str = "singbox-controller.json";
+
+/// Where sing-box's clash_api listens and the secret it requires. sing-box
+/// has no unix-socket controller, so the loopback TCP port is reachable by
+/// every local user and process: the secret is what keeps them out.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ControllerSettings {
+    pub port: u16,
+    pub secret: String,
+}
+
+impl ControllerSettings {
+    pub fn addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([127, 0, 0, 1], self.port))
+    }
+}
+
+/// The controller settings in `home`, created on first use: a free port
+/// (preferring 9097 and up, away from the common 9090) and a random secret.
+pub fn controller_settings(home: &std::path::Path) -> std::io::Result<ControllerSettings> {
+    if let Some(settings) = read_json_file::<ControllerSettings>(home, CONTROLLER_FILE)
+        .filter(|settings| settings.port != 0 && settings.secret.len() >= 32)
+    {
+        return Ok(settings);
+    }
+    let settings = ControllerSettings {
+        port: free_loopback_port(),
+        secret: format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple()),
+    };
+    std::fs::create_dir_all(home)?;
+    let body = serde_json::to_string_pretty(&settings)?;
+    let partial = home.join(format!("{CONTROLLER_FILE}.partial"));
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&partial)?;
+        file.write_all(body.as_bytes())?;
+    }
+    std::fs::rename(&partial, home.join(CONTROLLER_FILE))?;
+    Ok(settings)
+}
+
+fn free_loopback_port() -> u16 {
+    (9097..9200)
+        .find(|port| std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok())
+        .or_else(|| {
+            std::net::TcpListener::bind(("127.0.0.1", 0))
+                .ok()
+                .and_then(|listener| listener.local_addr().ok())
+                .map(|addr| addr.port())
+        })
+        .unwrap_or(9097)
+}
+
 fn read_json_file<T: serde::de::DeserializeOwned>(home: &std::path::Path, name: &str) -> Option<T> {
     let body = std::fs::read_to_string(home.join(name)).ok()?;
     serde_json::from_str(&body).ok()
@@ -97,6 +158,28 @@ mod storage_tests {
         let dir = std::env::temp_dir().join(format!("singbox-mod-test-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
+    }
+
+    #[test]
+    fn controller_settings_are_created_once_privately_and_reused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = temp_home("controller");
+        let _ = std::fs::remove_file(home.join(CONTROLLER_FILE));
+        let first = controller_settings(&home).expect("create");
+        assert!(first.secret.len() >= 32 && first.port != 0);
+        let mode = std::fs::metadata(home.join(CONTROLLER_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(controller_settings(&home).expect("reuse"), first);
+
+        // A weak or broken file is replaced.
+        std::fs::write(home.join(CONTROLLER_FILE), r#"{"port":9090,"secret":""}"#).unwrap();
+        let replaced = controller_settings(&home).expect("replace");
+        assert!(replaced.secret.len() >= 32);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
