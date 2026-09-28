@@ -44,6 +44,9 @@ pub enum IRouteRule {
     Simple {
         matches: Vec<MatchField>,
         target: RuleTarget,
+        /// Clash rule options after the target (`no-resolve`, `src`),
+        /// kept for the Clash form; sing-box has no equivalent.
+        options: Vec<String>,
     },
     #[allow(dead_code)]
     Logical {
@@ -110,16 +113,19 @@ fn field_from_clash_str(kind: &str, value: &str) -> Option<MatchField> {
 }
 
 /// Parse a clash rule string. Unrecognized kinds become Raw passthrough.
+///
+/// Clash rules are `TYPE,VALUE,TARGET[,OPTION...]` (e.g.
+/// `IP-CIDR,10.0.0.0/8,DIRECT,no-resolve`): the target is the third field,
+/// not the last, and trailing options are kept for the Clash form.
 pub fn from_clash_rule_str(rule: &str) -> IRouteRule {
     let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
-    if parts.len() < 2 {
+    // SUB-RULE and other exotic headers pass through verbatim, as does
+    // anything without a target (MATCH has no value and stays Raw too; it
+    // becomes the route's final outbound instead).
+    if parts.len() < 3 || matches!(parts[0], "SUB-RULE" | "AND" | "OR" | "NOT" | "MATCH") {
         return IRouteRule::Raw { clash_raw: rule.into() };
     }
-    // SUB-RULE and other exotic headers pass through verbatim.
-    if matches!(parts[0], "SUB-RULE" | "AND" | "OR" | "NOT") {
-        return IRouteRule::Raw { clash_raw: rule.into() };
-    }
-    let Some(target) = target_from_clash_str(parts[parts.len() - 1]) else {
+    let Some(target) = target_from_clash_str(parts[2]) else {
         return IRouteRule::Raw { clash_raw: rule.into() };
     };
     let Some(field) = field_from_clash_str(parts[0], parts[1]) else {
@@ -128,6 +134,7 @@ pub fn from_clash_rule_str(rule: &str) -> IRouteRule {
     IRouteRule::Simple {
         matches: vec![field],
         target,
+        options: parts[3..].iter().map(|option| (*option).to_string()).collect(),
     }
 }
 
@@ -135,13 +142,18 @@ pub fn from_clash_rule_str(rule: &str) -> IRouteRule {
 pub fn to_clash_rule_str(rule: &IRouteRule) -> String {
     match rule {
         IRouteRule::Raw { clash_raw } => clash_raw.clone(),
-        IRouteRule::Simple { matches, target } => {
+        IRouteRule::Simple {
+            matches,
+            target,
+            options,
+        } => {
             let mut parts: Vec<String> = matches
                 .iter()
                 .filter_map(field_to_clash_str)
                 .flat_map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
                 .collect();
             parts.push(target_to_clash_str(target));
+            parts.extend(options.iter().cloned());
             parts.join(",")
         }
         IRouteRule::Logical { .. } => {
@@ -221,7 +233,11 @@ fn simple_from_singbox(rule: &Value) -> Option<IRouteRule> {
         matches.push(MatchField::Port(port.as_u64()? as u16));
     }
     let target = target_from_singbox(rule)?;
-    Some(IRouteRule::Simple { matches, target })
+    Some(IRouteRule::Simple {
+        matches,
+        target,
+        options: Vec::new(),
+    })
 }
 
 /// Convert an IRouteRule into a sing-box route rule JSON object.
@@ -231,7 +247,7 @@ fn simple_from_singbox(rule: &Value) -> Option<IRouteRule> {
 pub fn to_singbox_json(rule: &IRouteRule) -> Option<Value> {
     match rule {
         IRouteRule::Raw { .. } => None,
-        IRouteRule::Simple { matches, target } => {
+        IRouteRule::Simple { matches, target, .. } => {
             let mut rule = json!({});
             for field in matches {
                 field_to_singbox(field, &mut rule);
@@ -277,6 +293,33 @@ pub fn from_singbox_json(rule: &Value) -> Option<IRouteRule> {
 }
 
 #[cfg(test)]
+mod clash_option_tests {
+    use super::*;
+
+    #[test]
+    fn the_target_is_the_third_field_and_options_round_trip() {
+        let rule = from_clash_rule_str("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve");
+        assert_eq!(
+            rule,
+            IRouteRule::Simple {
+                matches: vec![MatchField::IpCidr("10.0.0.0/8".into())],
+                target: RuleTarget::Direct,
+                options: vec!["no-resolve".into()],
+            }
+        );
+        assert_eq!(to_clash_rule_str(&rule), "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve");
+        // sing-box has no no-resolve: the rule still routes to direct.
+        assert_eq!(to_singbox_json(&rule).unwrap()["outbound"], "direct");
+
+        let plain = from_clash_rule_str("DOMAIN-SUFFIX,example.com,Proxy");
+        assert_eq!(to_clash_rule_str(&plain), "DOMAIN-SUFFIX,example.com,Proxy");
+        // MATCH and two-field rules are not simple rules.
+        assert!(from_clash_rule_str("MATCH,Proxy").is_raw());
+        assert!(from_clash_rule_str("DOMAIN,a.com").is_raw());
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -315,6 +358,7 @@ mod tests {
                 MatchField::IpCidr("10.0.0.0/8".into()),
             ],
             target: RuleTarget::Outbound("PROXY".into()),
+            options: Vec::new(),
         };
         let json = to_singbox_json(&simple).expect("simple");
         assert_eq!(json["domain_suffix"], json!(["google.com"]));
@@ -326,10 +370,12 @@ mod tests {
                 IRouteRule::Simple {
                     matches: vec![MatchField::Domain("a.com".into())],
                     target: RuleTarget::Direct,
+                    options: Vec::new(),
                 },
                 IRouteRule::Simple {
                     matches: vec![MatchField::Port(443)],
                     target: RuleTarget::Direct,
+                    options: Vec::new(),
                 },
             ],
             target: RuleTarget::Direct,
@@ -476,10 +522,12 @@ mod describe_tests {
                 IRouteRule::Simple {
                     matches: vec![MatchField::Port(443)],
                     target: RuleTarget::Direct,
+                    options: Vec::new(),
                 },
                 IRouteRule::Simple {
                     matches: vec![MatchField::Domain("a.com".into())],
                     target: RuleTarget::Direct,
+                    options: Vec::new(),
                 },
             ],
             target: RuleTarget::Direct,
@@ -535,6 +583,7 @@ pub fn build_simple_rule(spec: &str) -> Result<IRouteRule, String> {
     Ok(IRouteRule::Simple {
         matches: vec![field],
         target,
+        options: Vec::new(),
     })
 }
 
@@ -551,6 +600,7 @@ mod form_tests {
             IRouteRule::Simple {
                 matches: vec![MatchField::DomainSuffix("google.com".into())],
                 target: RuleTarget::Outbound("PROXY".into()),
+                options: Vec::new(),
             }
         );
 
@@ -559,6 +609,7 @@ mod form_tests {
             IRouteRule::Simple {
                 matches: vec![MatchField::IpCidr("10.0.0.0/8".into())],
                 target: RuleTarget::Direct,
+                options: Vec::new(),
             }
         );
         assert_eq!(
@@ -566,6 +617,7 @@ mod form_tests {
             IRouteRule::Simple {
                 matches: vec![MatchField::RuleSet("geoip".into())],
                 target: RuleTarget::Block,
+                options: Vec::new(),
             }
         );
         assert_eq!(
@@ -573,6 +625,7 @@ mod form_tests {
             IRouteRule::Simple {
                 matches: vec![MatchField::Port(443)],
                 target: RuleTarget::Outbound("PROXY".into()),
+                options: Vec::new(),
             }
         );
     }

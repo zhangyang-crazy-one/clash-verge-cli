@@ -415,6 +415,13 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
             let kind = match gtype {
                 "select" => crate::singbox::GroupKind::Selector,
                 "url-test" => crate::singbox::GroupKind::UrlTest,
+                // sing-box has neither: the closest is picking the fastest
+                // live member, which keeps the group (and everything that
+                // references it) working.
+                "fallback" | "load-balance" => {
+                    result.degraded.push(format!("{name}: {gtype} group runs as url-test"));
+                    crate::singbox::GroupKind::UrlTest
+                }
                 other => {
                     result.skipped.push(format!("{name}: group type '{other}' unsupported"));
                     continue;
@@ -460,19 +467,21 @@ proxy-groups:
   - name: fallback-g
     type: fallback
     proxies: [ok-node]
+  - name: relay-g
+    type: relay
+    proxies: [ok-node]
 "#;
         let result = convert_profile(yaml).expect("convert profile");
         assert_eq!(result.outbounds.len(), 1);
         assert_eq!(result.outbounds[0]["tag"], "ok-node");
-        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups.len(), 2);
         assert_eq!(result.groups[0].name, "PROXY");
         assert_eq!(result.groups[0].kind, crate::singbox::GroupKind::Selector);
-        assert_eq!(
-            result.skipped.len(),
-            2,
-            "bad node + fallback group: {:?}",
-            result.skipped
-        );
+        // fallback degrades to url-test instead of vanishing.
+        assert_eq!(result.groups[1].name, "fallback-g");
+        assert_eq!(result.groups[1].kind, crate::singbox::GroupKind::UrlTest);
+        assert!(result.degraded.iter().any(|d| d.contains("fallback-g")));
+        assert_eq!(result.skipped.len(), 2, "bad node + relay group: {:?}", result.skipped);
         assert!(result.skipped[0].starts_with("bad-node:"), "{:?}", result.skipped);
     }
 

@@ -14,7 +14,9 @@ pub mod dns;
 
 use serde_json::Value;
 
-pub use config_gen::{ClashApiSettings, ConfigInput, GroupKind, GroupSpec, TunSettings, generate_config};
+pub use config_gen::{
+    ClashApiSettings, ConfigInput, GroupKind, GroupSpec, TunSettings, generate_config, generate_config_reporting,
+};
 pub use dns::DnsConfigSpec;
 
 /// Task 7.4: durable rule-set storage (TUI-owned, separate from the
@@ -105,6 +107,7 @@ mod storage_tests {
             rules: vec![IRouteRule::Simple {
                 matches: vec![MatchField::Domain("a.com".into())],
                 target: RuleTarget::Direct,
+                options: Vec::new(),
             }],
             target: RuleTarget::Block,
         }];
@@ -123,6 +126,7 @@ mod storage_tests {
             IRouteRule::Simple {
                 matches: vec![MatchField::Port(443)],
                 target: RuleTarget::Direct,
+                options: Vec::new(),
             },
         ];
         assert!(save_logical_rules(&home, &mixed).is_err());

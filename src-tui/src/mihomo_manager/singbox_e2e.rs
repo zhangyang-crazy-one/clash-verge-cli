@@ -31,6 +31,8 @@ fn write_probe_config(dir: &std::path::Path, controller: SocketAddr) -> anyhow::
         rule_sets: Vec::new(),
         route_rules: Vec::new(),
         dns: None,
+        final_target: None,
+        default_mode: None,
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
     let path = dir.join("e2e-singbox.json");

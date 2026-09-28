@@ -118,6 +118,8 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
         rule_sets: Vec::new(),
         route_rules: Vec::new(),
         dns: None,
+        final_target: None,
+        default_mode: None,
     };
     let config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
     serde_json::to_string_pretty(&config).map_err(Into::into)
@@ -189,8 +191,34 @@ pub(super) async fn probe_readiness(
     kind: CoreKind,
     timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
+    probe_readiness_of(api, kind, timeout, None).await
+}
+
+/// [`probe_readiness`] for a child this process just spawned: when the
+/// child exits first (a config the core rejects), stop waiting and report
+/// what it printed instead of a bare timeout.
+pub(super) async fn probe_readiness_of(
+    api: &crate::mihomo_api::MihomoApi,
+    kind: CoreKind,
+    timeout: std::time::Duration,
+    mut child: Option<&mut tokio::process::Child>,
+) -> anyhow::Result<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        if let Some(child) = child.as_deref_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            let output = exit_output(child).await;
+            anyhow::bail!(
+                "{} exited ({status}) before its controller was ready{}",
+                kind.as_str(),
+                if output.is_empty() {
+                    String::new()
+                } else {
+                    format!(":\n{output}")
+                }
+            );
+        }
         match api.version().await {
             Ok(v) => {
                 if version_matches_kind(&v.version, kind) {
@@ -210,6 +238,54 @@ pub(super) async fn probe_readiness(
             }
         }
     }
+}
+
+/// The last lines an exited child printed (its pipes are at EOF by now).
+async fn exit_output(child: &mut tokio::process::Child) -> String {
+    use tokio::io::AsyncReadExt as _;
+    let mut text = String::new();
+    for pipe in [
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Unpin + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut buf = Vec::new();
+        let _ = pipe.take(64 * 1024).read_to_end(&mut buf).await;
+        text.push_str(&String::from_utf8_lossy(&buf));
+    }
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(5)..];
+    strip_ansi(&tail.join("\n"))
+}
+
+/// Remove terminal color codes (sing-box colors its log levels).
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ ... final byte in @..~
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl ManagerInner {
@@ -414,21 +490,23 @@ impl ManagerInner {
             String::new(),
         )
         .map_err(|e| anyhow::anyhow!("readiness probe client build failed: {e}"))?;
-        let probed_version = match probe_readiness(&probe_api, core_kind, READINESS_PROBE_TIMEOUT).await {
-            Ok(v) => v,
-            Err(error) => {
-                // P1-1 (reviewer): the readiness probe can fail in two ways
-                // — the child exited on its own (bad config) or it is wedged.
-                // Either way we must FULLY clean up the in-memory runtime
-                // state so a subsequent `start` does not see a stale pid /
-                // started_at and re-try the adopted-core bail path. The
-                // pidfile still names us at the time of the kill, so
-                // remove_if can confidently drop it.
-                let _ = signal::graceful_stop_by_pid(pid).await;
-                rollback_failed_spawn(&inner, socket_path, pid, error.to_string());
-                return Err(error);
-            }
-        };
+        let mut child = child;
+        let probed_version =
+            match probe_readiness_of(&probe_api, core_kind, READINESS_PROBE_TIMEOUT, Some(&mut child)).await {
+                Ok(v) => v,
+                Err(error) => {
+                    // P1-1 (reviewer): the readiness probe can fail in two ways
+                    // — the child exited on its own (bad config) or it is wedged.
+                    // Either way we must FULLY clean up the in-memory runtime
+                    // state so a subsequent `start` does not see a stale pid /
+                    // started_at and re-try the adopted-core bail path. The
+                    // pidfile still names us at the time of the kill, so
+                    // remove_if can confidently drop it.
+                    let _ = signal::graceful_stop_by_pid(pid).await;
+                    rollback_failed_spawn(&inner, socket_path, pid, error.to_string());
+                    return Err(error);
+                }
+            };
 
         if let Some(tx) = inner.action_tx.lock().as_ref() {
             let _ = tx.send(Action::CoreStarted {
@@ -582,11 +660,14 @@ impl ManagerInner {
                 rule_sets: vec![],
                 dns_section: None,
                 default_domain_resolver: None,
+                final_target: None,
+                notes: Vec::new(),
             };
             return Ok((path, parts));
         }
 
-        let parts = SingboxParts::assemble(yaml).await?;
+        let mut parts = SingboxParts::assemble(yaml).await?;
+        let default_mode = clash_verge_core::config::IClashTemp::new().await.get_mode();
         let input = crate::singbox::ConfigInput {
             outbounds: parts.conversion.outbounds.clone(),
             groups: parts.conversion.groups.clone(),
@@ -597,8 +678,14 @@ impl ManagerInner {
             tun,
             clash_api,
             dns: parts.dns_section.clone(),
+            final_target: parts.final_target.clone(),
+            default_mode,
         };
-        let mut config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
+        let (mut config, notes) = crate::singbox::generate_config_reporting(&input).map_err(anyhow::Error::msg)?;
+        for note in &parts.notes {
+            tracing::warn!(target: "singbox", "{note}");
+        }
+        parts.notes.extend(notes);
         // 1.12+ bootstrap: tell the core which DNS server resolves outbound
         // node domains (see D8).
         if let Some(resolver) = &parts.default_domain_resolver {
@@ -617,6 +704,15 @@ impl ManagerInner {
     }
 }
 
+/// The target of the profile's `MATCH,<target>` rule.
+fn match_target(yaml: &str) -> Option<String> {
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).ok()?;
+    doc.get("rules")?.as_sequence()?.iter().find_map(|rule| {
+        let mut parts = rule.as_str()?.split(',').map(str::trim);
+        (parts.next()? == "MATCH").then(|| parts.next().map(str::to_string))?
+    })
+}
+
 /// Everything assembled for one sing-box config generation pass.
 pub(crate) struct SingboxParts {
     pub conversion: crate::singbox::convert::ProfileConversion,
@@ -627,6 +723,10 @@ pub(crate) struct SingboxParts {
     pub rule_sets: Vec<serde_json::Value>,
     pub dns_section: Option<serde_json::Value>,
     pub default_domain_resolver: Option<String>,
+    /// The profile's `MATCH` target.
+    pub final_target: Option<String>,
+    /// What generation dropped to keep the config startable.
+    pub notes: Vec<String>,
 }
 
 impl SingboxParts {
@@ -641,14 +741,26 @@ impl SingboxParts {
         // Clash-expressible rules convert through IRouteRule; raw clash
         // fragments have no sing-box form and stay profile-only. Stored
         // logical rules are appended after them (see LOGICAL_RULES_FILE).
-        let mut route_rules: Vec<serde_json::Value> = match yaml {
-            Some(y) => crate::routing::load_profile_rules(y)
-                .map_err(anyhow::Error::msg)?
-                .iter()
-                .filter_map(crate::routing::to_singbox_json)
-                .collect(),
+        let profile_rules = match yaml {
+            Some(y) => crate::routing::load_profile_rules(y).map_err(anyhow::Error::msg)?,
             None => Vec::new(),
         };
+        // Rules with no sing-box form (GEOIP, GEOSITE, SRC-IP-CIDR, ...) are
+        // left out; say so rather than change routing silently. MATCH is
+        // not lost: it becomes route.final.
+        let mut notes: Vec<String> = profile_rules
+            .iter()
+            .filter_map(|rule| match rule {
+                crate::routing::IRouteRule::Raw { clash_raw } if !clash_raw.starts_with("MATCH,") => {
+                    Some(format!("rule {clash_raw:?} has no sing-box form; left out"))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut route_rules: Vec<serde_json::Value> = profile_rules
+            .iter()
+            .filter_map(crate::routing::to_singbox_json)
+            .collect();
         let home = clash_verge_core::utils::dirs::app_home_dir().ok();
         if let Some(logical) = home.as_ref().map(|home| crate::singbox::load_logical_rules(home)) {
             route_rules.extend(logical.iter().filter_map(crate::routing::to_singbox_json));
@@ -662,6 +774,7 @@ impl SingboxParts {
         let empty_dns = crate::singbox::dns::DnsConfigSpec::default();
         let dns_section = crate::singbox::dns::build_dns_section(dns_spec.as_ref().unwrap_or(&empty_dns))
             .map_err(anyhow::Error::msg)?;
+        let final_target = yaml.and_then(match_target);
         Ok(Self {
             conversion,
             profile_used,
@@ -669,6 +782,8 @@ impl SingboxParts {
             rule_sets,
             dns_section,
             default_domain_resolver,
+            final_target,
+            notes: std::mem::take(&mut notes),
         })
     }
 }
@@ -1490,6 +1605,36 @@ mod tests {
     }
 
     // ---- Task 3.3: readiness probe ----
+
+    #[tokio::test]
+    async fn a_core_that_exits_early_is_reported_with_its_own_error() {
+        use crate::mihomo_api::{MihomoApi, Transport};
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("printf 'starting\\n\\033[31mFATAL\\033[0m[0000] start service: dependency[DIRECT] not found\\n' >&2; exit 1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let api = MihomoApi::with_transport(Transport::Tcp("127.0.0.1:1".parse().unwrap()), "").unwrap();
+        let started = std::time::Instant::now();
+        let error = probe_readiness_of(
+            &api,
+            CoreKind::SingBox,
+            std::time::Duration::from_secs(10),
+            Some(&mut child),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(started.elapsed() < std::time::Duration::from_secs(3), "no 10s wait");
+        assert!(error.contains("exited"), "{error}");
+        assert!(
+            error.contains("FATAL[0000] start service: dependency[DIRECT] not found"),
+            "the core's own message, without color codes: {error}"
+        );
+    }
 
     #[test]
     fn version_kind_detection_by_prefix() {

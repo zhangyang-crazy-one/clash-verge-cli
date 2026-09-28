@@ -99,10 +99,11 @@ pub async fn apply_singbox_restart(
     // Human-readable degradation report for the status bar.
     let report = if parts.profile_used {
         format!(
-            "sing-box: {} nodes, {} skipped, {} fields degraded",
+            "sing-box: {} nodes, {} skipped, {} fields degraded, {} references dropped",
             parts.conversion.outbounds.len(),
             parts.conversion.skipped.len(),
-            parts.conversion.degraded.len()
+            parts.conversion.degraded.len(),
+            parts.notes.len()
         )
     } else {
         "sing-box: skeleton config applied".into()
