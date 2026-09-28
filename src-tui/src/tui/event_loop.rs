@@ -149,6 +149,8 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             },
 
             _ = render_tick.tick() => {
+                // Self-heal missed resize events (Orca embed) before painting.
+                ctx.guard.lock().await.sync_size_if_changed()?;
                 if app.view != rendered_view {
                     // Orca's terminal renderer can retain differential cells across
                     // alternate-screen view changes. Force one clean repaint per route.

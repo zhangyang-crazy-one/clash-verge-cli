@@ -1069,7 +1069,7 @@ stop it where it was started",
                 }
                 Ok(())
             },
-            || Self::resolve_and_preflight_singbox(),
+            Self::resolve_and_preflight_singbox,
             // resolve_and_preflight_singbox already runs the preflight; the
             // pipeline slot stays so the helper signature mirrors
             // orchestrate_restart and the order is unit-testable.

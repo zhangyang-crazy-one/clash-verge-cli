@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Build a minimal valid sing-box config for the probe test.
-fn write_probe_config(dir: &PathBuf, controller: SocketAddr) -> anyhow::Result<PathBuf> {
+fn write_probe_config(dir: &std::path::Path, controller: SocketAddr) -> anyhow::Result<PathBuf> {
     let input = crate::singbox::ConfigInput {
         outbounds: Vec::new(),
         groups: Vec::new(),

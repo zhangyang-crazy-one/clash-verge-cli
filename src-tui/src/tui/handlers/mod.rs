@@ -874,8 +874,8 @@ mod tests {
         );
         // The cached display flag stays at the pre-toggle value — the
         // failed apply means reality (systemd state) hasn't moved.
-        assert_eq!(
-            app.auto_launch_enabled, false,
+        assert!(
+            !app.auto_launch_enabled,
             "a failed toggle must NOT flip the cached display flag"
         );
         assert_eq!(

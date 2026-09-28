@@ -88,9 +88,12 @@ const RESERVED_FIELDS: &[&str] = &[
     "client-fingerprint",
 ];
 
+/// `(clash field, sing-box field)` pairs that translate directly.
+type FieldMap = &'static [(&'static str, &'static str)];
+
 /// (clash type, (sing-box type, [(clash field, sing-box field)]))
 /// Only fields whose names/values translate directly are listed here.
-const PROTOCOL_MAPS: &[(&str, (&str, &[(&str, &str)]))] = &[
+const PROTOCOL_MAPS: &[(&str, (&str, FieldMap))] = &[
     ("ss", ("shadowsocks", &[("cipher", "method"), ("password", "password")])),
     (
         "vmess",
