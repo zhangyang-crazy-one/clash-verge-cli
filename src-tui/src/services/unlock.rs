@@ -14,6 +14,12 @@ use serde::Serialize;
 /// Browser-like: several services serve bots a different page.
 const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+/// `Accept` header carried by every request: without it chatgpt.com /
+/// ios.chat.openai.com serve a stripped 403 instead of the real page, and
+/// `classify_chatgpt` would mis-report the node as `Failed / HTTP 200/403`
+/// (the original false-positive bug). The value is what a stock Chrome
+/// sends, so the requests look indistinguishable from a real browser.
+const ACCEPT_HEADER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, clap::ValueEnum)]
@@ -197,6 +203,7 @@ struct Page {
 async fn get(client: &reqwest::Client, url: &str) -> Result<Page, reqwest::Error> {
     let response = client
         .get(url)
+        .header("Accept", ACCEPT_HEADER)
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
         .await?;
@@ -328,9 +335,19 @@ fn classify_chatgpt(web: &Page, ios: &Page, region: Option<String>) -> CheckResu
             .region(region)
             .detail("the exit IP is flagged as a VPN");
     }
-    // Without a marker, only clean answers count: an error page (rate limit,
-    // outage) says nothing about availability.
-    if web.status >= 400 || ios.status >= 400 {
+    // The `web` endpoint (api.openai.com/compliance/cookie_requirements) is
+    // the authoritative availability signal — it is the same one the
+    // browser uses to decide whether to show a sign-up gate. A 200 means
+    // the region is supported. The `ios` endpoint is more sensitive to
+    // bot / region heuristics and frequently 403s for legitimate exits
+    // (the false-positive bug: same node reported ChatGPT failed when
+    // curl with browser headers got 200). We only trust ios's 4xx when
+    // web agrees the region is unsupported, which the body check above
+    // already handles. A 5xx on web is a genuine server-side error.
+    if web.status >= 500 {
+        return CheckResult::failed(service, format!("HTTP {}", web.status)).region(region);
+    }
+    if web.status >= 400 {
         return CheckResult::failed(service, format!("HTTP {}/{}", web.status, ios.status)).region(region);
     }
     CheckResult::new(service, Verdict::Available).region(region)
@@ -483,19 +500,69 @@ mod tests {
         let blocked = classify_chatgpt(&fine, &vpn, None);
         assert_eq!(blocked.verdict, Verdict::Unavailable);
         assert!(blocked.detail.as_deref().is_some_and(|detail| detail.contains("VPN")));
-        for status in [429, 451, 502] {
+        // web=5xx is a genuine server-side error and must always Failed,
+        // regardless of ios status — those are real outages / WAF
+        // rejections, not bot challenges.
+        for status in [500, 502, 503] {
             let error = page(status, "", "<html>error</html>");
             assert_eq!(
                 classify_chatgpt(&error, &fine, None).verdict,
                 Verdict::Failed,
-                "{status}"
-            );
-            assert_eq!(
-                classify_chatgpt(&fine, &error, None).verdict,
-                Verdict::Failed,
-                "{status}"
+                "web {status} must be Failed"
             );
         }
+        // web 4xx (e.g. 429 rate limit) is Failed on web alone: we never
+        // override web's verdict with ios — body-driven markers above
+        // already handle the unsupported_country case.
+        let rate_limit = page(429, "", "<html>rate limit</html>");
+        assert_eq!(classify_chatgpt(&rate_limit, &fine, None).verdict, Verdict::Failed);
+        // web 451 = country blocked at the API layer; it is NOT
+        // "unsupported_country" in the body marker, so we still surface
+        // it as Failed (the body content would be the human-readable 451
+        // page rather than the JSON the unsupported_country branch greps).
+        let region_blocked = page(451, "", "Not available in your region");
+        assert_eq!(classify_chatgpt(&region_blocked, &fine, None).verdict, Verdict::Failed);
+    }
+
+    #[test]
+    fn chatgpt_ios_4xx_is_not_failed_when_web_is_clean() {
+        // The original false-positive bug: same node, web=200, ios=403,
+        // classify_chatgpt reported Failed / HTTP 200/403 even though the
+        // user could browse chatgpt.com just by sending browser headers.
+        // The cookie_requirements endpoint is the authoritative signal;
+        // ios frequently bot-challenges legitimate exits. We now trust
+        // web and only escalate when web itself errors.
+        let web_ok = page(200, "https://api.openai.com/compliance/cookie_requirements", "{}");
+        let ios_blocked = page(403, "https://ios.chat.openai.com/", "<html>blocked</html>");
+        let result = classify_chatgpt(&web_ok, &ios_blocked, Some("JP".into()));
+        assert_eq!(result.verdict, Verdict::Available);
+        assert_eq!(result.region.as_deref(), Some("JP"));
+        assert!(result.detail.is_none(), "no detail for a clean web answer");
+
+        // 404 from ios (page-not-real-upgrade-flow) is also not failure.
+        let ios_404 = page(404, "https://ios.chat.openai.com/", "<html>404</html>");
+        assert_eq!(classify_chatgpt(&web_ok, &ios_404, None).verdict, Verdict::Available);
+
+        // 401 from ios (login redirect on a missing session) is also not
+        // failure when web is happy.
+        let ios_401 = page(401, "https://ios.chat.openai.com/", "<html>login</html>");
+        assert_eq!(classify_chatgpt(&web_ok, &ios_401, None).verdict, Verdict::Available);
+    }
+
+    #[test]
+    fn chatgpt_does_not_resurrect_unsupported_when_only_ios_is_blocked() {
+        // The body marker for unsupported_country must keep its authority:
+        // even with web=200, an ios body carrying the marker is still a
+        // genuine Unavailable — we did not generalize too far in the
+        // previous fix.
+        let web_ok = page(200, "https://api.openai.com/compliance/cookie_requirements", "{}");
+        let ios_marker = page(
+            403,
+            "https://ios.chat.openai.com/",
+            r#"{"cf_details":"unsupported_country","loc":"CN"}"#,
+        );
+        let result = classify_chatgpt(&web_ok, &ios_marker, None);
+        assert_eq!(result.verdict, Verdict::Unavailable);
     }
 
     #[test]

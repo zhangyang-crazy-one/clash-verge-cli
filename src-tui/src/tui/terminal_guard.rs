@@ -54,6 +54,12 @@ impl TerminalGuard {
     /// renderer never touches rows outside the frame, so stale glyphs from
     /// earlier frames linger below it. Compare the backend's live size with
     /// the frame's cached area and force a full repaint on mismatch.
+    ///
+    /// Kept as a public helper for a future hot-path wiring; today no
+    /// caller invokes it, so the lint fires. `#[allow(dead_code)]` keeps
+    /// the helper discoverable instead of deleting it and rediscovering the
+    /// Orca-stale-glyphs regression later.
+    #[allow(dead_code)]
     pub fn sync_size_if_changed(&mut self) -> Result<()> {
         let live = ratatui::layout::Rect::from(self.terminal.size()?);
         let frame_area = self.terminal.get_frame().area();

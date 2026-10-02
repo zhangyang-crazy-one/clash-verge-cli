@@ -12,11 +12,11 @@ use crate::chain::{apply_rules_fragment, parse_rules_fragment};
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// Reload the running mihomo core from a config file via `PUT /configs`.
-
-/// How a committed config reaches the running core (task 3.4).
-/// Consumed as call sites migrate from direct CoreKind checks; kept
-/// public so the strategy model has one home.
+/// How a committed config reaches the running core (task 3.4): reload the
+/// running mihomo core from a config file via `PUT /configs`, or restart
+/// the process for a core where hot reload is a no-op. Consumed as call
+/// sites migrate from direct CoreKind checks; kept public so the strategy
+/// model has one home.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadStrategy {
