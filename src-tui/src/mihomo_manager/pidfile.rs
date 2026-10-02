@@ -453,11 +453,7 @@ mod tests {
         // the shim (it would adopt a singbox as a mihomo, which is the
         // cross-core hazard the new schema was added to prevent).
         let path = path_for(&socket);
-        std::fs::write(
-            &path,
-            format!(r#"{{"pid":42,"started_at":1700000000,"kind":"singbox"}}"#),
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"pid":42,"started_at":1700000000,"kind":"singbox"}"#).unwrap();
         assert!(read_live(&path, &socket).is_none(), "legacy shim must stay mihomo-only");
 
         let _ = std::fs::remove_dir_all(&dir);

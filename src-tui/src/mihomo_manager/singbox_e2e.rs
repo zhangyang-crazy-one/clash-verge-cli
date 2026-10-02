@@ -10,11 +10,11 @@
 use crate::mihomo_api::{MihomoApi, Transport};
 use crate::mihomo_manager::singbox_binary;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Build a minimal valid sing-box config for the probe test.
-fn write_probe_config(dir: &PathBuf, controller: SocketAddr) -> anyhow::Result<PathBuf> {
+fn write_probe_config(dir: &Path, controller: SocketAddr) -> anyhow::Result<PathBuf> {
     let input = crate::singbox::ConfigInput {
         outbounds: Vec::new(),
         groups: Vec::new(),

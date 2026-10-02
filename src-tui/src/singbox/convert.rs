@@ -90,7 +90,11 @@ const RESERVED_FIELDS: &[&str] = &[
 
 /// (clash type, (sing-box type, [(clash field, sing-box field)]))
 /// Only fields whose names/values translate directly are listed here.
-const PROTOCOL_MAPS: &[(&str, (&str, &[(&str, &str)]))] = &[
+type ProtocolField = (&'static str, &'static str);
+type ProtocolBody = (&'static str, &'static [ProtocolField]);
+type ProtocolEntry = (&'static str, ProtocolBody);
+
+const PROTOCOL_MAPS: &[ProtocolEntry] = &[
     ("ss", ("shadowsocks", &[("cipher", "method"), ("password", "password")])),
     (
         "vmess",

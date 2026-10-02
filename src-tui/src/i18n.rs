@@ -128,6 +128,15 @@ fn english(key: &'static str) -> &'static str {
         "home.no_active_profile" => "No active profile",
         "home.import_profile" => "Press 3, then i to import",
         "home.proxy_system" => "Proxy / System",
+        // TUN state labels for the Home "Proxy / System" panel. Shown next
+        // to the system proxy line so a misconfigured TUN (config on, binary
+        // missing capabilities, core not running) is visibly distinct from
+        // a healthy "on" — the previous code displayed only the config
+        // intent and the user could not tell TUN was dead.
+        "home.tun_on" => "on",
+        "home.tun_off" => "off",
+        "home.tun_needs_setup" => "on (needs setup)",
+        "home.tun_pending" => "on (core starting)",
         "home.chain_enabled" => "Chain selection enabled",
         "home.direct_selection" => "Direct proxy selection",
         "home.menu_focus" => "Menu focus",
@@ -393,6 +402,13 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "home.no_active_profile" => "未选择订阅",
         "home.import_profile" => "按 3 后按 i 导入订阅",
         "home.proxy_system" => "代理 / 系统",
+        // TUN 状态标签：在“代理 / 系统”面板中与系统代理同行显示，
+        // 让「配置开启了 TUN 但权限缺失 / 内核未启动」与「正常运行」
+        // 在 UI 上有明确区分（之前只显示配置意图，用户无法察觉 TUN 已死）。
+        "home.tun_on" => "开",
+        "home.tun_off" => "关",
+        "home.tun_needs_setup" => "开（需设置权限）",
+        "home.tun_pending" => "开（内核启动中）",
         "home.chain_enabled" => "已启用链式代理选择",
         "home.direct_selection" => "直接选择代理",
         "home.menu_focus" => "菜单焦点",
@@ -576,5 +592,29 @@ mod tests {
         assert_eq!(tr(Language::SimplifiedChinese, "view.settings"), "设置");
         assert_eq!(tr(Language::English, "view.settings"), "Settings");
         assert_eq!(tr(Language::SimplifiedChinese, "missing.key"), "missing.key");
+    }
+
+    #[test]
+    fn tun_status_keys_are_present_in_both_locales() {
+        // The TUN status line on the Home panel must be readable in both
+        // English and Simplified Chinese. The NeedsSetup variant is the
+        // case where the GUI says TUN is on but the binary lacks the
+        // capability — the silent-TUN-dead scenario must not regress to
+        // the English fallback in the zh-CN build.
+        for key in [
+            "home.tun_on",
+            "home.tun_off",
+            "home.tun_needs_setup",
+            "home.tun_pending",
+        ] {
+            let en = tr(Language::English, key);
+            let zh = tr(Language::SimplifiedChinese, key);
+            assert_ne!(en, key, "english `{key}` must be translated");
+            assert_ne!(
+                zh, en,
+                "zh-CN `{key}` must differ from English (no Chinese translation)"
+            );
+            assert_ne!(zh, key, "zh-CN `{key}` must be translated");
+        }
     }
 }

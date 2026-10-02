@@ -194,6 +194,32 @@ fn draw_system(frame: &mut Frame<'_>, area: Rect, app: &App) {
             "common.off"
         })
     };
+    // TUN status reflects the *effective* state, not just the GUI flag.
+    // When the user has TUN enabled but the mihomo binary lacks the file
+    // capability (the classic "TUN silently dies" case on a fresh
+    // install / after an upgrade that strips setcap), the home screen
+    // would otherwise show "TUN: on" while /dev/net/tun has no Meta
+    // device and the routing table 2022 is empty — the user has no way to
+    // tell anything is wrong. We surface that as "on (needs setup)" so
+    // the failing case is distinguishable from a healthy on.
+    let tun_state = effective_tun_state(
+        app.gui_config.enable_tun_mode.unwrap_or(false),
+        app.tun_privileged,
+        matches!(app.core_state, CoreState::Running),
+    );
+    let tun_status = match tun_state {
+        TunState::On => app.tr("home.tun_on"),
+        TunState::Off => app.tr("home.tun_off"),
+        TunState::NeedsSetup => app.tr("home.tun_needs_setup"),
+        TunState::Pending => app.tr("home.tun_pending"),
+    };
+    // Highlight the GUI-vs-runtime mismatch (TUN configured but dead) in
+    // warn color so it is unmissable; healthy / off / pending stay dim so
+    // the home view does not get noisy during a normal lifecycle.
+    let tun_color = match tun_state {
+        TunState::NeedsSetup => theme::warn(),
+        TunState::On | TunState::Off | TunState::Pending => theme::dim(),
+    };
     let mut lines = vec![
         Line::from(Span::styled(
             format!("{}: {mode}", app.tr("home.mode")),
@@ -203,15 +229,17 @@ fn draw_system(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(format!("{}: ", app.tr("home.outbound")), Style::new().fg(theme::dim())),
             outbound,
         ]),
-        Line::from(Span::styled(
-            format!(
-                "{}: {} · TUN: {}",
-                app.tr("home.system_proxy"),
-                on_off(app.gui_config.enable_system_proxy),
-                on_off(app.gui_config.enable_tun_mode)
+        Line::from(vec![
+            Span::styled(
+                format!(
+                    "{}: {} · TUN: ",
+                    app.tr("home.system_proxy"),
+                    on_off(app.gui_config.enable_system_proxy)
+                ),
+                Style::new().fg(theme::dim()),
             ),
-            Style::new().fg(theme::dim()),
-        )),
+            Span::styled(tun_status, Style::new().fg(tun_color)),
+        ]),
     ];
     if app.chain_mode {
         lines.push(Line::from(Span::styled(
@@ -288,4 +316,76 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .wrap(ratatui::widgets::Wrap { trim: true })
         .block(theme::panel_block(app.tr("home.messages"), false).padding(Padding::horizontal(1)));
     frame.render_widget(paragraph, area);
+}
+
+/// Whether the TUN panel label reflects an actually-working TUN, an intent
+/// only, or an intent the runtime cannot honor. Split out from `draw_system`
+/// so the four-state mapping is testable without rendering the home view
+/// and so a future `cli` command can dump the same verdict.
+///
+/// `enabled` is the GUI intent (`verge.yaml`'s `enable_tun_mode`), `privileged`
+/// is the cached result of `getcap` on the mihomo binary (false on a fresh
+/// install / after an upgrade that strips the file capability), and
+/// `core_running` is true only when the core has reached `CoreState::Running`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunState {
+    /// User has TUN off — nothing to report.
+    Off,
+    /// User wants TUN, binary has caps, core is up: TUN should be live.
+    On,
+    /// User wants TUN, core is starting/stopped: not yet live, but the
+    /// capability is in place so the start will succeed.
+    Pending,
+    /// User wants TUN but the binary lacks `cap_net_admin,cap_net_raw+eip`:
+    /// the GUI says "on", `/dev/net/tun` is empty, `ip route show table
+    /// 2022` returns nothing. This is the silent-TUN-dead case the home
+    /// panel now has to surface.
+    NeedsSetup,
+}
+
+pub fn effective_tun_state(enabled: bool, privileged: bool, core_running: bool) -> TunState {
+    if !enabled {
+        return TunState::Off;
+    }
+    if !privileged {
+        return TunState::NeedsSetup;
+    }
+    if !core_running {
+        return TunState::Pending;
+    }
+    TunState::On
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TunState;
+    use super::effective_tun_state;
+
+    #[test]
+    fn disabled_means_off_even_when_caps_are_present() {
+        // A binary with capabilities but TUN not requested is still off.
+        assert_eq!(effective_tun_state(false, true, true), TunState::Off);
+        assert_eq!(effective_tun_state(false, true, false), TunState::Off);
+        assert_eq!(effective_tun_state(false, false, true), TunState::Off);
+        assert_eq!(effective_tun_state(false, false, false), TunState::Off);
+    }
+
+    #[test]
+    fn enabled_without_cap_caps_means_needs_setup_regardless_of_core_state() {
+        // The bug: GUI says on, but `getcap` shows nothing — TUN is dead
+        // even if the core process happens to be running.
+        assert_eq!(effective_tun_state(true, false, true), TunState::NeedsSetup);
+        assert_eq!(effective_tun_state(true, false, false), TunState::NeedsSetup);
+    }
+
+    #[test]
+    fn enabled_with_cap_caps_but_core_not_running_means_pending() {
+        // Capable binary + enabled + starting/stopped = not yet live.
+        assert_eq!(effective_tun_state(true, true, false), TunState::Pending);
+    }
+
+    #[test]
+    fn enabled_with_cap_caps_and_core_running_means_on() {
+        assert_eq!(effective_tun_state(true, true, true), TunState::On);
+    }
 }
