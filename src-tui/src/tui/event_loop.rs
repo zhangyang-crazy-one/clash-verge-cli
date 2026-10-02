@@ -110,12 +110,28 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         });
     }
 
+    // Error captured from the render/reset paths: `?` inside the loop would
+    // return early and skip the owned-core cleanup below, so loop errors are
+    // recorded and surfaced AFTER the cleanup runs.
+    let mut loop_error: Option<anyhow::Error> = None;
+
     loop {
         tokio::select! {
             maybe_event = events.next() => match maybe_event {
-                Some(Ok(Event::Resize(_, _))) => ctx.guard.lock().await.reset_screen()?,
+                Some(Ok(Event::Resize(_, _))) => {
+                    if let Err(error) = ctx.guard.lock().await.reset_screen() {
+                        loop_error = Some(error);
+                        break;
+                    }
+                }
                 Some(Ok(Event::Mouse(mouse))) => {
-                    let screen = ctx.guard.lock().await.terminal_mut().size()?;
+                    let screen = match ctx.guard.lock().await.terminal_mut().size() {
+                        Ok(size) => size,
+                        Err(error) => {
+                            loop_error = Some(error.into());
+                            break;
+                        }
+                    };
                     let screen = ratatui::layout::Rect::new(0, 0, screen.width, screen.height);
                     handlers::handle_mouse(&mut app, &ctx, mouse, screen).await;
                 }
@@ -152,10 +168,16 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 if app.view != rendered_view {
                     // Orca's terminal renderer can retain differential cells across
                     // alternate-screen view changes. Force one clean repaint per route.
-                    ctx.guard.lock().await.reset_screen()?;
+                    if let Err(error) = ctx.guard.lock().await.reset_screen() {
+                        loop_error = Some(error);
+                        break;
+                    }
                     rendered_view = app.view;
                 }
-                ctx.guard.lock().await.terminal_mut().draw(|f| crate::ui::draw(f, &app))?;
+                if let Err(error) = ctx.guard.lock().await.terminal_mut().draw(|f| crate::ui::draw(f, &app)) {
+                    loop_error = Some(error.into());
+                    break;
+                }
             }
 
             _ = runtime_refresh_tick.tick(), if app.core_state == CoreState::Running => {
@@ -192,11 +214,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     }
 
     // A core this TUI spawned is supervised (and its output piped) by this
-    // process only: stop it cleanly rather than leave it unsupervised. A core
-    // adopted from `clash-verge-cli start` keeps running under its own
-    // supervisor.
+    // process only: stop it cleanly rather than leave it unsupervised. This
+    // runs on EVERY exit path — clean quit AND render/reset errors captured
+    // in `loop_error` above. A core adopted from `clash-verge-cli start`
+    // keeps running under its own supervisor.
     if ctx.manager.owns_child() {
         let _ = ctx.manager.stop().await;
+    }
+
+    // Surface any loop error only after the owned core has been stopped.
+    if let Some(error) = loop_error {
+        return Err(error);
     }
 
     Ok(())
