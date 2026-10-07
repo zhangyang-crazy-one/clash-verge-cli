@@ -53,7 +53,13 @@ Alternatives considered: a latest-version-only policy was rejected because it ca
 4. Run OpenSpec validation and, in the current workspace, run serialized tests with temporary XDG directories and `real_sing_box_spawns_and_answers_controller` skipped, followed by a locked workspace build. Do not use `--ignored` or `--include-ignored`. Live/network/TUN verification requires separate authorization and isolated resources.
 5. Roll back by selecting the prior validated cache/config snapshot; failed staged downloads and restores leave the previous state intact.
 
-## Open Questions
+## Resolved implementation choices
 
-- Which upstream API endpoint and parameter represent provider provenance for each core? The implementation must use only an endpoint confirmed by fixtures and reject ambiguous cases.
-- Which transitional sing-box 1.13.21 test profile, if any, is retained alongside the 1.14.2 candidate? It must be explicitly selected and never become an implicit downgrade.
+- The reviewed version range is currently a singleton for each core: mihomo 1.19.32 and sing-box 1.14.2. Build metadata is permitted; prereleases and future patch versions require an explicit policy/matrix update. No transitional 1.13 target is selected automatically.
+- Mihomo provider delay uses the pinned official `GET /providers/proxies/{provider}/{name}/healthcheck` endpoint. The effective group's `use` / `include-all-providers` declarations establish source scope. Sing-box uses unique native outbound tags. Selection APIs accept names only; ambiguous selection is rejected. The UI can display separate provider outcomes on a shared name row.
+- DNS source confirmation hashes profile UID and canonical nonempty provider-DNS fields before the global overlay; changing only the subscription URL does not invalidate that upstream-compatible proof. A source change affects only its UID. Durable sing-box DNS settings explicitly saved by the user take precedence over converted profile DNS. Unsupported profile DNS semantics produce diagnostics even when a sidecar exists.
+- Generated/native runtime JSON uses a private same-directory temporary file. Apply cancellation restores the previous formal bytes; prevalidation failure never installs the candidate. The resolved manager binary is used for validation, with the pinned resolver as the fallback. Stopped applies persist without starting; externally managed running sing-box instances are rejected before configuration work.
+- Digest-qualified receipt filenames keep the old binary verifiable if acquisition is interrupted between receipt publication and executable replacement. Legacy single receipts remain readable.
+- Traffic/log delivery is bounded and tagged with both work and core generations. Completed control events use bounded reservation/backpressure; local refresh intents coalesce and overflow is visible. Final cleanup waits for owned background futures to be destroyed before stopping an owned core. No CPU or memory benchmark is claimed.
+
+See [evidence.md](evidence.md) for implementation/test traceability and verification limits.

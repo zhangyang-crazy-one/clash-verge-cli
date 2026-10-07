@@ -1,6 +1,6 @@
 # 上游依据与本地对齐范围
 
-审查日期：2026-10-07。本文件记录提案依据；代码尚未按本变更实现。
+审查日期：2026-10-07。本文件保留提案时的上游依据，并记录 apply 实现与离线验证。前面的“本地定位”表描述审查时缺口，修复状态见下方实施映射。
 
 | 对齐项 | 上游依据 | 本地定位 | 结论与证据类型 |
 |---|---|---|---|
@@ -32,6 +32,49 @@
 ## 验证真实性
 
 - OpenSpec validate 只证明文档结构可解析。
-- 本轮 test/build 是未修改 Rust 实现的基线检查，不证明清单中的问题已经修复。
+- 文档阶段的 500 项基线测试不证明修复完成；apply 阶段的最终测试结果记录在下方，二者不得混用。
 - 真实联网、TLS/协议互通、TUN 和跨核心切换均未按本变更验证；不得据此发布完整支持声明。
 - 用户运行实例受保护；真实核心验证须另行授权且使用隔离资源。
+
+## Apply 实施与回归映射
+
+所有路径均以仓库根为基准。下表测试通过情况以最终隔离 suite 为准；schema fixtures 属于本地结构检查，不是完整 sing-box schema 或协议互通认证。
+
+| 能力 / 任务 | 实现位置 | 主要验证依据 |
+|---|---|---|
+| compatibility-policy；1.1 | `src-tui/src/mihomo_manager/core_policy.rs`、`binary.rs`、`singbox_binary.rs` | `pinned_policy_accepts_only_explicitly_reviewed_versions`、`semantic_versions_order_prereleases_and_reject_ambiguity`；固定版本不调用 latest 选版 |
+| version parsing；1.2 | `singbox_binary.rs` | `parses_official_and_installed_singbox_output_shapes`；official/full/raw/冲突/non-zero 输出 fixture |
+| atomic acquisition；1.3 | `binary.rs`、`singbox_binary.rs` | `install_lock_is_exclusive_across_handles`、`verify_sha256_accepts_matching_digest_and_rejects_others`、`failed_or_cancelled_binary_replace_keeps_old_digest_receipt_valid`、归档提取 fixture；没有执行真实核心或下载发布资产 |
+| compatibility test safety；1.4 / 5.1 | `mihomo_manager/mod.rs`、隔离路径 fixture、验证命令 | 路径测试使用纯 resolver；缺失控制端点使用测试自己的 tempdir；真实核心 E2E 显式跳过 |
+| conversion/matrix；2.1 | `singbox/capabilities.rs`、`convert.rs`、`config_gen.rs`、`mihomo_manager/manager.rs` | client fingerprint/Reality/transport/UDP fixture；`vless_plaintext_is_preserved_and_malformed_tls_identity_is_rejected`；legacy DNS / removed outbound / TUN 栈诊断；未知 native 字段保留 |
+| nested route/reference；2.2 | `singbox/config_gen.rs`、`mihomo_manager/manager.rs` | `rule_sets_are_nested_under_route_when_present`、`dangling_group_and_rule_set_references_are_rejected`、`nested_logical_rules_and_selector_defaults_cannot_reference_missing_targets`；不支持的 Clash route syntax 显式拒绝 |
+| DNS/unknown YAML persistence；2.3 | `crates/clash-verge-core/src/config/{verge,profiles,prfitem}.rs`、`src-tui/src/{chain,runtime_config}.rs`、`services/profile.rs` | UID/source confirmation、root/nested round-trip、typed precedence、unset/empty、成功后确认持久化；`cancelled_apply_restores_previous_runtime_and_removes_staged_candidate`；`unsupported_dns_endpoint_diagnostics_do_not_expose_credentials_or_tokens` |
+| versioned backup；2.4 | `services/backup.rs` | sidecar manifest/schema；`legacy_archives_leave_new_sidecars_untouched`、`failed_mid_commit_rolls_back_every_file_and_keeps_no_staging_files`；私有权限/secret/runtime 排除 fixture |
+| atomic durable JSON；2.5 | `singbox/mod.rs`、`dns.rs` | `malformed_storage_is_reported_and_atomic_validation_preserves_previous_file`、`atomic_rename_failure_keeps_previous_json_and_cleans_temporary_file`、`stored_logical_rule_rejects_unmodeled_fields_instead_of_truncating` |
+| injected lifecycle；3.1 | `subscribe/lifecycle.rs`、`scheduler.rs`、`runtime_config.rs`、`commands/daemon.rs` | fake 双核心 reload/stopped/external；`reload_selected_runs_readiness_before_selection_and_surfaces_failures`；取消 guard、watcher 代际、失败恢复 fixture |
+| provider capability/readiness；3.2 | `mihomo_api/client.rs`、`core_api/proxy_core.rs`、`commands/provider.rs` | `singbox_provider_operations_are_rejected_before_connecting`；编码 scoped healthcheck / provider refresh 请求；`accepted_hot_reload_requires_controller_readiness_before_success` |
+| provider provenance；3.3 | `services/proxy.rs`、`subscribe/lifecycle.rs`、`commands/proxy.rs`、`ui/proxy_list.rs` | provider scope / duplicate / include-all fixture；`saved_provider_identity_must_survive_refresh`；`one_shared_name_row_keeps_both_provider_outcomes`；CLI/TUI 歧义选择拒绝 |
+| deadlines；3.4 | `mihomo_api/client.rs`、`error.rs` | delay 1..32767ms + 5s margin；health 5s；provider default 30s / 可配置上限 120s；慢响应和 timeout mock；长请求复用连接池 |
+| scheduler/probe；3.5 | `subscribe/scheduler.rs`、`lifecycle.rs`、`commands/daemon.rs` | interval/disable/cooldown/external-edit、3 次失败/5 分钟去抖、controller error 分类、fixed-exit/provider identity、stopped unavailable fixture；已移除未使用的 mihomo-only probe/recovery 路径 |
+| bounded traffic/log；4.1 | `tui/event_loop.rs`、`handlers/connections.rs` | latest-value watch、bounded log queue、dropped counter、NDJSON buffer cap；确定性 overload fixture |
+| lifecycle/render/cancel；4.2 | `tui/background.rs`、`event_loop.rs`、`handlers/mod.rs`、`mihomo_manager/{manager,watcher}.rs` | reservation ordering、local coalescing/visible overflow、stale work/core generations；`intentional_restart_suppresses_predecessor_exit_but_keeps_ready_ordered`、`final_cancellation_waits_for_transaction_cleanup_and_filters_old_core_snapshots`；100ms dirty render budget |
+| batch safety；4.3 | `services/proxy.rs`、`tui/handlers/proxy.rs`、`app/mod.rs` | `delay_request_scheduler_caps_concurrency_and_preserves_input_order`：9 个门控 mock，最多 4 并发，反序完成 progress，结果输入顺序；`dropping_scheduler_aborts_owned_requests`；重复批次 guard |
+| retained regression；4.4 | `mihomo_manager/{signal,watcher}.rs`、`tui/event_loop.rs`、`subscribe/fetch.rs`、`enhance/mod.rs` | 5 秒 SIGTERM fallback 只作用于自建非核心 child；watcher cancellation；draw-failure cleanup seam；gzip mock / Basic 空密码；TLS1.2 最低版本 builder policy；fake-IP IPv6 fixture |
+| verification；5.2–5.4 | 此文档、`tasks.md`、GSD quick summary | 最终 serialized suite / locked build / strict OpenSpec 校验；六份 delta specs 的 requirement/scenario 家族通过以上实现与 fixture 关联 |
+
+补充官方依据：VLESS TLS 是可选项，已按 [1.14.2 VLESS outbound](https://github.com/SagerNet/sing-box/blob/v1.14.2/protocol/vless/outbound.go) 的分支行为保留 `tls: false`；该核对属于源码证据，不是握手测试。
+
+### 最终验证与边界
+
+实施提交：`6aff4da7`。最终验证使用同一代码状态：
+
+- `cargo test --workspace --all-targets --locked -- --test-threads=1 --skip real_sing_box_spawns_and_answers_controller`：退出码 0，571 个 CLI/TUI 单测、4 个配置集成测试、13 个共享核心单测，共 588 passed / 0 failed / 1 filtered。
+- `cargo build --workspace --locked`：退出码 0，dev workspace build 完成；没有运行、安装或部署构建产物。
+- `cargo fmt --all -- --check`、`git diff --check`：退出码 0。
+- `openspec validate align-dual-core-and-client-behavior --strict`：valid。
+- 四项 XDG 环境变量指向 `/tmp/clash-alignment-validation.b0a49x` 下的 `data`、`runtime`、`config`、`bin`；`CARGO_BUILD_JOBS=2`。没有修改 HOME/CARGO_HOME。磁盘配置测试的 app home、缺失 socket 和 mock listener 使用各自临时资源。
+- 日志：`/tmp/clash-alignment-validation.b0a49x/test.log`，SHA-256 `9c8eee0fe2cc3bc80aa25a5042503b79593939f0bcc46b9514f2ad9988cedc53`；`/tmp/clash-alignment-validation.b0a49x/build.log`，SHA-256 `fecede7c2157efe2f16c8c8b9dce94b0fb4dd384dca8207046c8bf7636eb0ffe`。这些路径是本地验证记录，不是发布包。
+
+命令明确跳过 `real_sing_box_spawns_and_answers_controller`，不使用 `--ignored`、`--include-ignored`、`cargo run` 或应用生命周期/服务命令。测试自己的 mock listeners、tempfiles 和非核心 child 不与现有实例共用资源。
+
+未验证：真实核心启动/切换/重启、网络资产下载、TLS 握手与协议互通、TUN/权限、联网订阅、真实性能指标。没有替换已安装二进制或部署构建产物，也没有停止用户当前运行的 clash-tui。对于没有经过映射审查的 DNS/transport/routing 字段，当前行为是保留原文件并报告拒绝；不声明完整 Clash→sing-box 无损转换。
