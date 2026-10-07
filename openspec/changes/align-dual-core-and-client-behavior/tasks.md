@@ -1,0 +1,38 @@
+## 1. Core policy and managed binaries
+
+- [ ] 1.1 Add pinned mihomo `1.19.32` and sing-box `1.14.2` policy data, offline semantic comparison, system-binary read-only preference, validated-cache reuse, and explicit no-downgrade errors; add edge-case unit/property fixtures.
+- [ ] 1.2 Implement the real `sing-box version` parser for complete official output and malformed, partial, conflicting, and non-zero-exit fixtures; include the installed-output shape without spawning a core.
+- [ ] 1.3 Implement cross-process locked staged downloads with streamed integrity verification, executable validation, atomic rename, temporary-file cleanup, and preservation of the prior validated binary on every failure.
+- [ ] 1.4 Add audit coverage proving compatibility tests cannot start, stop, signal, switch, or probe a live core, and document any real-core test name that must remain skipped.
+
+## 2. Dual-core conversion and persistence
+
+- [ ] 2.1 Add versioned capability matrices for route/rule-set nesting, conversion references, client-fingerprint, transport/security, DNS, TUN, and native JSON; reject or explain critical unsupported fields and preserve supported unknown native fields.
+- [ ] 2.2 Fix sing-box output generation so `rule_set` is nested under `route`; add offline schema fixtures for accepted nested output and rejected root output, including skipped-node/group reference diagnostics.
+- [ ] 2.3 Persist `profile_dns_settings` by source identity with typed-field precedence, unset-inherits versus empty-clears semantics, and YAML root/nested unknown-field round-trip fixtures; preserve last valid data after reload failure and redact secret URLs.
+- [ ] 2.4 Add `singbox-dns.json`, `singbox-rules.json`, and `singbox-rule-sets.json` to versioned backup/restore validation; test staged all-or-nothing restore, legacy archive preservation, permissions/secrets, and exclusion of runtime files, sockets, pidfiles, downloads, and binaries.
+- [ ] 2.5 Validate and atomically save durable sing-box JSON settings, surface malformed reads instead of silently loading defaults, and test interruption/read-error paths without touching real files.
+
+## 3. Core-aware client operations
+
+- [ ] 3.1 Introduce an injected core lifecycle interface for daemon refresh, scheduler ticks, forced probe refresh, readiness confirmation, rollback, and cancellation; test mihomo and sing-box dispatch without implicitly starting a stopped core.
+- [ ] 3.2 Add core-specific provider capability gates and diagnostics; percent-encode URL path segments and verify refresh success only after readiness.
+- [ ] 3.3 Resolve provider duplicate targets by provider/group/tag provenance; add fixtures for duplicate display names, representable identities, and informative rejection when the API cannot represent provenance.
+- [ ] 3.4 Separate 5-second health deadlines from delay deadlines derived from `timeout_ms` plus bounded response margin and configurable/default 30-second provider refresh deadlines; test that operation timeout alone does not mark a core dead.
+- [ ] 3.5 Preserve auto-update interval/disabled/cooldown behavior while making reload, forced refresh, rollback, and selected-node reapply core-aware; test controller errors are not node failures and stopped cores are not implicitly started.
+
+## 4. TUI event and batch safety
+
+- [ ] 4.1 Replace unbounded traffic/log delivery with a latest-value traffic slot and bounded log queue with dropped-count reporting; add deterministic overload tests that do not assert wall-clock timing.
+- [ ] 4.2 Add bounded control/lifecycle delivery with reservation/backpressure, generation checks, cancellation, dirty-rate rendering, and ordered reload/ready/stop events; test stale events cannot resurrect a cancelled generation.
+- [ ] 4.3 Update batch delay target resolution to use scoped provider identity, retain stable unique leaves, reject ambiguous targets, enforce at most four concurrent requests, and prevent duplicate runs; add mock result/progress tests.
+- [ ] 4.4 Add regression tests for five-second SIGTERM cleanup, watcher cancellation, render-error cleanup, gzip/basic empty-password auth, TLS 1.2+, and fake-IP IPv6 preservation.
+
+## 5. Verification and review gates
+
+- [ ] 5.1 Audit all tests and fixtures for access to existing processes, controllers, real configs, pidfiles, managed binaries, or ignored E2E; explicitly skip `real_sing_box_spawns_and_answers_controller`. Disposable mock endpoints and non-core test-owned child processes are permitted; never signal a production instance. Do not use `--ignored`, `--include-ignored`, `cargo run`, app lifecycle commands, service management or privileged installation during verification.
+- [ ] 5.2 Run the serialized safe test command in temporary `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, and `XDG_BIN_HOME` directories created under `mktemp` (do not repurpose `HOME` or `CARGO_HOME`): `cargo test --workspace --all-targets --locked -- --test-threads=1 --skip real_sing_box_spawns_and_answers_controller`.
+- [ ] 5.3 Run the locked workspace build: `cargo build --workspace --locked`.
+- [ ] 5.4 Review capability traceability from all six delta specs to implementation and unit/fixture tests, record mock/schema coverage versus unverified live/network/TUN behavior, and defer separately authorized real-core validation.
+
+All checkboxes intentionally remain unchecked: implementation occurs only in a later apply workflow.
