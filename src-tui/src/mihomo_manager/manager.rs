@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::process::Command;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc;
 
 use crate::app::{Action, CoreState};
 use crate::mihomo_api::MihomoApi;
@@ -41,7 +41,7 @@ pub use crate::mihomo_manager::pidfile::CoreKind;
 
 pub struct ManagerInner {
     pub state: Mutex<CoreState>,
-    pub action_tx: Mutex<Option<UnboundedSender<Action>>>,
+    pub action_tx: Mutex<Option<mpsc::Sender<Action>>>,
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
@@ -53,6 +53,7 @@ pub struct ManagerInner {
     /// counter for back-compat with the cross-process pidfile intent path
     /// (owner main's pidfile/`clash-verge-cli stop` lifecycle).
     pub expected_exit: AtomicBool,
+    pub restarting: AtomicBool,
     /// True while this process's watcher supervises the core it spawned
     /// (as opposed to a core adopted from another process's pid record).
     pub owns_child: AtomicBool,
@@ -213,6 +214,23 @@ pub(super) async fn probe_readiness(
 }
 
 impl ManagerInner {
+    pub(crate) async fn send_action(&self, action: Action) {
+        // The predecessor exiting during an explicit restart is not a final
+        // stop notification; the replacement publishes ready or an error.
+        if matches!(action, Action::CoreExited(_)) && self.restarting.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let tx = self.action_tx.lock().clone();
+        if let Some(tx) = tx {
+            let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = tx
+                .send(Action::CoreGeneration {
+                    generation,
+                    action: Box::new(action),
+                })
+                .await;
+        }
+    }
     pub fn new() -> Self {
         Self {
             state: Mutex::new(CoreState::Stopped),
@@ -222,6 +240,7 @@ impl ManagerInner {
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
+            restarting: AtomicBool::new(false),
             owns_child: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             expected_exit_gen: AtomicU64::new(u64::MAX),
@@ -430,13 +449,13 @@ impl ManagerInner {
             }
         };
 
-        if let Some(tx) = inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreStarted {
+        inner
+            .send_action(Action::CoreStarted {
                 version: Some(probed_version),
                 binary_path: Some(resolved_path.display().to_string()),
                 binary_source: Some(source.to_string()),
-            });
-        }
+            })
+            .await;
 
         // The desktop proxy follows the core (no-op unless
         // `enable_system_proxy` is on). Apply before the watcher exists so a
@@ -506,20 +525,45 @@ impl ManagerInner {
 
     /// Read the active profile's YAML from disk, if one is selected and
     /// readable. None means "generate the bare skeleton".
-    pub(crate) async fn active_profile_yaml() -> Option<String> {
-        let store = crate::profile_store::store::ProfileStore::snapshot().await.ok()?;
-        let uid = store.current_uid();
-        let item = store.items().into_iter().find(|i| i.uid == uid)?;
-        let file = item.file.as_deref()?;
-        let path = clash_verge_core::utils::dirs::app_profiles_dir().ok()?.join(file);
-        std::fs::read_to_string(path).ok()
+    pub(crate) async fn active_profile_yaml() -> anyhow::Result<Option<String>> {
+        let store = crate::profile_store::store::ProfileStore::snapshot().await?;
+        let Some(uid) = store.current_uid() else {
+            return Ok(None);
+        };
+        let item = store
+            .items()
+            .into_iter()
+            .find(|item| item.uid.as_deref() == Some(uid.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("selected profile {uid} is missing"))?;
+        let file = item.file.as_deref().context("selected profile has no file")?;
+        let path = clash_verge_core::utils::dirs::app_profiles_dir()?.join(file);
+        let raw = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read profile {}", path.display()))?;
+        if crate::subscribe::from_url::is_singbox_json_profile(&raw) {
+            return Ok(Some(raw));
+        }
+        let mapping = if item.itype.as_deref() == Some("remote") {
+            crate::runtime_config::load_remote_profile_with_rules(&item)
+                .await
+                .map_err(anyhow::Error::msg)?
+        } else {
+            let mut mapping = clash_verge_core::config::IClashTemp::new().await.0;
+            let chain = crate::chain::resolve_chain(&item, path.parent().context("profile directory missing")?).await?;
+            crate::chain::apply_chain_to_config(&mut mapping, &chain)?;
+            mapping
+        };
+        let (mapping, _) = crate::services::profile::prepare_profile_dns_from_settings(&uid, mapping)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(Some(serde_yaml_ng::to_string(&mapping)?))
     }
 
     /// Generate and persist the sing-box runtime config from whatever the
     /// active profile currently holds (task 7.5): converted outbounds/groups,
     /// route rules, stored logical rules, rule-sets and structured DNS.
     pub(crate) async fn write_singbox_full(config_dir: &Path) -> anyhow::Result<PathBuf> {
-        let yaml = Self::active_profile_yaml().await;
+        let yaml = Self::active_profile_yaml().await?;
         let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
         Ok(Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun)
             .await?
@@ -534,17 +578,30 @@ impl ManagerInner {
         yaml: Option<&str>,
         enable_tun: bool,
     ) -> anyhow::Result<(PathBuf, SingboxParts)> {
+        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        Self::write_singbox_assembled_to(config_dir, yaml, enable_tun, &path).await
+    }
+
+    /// Assemble and atomically write to an explicit destination. Runtime
+    /// applies use a candidate path, validate it, and only then replace the
+    /// formal config consumed by the core.
+    pub(crate) async fn write_singbox_assembled_to(
+        config_dir: &Path,
+        yaml: Option<&str>,
+        enable_tun: bool,
+        destination: &Path,
+    ) -> anyhow::Result<(PathBuf, SingboxParts)> {
         let _ = config_dir;
+        crate::singbox::capabilities::for_version(crate::mihomo_manager::core_policy::SINGBOX_POLICY_VERSION)
+            .ok_or_else(|| anyhow::anyhow!("missing pinned sing-box configuration capability matrix"))?;
         // Honour the CLI's own `verge_mixed_port` override so sing-box binds the
         // same non-conflicting port as the mihomo runtime config.
         let mixed_port = crate::enhance::effective_mixed_port().await;
-        let tun = crate::singbox::TunSettings {
-            stack: "gvisor".into(),
-            mtu: 9000,
-        };
+        let core_config = clash_verge_core::config::IClashTemp::new().await;
+        let tun = profile_tun_settings(yaml, &core_config.0).map_err(anyhow::Error::msg)?;
         let clash_api = crate::singbox::ClashApiSettings {
             listen: "127.0.0.1:9090".parse().expect("static addr"),
-            secret: String::new(),
+            secret: core_config.get_client_info().secret.unwrap_or_default(),
         };
 
         // Native sing-box JSON profile passthrough: preserve the provider's own
@@ -555,15 +612,16 @@ impl ManagerInner {
         {
             let mut config: serde_json::Value =
                 serde_json::from_str(text).context("failed to parse native sing-box JSON profile")?;
+            crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
             crate::singbox::config_gen::apply_control_plane(&mut config, mixed_port, enable_tun, &tun, &clash_api);
-            let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+            let home = clash_verge_core::utils::dirs::app_home_dir()?;
+            apply_native_sidecars(&mut config, &home)?;
+            crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
+            let path = destination.to_path_buf();
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.ok();
             }
-            let body = serde_json::to_string_pretty(&config)?;
-            let tmp = path.with_extension("json.download");
-            tokio::fs::write(&tmp, body).await?;
-            tokio::fs::rename(&tmp, &path).await?;
+            write_generated_json(&path, &config)?;
 
             let outbounds = config
                 .get("outbounds")
@@ -604,15 +662,12 @@ impl ManagerInner {
         if let Some(resolver) = &parts.default_domain_resolver {
             config["route"]["default_domain_resolver"] = serde_json::json!(resolver);
         }
-        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        let path = destination.to_path_buf();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        let body = serde_json::to_string_pretty(&config)?;
-        // Write-then-rename so a crash mid-write never leaves a truncated config.
-        let tmp = path.with_extension("json.download");
-        tokio::fs::write(&tmp, body).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
+        write_generated_json(&path, &config)?;
         Ok((path, parts))
     }
 }
@@ -638,30 +693,40 @@ impl SingboxParts {
             ),
             None => (crate::singbox::convert::ProfileConversion::default(), false),
         };
-        // Clash-expressible rules convert through IRouteRule; raw clash
-        // fragments have no sing-box form and stay profile-only. Stored
-        // logical rules are appended after them (see LOGICAL_RULES_FILE).
+        // Reject rules that have no supported sing-box representation rather
+        // than silently removing routing policy from the applied profile.
         let mut route_rules: Vec<serde_json::Value> = match yaml {
-            Some(y) => crate::routing::load_profile_rules(y)
-                .map_err(anyhow::Error::msg)?
-                .iter()
-                .filter_map(crate::routing::to_singbox_json)
-                .collect(),
+            Some(y) => profile_route_rules(y).map_err(anyhow::Error::msg)?,
             None => Vec::new(),
         };
         let home = clash_verge_core::utils::dirs::app_home_dir().ok();
-        if let Some(logical) = home.as_ref().map(|home| crate::singbox::load_logical_rules(home)) {
+        if let Some(home) = &home {
+            let logical = crate::singbox::load_logical_rules(home).map_err(anyhow::Error::msg)?;
             route_rules.extend(logical.iter().filter_map(crate::routing::to_singbox_json));
         }
-        let rule_sets = home
+        let rule_sets = match &home {
+            Some(home) => crate::singbox::load_rule_sets(home).map_err(anyhow::Error::msg)?,
+            None => Vec::new(),
+        };
+        let stored_dns = match &home {
+            Some(home) => crate::singbox::load_dns_spec(home).map_err(anyhow::Error::msg)?,
+            None => crate::singbox::DnsConfigSpec::default(),
+        };
+        let profile_dns = yaml
+            .map(crate::singbox::dns::dns_spec_from_clash_yaml)
+            .transpose()
+            .map_err(anyhow::Error::msg)?
+            .flatten();
+        let dns_spec = if home
             .as_ref()
-            .map(|home| crate::singbox::load_rule_sets(home))
-            .unwrap_or_default();
-        let dns_spec = home.as_deref().and_then(crate::singbox::load_dns_spec);
-        let default_domain_resolver = dns_spec.as_ref().and_then(crate::singbox::dns::default_domain_resolver);
-        let empty_dns = crate::singbox::dns::DnsConfigSpec::default();
-        let dns_section = crate::singbox::dns::build_dns_section(dns_spec.as_ref().unwrap_or(&empty_dns))
-            .map_err(anyhow::Error::msg)?;
+            .is_some_and(|home| home.join(crate::singbox::DNS_CONFIG_FILE).exists())
+        {
+            stored_dns
+        } else {
+            profile_dns.unwrap_or(stored_dns)
+        };
+        let default_domain_resolver = crate::singbox::dns::default_domain_resolver(&dns_spec);
+        let dns_section = crate::singbox::dns::build_dns_section(&dns_spec).map_err(anyhow::Error::msg)?;
         Ok(Self {
             conversion,
             profile_used,
@@ -772,7 +837,7 @@ impl MihomoManager {
     /// Install the action channel sender. Called by the TUI after it has
     /// spawned its action loop. The CLI mode leaves this unset and just
     /// ignores watcher events.
-    pub fn set_action_tx(&self, tx: UnboundedSender<Action>) {
+    pub fn set_action_tx(&self, tx: mpsc::Sender<Action>) {
         *self.inner.action_tx.lock() = Some(tx);
     }
 
@@ -832,6 +897,10 @@ impl MihomoManager {
 
     /// Build a MihomoApi client targeting this manager's socket with
     /// bearer auth from the configured secret.
+    pub fn current_generation(&self) -> u64 {
+        self.inner.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     pub fn api(&self) -> MihomoApi {
         let result = match self.core_kind {
             CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
@@ -840,7 +909,9 @@ impl MihomoManager {
                 self.secret.clone(),
             ),
         };
-        result.expect("MihomoApi construction failed — secret may contain invalid header characters")
+        result
+            .expect("MihomoApi construction failed — secret may contain invalid header characters")
+            .for_core(self.core_kind)
     }
 
     /// D1: resolve the next mihomo binary and run the read-only TUN
@@ -971,9 +1042,7 @@ stop it where it was started",
         // Never leave the desktop pointing at the port we just closed.
         crate::sys_proxy::release_on_core_stop().await;
 
-        if let Some(tx) = self.inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreExited(0));
-        }
+        self.inner.send_action(Action::CoreExited(0)).await;
 
         Ok(())
     }
@@ -988,6 +1057,16 @@ stop it where it was started",
     /// capability) returns explicit `tun setup` guidance and leaves the
     /// currently running core untouched. No sudo/setcap here.
     pub async fn restart(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        if self.inner.restarting.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("a core restart is already in progress");
+        }
+        struct RestartGuard<'a>(&'a AtomicBool);
+        impl Drop for RestartGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _restart_guard = RestartGuard(&self.inner.restarting);
         if self.inner.core_kind() == CoreKind::SingBox {
             return self.restart_singbox().await;
         }
@@ -1160,7 +1239,10 @@ stop it where it was started",
         crate::enhance::ensure_mixed_port_available()
             .await
             .map_err(anyhow::Error::msg)?;
-        let config_path = ManagerInner::write_singbox_full(&self.config_dir).await?;
+        let config_path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        if !tokio::fs::try_exists(&config_path).await? {
+            ManagerInner::write_singbox_full(&self.config_dir).await?;
+        }
         ManagerInner::spawn_core(
             &resolved.path,
             &resolved.version,
@@ -1503,10 +1585,8 @@ mod tests {
     #[tokio::test]
     async fn probe_accepts_matching_core_and_rejects_mismatch() {
         use crate::mihomo_api::{MihomoApi, Transport};
-        use std::net::SocketAddr;
-
-        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let api = MihomoApi::new(dir.path().join("missing.sock"), "s").unwrap();
 
         // Nothing listens: short timeout must surface as a readiness failure.
         let started = std::time::Instant::now();
@@ -2155,5 +2235,203 @@ mod tests {
         check_cross_kind_record(&socket, CoreKind::SingBox)
             .expect("a stale sing-box record is harmless for same-kind too");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+fn profile_tun_settings(
+    yaml: Option<&str>,
+    base: &serde_yaml_ng::Mapping,
+) -> Result<crate::singbox::TunSettings, String> {
+    let profile: Option<serde_yaml_ng::Mapping> = yaml
+        .map(serde_yaml_ng::from_str)
+        .transpose()
+        .map_err(|error| format!("invalid profile TUN settings: {error}"))?;
+    let native_tun = profile
+        .as_ref()
+        .and_then(|mapping| mapping.get("inbounds"))
+        .and_then(serde_yaml_ng::Value::as_sequence)
+        .and_then(|inbounds| {
+            inbounds
+                .iter()
+                .find(|inbound| inbound.get("type").and_then(serde_yaml_ng::Value::as_str) == Some("tun"))
+        });
+    let tun = native_tun
+        .or_else(|| profile.as_ref().and_then(|mapping| mapping.get("tun")))
+        .or_else(|| base.get("tun"));
+    let stack = tun
+        .and_then(|tun| tun.get("stack"))
+        .map(|stack| stack.as_str().ok_or_else(|| "TUN stack must be a string".to_string()))
+        .transpose()?
+        .unwrap_or("gvisor");
+    crate::singbox::config_gen::validate_tun_stack(stack)?;
+    let mtu = tun
+        .and_then(|tun| tun.get("mtu"))
+        .map(|mtu| {
+            mtu.as_u64()
+                .ok_or_else(|| "TUN mtu must be an unsigned integer".to_string())
+        })
+        .transpose()?
+        .unwrap_or(9000);
+    let mtu = u16::try_from(mtu).map_err(|_| "TUN mtu exceeds 65535".to_string())?;
+    Ok(crate::singbox::TunSettings {
+        stack: stack.into(),
+        mtu,
+    })
+}
+
+fn profile_route_rules(yaml: &str) -> Result<Vec<serde_json::Value>, String> {
+    let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).map_err(|error| error.to_string())?;
+    let Some(rules) = document.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = rules.as_sequence().ok_or("profile rules must be a list")?;
+    rules.iter().enumerate().map(|(index, rule)| {
+        let rule = rule.as_str().ok_or_else(|| format!("profile rules[{index}] must be a string"))?;
+        let parts: Vec<_> = rule.split(',').map(str::trim).collect();
+        if parts.first() == Some(&"MATCH") && parts.len() == 2 {
+            let target = match parts[1] { "DIRECT" => "direct", "REJECT" => "block", value => value };
+            return Ok(serde_json::json!({"outbound": target}));
+        }
+        if parts.len() != 3 { return Err(format!("profile rules[{index}] has unsupported sing-box rule syntax or modifiers; migrate it to a native route rule/rule-set")); }
+        crate::routing::to_singbox_json(&crate::routing::from_clash_rule_str(rule))
+            .ok_or_else(|| format!("profile rules[{index}] kind {} cannot be represented by sing-box 1.14.2; migrate it to a native route rule/rule-set", parts[0]))
+    }).collect()
+}
+
+fn write_generated_json(path: &Path, config: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().context("runtime config has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        staged
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    staged.write_all(&serde_json::to_vec_pretty(config)?)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+fn apply_native_sidecars(config: &mut serde_json::Value, home: &Path) -> anyhow::Result<()> {
+    if home.join(crate::singbox::RULE_SETS_FILE).exists() {
+        config["route"]["rule_set"] =
+            serde_json::json!(crate::singbox::load_rule_sets(home).map_err(anyhow::Error::msg)?);
+    }
+    if home.join(crate::singbox::LOGICAL_RULES_FILE).exists() {
+        let rules = crate::singbox::load_logical_rules(home).map_err(anyhow::Error::msg)?;
+        config["route"]["rules"] = serde_json::json!(
+            rules
+                .iter()
+                .filter_map(crate::routing::to_singbox_json)
+                .collect::<Vec<_>>()
+        );
+    }
+    if home.join(crate::singbox::DNS_CONFIG_FILE).exists() {
+        let dns = crate::singbox::load_dns_spec(home).map_err(anyhow::Error::msg)?;
+        let generated = crate::singbox::dns::build_dns_section(&dns).map_err(anyhow::Error::msg)?;
+        if !config["dns"].is_object() {
+            config["dns"] = serde_json::json!({});
+        }
+        let owned = config["dns"].as_object_mut().expect("object initialized");
+        owned.remove("servers");
+        owned.remove("rules");
+        if let Some(serde_json::Value::Object(fields)) = generated {
+            owned.extend(fields);
+        }
+        if let Some(resolver) = crate::singbox::dns::default_domain_resolver(&dns) {
+            config["route"]["default_domain_resolver"] = serde_json::json!(resolver);
+        } else {
+            config["route"]
+                .as_object_mut()
+                .context("native route is not an object")?
+                .remove("default_domain_resolver");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod alignment_regressions {
+    use super::*;
+
+    #[test]
+    fn profile_tun_preserves_supported_stack_and_rejects_malformed_or_mihomo_only_stack() {
+        let base = serde_yaml_ng::Mapping::new();
+        for stack in ["gvisor", "system", "mixed"] {
+            let yaml = format!("tun:\n  stack: {stack}\n  mtu: 1500\n");
+            let settings = profile_tun_settings(Some(&yaml), &base).unwrap();
+            assert_eq!(settings.stack, stack);
+            assert_eq!(settings.mtu, 1500);
+        }
+        assert!(profile_tun_settings(Some("tun: {stack: mips}"), &base).is_err());
+        assert!(profile_tun_settings(Some("tun: {stack: 7}"), &base).is_err());
+        let native = r#"{"inbounds":[{"type":"tun","stack":"gvisor","mtu":1400}]}"#;
+        assert_eq!(profile_tun_settings(Some(native), &base).unwrap().mtu, 1400);
+    }
+
+    #[test]
+    fn profile_routing_preserves_final_policy_and_rejects_unsupported_rules() {
+        let rules = profile_route_rules("rules: ['DOMAIN,example.com,DIRECT', 'MATCH,Proxy']").unwrap();
+        assert_eq!(rules[0]["outbound"], "direct");
+        assert_eq!(rules[1], serde_json::json!({"outbound":"Proxy"}));
+        for yaml in [
+            "rules: ['GEOIP,CN,DIRECT']",
+            "rules: ['IP-CIDR,10.0.0.0/8,DIRECT,no-resolve']",
+            "rules: [7]",
+        ] {
+            assert!(profile_route_rules(yaml).is_err());
+        }
+    }
+
+    #[test]
+    fn native_sidecars_preserve_unknown_fields_and_runtime_files_are_private() {
+        let home = tempfile::tempdir().unwrap();
+        crate::singbox::save_dns_spec(home.path(), &crate::singbox::DnsConfigSpec::default()).unwrap();
+        let mut config = serde_json::json!({"dns":{"independent_cache":true,"servers":[]},"route":{"auto_detect_interface":true},"custom":{"future":1}});
+        apply_native_sidecars(&mut config, home.path()).unwrap();
+        assert_eq!(config["dns"]["independent_cache"], true);
+        assert_eq!(config["route"]["auto_detect_interface"], true);
+        assert_eq!(config["custom"]["future"], 1);
+        let output = home.path().join("runtime.json");
+        write_generated_json(&output, &config).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&output).unwrap()).unwrap(),
+            config
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(output).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn intentional_restart_suppresses_predecessor_exit_but_keeps_ready_ordered() {
+        let inner = ManagerInner::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        *inner.action_tx.lock() = Some(tx);
+        inner.generation.store(4, std::sync::atomic::Ordering::SeqCst);
+        inner.restarting.store(true, std::sync::atomic::Ordering::SeqCst);
+        inner.send_action(Action::CoreExited(0)).await;
+        assert!(rx.try_recv().is_err());
+        inner
+            .send_action(Action::CoreStarted {
+                version: None,
+                binary_path: None,
+                binary_source: None,
+            })
+            .await;
+        assert!(
+            matches!(rx.recv().await, Some(Action::CoreGeneration { generation: 4, action }) if matches!(*action, Action::CoreStarted {..}))
+        );
+        inner.restarting.store(false, std::sync::atomic::Ordering::SeqCst);
+        inner.send_action(Action::CoreExited(0)).await;
+        assert!(
+            matches!(rx.recv().await, Some(Action::CoreGeneration { generation: 4, action }) if matches!(*action, Action::CoreExited(0)))
+        );
     }
 }

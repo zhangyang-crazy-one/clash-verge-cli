@@ -61,6 +61,40 @@ pub fn apply_merge(base: &mut Mapping, merge: &Mapping, key: &str) {
     }
 }
 
+/// Overlay the standalone `dns_config.yaml` section onto a profile's `dns`
+/// mapping. Maps merge recursively so valid unknown nested fields survive;
+/// scalar and sequence values replace the old value, including an explicit
+/// empty sequence which clears an inherited list.
+pub fn apply_dns_override(config: &mut Mapping, dns_override: &Mapping) -> anyhow::Result<()> {
+    if dns_override.is_empty() {
+        return Ok(());
+    }
+
+    let dns_key = Value::from("dns");
+    let mut dns = match config.get(&dns_key) {
+        Some(value) => value
+            .as_mapping()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("profile dns section must be a mapping"))?,
+        None => Mapping::new(),
+    };
+    merge_mapping_values(&mut dns, dns_override);
+    config.insert(dns_key, Value::Mapping(dns));
+    Ok(())
+}
+
+fn merge_mapping_values(base: &mut Mapping, overlay: &Mapping) {
+    for (key, overlay_value) in overlay {
+        if let (Some(Value::Mapping(base_nested)), Value::Mapping(overlay_nested)) = (base.get_mut(key), overlay_value)
+            && !overlay_nested.is_empty()
+        {
+            merge_mapping_values(base_nested, overlay_nested);
+            continue;
+        }
+        base.insert(key.clone(), overlay_value.clone());
+    }
+}
+
 /// Parsed rule-fragment shape. Either a GUI mapping with prepend/append/delete
 /// string arrays, or a legacy YAML sequence of rule strings that fully
 /// replaces the upstream rule list.
@@ -219,11 +253,30 @@ pub fn apply_rules_fragment(config: &mut Mapping, fragment: &RulesFragment) {
 }
 
 /// Apply a resolved profile chain without discarding unrelated configuration.
-pub fn apply_chain_to_config(config: &mut Mapping, chain: &ChainType) {
+pub fn apply_chain_to_config(config: &mut Mapping, chain: &ChainType) -> anyhow::Result<()> {
     match chain {
         ChainType::Merge(merge) => {
             for key in ["proxies", "proxy-groups", "rules", "rule-providers", "proxy-providers"] {
                 apply_merge(config, merge, key);
+            }
+            if let Some(dns_value) = merge.get("dns") {
+                let Some(dns) = dns_value.as_mapping() else {
+                    anyhow::bail!("merge profile dns section must be a mapping");
+                };
+                let dns_key = Value::from("dns");
+                let mut base_dns = match config.get(&dns_key) {
+                    Some(value) => value
+                        .as_mapping()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("profile dns section must be a mapping"))?,
+                    None => Mapping::new(),
+                };
+                if dns.is_empty() {
+                    config.insert(dns_key, Value::Mapping(Mapping::new()));
+                } else {
+                    merge_mapping_values(&mut base_dns, dns);
+                    config.insert(dns_key, Value::Mapping(base_dns));
+                }
             }
         }
         ChainType::Rules(seq) => {
@@ -235,9 +288,70 @@ pub fn apply_chain_to_config(config: &mut Mapping, chain: &ChainType) {
         ChainType::Groups(seq) => {
             config.insert("proxy-groups".into(), seq.clone().into());
         }
-        ChainType::Script => {
-            // Script execution has a separate runtime and is intentionally not implicit here.
-        }
+        ChainType::Script => anyhow::bail!("script profile chains are unsupported by the standalone TUI"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod dns_merge_tests {
+    use super::{ChainType, apply_chain_to_config, apply_dns_override};
+    use serde_yaml_ng::{Mapping, Value};
+
+    fn parse(yaml: &str) -> Mapping {
+        serde_yaml_ng::from_str(yaml).expect("valid fixture")
+    }
+
+    #[test]
+    fn global_dns_override_is_recursive_and_empty_lists_clear() {
+        let mut profile = parse(
+            "dns:\n  nameserver: [profile-dns]\n  future: {keep: true, replace: old}\n  nameserver-policy: {a.example: [1.1.1.1]}\n",
+        );
+        let global = parse("nameserver: []\nfuture: {replace: new, nested: [preserved]}\nnameserver-policy: {}\n");
+        apply_dns_override(&mut profile, &global).expect("valid profile DNS section");
+
+        assert_eq!(profile["dns"]["nameserver"], Value::Sequence(Vec::new()));
+        assert_eq!(profile["dns"]["future"]["keep"], Value::from(true));
+        assert_eq!(profile["dns"]["future"]["replace"], Value::from("new"));
+        assert_eq!(profile["dns"]["future"]["nested"][0], Value::from("preserved"));
+        assert_eq!(profile["dns"]["nameserver-policy"], Value::Mapping(Mapping::new()));
+    }
+
+    #[test]
+    fn malformed_profile_dns_is_reported_without_defaulting_or_replacing_it() {
+        let mut profile = parse("dns: invalid-scalar\n");
+        let before = profile.clone();
+        let global = parse("nameserver: [global]\n");
+        assert!(apply_dns_override(&mut profile, &global).is_err());
+        assert_eq!(profile, before);
+    }
+
+    #[test]
+    fn merge_profile_deeply_overlays_dns_and_unset_fields_inherit() {
+        let mut config = parse("dns: {nameserver: [profile], future: {keep: true, change: old}}\n");
+        let merge = parse("dns: {future: {change: new}, fallback: [8.8.8.8]}\n");
+        apply_chain_to_config(&mut config, &ChainType::Merge(merge)).expect("valid DNS merge");
+
+        assert_eq!(config["dns"]["nameserver"][0], Value::from("profile"));
+        assert_eq!(config["dns"]["future"]["keep"], Value::from(true));
+        assert_eq!(config["dns"]["future"]["change"], Value::from("new"));
+        assert_eq!(config["dns"]["fallback"][0], Value::from("8.8.8.8"));
+    }
+
+    #[test]
+    fn explicit_empty_merge_dns_section_clears_inherited_section() {
+        let mut config = parse("dns: {nameserver: [profile]}\n");
+        let merge = parse("dns: {}\n");
+        apply_chain_to_config(&mut config, &ChainType::Merge(merge)).expect("valid empty DNS merge");
+        assert_eq!(config["dns"], Value::Mapping(Mapping::new()));
+    }
+
+    #[test]
+    fn script_chain_is_rejected_before_any_config_mutation() {
+        let mut config = parse("dns: {nameserver: [profile]}\n");
+        let before = config.clone();
+        assert!(apply_chain_to_config(&mut config, &ChainType::Script).is_err());
+        assert_eq!(config, before);
     }
 }
 

@@ -248,12 +248,16 @@ pub struct App {
     pub log_level: String,
     /// The running log stream, aborted when the level changes.
     pub log_stream: Option<tokio::task::AbortHandle>,
+    pub traffic_stream: Option<tokio::task::AbortHandle>,
 
     // Proxy node state
     pub proxy_groups: HashMap<String, ProxyGroup>,
     pub expanded_proxy_group: Option<String>,
     pub node_selected_index: usize,
     pub delay_map: HashMap<String, Option<u64>>,
+    /// Maps the visible `(group, node)` pair to its provider-qualified delay
+    /// result key when source provenance is available.
+    pub proxy_delay_keys: HashMap<(String, String), Vec<crate::mihomo_api::types::ProxyDelayTarget>>,
     /// Node order in the expanded group (`o` cycles it).
     pub proxy_sort: ProxySort,
     /// Hide nodes whose last delay test failed (`H`).
@@ -369,10 +373,12 @@ impl App {
             runtime_errors: RuntimeErrors::default(),
             log_level: "info".into(),
             log_stream: None,
+            traffic_stream: None,
             proxy_groups: HashMap::new(),
             expanded_proxy_group: None,
             node_selected_index: 0,
             delay_map: HashMap::new(),
+            proxy_delay_keys: HashMap::new(),
             proxy_sort: ProxySort::default(),
             hide_failed_proxies: false,
             batch_delay: None,
@@ -409,6 +415,15 @@ impl App {
     }
 
     pub fn clear_runtime_caches(&mut self) {
+        if let Some(stream) = self.log_stream.take() {
+            stream.abort();
+        }
+        if let Some(stream) = self.traffic_stream.take() {
+            stream.abort();
+        }
+        self.batch_delay = None;
+        self.proxy_delay_keys.clear();
+        self.delay_map.clear();
         self.traffic = None;
         self.traffic_totals = None;
         self.connections.clear();
@@ -696,11 +711,29 @@ impl App {
 
     /// The Proxies view's rows, as rendered and as the cursor indexes them.
     pub fn proxy_rows(&self) -> Vec<ProxyDisplayRow> {
-        proxy_display_rows(
-            &self.proxy_groups,
-            self.expanded_proxy_group.as_deref(),
-            &self.proxy_list_options(),
-        )
+        let mut display_delays = self.delay_map.clone();
+        if let Some(group) = &self.expanded_proxy_group {
+            for ((source_group, name), targets) in &self.proxy_delay_keys {
+                if source_group != group {
+                    continue;
+                }
+                let known: Vec<_> = targets
+                    .iter()
+                    .filter_map(|target| self.delay_map.get(&target.key))
+                    .collect();
+                if known.is_empty() {
+                    continue;
+                }
+                let best = known.iter().filter_map(|value| **value).min();
+                // A partial failure does not hide healthy or untested identities.
+                if best.is_some() || known.len() == targets.len() {
+                    display_delays.insert(name.clone(), best);
+                }
+            }
+        }
+        let mut options = self.proxy_list_options();
+        options.delays = Some(&display_delays);
+        proxy_display_rows(&self.proxy_groups, self.expanded_proxy_group.as_deref(), &options)
     }
 
     /// Indices into `profiles` that the profile filter keeps.

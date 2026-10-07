@@ -1,5 +1,5 @@
 use super::{TunSetupReason, View};
-use crate::mihomo_api::types::{LogEntry, Rule, RuleProvider, TrafficData};
+use crate::mihomo_api::types::{LogEntry, ProxyDelayTarget, Rule, RuleProvider, TrafficData};
 
 /// What config file to open in `$EDITOR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,15 @@ pub enum EditorTarget {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Background {
+        generation: u64,
+        core_generation: Option<u64>,
+        action: Box<Action>,
+    },
+    CoreGeneration {
+        generation: u64,
+        action: Box<Action>,
+    },
     StartCore,
     StopCore,
     RestartCore,
@@ -75,16 +84,18 @@ pub enum Action {
     // Proxy nodes
     ProxiesRefresh,
     ProxiesFetched(std::collections::HashMap<String, crate::mihomo_api::types::ProxyGroup>),
+    ProxyDelayKeysFetched(std::collections::HashMap<(String, String), Vec<crate::mihomo_api::types::ProxyDelayTarget>>),
     ProxiesFailed(String),
     NodeDelayTest,
     NodeDelayAll,
-    DelayResult(String, Option<u64>),
-    DelayFailed(String, String),
+    DelayResult(ProxyDelayTarget, Option<u64>),
+    DelayFailed(ProxyDelayTarget, String),
     /// Batch-only result events. Kept distinct from the single-node
     /// `DelayResult`/`DelayFailed` so a single-node `t` result can never
     /// advance or clear the active batch progress/guard.
-    BatchDelayResult(String, Option<u64>),
-    BatchDelayFailed(String, String),
+    BatchDelayResult(ProxyDelayTarget, Option<u64>),
+    BatchDelayFailed(ProxyDelayTarget, String),
+    BatchDelayResolved(usize),
     /// `o`: next node order (profile / delay / name).
     CycleProxySort,
     /// `H`: hide or show nodes whose delay test failed.

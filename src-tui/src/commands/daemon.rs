@@ -17,15 +17,17 @@ use tokio::sync::Mutex;
 use tokio::time;
 
 use crate::commands;
-use crate::subscribe::scheduler::{AutoUpdateScheduler, reload_current_profile};
+use crate::subscribe::lifecycle::{ManagerLifecycle, reload_with_lifecycle};
+use crate::subscribe::scheduler::AutoUpdateScheduler;
 
 pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
     let manager = commands::build_manager(config_dir).await?;
-    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(64);
     manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
     manager.start().await?;
+    let manager = Arc::new(manager);
 
     // Reload target state for current-profile refreshes (owned core → running).
     let gui = clash_verge_core::config::IVerge::new().await;
@@ -42,21 +44,30 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
 
     loop {
         tokio::select! {
-            Some(action) = lifecycle_rx.recv() => match action {
+            Some(action) = lifecycle_rx.recv() => {
+                let action = match action {
+                    crate::app::Action::CoreGeneration { generation, action } if generation == manager.current_generation() => *action,
+                    crate::app::Action::CoreGeneration { .. } => continue,
+                    other => other,
+                };
+                match action {
                 crate::app::Action::CoreExited(_) if manager.state() == crate::app::CoreState::Stopped => {
                     tracing::info!(target: "daemon", "mihomo was stopped, exiting");
                     if let Some(handle) = in_flight.take() {
                         handle.abort();
+                        let _ = handle.await;
                     }
                     return Ok(());
                 }
                 crate::app::Action::CoreError(error) => {
                     if let Some(handle) = in_flight.take() {
                         handle.abort();
+                        let _ = handle.await;
                     }
                     anyhow::bail!("mihomo stopped: {error}");
                 }
                 _ => {}
+                }
             },
             _ = term.recv() => {
                 tracing::info!(target: "daemon", "received SIGTERM, stopping");
@@ -66,21 +77,33 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                 tracing::info!(target: "daemon", "received SIGINT, stopping");
                 break;
             }
+            completed = async {
+                match in_flight.as_mut() {
+                    Some(handle) => Some(handle.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                in_flight = None;
+                if let Some(Err(error)) = completed {
+                    tracing::error!(target: "auto_update", "background refresh task failed: {error}");
+                }
+            }
             _ = auto_update_tick.tick(), if in_flight.is_none() => {
                 let sched = scheduler.clone();
-                let api = manager.api();
+                let manager = Arc::clone(&manager);
                 let handle = tokio::spawn(async move {
                     let (outcome, probe) = {
                         let mut scheduler = sched.lock().await;
                         (
                             scheduler.tick().await,
-                            scheduler.probe(&api, enable_tun, true).await,
+                            scheduler.probe_with_manager(&manager, enable_tun, true).await,
                         )
                     };
                     for (uid, is_current) in outcome.updated {
                         tracing::info!(target: "auto_update", "refreshed {uid} (current={is_current})");
                         if is_current {
-                            match reload_current_profile(&api, &uid, enable_tun, true).await {
+                            let lifecycle = ManagerLifecycle::new(&manager);
+                            match reload_with_lifecycle(&lifecycle, &uid, enable_tun).await {
                                 Ok(()) => {
                                     tracing::info!(target: "auto_update", "reloaded current profile {uid}")
                                 }
@@ -117,6 +140,7 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
     // Cancel any in-flight refresh before stopping the core.
     if let Some(handle) = in_flight.take() {
         handle.abort();
+        let _ = handle.await;
     }
     manager.stop().await?;
     tracing::info!(target: "daemon", "mihomo stopped, exiting");

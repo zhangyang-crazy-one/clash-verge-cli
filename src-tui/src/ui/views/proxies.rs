@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &rows,
         app.node_selected_index,
         &app.delay_map,
+        &app.proxy_delay_keys,
         &app.core_state,
         app.runtime_loading.proxies,
         app.runtime_errors.proxies.as_deref(),
@@ -71,11 +72,14 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App, rows: &[ProxyDispla
             Line::from(Span::styled(chain_command_hint(app), Style::new().fg(theme::dim()))),
         ],
         Some(ProxyDisplayRow::Node { group, name, current }) => {
-            let delay = match app.delay_map.get(name) {
-                Some(Some(milliseconds)) => format!("{milliseconds}ms"),
-                Some(None) => app.tr("common.failed").to_string(),
-                None => app.tr("proxies.not_tested").to_string(),
-            };
+            let delay = crate::ui::proxy_list::target_delays(
+                &app.delay_map,
+                app.proxy_delay_keys
+                    .get(&(group.clone(), name.clone()))
+                    .map(Vec::as_slice),
+                name,
+                app.tr("common.failed"),
+            );
             vec![
                 Line::from(Span::styled(
                     crate::ui::terminal_text::display(name),

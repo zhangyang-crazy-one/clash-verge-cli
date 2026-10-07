@@ -2,6 +2,7 @@ use crate::utils::{dirs, help, tmpl};
 use anyhow::{Context as _, Result, bail};
 use compact_str::CompactString as String;
 use serde::{Deserialize, Serialize};
+use serde_yaml_ng::{Mapping, Value};
 use tokio::fs;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -49,20 +50,28 @@ pub struct PrfItem {
     /// the file data
     #[serde(skip)]
     pub file_data: Option<String>,
+
+    /// Preserve fields added by newer GUI versions.
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
 }
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PrfSelected {
     pub name: Option<String>,
     pub now: Option<String>,
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
 }
 
-#[derive(Default, Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Default, Debug, Clone, Deserialize, Serialize)]
 pub struct PrfExtra {
     pub upload: u64,
     pub download: u64,
     pub total: u64,
     pub expire: u64,
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
 }
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -114,6 +123,21 @@ pub struct PrfOption {
     /// are permitted even when they resolve to private/loopback ranges.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted_hosts: Option<Vec<String>>,
+
+    /// Preserve unknown per-profile options through read/merge/write.
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
+}
+
+pub(crate) fn merge_unknown_fields(base: &mut Mapping, overlay: &Mapping) {
+    for (key, overlay_value) in overlay {
+        if let (Some(Value::Mapping(base_nested)), Value::Mapping(overlay_nested)) = (base.get_mut(key), overlay_value)
+        {
+            merge_unknown_fields(base_nested, overlay_nested);
+        } else {
+            base.insert(key.clone(), overlay_value.clone());
+        }
+    }
 }
 
 impl PrfOption {
@@ -135,6 +159,7 @@ impl PrfOption {
                 result.groups = b_ref.groups.clone().or(result.groups);
                 result.timeout_seconds = b_ref.timeout_seconds.or(result.timeout_seconds);
                 result.trusted_hosts = b_ref.trusted_hosts.clone().or(result.trusted_hosts);
+                merge_unknown_fields(&mut result.unknown_fields, &b_ref.unknown_fields);
                 Some(result)
             }
             (Some(a_ref), None) => Some(a_ref.clone()),
@@ -169,6 +194,7 @@ impl PrfItem {
             home: None,
             updated: Some(chrono::Local::now().timestamp() as usize),
             file_data: Some(file_data.unwrap_or_else(|| tmpl::ITEM_LOCAL.into())),
+            unknown_fields: Mapping::new(),
         })
     }
 

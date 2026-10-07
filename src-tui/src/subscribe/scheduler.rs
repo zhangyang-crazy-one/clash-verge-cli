@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clash_verge_core::config::PrfItem;
 use serde_yaml_ng::{Mapping, Value};
 
+use super::lifecycle::{CoreLifecycle, ManagerLifecycle};
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::ProxyDelay;
@@ -33,10 +34,8 @@ use crate::profile_store::store::ProfileStore;
 /// [`crate::runtime_config::apply_singbox_restart`], which regenerates
 /// the JSON config, prevalidates with `sing-box check`, and restarts
 /// the process. Used by the manager-aware wrappers in this module; the
-/// mihomo-only `probe` / `reload_current_profile` / `force_refresh`
-/// entry points are kept for the headless daemon and CLI commands
-/// (out-of-scope here; they remain sing-box-broken — see `notes` in the
-/// public function doc-comments).
+/// selected-core callers use the lifecycle adapter below; the explicit
+/// mihomo reload helper is retained for its hot-reload branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshPath {
     HotReload,
@@ -107,12 +106,16 @@ pub fn classify_delay(result: &Result<ProxyDelay, MihomoError>) -> ProbeVerdict 
     match result {
         Ok(delay) if delay.delay > 0 => ProbeVerdict::Alive,
         Ok(_) => ProbeVerdict::Dead,
-        Err(MihomoError::CoreDown { .. } | MihomoError::Unauthorized) => ProbeVerdict::ApiIssue,
-        Err(_) => ProbeVerdict::Dead,
+        Err(MihomoError::CoreDown { .. } | MihomoError::Unauthorized | MihomoError::OperationTimeout { .. }) => {
+            ProbeVerdict::ApiIssue
+        }
+        Err(MihomoError::HttpStatus { status: 503 | 504, .. }) => ProbeVerdict::Dead,
+        Err(_) => ProbeVerdict::ApiIssue,
     }
 }
 
 /// Policy pseudo-nodes cannot be delay-tested.
+#[cfg(test)]
 fn is_policy_node(name: &str) -> bool {
     matches!(name, "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE")
 }
@@ -120,6 +123,25 @@ fn is_policy_node(name: &str) -> bool {
 /// Whether a parsed clash config still contains `node` (top-level `proxies`
 /// or a `proxy-groups` reference). Used for the fixed-exit rollback check.
 pub fn config_contains_node(config: &Mapping, node: &str) -> bool {
+    if config
+        .get("outbounds")
+        .and_then(Value::as_sequence)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.get("tag").and_then(Value::as_str) == Some(node))
+        })
+    {
+        return true;
+    }
+    // Provider membership can only be confirmed after reload via its live registry.
+    if config
+        .get("proxy-providers")
+        .and_then(Value::as_mapping)
+        .is_some_and(|providers| !providers.is_empty())
+    {
+        return true;
+    }
     if let Some(Value::Sequence(proxies)) = config.get("proxies") {
         for proxy in proxies {
             if let Value::Mapping(map) = proxy
@@ -228,58 +250,6 @@ impl AutoUpdateScheduler {
         }
     }
 
-    /// Probe the current exit node and force a subscription refresh when it
-    /// dies. Returns notices for the caller to surface. No-op unless
-    /// `probe_enabled` is set (default on), the core is running, and a
-    /// current profile with a delay-testable exit node exists.
-    ///
-    /// **Mihomo-only entry point.** A sing-box forced refresh also needs
-    /// the manager (to restart the process). Use [`probe_with_manager`]
-    /// for the dispatching path used by the TUI; the headless daemon still
-    /// calls this and remains sing-box-broken (out of scope here).
-    pub async fn probe(&mut self, api: &MihomoApi, enable_tun: bool, core_running: bool) -> ProbeOutcome {
-        let gui = clash_verge_core::config::IVerge::new().await;
-        if !gui.probe_enabled.unwrap_or(true) {
-            return ProbeOutcome::default();
-        }
-        if !core_running {
-            return ProbeOutcome::default();
-        }
-
-        let store = match ProfileStore::snapshot().await {
-            Ok(store) => store,
-            Err(error) => {
-                return ProbeOutcome {
-                    error: Some(error.to_string()),
-                    ..Default::default()
-                };
-            }
-        };
-        let Some(current) = store.current_uid() else {
-            return ProbeOutcome::default();
-        };
-        let items = store.items();
-        let Some(node) = current_exit_node(api, &items, &current).await else {
-            return ProbeOutcome::default();
-        };
-
-        let verdict = classify_delay(&api.delay_test(&node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
-        match verdict {
-            ProbeVerdict::Alive => {
-                self.probe_failures = 0;
-                ProbeOutcome::default()
-            }
-            ProbeVerdict::ApiIssue => ProbeOutcome::default(),
-            ProbeVerdict::Dead => {
-                if self.record_probe_failure(unix_now_secs()) {
-                    Self::force_refresh(api, &current, &node, enable_tun, core_running).await
-                } else {
-                    ProbeOutcome::default()
-                }
-            }
-        }
-    }
-
     /// Probe the current exit node and, on a sustained failure, force a
     /// subscription refresh that dispatches by [`CoreKind`]. The
     /// controller transport is reached through `manager.api()`; the
@@ -287,12 +257,24 @@ impl AutoUpdateScheduler {
     /// restart through [`crate::runtime_config::apply_singbox_restart`]
     /// instead of `reload_current_profile` (a no-op for sing-box).
     ///
-    /// Used by the TUI's auto-update tick (`spawn_auto_update`). The
-    /// headless daemon still calls [`probe`](Self::probe) and stays on
-    /// the mihomo-only path.
+    /// Used by the TUI and headless daemon auto-update ticks through the
+    /// manager adapter; tests can call the lifecycle variant directly.
     pub async fn probe_with_manager(
         &mut self,
         manager: &MihomoManager,
+        enable_tun: bool,
+        core_running: bool,
+    ) -> ProbeOutcome {
+        self.probe_with_lifecycle(&ManagerLifecycle::new(manager), enable_tun, core_running)
+            .await
+    }
+
+    /// Injectable probe path for deterministic fake-core tests. Production
+    /// callers use [`ManagerLifecycle`], while the lifecycle owns controller
+    /// access and stopped/external-core policy.
+    pub(crate) async fn probe_with_lifecycle<C: CoreLifecycle>(
+        &mut self,
+        lifecycle: &C,
         enable_tun: bool,
         core_running: bool,
     ) -> ProbeOutcome {
@@ -300,11 +282,10 @@ impl AutoUpdateScheduler {
         if !gui.probe_enabled.unwrap_or(true) {
             return ProbeOutcome::default();
         }
-        if !core_running {
-            return ProbeOutcome::default();
+        if !core_running || !lifecycle.is_running() {
+            return unavailable_probe(lifecycle.core_kind());
         }
 
-        let api = manager.api();
         let store = match ProfileStore::snapshot().await {
             Ok(store) => store,
             Err(error) => {
@@ -318,20 +299,23 @@ impl AutoUpdateScheduler {
             return ProbeOutcome::default();
         };
         let items = store.items();
-        let Some(node) = current_exit_node(&api, &items, &current).await else {
+        let Some(node) = lifecycle.current_exit_node(&items, &current).await else {
             return ProbeOutcome::default();
         };
 
-        let verdict = classify_delay(&api.delay_test(&node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
+        let verdict = classify_delay(&lifecycle.delay_test(&node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
         match verdict {
             ProbeVerdict::Alive => {
                 self.probe_failures = 0;
                 ProbeOutcome::default()
             }
-            ProbeVerdict::ApiIssue => ProbeOutcome::default(),
+            ProbeVerdict::ApiIssue => {
+                self.probe_failures = 0;
+                ProbeOutcome::default()
+            }
             ProbeVerdict::Dead => {
                 if self.record_probe_failure(unix_now_secs()) {
-                    Self::force_refresh_with_manager(manager, &current, &node, enable_tun, core_running).await
+                    Self::force_refresh_with_lifecycle(lifecycle, &current, &node, enable_tun).await
                 } else {
                     ProbeOutcome::default()
                 }
@@ -352,16 +336,14 @@ impl AutoUpdateScheduler {
         due
     }
 
-    /// Force-refresh the current profile, bypassing interval and cooldown.
-    /// Preserves the fixed exit: if the selected node name vanishes from the
-    /// refreshed config, the old profile file and `updated` timestamp are
-    /// restored and the old config reloaded.
-    async fn force_refresh(
-        api: &MihomoApi,
+    /// Force-refresh through an injected lifecycle. Same fixed-exit rollback
+    /// as the legacy mihomo path, while the production adapter selects the
+    /// correct core operation and refuses external sing-box restarts.
+    async fn force_refresh_with_lifecycle<C: CoreLifecycle>(
+        lifecycle: &C,
         uid: &str,
         node: &str,
         enable_tun: bool,
-        core_running: bool,
     ) -> ProbeOutcome {
         let items = match ProfileStore::snapshot().await {
             Ok(store) => store.items(),
@@ -382,97 +364,44 @@ impl AutoUpdateScheduler {
         match ProfileStore::update_remotes_locked(&[uid.to_string()]).await {
             Ok((updated, _failed)) if !updated.is_empty() => {
                 if refreshed_config_has_node(uid, node).await {
-                    match reload_current_profile(api, uid, enable_tun, core_running).await {
+                    match super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await {
                         Ok(()) => {
-                            let verdict = classify_delay(&api.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
+                            let verdict =
+                                classify_delay(&lifecycle.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
                             ProbeOutcome {
                                 forced_refresh: true,
                                 may_be_down: verdict != ProbeVerdict::Alive,
                                 ..Default::default()
                             }
                         }
-                        Err(error) => ProbeOutcome {
-                            forced_refresh: true,
-                            error: Some(format!("reload after forced refresh: {error}")),
-                            ..Default::default()
-                        },
-                    }
-                } else {
-                    // Fixed-exit rollback: restore the old file and timestamp.
-                    let file = items
-                        .iter()
-                        .find(|item| item.uid.as_deref() == Some(uid))
-                        .and_then(|item| item.file.clone());
-                    if let Some(file) = file {
-                        restore_profile_snapshot(uid, &file, &old_bytes, old_updated).await;
-                    }
-                    let _ = reload_current_profile(api, uid, enable_tun, core_running).await;
-                    ProbeOutcome {
-                        forced_refresh: true,
-                        rolled_back: true,
-                        ..Default::default()
-                    }
-                }
-            }
-            Ok(_) => ProbeOutcome {
-                forced_refresh: true,
-                error: Some(format!("forced refresh of {uid} produced no update")),
-                ..Default::default()
-            },
-            Err(error) => ProbeOutcome {
-                error: Some(format!("forced refresh failed: {error}")),
-                ..Default::default()
-            },
-        }
-    }
-
-    /// Force-refresh the current profile, dispatching the post-refresh
-    /// config application by [`CoreKind`]. Same fixed-exit rollback as
-    /// [`force_refresh`](Self::force_refresh); the sing-box branch routes
-    /// through [`reload_current_profile_for_core`] so the JSON config is
-    /// regenerated and the core restarted instead of issuing a no-op
-    /// `PUT /configs`.
-    async fn force_refresh_with_manager(
-        manager: &MihomoManager,
-        uid: &str,
-        node: &str,
-        enable_tun: bool,
-        core_running: bool,
-    ) -> ProbeOutcome {
-        let api = manager.api();
-        let items = match ProfileStore::snapshot().await {
-            Ok(store) => store.items(),
-            Err(error) => {
-                return ProbeOutcome {
-                    error: Some(error.to_string()),
-                    ..Default::default()
-                };
-            }
-        };
-        let Some((old_bytes, old_updated)) = profile_snapshot(&items, uid).await else {
-            return ProbeOutcome {
-                error: Some(format!("profile {uid} file unavailable for snapshot")),
-                ..Default::default()
-            };
-        };
-
-        match ProfileStore::update_remotes_locked(&[uid.to_string()]).await {
-            Ok((updated, _failed)) if !updated.is_empty() => {
-                if refreshed_config_has_node(uid, node).await {
-                    match reload_current_profile_for_core(manager, uid, enable_tun, core_running).await {
-                        Ok(()) => {
-                            let verdict = classify_delay(&api.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
-                            ProbeOutcome {
-                                forced_refresh: true,
-                                may_be_down: verdict != ProbeVerdict::Alive,
-                                ..Default::default()
+                        Err(error) => {
+                            let file = items
+                                .iter()
+                                .find(|item| item.uid.as_deref() == Some(uid))
+                                .and_then(|item| item.file.as_deref());
+                            if let Some(file) = file {
+                                restore_profile_snapshot(uid, file, &old_bytes, old_updated).await;
+                                let rollback =
+                                    super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun)
+                                        .await;
+                                let suffix = rollback
+                                    .err()
+                                    .map(|e| format!("; rollback apply failed: {e}"))
+                                    .unwrap_or_default();
+                                ProbeOutcome {
+                                    forced_refresh: true,
+                                    rolled_back: true,
+                                    error: Some(format!("reload after forced refresh failed: {error}{suffix}")),
+                                    ..Default::default()
+                                }
+                            } else {
+                                ProbeOutcome {
+                                    forced_refresh: true,
+                                    error: Some(format!("reload after forced refresh: {error}")),
+                                    ..Default::default()
+                                }
                             }
                         }
-                        Err(error) => ProbeOutcome {
-                            forced_refresh: true,
-                            error: Some(format!("reload after forced refresh: {error}")),
-                            ..Default::default()
-                        },
                     }
                 } else {
                     let file = items
@@ -482,7 +411,16 @@ impl AutoUpdateScheduler {
                     if let Some(file) = file {
                         restore_profile_snapshot(uid, &file, &old_bytes, old_updated).await;
                     }
-                    let _ = reload_current_profile_for_core(manager, uid, enable_tun, core_running).await;
+                    let rollback =
+                        super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await;
+                    if let Err(error) = rollback {
+                        return ProbeOutcome {
+                            forced_refresh: true,
+                            rolled_back: true,
+                            error: Some(format!("rollback apply failed: {error}")),
+                            ..Default::default()
+                        };
+                    }
                     ProbeOutcome {
                         forced_refresh: true,
                         rolled_back: true,
@@ -503,22 +441,14 @@ impl AutoUpdateScheduler {
     }
 }
 
-/// Resolve the current exit node: the live `GLOBAL` group selection from the
-/// controller, falling back to the saved `PrfSelected` entry.
-async fn current_exit_node(api: &MihomoApi, items: &[PrfItem], current_uid: &str) -> Option<String> {
-    if let Ok(data) = api.get_proxies().await
-        && let Some(global) = data.proxies.get("GLOBAL")
-        && let Some(now) = global.now.as_deref()
-        && !is_policy_node(now)
-    {
-        return Some(now.to_string());
+fn unavailable_probe(kind: CoreKind) -> ProbeOutcome {
+    ProbeOutcome {
+        error: Some(format!(
+            "{} unavailable: core stopped; no probe or startup attempted",
+            kind.as_str()
+        )),
+        ..Default::default()
     }
-    items
-        .iter()
-        .find(|item| item.uid.as_deref() == Some(current_uid))
-        .and_then(|item| item.selected.as_ref())
-        .and_then(|selected| selected.iter().find(|entry| entry.name.as_deref() == Some("GLOBAL")))
-        .and_then(|entry| entry.now.as_deref().map(str::to_string))
 }
 
 /// Snapshot a remote profile's file bytes and `updated` timestamp so a forced
@@ -571,8 +501,7 @@ async fn refreshed_config_has_node(uid: &str, node: &str) -> bool {
 /// **Mihomo-only entry point.** Sing-box's `PUT /configs` is a no-op, so
 /// calling this against a sing-box controller silently leaves the running
 /// config unchanged. The TUI uses [`reload_current_profile_for_core`]
-/// instead; the headless daemon and CLI `profile update --reload` still
-/// call this function and remain sing-box-broken (out of scope here).
+/// instead; daemon and CLI also dispatch through their selected-core wrappers.
 pub async fn reload_current_profile(
     api: &MihomoApi,
     uid: &str,
@@ -604,6 +533,20 @@ pub async fn reload_current_profile_for_core(
     enable_tun: bool,
     core_running: bool,
 ) -> Result<(), String> {
+    reload_current_profile_for_manager(manager, uid, enable_tun, core_running).await
+}
+
+pub(crate) async fn reload_current_profile_for_manager(
+    manager: &MihomoManager,
+    uid: &str,
+    enable_tun: bool,
+    core_running: bool,
+) -> Result<(), String> {
+    if !core_running {
+        // A successful subscription update may be persisted while the core is
+        // stopped, but applying it must not implicitly start that core.
+        return Ok(());
+    }
     match decide_refresh_path(manager.core_kind()) {
         RefreshPath::HotReload => reload_current_profile(&manager.api(), uid, enable_tun, core_running).await,
         RefreshPath::SingboxRestart => {
@@ -617,9 +560,14 @@ pub async fn reload_current_profile_for_core(
                 .find(|item| item.uid.as_deref() == Some(uid))
                 .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
             let yaml = read_profile_yaml(&item).await?;
-            crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
-                .await
-                .map(|_report| ())
+            crate::runtime_config::apply_singbox_restart_for_profile(
+                manager,
+                Some(yaml.as_str()),
+                enable_tun,
+                Some(uid),
+            )
+            .await
+            .map(|_report| ())
         }
     }
 }
@@ -811,7 +759,7 @@ mod tests {
         assert_eq!(classify_delay(&Err(MihomoError::Unauthorized)), ProbeVerdict::ApiIssue);
         assert_eq!(
             classify_delay(&Err(MihomoError::NotFound("no proxy".into()))),
-            ProbeVerdict::Dead
+            ProbeVerdict::ApiIssue
         );
     }
 
@@ -874,6 +822,16 @@ proxy-groups:
         assert!(is_policy_node("DIRECT"));
         assert!(is_policy_node("REJECT"));
         assert!(!is_policy_node("JP-4"));
+    }
+
+    #[test]
+    fn stopped_probe_records_selected_core_unavailability_without_recovery() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let outcome = unavailable_probe(kind);
+            assert!(outcome.error.unwrap().contains(kind.as_str()));
+            assert!(!outcome.forced_refresh);
+            assert!(!outcome.rolled_back);
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 //! opens the password popup directly through `begin_service_install` and
 //! `confirm_service_uninstall`.
 
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, Overlay, PendingSudoAction, TunSetupReason};
@@ -70,7 +71,7 @@ pub(super) fn cancel_service_uninstall(app: &mut App) {
 ///   the explicit Settings flow passes `None`. Service install / uninstall
 ///   surface their own terminal actions so the Settings row can refresh
 ///   its cached `service_installed` probe.
-pub(super) fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+pub(super) fn handle_password_submit(app: &mut App, action_tx: &crate::tui::background::EventSender) {
     let Some(pending) = app.pending_sudo.take() else {
         return;
     };
@@ -83,13 +84,13 @@ pub(super) fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedS
             resume_start,
             reason: _,
         } => {
-            tokio::spawn(async move {
+            tx.clone().spawn(async move {
                 match crate::commands::privilege::apply_tun_capability_with_password(&binary, &password) {
                     Ok(()) => {
-                        let _ = tx.send(Action::TunSetupSucceeded { resume_start });
+                        let _ = tx.send(Action::TunSetupSucceeded { resume_start }).await;
                     }
                     Err(error) => {
-                        let _ = tx.send(Action::CoreError(error.to_string()));
+                        let _ = tx.send(Action::CoreError(error.to_string())).await;
                     }
                 }
             });
@@ -98,25 +99,25 @@ pub(super) fn handle_password_submit(app: &mut App, action_tx: &mpsc::UnboundedS
             binary_path,
             config_dir,
         } => {
-            tokio::spawn(async move {
+            tx.clone().spawn(async move {
                 match crate::service_cmd::install_service_with_password(&binary_path, &config_dir, true, &password) {
                     Ok(()) => {
-                        let _ = tx.send(Action::ServiceInstalled);
+                        let _ = tx.send(Action::ServiceInstalled).await;
                     }
                     Err(error) => {
-                        let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                        let _ = tx.send(Action::ServiceActionFailed(error.to_string())).await;
                     }
                 }
             });
         }
         PendingSudoAction::ServiceUninstall => {
-            tokio::spawn(async move {
+            tx.clone().spawn(async move {
                 match crate::service_cmd::uninstall_service_with_password(&password) {
                     Ok(()) => {
-                        let _ = tx.send(Action::ServiceUninstalled);
+                        let _ = tx.send(Action::ServiceUninstalled).await;
                     }
                     Err(error) => {
-                        let _ = tx.send(Action::ServiceActionFailed(error.to_string()));
+                        let _ = tx.send(Action::ServiceActionFailed(error.to_string())).await;
                     }
                 }
             });
@@ -197,7 +198,7 @@ pub(super) fn confirm_tun_setup(app: &mut App) {
 ///   setup command instead of a confusing resume-then-fail.
 /// - missing DNS polkit rule only (soft gate, capability present): skip
 ///   starts anyway, preserving the passive DNS-rule warning.
-pub(super) fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+pub(super) async fn skip_tun_setup_start(app: &mut App, action_tx: &crate::tui::background::EventSender) {
     let pending = app.pending_sudo.take();
     app.overlay = None;
     let Some(PendingSudoAction::TunSetup {
@@ -230,16 +231,16 @@ pub(super) fn skip_tun_setup_start(app: &mut App, action_tx: &mpsc::UnboundedSen
     } else {
         app.status_msg = Some(app.tr("home.starting_core").into());
     }
-    let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+    let _ = action_tx.send(Action::ResumeCoreStart { enable_tun }).await;
 }
 
 /// Record a successful TUN setup transaction. With `resume_start` set, the
 /// pending core start is resumed via `ResumeCoreStart`; `None` (explicit
 /// Settings flow) just marks the TUI as privileged.
-pub(super) fn note_tun_setup_succeeded(
+pub(super) async fn note_tun_setup_succeeded(
     app: &mut App,
     resume_start: Option<bool>,
-    action_tx: &mpsc::UnboundedSender<Action>,
+    action_tx: &crate::tui::background::EventSender,
 ) {
     app.tun_privileged = true;
     app.status_msg = Some(if crate::commands::privilege::resolved_policy_present() {
@@ -248,7 +249,7 @@ pub(super) fn note_tun_setup_succeeded(
         "TUN capability installed (one-time sudo)".into()
     });
     if let Some(enable_tun) = resume_start {
-        let _ = action_tx.send(Action::ResumeCoreStart { enable_tun });
+        let _ = action_tx.send(Action::ResumeCoreStart { enable_tun }).await;
     }
 }
 
@@ -266,8 +267,8 @@ mod tests {
         app.password_buffer = vec!['x'];
         app.pending_sudo = None;
 
-        let (tx, _rx) = mpsc::unbounded_channel::<Action>();
-        handle_password_submit(&mut app, &tx);
+        let (tx, _rx) = mpsc::channel::<Action>(32);
+        handle_password_submit(&mut app, &tx.into());
 
         assert!(app.pending_sudo.is_none(), "nothing may be created by a stale submit");
         assert_eq!(
@@ -348,14 +349,14 @@ mod tests {
         assert_eq!(resume, Some(true), "password popup must keep the pending resume");
     }
 
-    #[test]
-    fn tun_setup_success_with_resume_requests_the_pending_start() {
+    #[tokio::test]
+    async fn tun_setup_success_with_resume_requests_the_pending_start() {
         // Success after `s` → y → password: the start must resume. The resume
         // request is observed on the action channel (no tokio needed); the
         // explicit Settings flow (None) never emits one.
         let mut app = App::new();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-        note_tun_setup_succeeded(&mut app, Some(true), &tx);
+        let (tx, mut rx) = mpsc::channel::<Action>(32);
+        note_tun_setup_succeeded(&mut app, Some(true), &tx.into()).await;
 
         assert!(app.tun_privileged, "setup success must mark the TUI privileged");
         match rx.try_recv() {
@@ -364,13 +365,13 @@ mod tests {
         }
 
         let mut app = App::new();
-        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-        note_tun_setup_succeeded(&mut app, None, &tx);
+        let (tx, mut rx) = mpsc::channel::<Action>(32);
+        note_tun_setup_succeeded(&mut app, None, &tx.into()).await;
         assert!(rx.try_recv().is_err(), "Settings flow must not resume any start");
     }
 
-    #[test]
-    fn skip_tun_setup_start_dismisses_and_resumes_the_start() {
+    #[tokio::test]
+    async fn skip_tun_setup_start_dismisses_and_resumes_the_start() {
         // `n`/Esc/q on the confirm when only the DNS rule is missing (soft
         // gate, capability present): dismiss and start anyway, preserving
         // the current behavior (no setup transaction runs).
@@ -382,8 +383,8 @@ mod tests {
             true,
             TunSetupReason::MissingDnsRule,
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-        skip_tun_setup_start(&mut app, &tx);
+        let (tx, mut rx) = mpsc::channel::<Action>(32);
+        skip_tun_setup_start(&mut app, &tx.into()).await;
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
         assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");
@@ -393,8 +394,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn skip_tun_setup_start_when_capability_missing_cancels_the_start() {
+    #[tokio::test]
+    async fn skip_tun_setup_start_when_capability_missing_cancels_the_start() {
         // `n`/Esc/q when the prompt fired because the binary lacks the TUN
         // capability (hard gate): starting anyway would only hit the spawn
         // preflight hard-fail a moment later. The skip must CANCEL the
@@ -407,8 +408,8 @@ mod tests {
             true,
             TunSetupReason::MissingCapability,
         );
-        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-        skip_tun_setup_start(&mut app, &tx);
+        let (tx, mut rx) = mpsc::channel::<Action>(32);
+        skip_tun_setup_start(&mut app, &tx.into()).await;
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
         assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");

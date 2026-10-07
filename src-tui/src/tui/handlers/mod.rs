@@ -27,9 +27,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crossterm::event::{KeyEvent, MouseEvent};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::{mpsc, watch};
 
 use crate::app::{Action, App, Focus, InputMode, Overlay, View};
+use crate::mihomo_api::types::{LogEntry, TrafficData};
 use crate::mihomo_manager::manager::MihomoManager;
 use crate::tui::{TerminalGuard, input};
 
@@ -48,25 +49,110 @@ pub(super) enum Flow {
 /// Shared handles every handler needs.
 pub(super) struct Ctx {
     pub manager: MihomoManager,
-    pub tx: UnboundedSender<Action>,
+    pub tx: crate::tui::background::EventSender,
+    pub traffic_tx: watch::Sender<Option<(u64, u64, TrafficData)>>,
+    pub log_tx: mpsc::Sender<(u64, u64, LogEntry)>,
+    pub dropped_logs: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) local_actions: Arc<parking_lot::Mutex<LocalActionQueue>>,
     pub guard: Arc<tokio::sync::Mutex<TerminalGuard>>,
     /// Key remaps from `tui.yaml`.
     pub keys: crate::tui::keymap::KeyMap,
 }
 
+const LOCAL_ACTION_CAPACITY: usize = 64;
+
+pub(super) struct LocalActionQueue {
+    queue: std::collections::VecDeque<Action>,
+    overflowed: bool,
+}
+
+impl LocalActionQueue {
+    pub(super) fn new() -> Self {
+        Self {
+            queue: std::collections::VecDeque::new(),
+            overflowed: false,
+        }
+    }
+
+    pub(super) fn push(&mut self, action: Action) -> Result<(), Action> {
+        if is_refresh_intent(&action)
+            && self
+                .queue
+                .iter()
+                .any(|pending| std::mem::discriminant(pending) == std::mem::discriminant(&action))
+        {
+            return Ok(());
+        }
+        // Refresh intents coalesce. Capacity remains available for explicit
+        // local actions; completed background/lifecycle events use mpsc.
+        let limit = if is_refresh_intent(&action) {
+            LOCAL_ACTION_CAPACITY - 4
+        } else {
+            LOCAL_ACTION_CAPACITY
+        };
+        if self.queue.len() >= limit {
+            if !is_refresh_intent(&action) {
+                if let Some(at) = self.queue.iter().position(is_refresh_intent) {
+                    self.queue.remove(at);
+                } else {
+                    self.overflowed = true;
+                    return Err(action);
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        self.queue.push_back(action);
+        Ok(())
+    }
+
+    pub(super) fn take_overflow(&mut self) -> bool {
+        std::mem::take(&mut self.overflowed)
+    }
+
+    fn pop(&mut self) -> Option<Action> {
+        self.queue.pop_front()
+    }
+}
+
+fn is_refresh_intent(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::TrafficRefresh
+            | Action::ConnectionsRefresh
+            | Action::LogsRefresh
+            | Action::ProxiesRefresh
+            | Action::RulesRefresh
+            | Action::RuleProvidersRefresh
+            | Action::ServiceStatusRefresh
+    )
+}
+
 impl Ctx {
+    pub(super) fn cancel_background(&self) {
+        self.tx.cancel();
+        self.traffic_tx.send_replace(None);
+        self.local_actions.lock().queue.clear();
+    }
+
     /// Queue an action for the next loop iteration.
-    fn send(&self, action: Action) {
-        let _ = self.tx.send(action);
+    pub(super) fn send(&self, action: Action) {
+        if self.local_actions.lock().push(action).is_err() {
+            tracing::error!(target: "tui", "local lifecycle intent queue is full; refusing to block the event loop");
+        }
+    }
+
+    pub(super) fn take_local_action(&self) -> Option<Action> {
+        self.local_actions.lock().pop()
     }
 
     /// Run `task` in the background with its own sender.
-    fn spawn<F, Fut>(&self, task: F)
+    fn spawn<F, Fut>(&self, task: F) -> tokio::task::JoinHandle<()>
     where
-        F: FnOnce(UnboundedSender<Action>) -> Fut,
+        F: FnOnce(crate::tui::background::EventSender) -> Fut,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        tokio::spawn(task(self.tx.clone()));
+        self.tx.spawn(task(self.tx.for_current()))
     }
 
     /// Run `work` in the background and report its outcome as one action.
@@ -81,10 +167,12 @@ impl Ctx {
         E: Send + 'static,
     {
         self.spawn(|tx| async move {
-            let _ = tx.send(match work.await {
-                Ok(value) => on_ok(value),
-                Err(error) => on_err(error),
-            });
+            let _ = tx
+                .send(match work.await {
+                    Ok(value) => on_ok(value),
+                    Err(error) => on_err(error),
+                })
+                .await;
         });
     }
 }
@@ -159,7 +247,7 @@ async fn handle_intent(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
     match action {
         Action::Quit => return Flow::Quit,
         Action::StartCore => lifecycle::start(app, ctx),
-        Action::StopCore => lifecycle::stop(ctx),
+        Action::StopCore => lifecycle::stop(app, ctx),
         Action::RestartCore => lifecycle::restart(app, ctx),
         Action::StartImport => app.input_mode = InputMode::Importing(String::new()),
         Action::MoveNext => navigation::move_selection(app, true),
@@ -210,6 +298,14 @@ async fn activate(app: &mut App, ctx: &Ctx) {
 
 /// Handle an action received on the action channel.
 pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Flow {
+    let Some(action) = ctx.tx.accept(action) else {
+        return Flow::Continue;
+    };
+    let action = match action {
+        Action::CoreGeneration { generation, action } if generation == ctx.manager.current_generation() => *action,
+        Action::CoreGeneration { .. } => return Flow::Continue,
+        other => other,
+    };
     match action {
         Action::Quit => return Flow::Quit,
 
@@ -219,8 +315,14 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             binary_path,
             binary_source,
         } => lifecycle::note_started(app, ctx, version, binary_path, binary_source),
-        Action::CoreExited(0) => lifecycle::note_stopped(app),
-        Action::CoreError(msg) => lifecycle::note_error(app, msg),
+        Action::CoreExited(0) => {
+            ctx.cancel_background();
+            lifecycle::note_stopped(app);
+        }
+        Action::CoreError(msg) => {
+            ctx.cancel_background();
+            lifecycle::note_error(app, msg);
+        }
         Action::ResumeCoreStart { enable_tun } => lifecycle::resume_start(ctx, enable_tun),
 
         // Profiles and subscriptions.
@@ -243,14 +345,18 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         // Proxies, delay tests, chains, and mode.
         Action::ProxiesRefresh if !app.runtime_loading.proxies => proxy::refresh(app, ctx),
         Action::ProxiesFetched(groups) => proxy::note_fetched(app, groups),
+        Action::ProxyDelayKeysFetched(keys) => app.proxy_delay_keys = keys,
         Action::ProxiesFailed(error) => {
             app.runtime_loading.proxies = false;
             app.runtime_errors.proxies = Some(error);
         }
-        Action::DelayResult(name, delay) => proxy::note_delay_result(app, name, delay),
-        Action::DelayFailed(name, error) => proxy::note_delay_failed(app, name, error),
-        Action::BatchDelayResult(name, delay) => proxy::note_batch_delay_result(app, name, delay),
-        Action::BatchDelayFailed(name, error) => proxy::note_batch_delay_failed(app, name, error),
+        Action::DelayResult(target, delay) => proxy::note_delay_result(app, target, delay),
+        Action::DelayFailed(target, error) => proxy::note_delay_failed(app, target, error),
+        Action::BatchDelayResult(target, delay) => proxy::note_batch_delay_result(app, target, delay),
+        Action::BatchDelayFailed(target, error) => proxy::note_batch_delay_failed(app, target, error),
+        Action::BatchDelayResolved(total) => {
+            app.batch_delay = (total > 0).then_some((0, total));
+        }
         Action::ChainApplied(nodes) => proxy::note_chain_applied(app, nodes),
         Action::ChainFailed(error) => app.status_msg = Some(format!("Chain not applied: {error}")),
         Action::CycleClashMode => proxy::cycle_clash_mode(app, ctx),
@@ -364,8 +470,8 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             reason,
         } => tun::begin_tun_setup_confirm(app, binary, enable_tun, reason),
         Action::ConfirmTunSetup => tun::confirm_tun_setup(app),
-        Action::SkipTunSetupStart => tun::skip_tun_setup_start(app, &ctx.tx),
-        Action::TunSetupSucceeded { resume_start } => tun::note_tun_setup_succeeded(app, resume_start, &ctx.tx),
+        Action::SkipTunSetupStart => tun::skip_tun_setup_start(app, &ctx.tx).await,
+        Action::TunSetupSucceeded { resume_start } => tun::note_tun_setup_succeeded(app, resume_start, &ctx.tx).await,
         Action::TunCapabilityState(privileged) => app.tun_privileged = privileged,
         Action::TunSetupRequested(binary) => tun::open_password_prompt(app, binary),
         Action::PasswordChar(c) => app.password_buffer.push(c),
@@ -464,12 +570,14 @@ fn refresh_service_status(ctx: &Ctx) {
         let enabled = crate::service_cmd::service_enabled_state();
         let installed = crate::service_cmd::service_installed_state();
         let auto_launch = crate::autostart::is_enabled();
-        let _ = tx.send(Action::ServiceStatus {
-            active,
-            enabled,
-            installed,
-            auto_launch,
-        });
+        let _ = tx
+            .send(Action::ServiceStatus {
+                active,
+                enabled,
+                installed,
+                auto_launch,
+            })
+            .await;
     });
 }
 
@@ -479,11 +587,15 @@ mod tests {
 
     use super::*;
 
-    fn ctx() -> (Ctx, tokio::sync::mpsc::UnboundedReceiver<Action>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn ctx() -> (Ctx, tokio::sync::mpsc::Receiver<Action>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
         let ctx = Ctx {
             manager: MihomoManager::new(std::env::temp_dir()),
-            tx,
+            tx: tx.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: Arc::new(parking_lot::Mutex::new(LocalActionQueue::new())),
             guard: Arc::new(tokio::sync::Mutex::new(TerminalGuard::detached())),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -537,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_mode_edits_the_buffer_and_enter_queues_the_import() {
-        let (ctx, mut rx) = ctx();
+        let (ctx, _rx) = ctx();
         let mut app = App::new();
         app.input_mode = InputMode::Importing(String::new());
         for c in "ab".chars() {
@@ -548,7 +660,7 @@ mod tests {
 
         handle_key(&mut app, &ctx, key(KeyCode::Enter)).await;
         assert!(matches!(app.input_mode, InputMode::Normal));
-        assert!(matches!(rx.try_recv(), Ok(Action::ConfirmImport(url)) if url == "a"));
+        assert!(matches!(ctx.take_local_action(), Some(Action::ConfirmImport(url)) if url == "a"));
     }
 
     #[tokio::test]
@@ -778,14 +890,15 @@ mod tests {
         app.node_selected_index = 1; // a (both untested: profile order)
 
         // b becomes the fastest and moves to the top.
-        handle_event(&mut app, &ctx, Action::BatchDelayResult("b".to_string(), Some(10))).await;
+        let target = |name: &str| crate::mihomo_api::types::ProxyDelayTarget {
+            key: name.to_string(),
+            label: name.to_string(),
+            provider: None,
+            name: name.to_string(),
+        };
+        handle_event(&mut app, &ctx, Action::BatchDelayResult(target("b"), Some(10))).await;
         assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
-        handle_event(
-            &mut app,
-            &ctx,
-            Action::DelayFailed("a".to_string(), "timeout".to_string()),
-        )
-        .await;
+        handle_event(&mut app, &ctx, Action::DelayFailed(target("a"), "timeout".to_string())).await;
         assert_eq!(proxy::selected_node(&app).map(|(_, node)| node).as_deref(), Some("a"));
     }
 
@@ -946,5 +1059,29 @@ mod tests {
             app.gui_config.proxy_host, host_before,
             "cached host must be left untouched"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_queue_tests {
+    use super::*;
+
+    #[test]
+    fn local_intents_are_bounded_and_never_wait_for_the_event_loop() {
+        let mut queue = LocalActionQueue::new();
+        for _ in 0..1000 {
+            assert!(queue.push(Action::ConnectionsRefresh).is_ok());
+        }
+        assert_eq!(queue.queue.len(), 1);
+        assert!(queue.push(Action::ResumeCoreStart { enable_tun: false }).is_ok());
+        assert!(matches!(queue.pop(), Some(Action::ConnectionsRefresh)));
+        assert!(matches!(queue.pop(), Some(Action::ResumeCoreStart { .. })));
+        for _ in 0..LOCAL_ACTION_CAPACITY {
+            assert!(queue.push(Action::ConfirmImport("fixture".into())).is_ok());
+        }
+        assert!(queue.push(Action::ConfirmImport("rejected".into())).is_err());
+        assert!(queue.take_overflow());
+        assert!(!queue.take_overflow());
+        assert_eq!(queue.queue.len(), LOCAL_ACTION_CAPACITY);
     }
 }

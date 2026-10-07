@@ -51,6 +51,10 @@ pub fn spawn_watcher(
             }
         };
 
+        // A superseded watcher must not clear the new generation pid/state.
+        if spawned_gen != inner.generation.load(Ordering::SeqCst) {
+            return;
+        }
         tracing::info!("mihomo exited with code {exit_code}");
 
         let exited_pid = inner.pid.lock().take();
@@ -68,9 +72,7 @@ pub fn spawn_watcher(
             *inner.state.lock() = CoreState::Stopped;
         }
 
-        if let Some(tx) = inner.action_tx.lock().as_ref() {
-            let _ = tx.send(Action::CoreExited(exit_code));
-        }
+        inner.send_action(Action::CoreExited(exit_code)).await;
 
         // Combined exit classification: owner main's legacy `expected_exit`
         // bool + cross-process pidfile intent (already set state to
@@ -112,17 +114,13 @@ pub fn spawn_watcher(
                 let msg = auto_restart_failure_message(exit_code, &e);
                 crate::sys_proxy::release_on_core_stop().await;
                 *inner.state.lock() = CoreState::Error(msg.clone());
-                if let Some(tx) = inner.action_tx.lock().as_ref() {
-                    let _ = tx.send(Action::CoreError(msg));
-                }
+                inner.send_action(Action::CoreError(msg)).await;
             }
         } else {
             let msg = format!("exited {exit_code}");
             crate::sys_proxy::release_on_core_stop().await;
             *inner.state.lock() = CoreState::Error(msg.clone());
-            if let Some(tx) = inner.action_tx.lock().as_ref() {
-                let _ = tx.send(Action::CoreError(msg));
-            }
+            inner.send_action(Action::CoreError(msg)).await;
         }
     })
 }
@@ -161,6 +159,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn superseded_watcher_does_not_clear_the_new_generation_state() {
+        let home = tempfile::tempdir().unwrap();
+        let manager = crate::mihomo_manager::MihomoManager::new(home.path().to_path_buf());
+        let inner = manager.inner();
+        inner.generation.store(2, Ordering::SeqCst);
+        *inner.pid.lock() = Some(std::process::id());
+        *inner.state.lock() = CoreState::Running;
+        let child = tokio::process::Command::new("/bin/true").spawn().unwrap();
+        spawn_watcher(child, inner.clone(), home.path(), &home.path().join("fixture.sock"), 1)
+            .await
+            .unwrap();
+        assert_eq!(*inner.pid.lock(), Some(std::process::id()));
+        assert_eq!(*inner.state.lock(), CoreState::Running);
+    }
+
+    #[tokio::test]
+    async fn cancelling_test_owned_watcher_stops_its_task() {
+        let home = tempfile::tempdir().unwrap();
+        let manager = crate::mihomo_manager::MihomoManager::new(home.path().to_path_buf());
+        let child = tokio::process::Command::new("/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let task = spawn_watcher(
+            child,
+            manager.inner(),
+            home.path(),
+            &home.path().join("fixture.sock"),
+            0,
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
 
     #[test]
     fn auto_restart_failure_message_keeps_the_underlying_error() {

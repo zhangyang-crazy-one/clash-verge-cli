@@ -17,6 +17,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use clash_verge_core::config::{IProfiles, IVerge};
+use serde_yaml_ng::Value;
 
 /// Round-trip `verge.yaml`: deserialize, serialize, deserialize, serialize.
 /// Asserts byte-identical output, proving the format is stable.
@@ -70,4 +71,55 @@ fn test_verge_template_round_trip() {
         serialized_once, serialized_twice,
         "verge template round-trip is not byte-identical"
     );
+}
+
+#[test]
+fn typed_edits_preserve_unknown_yaml_and_dns_clear_values() {
+    let source = include_str!("fixtures/profiles-lossless.yaml");
+    let original: Value = serde_yaml_ng::from_str(source).expect("profile fixture must parse");
+    let mut profiles: IProfiles = serde_yaml_ng::from_str(source).expect("profile fixture must parse");
+    let item = profiles.items.as_mut().unwrap().first_mut().unwrap();
+    item.name = Some("After edit".into());
+    item.option.as_mut().unwrap().user_agent = Some("after-agent".into());
+    let saved = serde_yaml_ng::to_string(&profiles).expect("profiles must serialize");
+    let actual: Value = serde_yaml_ng::from_str(&saved).expect("saved profiles must parse");
+
+    for path in [("future_profiles", "mode"), ("future_profiles", "sequence")] {
+        assert_eq!(actual[path.0][path.1], original[path.0][path.1]);
+    }
+    for key in ["future_item", "selected", "extra"] {
+        assert_eq!(actual["items"][0][key], original["items"][0][key]);
+    }
+    assert_eq!(
+        actual["items"][0]["option"]["future_option"],
+        original["items"][0]["option"]["future_option"]
+    );
+    assert_eq!(
+        actual["items"][0]["option"]["dns"]["nameserver"],
+        Value::Sequence(Vec::new()),
+        "an explicit empty list remains a clear operation"
+    );
+    assert!(
+        actual["items"][0]["option"]["dns"]
+            .as_mapping()
+            .unwrap()
+            .get("proxy-server-nameserver")
+            .is_none(),
+        "an omitted field remains unset and therefore inherits"
+    );
+    assert_eq!(actual["items"][0]["name"], Value::from("After edit"));
+    assert_eq!(actual["items"][0]["option"]["user_agent"], Value::from("after-agent"));
+
+    let verge_source = include_str!("fixtures/verge-lossless.yaml");
+    let original_verge: Value = serde_yaml_ng::from_str(verge_source).expect("verge fixture must parse");
+    let mut verge: IVerge = serde_yaml_ng::from_str(verge_source).expect("verge fixture must parse");
+    verge.language = Some("en".into());
+    let saved_verge = serde_yaml_ng::to_string(&verge).expect("verge must serialize");
+    let actual_verge: Value = serde_yaml_ng::from_str(&saved_verge).expect("saved verge must parse");
+    assert_eq!(actual_verge["future_verge"], original_verge["future_verge"]);
+    assert_eq!(
+        actual_verge["profile_dns_settings"]["R1"]["future_setting"],
+        original_verge["profile_dns_settings"]["R1"]["future_setting"]
+    );
+    assert_eq!(actual_verge["language"], Value::from("en"));
 }

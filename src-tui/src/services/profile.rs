@@ -1,12 +1,74 @@
 //! Profiles: resolving a user's profile argument and switching the current
 //! profile.
 
-use clash_verge_core::config::PrfItem;
+use clash_verge_core::config::{DnsOverrideState, IVerge, PrfItem};
+use serde_yaml_ng::Mapping;
 
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
 use crate::runtime_config::{commit_runtime_config, reload_remote_profile};
+
+/// Prepare a candidate profile with the shared GUI DNS section applied when
+/// this profile's setting is enabled and its provider DNS source is confirmed.
+/// The source decision is captured before the overlay, so the global values
+/// cannot invalidate their own confirmation.
+pub fn prepare_profile_dns(
+    profile_uid: &str,
+    mut effective_config: Mapping,
+    global_dns_config: &Mapping,
+    verge: &IVerge,
+) -> Result<(Mapping, DnsOverrideState), String> {
+    if profile_uid.is_empty() {
+        return Err("profile DNS override requires a profile uid".into());
+    }
+    let state = verge
+        .dns_override_for(profile_uid, &effective_config)
+        .map_err(|error| format!("failed to identify profile DNS source: {error}"))?;
+    if state.enabled {
+        crate::chain::apply_dns_override(&mut effective_config, global_dns_config)
+            .map_err(|error| format!("failed to apply global DNS settings: {error}"))?;
+    }
+    Ok((effective_config, state))
+}
+
+/// Read the GUI-compatible DNS section file. Its root mapping is the content
+/// placed beneath `dns:` in the effective Mihomo config. A missing file means
+/// there is no global DNS overlay; malformed or unreadable files are errors.
+pub async fn read_global_dns_config() -> Result<Mapping, String> {
+    let path = clash_verge_core::utils::dirs::app_home_dir()
+        .map_err(|error| error.to_string())?
+        .join("dns_config.yaml");
+    let raw = match tokio::fs::read_to_string(&path).await {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Mapping::new()),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    serde_yaml_ng::from_str(&raw).map_err(|error| format!("invalid DNS config in {}: {error}", path.display()))
+}
+
+/// Convenience entry point for runtime candidate builders: load the latest
+/// Verge preference and the shared GUI DNS section, then return the prepared
+/// mapping and the source-bound state that must be persisted after success.
+pub async fn prepare_profile_dns_from_settings(
+    profile_uid: &str,
+    effective_config: Mapping,
+) -> Result<(Mapping, DnsOverrideState), String> {
+    if profile_uid.is_empty() {
+        return Err("profile DNS override requires a profile uid".into());
+    }
+    let verge = IVerge::try_new()
+        .await
+        .map_err(|error| format!("failed to load Verge DNS settings: {error}"))?;
+    let state = verge
+        .dns_override_for(profile_uid, &effective_config)
+        .map_err(|error| format!("failed to identify profile DNS source: {error}"))?;
+    if !state.enabled {
+        return Ok((effective_config, state));
+    }
+    let global_dns = read_global_dns_config().await?;
+    prepare_profile_dns(profile_uid, effective_config, &global_dns, &verge)
+}
 
 /// Strategy `switch_profile_for_core` uses to push `item` to the running
 /// core. Mirrors the scheduler's `RefreshPath`: kept here so the
@@ -75,7 +137,24 @@ pub async fn switch_profile(
         .await
         .map_err(|error| format!("profile switch: {error}"))?;
 
-    let applied = if item.itype.as_deref() == Some("remote") {
+    let applied = apply_profile(api, item, enable_tun, core_running).await;
+
+    if applied.is_err() {
+        let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
+    }
+    applied
+}
+
+async fn apply_profile(api: &MihomoApi, item: &PrfItem, enable_tun: bool, core_running: bool) -> Result<(), String> {
+    if item
+        .option
+        .as_ref()
+        .and_then(|option| option.script.as_deref())
+        .is_some_and(|uid| !uid.is_empty())
+    {
+        return Err("script profile overrides are unsupported by the standalone TUI".into());
+    }
+    if item.itype.as_deref() == Some("remote") {
         reload_remote_profile(api, item, enable_tun, core_running)
             .await
             .map_err(|error| format!("profile reload: {error}"))
@@ -83,7 +162,7 @@ pub async fn switch_profile(
         let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().unwrap_or_default();
         match crate::chain::resolve_chain(item, &profiles_dir).await {
             Ok(chain) => commit_runtime_config(api, enable_tun, core_running, Some(item), |mut config| {
-                crate::chain::apply_chain_to_config(&mut config, &chain);
+                crate::chain::apply_chain_to_config(&mut config, &chain).map_err(|error| error.to_string())?;
                 Ok(config)
             })
             .await
@@ -91,12 +170,7 @@ pub async fn switch_profile(
             .map_err(|error| format!("config write: {error}")),
             Err(error) => Err(format!("chain: {error}")),
         }
-    };
-
-    if applied.is_err() {
-        let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
     }
-    applied
 }
 
 /// Make `item` the current profile and apply it, dispatching by
@@ -106,9 +180,7 @@ pub async fn switch_profile(
 /// [`crate::runtime_config::apply_singbox_restart`], which regenerates
 /// the JSON config (with prevalidation) and restarts the process.
 ///
-/// Used by the TUI's `Enter`-on-Profiles flow. The CLI `profile use`
-/// command still calls [`switch_profile`] and remains sing-box-broken
-/// (out of scope here).
+/// Used by the TUI and CLI selected-core profile flows.
 ///
 /// On a failed apply the previous `current` UID is restored, matching
 /// the mihomo branch's semantics; the sing-box branch's underlying
@@ -125,32 +197,42 @@ pub async fn switch_profile_for_core(
         .await
         .map_err(|error| format!("profile switch: {error}"))?;
 
-    let applied = match decide_switch_path(manager.core_kind()) {
-        SwitchPath::HotReload => switch_profile(&manager.api(), item, enable_tun, core_running).await,
-        SwitchPath::SingboxRestart => {
-            // sing-box: read the profile YAML from disk (chain resolution
-            // is a clash-only concept; the sing-box pipeline converts
-            // whatever proxies/proxy-groups are present and skips the
-            // rest). For an unresolvable file we error early so the
-            // current-uid rollback below can run.
-            let file = item.file.as_deref().ok_or_else(|| {
-                format!(
-                    "profile switch: profile {} has no file",
-                    item.uid.as_deref().unwrap_or("?")
+    let applied = async {
+        match decide_switch_path(manager.core_kind()) {
+            // Current UID was captured and replaced above, so do not call
+            // `switch_profile` here and replace it a second time.
+            SwitchPath::HotReload => apply_profile(&manager.api(), item, enable_tun, core_running).await,
+            SwitchPath::SingboxRestart => {
+                // sing-box: read the profile YAML from disk (chain resolution
+                // is a clash-only concept; the sing-box pipeline converts
+                // whatever proxies/proxy-groups are present and skips the
+                // rest). For an unresolvable file we error early so the
+                // current-uid rollback below can run.
+                let file = item.file.as_deref().ok_or_else(|| {
+                    format!(
+                        "profile switch: profile {} has no file",
+                        item.uid.as_deref().unwrap_or("?")
+                    )
+                })?;
+                let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()
+                    .map_err(|error| format!("profile switch: {error}"))?;
+                let path = profiles_dir.join(file);
+                let yaml = tokio::fs::read_to_string(&path)
+                    .await
+                    .map_err(|error| format!("profile switch: failed to read {}: {error}", path.display()))?;
+                crate::runtime_config::apply_singbox_restart_for_profile(
+                    manager,
+                    Some(yaml.as_str()),
+                    enable_tun,
+                    Some(uid),
                 )
-            })?;
-            let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()
-                .map_err(|error| format!("profile switch: {error}"))?;
-            let path = profiles_dir.join(file);
-            let yaml = tokio::fs::read_to_string(&path)
-                .await
-                .map_err(|error| format!("profile switch: failed to read {}: {error}", path.display()))?;
-            crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
                 .await
                 .map(|_report| ())
                 .map_err(|error| format!("profile reload: {error}"))
+            }
         }
-    };
+    }
+    .await;
 
     if applied.is_err() {
         let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
@@ -161,6 +243,7 @@ pub async fn switch_profile_for_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_yaml_ng::Value;
 
     fn item(uid: &str, name: &str) -> PrfItem {
         PrfItem {
@@ -210,6 +293,58 @@ mod tests {
         // core via `apply_singbox_restart`; `commit_runtime_config`'s
         // `PUT /configs` is a no-op against sing-box's controller.
         assert_eq!(decide_switch_path(CoreKind::SingBox), SwitchPath::SingboxRestart);
+    }
+
+    #[test]
+    fn prepare_profile_dns_overlays_only_after_matching_confirmation() {
+        let original = serde_yaml_ng::from_str::<Mapping>(
+            "port: 7890\ndns:\n  proxy-server-nameserver: [https://provider.example/dns]\n  nameserver: [profile-dns]\n  future: {keep: true}\n",
+        )
+        .expect("profile fixture");
+        let global =
+            serde_yaml_ng::from_str::<Mapping>("nameserver: []\nfallback: [8.8.8.8]\nfuture: {global: true}\n")
+                .expect("global DNS fixture");
+        let source = clash_verge_core::config::dns_override_source("R1", &original).expect("valid source identity");
+        let mut verge = IVerge::default();
+        verge.enable_dns_settings = Some(true);
+        verge.profile_dns_settings.insert(
+            "R1".into(),
+            clash_verge_core::config::ProfileDnsSettings {
+                enabled: true,
+                confirmation: Some(source.clone().expect("provider DNS source")),
+                ..Default::default()
+            },
+        );
+
+        let (prepared, state) =
+            prepare_profile_dns("R1", original.clone(), &global, &verge).expect("confirmed profile prepares");
+        assert!(state.enabled);
+        assert_eq!(state.source, source, "source is captured before applying global DNS");
+        assert_eq!(prepared["port"], original["port"]);
+        assert_eq!(prepared["dns"]["nameserver"], Value::Sequence(Vec::new()));
+        assert_eq!(
+            prepared["dns"]["proxy-server-nameserver"],
+            original["dns"]["proxy-server-nameserver"]
+        );
+        assert_eq!(prepared["dns"]["future"]["keep"], Value::from(true));
+        assert_eq!(prepared["dns"]["future"]["global"], Value::from(true));
+        assert_eq!(prepared["dns"]["fallback"][0], Value::from("8.8.8.8"));
+    }
+
+    #[test]
+    fn prepare_profile_dns_keeps_candidate_when_provider_source_is_unconfirmed() {
+        let original = serde_yaml_ng::from_str::<Mapping>(
+            "dns: {proxy-server-nameserver: [https://provider.example/dns], nameserver: [profile-dns]}\n",
+        )
+        .expect("profile fixture");
+        let global = serde_yaml_ng::from_str::<Mapping>("nameserver: [global-dns]\n").expect("global DNS fixture");
+        let mut verge = IVerge::default();
+        verge.enable_dns_settings = Some(true);
+
+        let (prepared, state) = prepare_profile_dns("R1", original.clone(), &global, &verge)
+            .expect("unconfirmed profile is still a valid candidate");
+        assert!(!state.enabled);
+        assert_eq!(prepared, original, "unconfirmed provider DNS stays intact");
     }
 
     #[test]

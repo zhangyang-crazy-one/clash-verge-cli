@@ -4,10 +4,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::Serialize;
+use serde_yaml_ng::Mapping;
 
 use crate::mihomo_api::types::ProxyGroup;
+use crate::mihomo_manager::manager::CoreKind;
 use crate::mihomo_manager::manager::MihomoManager;
-use crate::services::proxy::{delay_many, is_group, last_delay, leaf_targets};
+use crate::services::proxy::{
+    DelayTargetResolution, delay_many, has_proxy_provider_scope, is_group, last_delay, leaf_targets, native_target,
+    resolve_delay_targets,
+};
 
 #[derive(Serialize)]
 struct GroupSummary<'a> {
@@ -77,6 +82,18 @@ pub async fn select(manager: &MihomoManager, group: &str, node: &str) -> anyhow:
     if !members.iter().any(|member| member == node) {
         anyhow::bail!("'{node}' is not a member of '{group}' (see `clash-verge-cli proxy list '{group}'`)");
     }
+    if manager.core_kind() == CoreKind::Mihomo && !is_group(&groups, node) {
+        let effective = clash_verge_core::config::IClashTemp::try_read().await?.0;
+        if has_proxy_provider_scope(&effective) {
+            let providers = api.get_proxy_providers().await?;
+            let resolved = resolve_delay_targets(&groups, &[node.to_string()], &effective, &providers, Some(group));
+            if resolved.targets.len() != 1 || !resolved.rejected.is_empty() {
+                anyhow::bail!(
+                    "cannot select '{node}' uniquely in '{group}': the controller selects by name; use a group scoped to one provider"
+                );
+            }
+        }
+    }
     api.select_proxy(group, node).await?;
     println!("{group} → {node}");
     Ok(())
@@ -85,31 +102,59 @@ pub async fn select(manager: &MihomoManager, group: &str, node: &str) -> anyhow:
 pub async fn delay(manager: &MihomoManager, target: &str, url: &str, timeout_ms: u64) -> anyhow::Result<()> {
     let api = super::running_api(manager).await?;
     let groups = api.get_proxies().await?.proxies;
-    let targets = if is_group(&groups, target) {
-        let targets = leaf_targets(&groups, Some(target));
-        if targets.is_empty() {
+    let names = if is_group(&groups, target) {
+        let names = leaf_targets(&groups, Some(target));
+        if names.is_empty() {
             anyhow::bail!("group '{target}' has no testable proxies");
         }
-        targets
+        names
     } else if groups.contains_key(target) {
         vec![target.to_string()]
     } else {
         anyhow::bail!("no proxy or group named '{target}' (see `clash-verge-cli proxy list`)");
     };
 
-    let results = delay_many(Arc::new(api), targets, url.to_string(), timeout_ms).await;
+    let effective = if manager.core_kind() == CoreKind::Mihomo {
+        clash_verge_core::config::IClashTemp::try_read().await?.0
+    } else {
+        Mapping::new()
+    };
+    let providers = if manager.core_kind() == CoreKind::Mihomo && has_proxy_provider_scope(&effective) {
+        api.get_proxy_providers().await?
+    } else {
+        crate::mihomo_api::types::ProxyProvidersResponse {
+            providers: HashMap::new(),
+        }
+    };
+    let group_scope = is_group(&groups, target).then_some(target);
+    let resolution = if manager.core_kind() == CoreKind::SingBox {
+        DelayTargetResolution {
+            targets: names.iter().map(|name| native_target(name)).collect(),
+            rejected: Vec::new(),
+        }
+    } else {
+        resolve_delay_targets(&groups, &names, &effective, &providers, group_scope)
+    };
+    for rejected in &resolution.rejected {
+        println!("{}	rejected: {}", rejected.name, rejected.reason);
+    }
+    if resolution.targets.is_empty() {
+        anyhow::bail!("no delay targets have an unambiguous provider/native identity");
+    }
+
+    let results = delay_many(Arc::new(api), resolution.targets, url.to_string(), timeout_ms).await;
     let mut succeeded = 0;
-    for (name, result) in &results {
+    for (target, result) in &results {
         match result {
             Ok(delay) => {
                 succeeded += 1;
-                println!("{name}\t{delay} ms");
+                println!("{}\t{delay} ms", target.label);
             }
-            Err(error) => println!("{name}\tfailed: {error}"),
+            Err(error) => println!("{}\tfailed: {error}", target.label),
         }
     }
     if succeeded == 0 {
-        anyhow::bail!("every delay test failed");
+        anyhow::bail!("every resolved delay test failed (or all other targets were rejected)");
     }
     Ok(())
 }

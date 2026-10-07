@@ -50,6 +50,18 @@ pub struct ProxyDelay {
     pub delay: u64,
 }
 
+/// A delay-test target with enough provenance to distinguish equal display
+/// names from different provider sources.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProxyDelayTarget {
+    /// Stable map key: native targets use their tag; provider targets use a
+    /// collision-safe encoding of `(provider, name)`.
+    pub key: String,
+    pub label: String,
+    pub provider: Option<String>,
+    pub name: String,
+}
+
 /// Select proxy request body: PUT /proxies/:group
 #[derive(Debug, Clone, Serialize)]
 pub struct SelectProxyRequest {
@@ -135,6 +147,25 @@ pub struct RuleProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleProvidersResponse {
     pub providers: std::collections::HashMap<String, RuleProvider>,
+}
+
+/// A node advertised by a mihomo proxy provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProxyNode {
+    pub name: String,
+}
+
+/// One entry from `GET /providers/proxies`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyProvider {
+    #[serde(default)]
+    pub proxies: Vec<ProviderProxyNode>,
+}
+
+/// Provider names and their node membership from mihomo.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyProvidersResponse {
+    pub providers: HashMap<String, ProxyProvider>,
 }
 
 #[cfg(test)]

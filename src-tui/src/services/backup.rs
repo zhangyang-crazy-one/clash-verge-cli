@@ -2,7 +2,8 @@
 //! configuration directory (and like Clash Verge GUI backups):
 //!
 //! ```text
-//! config.yaml  verge.yaml  profiles.yaml  dns_config.yaml  profiles/<file>
+//! config.yaml  verge.yaml  profiles.yaml  dns_config.yaml
+//! singbox-dns.json  singbox-rules.json  singbox-rule-sets.json  profiles/<file>
 //! ```
 //!
 //! Secrets stay out by default: the controller `secret` in `config.yaml` and
@@ -19,7 +20,18 @@ use serde::Serialize;
 use serde_yaml_ng::{Mapping, Value};
 
 /// Top-level files a backup holds, in the configuration directory.
-const FILES: [&str; 4] = ["config.yaml", "verge.yaml", "profiles.yaml", "dns_config.yaml"];
+const FILES: [&str; 7] = [
+    "config.yaml",
+    "verge.yaml",
+    "profiles.yaml",
+    "dns_config.yaml",
+    "singbox-dns.json",
+    "singbox-rules.json",
+    "singbox-rule-sets.json",
+];
+const JSON_FILES: [&str; 3] = ["singbox-dns.json", "singbox-rules.json", "singbox-rule-sets.json"];
+const MANIFEST_FILE: &str = "backup-manifest.json";
+const BACKUP_FORMAT_VERSION: u32 = 1;
 const PROFILES_DIR: &str = "profiles";
 /// Keys left out without `--include-secrets`, per file.
 const SECRETS: [(&str, &[&str]); 2] = [
@@ -45,6 +57,12 @@ pub struct Created {
     pub bytes: u64,
 }
 
+#[derive(Debug, Serialize, serde::Deserialize)]
+struct BackupManifest {
+    format_version: u32,
+    files: Vec<String>,
+}
+
 /// Archive the configuration in `home` to `dest`.
 pub fn create(home: &Path, dest: &Path, include_secrets: bool) -> anyhow::Result<Created> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -54,6 +72,7 @@ pub fn create(home: &Path, dest: &Path, include_secrets: bool) -> anyhow::Result
             continue;
         }
         let data = std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        validate_json_file(name, &data).with_context(|| format!("cannot back up invalid {name}"))?;
         let data = if include_secrets {
             data
         } else {
@@ -79,6 +98,12 @@ pub fn create(home: &Path, dest: &Path, include_secrets: bool) -> anyhow::Result
         }
     }
 
+    let manifest = BackupManifest {
+        format_version: BACKUP_FORMAT_VERSION,
+        files: entries.iter().map(|(name, _)| name.clone()).collect(),
+    };
+    entries.insert(0, (MANIFEST_FILE.into(), serde_json::to_vec(&manifest)?));
+
     if let Some(parent) = dest.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
@@ -91,7 +116,7 @@ pub fn create(home: &Path, dest: &Path, include_secrets: bool) -> anyhow::Result
     std::fs::rename(&partial, dest)?;
     Ok(Created {
         path: dest.to_path_buf(),
-        files: entries.len(),
+        files: entries.len().saturating_sub(1),
         bytes: std::fs::metadata(dest)?.len(),
     })
 }
@@ -230,6 +255,8 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
 
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut skipped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut manifest_files: Option<std::collections::HashSet<String>> = None;
     let mut unpacked = 0_u64;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index)?;
@@ -237,9 +264,36 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
         if entry.is_dir() {
             continue;
         }
+        if name == MANIFEST_FILE {
+            if manifest_files.is_some() {
+                bail!("duplicate {MANIFEST_FILE} in backup archive");
+            }
+            unpacked = unpacked.saturating_add(entry.size());
+            if unpacked > MAX_UNPACKED_BYTES {
+                bail!("{} unpacks to more than {MAX_UNPACKED_BYTES} bytes", archive.display());
+            }
+            let mut data = Vec::new();
+            entry.by_ref().take(MAX_UNPACKED_BYTES).read_to_end(&mut data)?;
+            let manifest: BackupManifest =
+                serde_json::from_slice(&data).with_context(|| format!("{MANIFEST_FILE} is invalid"))?;
+            if manifest.format_version != BACKUP_FORMAT_VERSION {
+                bail!("unsupported backup format version {}", manifest.format_version);
+            }
+            let mut declared = std::collections::HashSet::new();
+            for file in manifest.files {
+                if !is_restorable(&file) || !declared.insert(file.clone()) {
+                    bail!("{MANIFEST_FILE} contains an invalid or duplicate file entry {file:?}");
+                }
+            }
+            manifest_files = Some(declared);
+            continue;
+        }
         if !is_restorable(&name) {
             skipped.push(name);
             continue;
+        }
+        if !seen.insert(name.clone()) {
+            bail!("duplicate restorable entry {name:?} in backup archive");
         }
         unpacked = unpacked.saturating_add(entry.size());
         if unpacked > MAX_UNPACKED_BYTES {
@@ -256,10 +310,17 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
             serde_yaml_ng::from_slice::<Value>(&data)
                 .with_context(|| format!("{name} in the archive is not valid YAML"))?;
         }
+        validate_json_file(&name, &data).with_context(|| format!("{name} in the archive is not valid JSON"))?;
         files.push((name, data));
     }
     if !files.iter().any(|(name, _)| name == "profiles.yaml") {
         bail!("{} holds no profiles.yaml: not a backup", archive.display());
+    }
+    if let Some(declared) = manifest_files {
+        let actual: std::collections::HashSet<String> = files.iter().map(|(name, _)| name.clone()).collect();
+        if declared != actual {
+            bail!("{MANIFEST_FILE} file list does not match the archive contents");
+        }
     }
 
     // Keep what the archive left out on purpose.
@@ -299,6 +360,41 @@ fn is_restorable(name: &str) -> bool {
     })
 }
 
+fn validate_json_file(name: &str, data: &[u8]) -> anyhow::Result<()> {
+    if !JSON_FILES.contains(&name) {
+        return Ok(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(data).with_context(|| format!("{name} is not valid JSON"))?;
+    match name {
+        "singbox-dns.json" => {
+            let spec: crate::singbox::dns::DnsConfigSpec = serde_json::from_value(value)
+                .with_context(|| format!("{name} does not match the structured DNS schema"))?;
+            spec.validate().map_err(anyhow::Error::msg)?;
+        }
+        "singbox-rules.json" => {
+            let rules = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{name} must contain a JSON array"))?;
+            for (index, rule) in rules.iter().enumerate() {
+                if !matches!(
+                    crate::routing::from_singbox_json(rule),
+                    Some(crate::routing::IRouteRule::Logical { .. })
+                ) {
+                    bail!("{name} entry {index} is not a supported logical rule");
+                }
+            }
+        }
+        "singbox-rule-sets.json" => {
+            let sets = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{name} must contain a JSON array"))?;
+            crate::singbox::validate_rule_sets(sets).map_err(anyhow::Error::msg)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// The archive's `data` for `name` with the local secret keys it lacks put
 /// back; `None` when nothing needs merging.
 fn keep_local_secrets(name: &str, data: &[u8], local: &Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -330,50 +426,94 @@ fn keep_local_secrets(name: &str, data: &[u8], local: &Path) -> anyhow::Result<O
 /// first (mode 0600: they hold secrets and subscription URLs), then swapped
 /// in; a failure part-way puts the originals back.
 fn replace_all(targets: &[(PathBuf, &[u8])]) -> anyhow::Result<()> {
-    let staged = |path: &Path| path.with_extension("restore.partial");
-    let kept = |path: &Path| path.with_extension("restore.orig");
+    replace_all_using(targets, |from, to| std::fs::rename(from, to))
+}
+
+fn replace_all_using(
+    targets: &[(PathBuf, &[u8])],
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_RESTORE: AtomicU64 = AtomicU64::new(0);
+    let transaction = format!(
+        "{}.{}.{}",
+        std::process::id(),
+        NEXT_RESTORE.fetch_add(1, Ordering::Relaxed),
+        uuid::Uuid::new_v4()
+    );
+    let sibling = |path: &Path, kind: &str| {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!(".{name}.restore.{transaction}.{kind}"))
+    };
 
     let staging = targets.iter().try_for_each(|(path, data)| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        write_private(&staged(path), data).with_context(|| format!("cannot write {}", staged(path).display()))
+        let temp = sibling(path, "partial");
+        write_private(&temp, data).with_context(|| format!("cannot write {}", temp.display()))
     });
     if let Err(error) = staging {
         for (path, _) in targets {
-            let _ = std::fs::remove_file(staged(path));
+            let _ = std::fs::remove_file(sibling(path, "partial"));
         }
         return Err(error);
     }
 
-    // (path, whether an original was moved aside)
-    let mut swapped: Vec<(&Path, bool)> = Vec::new();
+    // (path, preserved original path, whether an original existed)
+    let mut swapped: Vec<(&Path, PathBuf, bool)> = Vec::new();
     let mut swap = || -> anyhow::Result<()> {
         for (path, _) in targets {
             let had_original = path.exists();
+            let old = sibling(path, "orig");
             if had_original {
-                std::fs::rename(path, kept(path)).with_context(|| format!("cannot move {} aside", path.display()))?;
+                rename(path, &old).with_context(|| format!("cannot move {} aside", path.display()))?;
             }
-            swapped.push((path, had_original));
-            std::fs::rename(staged(path), path).with_context(|| format!("cannot replace {}", path.display()))?;
+            swapped.push((path, old, had_original));
+            rename(&sibling(path, "partial"), path).with_context(|| format!("cannot replace {}", path.display()))?;
         }
         Ok(())
     };
     let result = swap();
-    if result.is_err() {
-        for (path, had_original) in swapped.iter().rev() {
+    drop(swap);
+    let mut rollback_errors = Vec::new();
+    if let Err(error) = result {
+        for (path, old, had_original) in swapped.iter().rev() {
             if *had_original {
-                let _ = std::fs::rename(kept(path), path);
+                if let Err(restore_error) = std::fs::rename(old, path) {
+                    rollback_errors.push(format!(
+                        "could not restore {} from {}: {restore_error}",
+                        path.display(),
+                        old.display()
+                    ));
+                }
             } else {
-                let _ = std::fs::remove_file(path);
+                if let Err(remove_error) = std::fs::remove_file(path)
+                    && remove_error.kind() != std::io::ErrorKind::NotFound
+                {
+                    rollback_errors.push(format!("could not remove partial {}: {remove_error}", path.display()));
+                }
             }
         }
+        for (path, _) in targets {
+            let _ = std::fs::remove_file(sibling(path, "partial"));
+        }
+        if rollback_errors.is_empty() {
+            return Err(error);
+        }
+        bail!("{error:#}; rollback was incomplete: {}", rollback_errors.join("; "));
     }
     for (path, _) in targets {
-        let _ = std::fs::remove_file(staged(path));
-        let _ = std::fs::remove_file(kept(path));
+        let _ = std::fs::remove_file(sibling(path, "partial"));
     }
-    result
+    for (_, old, had_original) in swapped {
+        if had_original {
+            std::fs::remove_file(old).with_context(|| "restore committed, but old file cleanup failed")?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -407,7 +547,14 @@ mod tests {
             "current: A\nitems:\n- uid: A\n  file: A.yaml\n",
         );
         write(&home.join("profiles/A.yaml"), "proxies: []\n");
+        write(&home.join("singbox-dns.json"), "{\"servers\": []}\n");
+        write(&home.join("singbox-rules.json"), "[]\n");
+        write(&home.join("singbox-rule-sets.json"), "[]\n");
         write(&home.join("cache.db"), "not backed up");
+        write(&home.join("singbox-runtime.json"), "{}\n");
+        write(&home.join("mihomo.pid"), "1234\n");
+        write(&home.join("mihomo.sock"), "socket placeholder");
+        write(&home.join("downloads/sing-box"), "binary placeholder");
         home
     }
 
@@ -430,15 +577,33 @@ mod tests {
         let home = sample_home("create");
         let dest = home.join("out/linux-backup-x.zip");
         let created = create(&home, &dest, false).unwrap();
-        assert_eq!(created.files, 4);
+        assert_eq!(created.files, 7);
         assert_eq!(
             archive_names(&dest),
-            ["config.yaml", "profiles.yaml", "profiles/A.yaml", "verge.yaml"]
+            [
+                "backup-manifest.json",
+                "config.yaml",
+                "profiles.yaml",
+                "profiles/A.yaml",
+                "singbox-dns.json",
+                "singbox-rule-sets.json",
+                "singbox-rules.json",
+                "verge.yaml"
+            ]
         );
         let config = archive_file(&dest, "config.yaml");
         assert!(config.contains("mixed-port") && !config.contains("s3cret"));
         let verge = archive_file(&dest, "verge.yaml");
         assert!(verge.contains("webdav_url") && !verge.contains("webdav_password") && !verge.contains("me"));
+        assert!(archive_file(&dest, "singbox-dns.json").contains("servers"));
+        for excluded in [
+            "singbox-runtime.json",
+            "mihomo.pid",
+            "mihomo.sock",
+            "downloads/sing-box",
+        ] {
+            assert!(!archive_names(&dest).iter().any(|name| name == excluded), "{excluded}");
+        }
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
 
@@ -463,7 +628,7 @@ mod tests {
         write(&home.join("profiles.yaml"), "items: []\n");
 
         let restored = restore(&home, &archive, &backups).unwrap();
-        assert_eq!(restored.files.len(), 4);
+        assert_eq!(restored.files.len(), 7);
         assert!(read(&home.join("profiles.yaml")).contains("uid: A"));
         assert_eq!(read(&home.join("profiles/A.yaml")), "proxies: []\n");
         let verge = read(&home.join("verge.yaml"));
@@ -514,6 +679,32 @@ mod tests {
         assert!(restore(&home, &broken, &backups).is_err());
         assert_eq!(read(&home.join("verge.yaml")), before, "nothing written");
 
+        let invalid_sidecar = make(
+            "invalid-sidecar.zip",
+            &[
+                ("profiles.yaml", "items: []\n"),
+                ("config.yaml", "mixed-port: 9999\n"),
+                ("singbox-rules.json", "{invalid json"),
+            ],
+        );
+        let error = restore(&home, &invalid_sidecar, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("singbox-rules.json"), "{error:#}");
+        assert!(read(&home.join("config.yaml")).contains("mixed-port: 7897"));
+        assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
+
+        let wrong_shape = make(
+            "wrong-sidecar-shape.zip",
+            &[
+                ("profiles.yaml", "items: []\n"),
+                ("config.yaml", "mixed-port: 9999\n"),
+                ("singbox-rules.json", "{}"),
+            ],
+        );
+        let error = restore(&home, &wrong_shape, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("must contain a JSON array"), "{error:#}");
+        assert!(read(&home.join("config.yaml")).contains("mixed-port: 7897"));
+        assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
+
         // Paths outside the directory are skipped, never written.
         let sneaky = make(
             "c.zip",
@@ -532,6 +723,68 @@ mod tests {
     }
 
     #[test]
+    fn legacy_archives_leave_new_sidecars_untouched() {
+        let home = sample_home("legacy");
+        let backups = home.join("backups");
+        let archive = backups.join("legacy.zip");
+        std::fs::create_dir_all(&backups).unwrap();
+        write_zip(
+            &archive,
+            &[("profiles.yaml".into(), b"current: old\nitems: []\n".to_vec())],
+        )
+        .unwrap();
+
+        restore(&home, &archive, &backups).unwrap();
+
+        assert_eq!(read(&home.join("singbox-dns.json")), "{\"servers\": []}\n");
+        assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
+        assert_eq!(read(&home.join("singbox-rule-sets.json")), "[]\n");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn versioned_manifest_mismatch_or_unknown_version_aborts_restore_before_writes() {
+        let home = sample_home("manifest");
+        let backups = home.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let before = read(&home.join("config.yaml"));
+        let write_manifest_archive = |name: &str, manifest: &str| {
+            let archive = backups.join(name);
+            write_zip(
+                &archive,
+                &[
+                    (MANIFEST_FILE.into(), manifest.as_bytes().to_vec()),
+                    ("profiles.yaml".into(), b"items: []\n".to_vec()),
+                ],
+            )
+            .unwrap();
+            archive
+        };
+        let unknown = write_manifest_archive(
+            "unknown-version.zip",
+            r#"{"format_version":99,"files":["profiles.yaml"]}"#,
+        );
+        assert!(
+            restore(&home, &unknown, &backups)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported backup format version")
+        );
+        let mismatch = write_manifest_archive(
+            "mismatch.zip",
+            r#"{"format_version":1,"files":["config.yaml","profiles.yaml"]}"#,
+        );
+        assert!(
+            restore(&home, &mismatch, &backups)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        assert_eq!(read(&home.join("config.yaml")), before);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn restored_files_are_private_and_profile_yaml_must_parse() {
         use std::os::unix::fs::PermissionsExt as _;
         let home = sample_home("private");
@@ -539,11 +792,24 @@ mod tests {
         let archive = backups.join("b.zip");
         create(&home, &archive, false).unwrap();
         restore(&home, &archive, &backups).unwrap();
-        for file in ["config.yaml", "verge.yaml", "profiles.yaml", "profiles/A.yaml"] {
+        for file in [
+            "config.yaml",
+            "verge.yaml",
+            "profiles.yaml",
+            "profiles/A.yaml",
+            "singbox-dns.json",
+            "singbox-rules.json",
+            "singbox-rule-sets.json",
+        ] {
             let mode = std::fs::metadata(home.join(file)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{file}");
         }
-        assert!(!home.join("config.restore.orig").exists(), "no leftovers");
+        assert!(
+            std::fs::read_dir(&home)
+                .unwrap()
+                .all(|entry| { !entry.unwrap().file_name().to_string_lossy().contains(".restore.") }),
+            "restore staging and rollback files are cleaned up"
+        );
 
         let broken = backups.join("broken.zip");
         write_zip(
@@ -562,21 +828,35 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_swap_puts_every_original_back() {
-        let dir = temp_dir("swap");
-        write(&dir.join("a.yaml"), "old a\n");
-        write(&dir.join("b.yaml"), "old b\n");
-        // A directory where b's original would be moved aside: that rename
-        // fails (for any user), after a has already been swapped in.
-        write(&dir.join("b.restore.orig/keep"), "x");
-        let targets: Vec<(PathBuf, &[u8])> = vec![(dir.join("a.yaml"), b"new a\n"), (dir.join("b.yaml"), b"new b\n")];
-
-        assert!(replace_all(&targets).is_err());
-        assert_eq!(read(&dir.join("a.yaml")), "old a\n", "a rolled back");
-        assert_eq!(read(&dir.join("b.yaml")), "old b\n");
-        assert!(!dir.join("a.restore.orig").exists());
-        assert!(!dir.join("a.restore.partial").exists() && !dir.join("b.restore.partial").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn failed_mid_commit_rolls_back_every_file_and_keeps_no_staging_files() {
+        let home = temp_dir("rollback");
+        let first = home.join("config.yaml");
+        let second = home.join("verge.yaml");
+        write(&first, "old-config: true\n");
+        write(&second, "old-verge: true\n");
+        let targets = vec![
+            (first.clone(), b"new-config: true\n".as_slice()),
+            (second.clone(), b"new-verge: true\n".as_slice()),
+        ];
+        let error = replace_all_using(&targets, |from, to| {
+            if to == second.as_path() && from.to_string_lossy().ends_with(".partial") {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected rename failure",
+                ));
+            }
+            std::fs::rename(from, to)
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("injected rename failure"));
+        assert_eq!(read(&first), "old-config: true\n");
+        assert_eq!(read(&second), "old-verge: true\n");
+        assert!(
+            std::fs::read_dir(&home)
+                .unwrap()
+                .all(|entry| { !entry.unwrap().file_name().to_string_lossy().contains(".restore.") })
+        );
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

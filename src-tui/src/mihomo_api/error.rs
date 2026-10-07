@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Errors produced when communicating with the mihomo REST API.
+/// Errors produced when communicating with a proxy core's REST API.
 ///
 /// Variants are partitioned by recovery path:
 /// - `CoreDown` / `Io` — the mihomo process is not reachable; the caller
@@ -12,7 +12,7 @@ use thiserror::Error;
 /// - `InvalidUri` — bad URL/path (e.g. secret contains a NUL byte).
 #[derive(Debug, Error)]
 pub enum MihomoError {
-    #[error("mihomo is not running at {endpoint}")]
+    #[error("proxy core is not running at {endpoint}")]
     CoreDown {
         /// Human-readable controller endpoint: unix socket path or `ip:port`.
         endpoint: String,
@@ -32,6 +32,12 @@ pub enum MihomoError {
 
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("{core} {operation} request timed out; the core may still be healthy")]
+    OperationTimeout { core: String, operation: String },
+
+    #[error("{core} does not support {operation}")]
+    UnsupportedCoreOperation { core: String, operation: String },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -57,6 +63,18 @@ mod tests {
             endpoint: "127.0.0.1:9090".into(),
         };
         assert!(err.to_string().contains("127.0.0.1:9090"));
+
+        let timeout = MihomoError::OperationTimeout {
+            core: "sing-box".into(),
+            operation: "provider refresh".into(),
+        };
+        assert!(timeout.to_string().contains("sing-box provider refresh"));
+        assert!(timeout.to_string().contains("may still be healthy"));
+        let unsupported = MihomoError::UnsupportedCoreOperation {
+            core: "sing-box".into(),
+            operation: "rule provider refresh".into(),
+        };
+        assert!(unsupported.to_string().contains("sing-box"));
 
         // Unauthorized
         assert!(MihomoError::Unauthorized.to_string().contains("401"));

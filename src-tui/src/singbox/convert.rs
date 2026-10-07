@@ -39,6 +39,13 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
             dropped.push(format!("{name}.{k}"));
         }
     }
+    const CRITICAL_UNSUPPORTED_FIELDS: &[&str] =
+        &["packet-addr", "ip-version", "smux", "obfs", "plugin", "plugin-opts"];
+    if let Some(field) = CRITICAL_UNSUPPORTED_FIELDS.iter().find(|field| get(field).is_some()) {
+        return Err(format!(
+            "node {name:?} uses critical field {field:?} with no supported sing-box 1.14.2 mapping"
+        ));
+    }
 
     let server = as_str("server").ok_or_else(|| format!("node '{name}' missing server"))?;
     let port = get("port")
@@ -65,8 +72,17 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
             outbound[*skey] = value;
         }
     }
-    apply_tls(&ptype, &mut outbound, map);
-    apply_transport(&mut outbound, map, &mut dropped);
+    apply_udp(&ptype, &mut outbound, map)?;
+    apply_tls(&ptype, &mut outbound, map)?;
+    if let Some(fingerprint) = as_str("client-fingerprint") {
+        if !crate::singbox::capabilities::SING_BOX_1_14_2.client_fingerprint {
+            return Err(format!(
+                "node {name:?} uses client-fingerprint unsupported by sing-box 1.14.2"
+            ));
+        }
+        outbound["tls"]["utls"] = json!({ "enabled": true, "fingerprint": fingerprint });
+    }
+    apply_transport(&ptype, &mut outbound, map)?;
 
     Ok(ConvertedNode { outbound, dropped })
 }
@@ -86,6 +102,7 @@ const RESERVED_FIELDS: &[&str] = &[
     "grpc-opts",
     "reality-opts",
     "client-fingerprint",
+    "udp",
 ];
 
 /// (clash type, (sing-box type, [(clash field, sing-box field)]))
@@ -151,14 +168,38 @@ fn yaml_to_json(value: Option<&Yaml>) -> Option<Value> {
     }
 }
 
-/// TLS handling: trojan/vLESS/Hysteria-family are TLS-native; the rest
+/// TLS handling: trojan/Hysteria-family are TLS-native; VLESS and VMess
 /// need `tls: true` to emit the block. reality-opts maps onto uTLS/reality.
-fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) {
+fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) -> Result<(), String> {
     let get = |key: &str| map.get(Yaml::String(key.into()));
-    let native_tls = matches!(ptype, "trojan" | "vless" | "hysteria" | "hysteria2" | "tuic" | "naive");
+    let native_tls = matches!(ptype, "trojan" | "hysteria" | "hysteria2" | "tuic" | "naive" | "anytls");
+    if get("tls").is_some() && get("tls").and_then(Yaml::as_bool).is_none() {
+        return Err("tls must be a boolean; refusing to guess security behavior".into());
+    }
+    if get("skip-cert-verify").is_some() && get("skip-cert-verify").and_then(Yaml::as_bool).is_none() {
+        return Err("skip-cert-verify must be a boolean; refusing to guess TLS verification behavior".into());
+    }
+    for field in ["servername", "sni", "client-fingerprint"] {
+        if get(field).is_some() && get(field).and_then(Yaml::as_str).is_none() {
+            return Err(format!("{field} must be a string; refusing to drop TLS settings"));
+        }
+    }
     let explicit_tls = get("tls").and_then(Yaml::as_bool).unwrap_or(false);
+    if native_tls && get("tls").and_then(Yaml::as_bool) == Some(false) {
+        return Err(format!(
+            "{ptype} node requires TLS; explicit tls: false cannot be preserved"
+        ));
+    }
     if !native_tls && !explicit_tls {
-        return;
+        if get("reality-opts").is_some()
+            || get("client-fingerprint").is_some()
+            || get("servername").is_some()
+            || get("sni").is_some()
+            || get("skip-cert-verify").and_then(Yaml::as_bool) == Some(true)
+        {
+            return Err("TLS parameters require tls: true; refusing to drop security settings".into());
+        }
+        return Ok(());
     }
 
     let mut tls = json!({ "enabled": true });
@@ -174,18 +215,60 @@ fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) {
         if let Some(pk) = public_key {
             tls["utls"] = json!({ "enabled": true, "fingerprint": "chrome" });
             tls["reality"] = json!({ "enabled": true, "public_key": pk, "short_id": short_id.unwrap_or("") });
+        } else {
+            return Err("reality-opts requires public-key; refusing to drop Reality security settings".into());
         }
+    } else if get("reality-opts").is_some() {
+        return Err("reality-opts must be a mapping".into());
     }
     outbound["tls"] = tls;
+    Ok(())
 }
 
 /// Transport layer for ws/grpc networks; other networks are noted by the
 /// caller through the dropped-fields report (they never reach `outbound`).
-fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: &mut Vec<String>) {
+fn apply_udp(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) -> Result<(), String> {
+    let Some(value) = map.get(Yaml::String("udp".into())) else {
+        return Ok(());
+    };
+    let enabled = value
+        .as_bool()
+        .ok_or_else(|| "udp must be a boolean; refusing to guess transport behavior".to_string())?;
+    if !matches!(ptype, "ss" | "hysteria2") {
+        return Err(format!(
+            "node type {ptype:?} has no verified sing-box mapping for explicit udp: {enabled}; refusing to lose transport semantics"
+        ));
+    }
+    // Both supported sing-box outbounds use their native default for UDP;
+    // the only explicit override needed to preserve Clash semantics is
+    // disabling UDP, which maps to the TCP-only network.
+    if !enabled {
+        outbound["network"] = json!("tcp");
+    }
+    Ok(())
+}
+
+fn apply_transport(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) -> Result<(), String> {
     let get = |key: &str| map.get(Yaml::String(key.into()));
     let Some(network) = get("network").and_then(Yaml::as_str) else {
-        return;
+        return Ok(());
     };
+    if matches!(ptype, "ss" | "hysteria2") && matches!(network, "udp" | "tcp") {
+        if let Some(udp) = get("udp").and_then(Yaml::as_bool)
+            && (network == "udp") != udp
+        {
+            return Err(format!(
+                "node {ptype:?} has conflicting network: {network} and udp: {udp}"
+            ));
+        }
+        outbound["network"] = json!(network);
+        return Ok(());
+    }
+    if matches!(ptype, "ss" | "hysteria2") && matches!(network, "ws" | "grpc") && get("udp").is_some() {
+        return Err(format!(
+            "node type {ptype:?} cannot combine explicit udp selection with {network} transport"
+        ));
+    }
     match network {
         "ws" => {
             let mut transport = json!({ "type": "ws" });
@@ -216,8 +299,13 @@ fn apply_transport(outbound: &mut Value, map: &serde_yaml_ng::Mapping, dropped: 
             }
             outbound["transport"] = transport;
         }
-        other => dropped.push(format!("transport:{other}")),
+        other => {
+            return Err(format!(
+                "unsupported transport {other:?}: refusing to silently lose security/network semantics"
+            ));
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -230,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_ss_node_exactly() {
+    fn maps_verified_udp_modes_for_shadowsocks_and_hysteria2() {
         let node = parse(
             r#"
 name: "ss-node"
@@ -242,24 +330,28 @@ password: "pw"
 udp: true
 "#,
         );
-        let converted = convert_node(&node).expect("convert");
-        assert_eq!(
-            converted.outbound,
-            json!({
-                "type": "shadowsocks",
-                "tag": "ss-node",
-                "server": "1.2.3.4",
-                "server_port": 8388,
-                "method": "aes-256-gcm",
-                "password": "pw",
-            })
-        );
-        // `udp` has no equivalent — must be reported, not silently lost.
+        let converted = convert_node(&node).expect("udp true is mapped");
         assert!(
-            converted.dropped.iter().any(|d| d.ends_with(".udp")),
-            "{:?}",
-            converted.dropped
+            converted.outbound.get("network").is_none(),
+            "udp:true keeps sing-box's native default"
         );
+
+        let tcp = parse(
+            "name: ss-tcp\ntype: ss\nserver: 1.2.3.4\nport: 8388\ncipher: aes-256-gcm\npassword: pw\nudp: false\n",
+        );
+        assert_eq!(convert_node(&tcp).unwrap().outbound["network"], "tcp");
+
+        let h2 = parse("name: h2\ntype: hysteria2\nserver: h.example\nport: 443\npassword: pw\nudp: true\n");
+        assert!(convert_node(&h2).unwrap().outbound.get("network").is_none());
+    }
+
+    #[test]
+    fn preserves_supported_client_fingerprint_in_tls() {
+        let node = parse(
+            "name: vless\ntype: vless\nserver: a.example\nport: 443\nuuid: 00000000-0000-0000-0000-000000000000\ntls: true\nclient-fingerprint: firefox\n",
+        );
+        let converted = convert_node(&node).expect("converted");
+        assert_eq!(converted.outbound["tls"]["utls"]["fingerprint"], "firefox");
     }
 
     #[test]
@@ -305,6 +397,25 @@ password: hunter2
     }
 
     #[test]
+    fn anytls_outbound_gets_required_tls_block() {
+        let node = parse("name: at\ntype: anytls\nserver: at.example\nport: 443\npassword: pw\n");
+        let converted = convert_node(&node).unwrap();
+        assert_eq!(converted.outbound["tls"]["enabled"], true);
+    }
+
+    #[test]
+    fn vless_plaintext_is_preserved_and_malformed_tls_identity_is_rejected() {
+        let yaml = "name: v\ntype: vless\nserver: example.com\nport: 443\nuuid: id\ntls: false\n";
+        assert!(convert_node(&parse(yaml)).unwrap().outbound.get("tls").is_none());
+        let malformed = format!("{yaml}client-fingerprint: 7\n");
+        assert!(
+            convert_node(&parse(&malformed))
+                .unwrap_err()
+                .contains("must be a string")
+        );
+    }
+
+    #[test]
     fn vless_reality_maps_to_utls() {
         let node = parse(
             r#"
@@ -338,6 +449,18 @@ port: 1
         );
         let err = convert_node(&node).expect_err("must error");
         assert!(err.contains("mieru"), "{err}");
+    }
+
+    #[test]
+    fn critical_fields_and_unknown_transports_are_rejected_not_dropped() {
+        let udp = parse("name: n\ntype: vmess\nserver: host\nport: 443\nuuid: id\nudp: false\n");
+        assert!(convert_node(&udp).unwrap_err().contains("no verified sing-box mapping"));
+        let ws = parse("name: n\ntype: vless\nserver: host\nport: 443\nuuid: id\ntls: true\nnetwork: h2\n");
+        assert!(convert_node(&ws).unwrap_err().contains("unsupported transport \"h2\""));
+        let reality = parse(
+            "name: n\ntype: vless\nserver: host\nport: 443\nuuid: id\ntls: true\nreality-opts: { short-id: abc }\n",
+        );
+        assert!(convert_node(&reality).unwrap_err().contains("requires public-key"));
     }
 
     #[test]

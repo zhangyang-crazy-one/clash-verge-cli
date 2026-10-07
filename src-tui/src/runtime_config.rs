@@ -75,28 +75,110 @@ pub async fn apply_singbox_restart(
     config_yaml: Option<&str>,
     enable_tun: bool,
 ) -> Result<String, String> {
+    apply_singbox_restart_for_profile(manager, config_yaml, enable_tun, None).await
+}
+
+/// Profile-aware variant used by subscription refresh. DNS confirmation is
+/// captured from the effective candidate before writing and persisted only
+/// after the candidate has been committed and (when running) reloaded.
+pub async fn apply_singbox_restart_for_profile(
+    manager: &crate::mihomo_manager::MihomoManager,
+    config_yaml: Option<&str>,
+    enable_tun: bool,
+    profile_uid: Option<&str>,
+) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
+    let core_running = manager.state() == crate::app::CoreState::Running;
+    if core_running && !manager.owns_child() {
+        return Err("cannot apply sing-box settings: controller is attached to an externally managed core; reconfigure it through its owner".into());
+    }
+    let mut prepared_yaml = None;
+    let mut dns_state = None;
+    if let (Some(uid), Some(raw)) = (profile_uid, config_yaml)
+        && !crate::subscribe::from_url::is_singbox_json_profile(raw)
+    {
+        let mapping = serde_yaml_ng::from_str(raw).map_err(|error| format!("invalid profile YAML: {error}"))?;
+        let (mapping, state) = crate::services::profile::prepare_profile_dns_from_settings(uid, mapping).await?;
+        prepared_yaml = Some(serde_yaml_ng::to_string(&mapping).map_err(|error| error.to_string())?);
+        dns_state = Some(state);
+    }
+    let config_yaml = prepared_yaml.as_deref().or(config_yaml);
     let config_path = clash_verge_core::utils::dirs::singbox_config_path().map_err(|e| e.to_string())?;
-    let previous = tokio::fs::read(&config_path).await.ok();
-
-    let (_path, parts) =
-        crate::mihomo_manager::ManagerInner::write_singbox_assembled(manager.config_dir(), config_yaml, enable_tun)
-            .await
-            .map_err(|e| e.to_string())?;
-
-    let Some(binary) = crate::mihomo_manager::singbox_binary::candidate_without_install() else {
-        return Err("sing-box binary not found".into());
+    let previous = match tokio::fs::read(&config_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot read {}: {error}", config_path.display())),
     };
-    // Reject bad configs BEFORE stopping the running core.
-    prevalidate_singbox_config(&binary, &config_path).await?;
+    let candidate = private_candidate_path(&config_path);
+    let mut transaction = RuntimeCandidate::new(config_path.clone(), candidate.clone(), previous);
+    let assembled = crate::mihomo_manager::ManagerInner::write_singbox_assembled_to(
+        manager.config_dir(),
+        config_yaml,
+        enable_tun,
+        &candidate,
+    )
+    .await;
+    let (_candidate_path, parts) = match assembled {
+        Ok(parts) => parts,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&candidate).await;
+            return Err(error.to_string());
+        }
+    };
+
+    let binary = match manager.binary_path() {
+        Some(binary) => binary,
+        None => {
+            crate::mihomo_manager::singbox_binary::resolve_or_install()
+                .await
+                .map_err(|error| error.to_string())?
+                .path
+        }
+    };
+    // Reject bad configs before replacing the formal file or stopping the
+    // running core. Candidate and formal configs live on the same filesystem.
+    if let Err(error) = prevalidate_singbox_config(&binary, &candidate).await {
+        let _ = tokio::fs::remove_file(&candidate).await;
+        return Err(error);
+    }
+    // An adopted pid identifies a running external core but does not grant
+    // this process restart ownership. Refreshes may persist while stopped,
+    // while live sing-box replacement requires a child owned by this manager.
+    transaction.install()?;
+
+    // Keep the validated durable config current while stopped, but never turn
+    // a refresh/settings write into an implicit core start.
+    if !core_running {
+        transaction.commit();
+        persist_dns_override_state(dns_state.as_ref()).await;
+        return Ok(if parts.profile_used {
+            format!(
+                "sing-box: {} nodes, {} skipped, {} fields degraded (saved; core stopped)",
+                parts.conversion.outbounds.len(),
+                parts.conversion.skipped.len(),
+                parts.conversion.degraded.len()
+            )
+        } else {
+            "sing-box: skeleton config saved (core stopped)".into()
+        });
+    }
 
     if let Err(restart_error) = manager.restart().await {
-        if let Some(previous) = previous {
-            let _ = tokio::fs::write(&config_path, &previous).await;
-            let _ = manager.restart().await; // best-effort fallback to old config
+        transaction
+            .rollback()
+            .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
+        if transaction.previous.is_some() {
+            if let Err(rollback_error) = manager.restart().await {
+                return Err(format!(
+                    "{restart_error}; previous configuration restored but fallback restart failed: {rollback_error}"
+                ));
+            }
         }
         return Err(restart_error.to_string());
     }
+
+    transaction.commit();
+    persist_dns_override_state(dns_state.as_ref()).await;
 
     // Human-readable degradation report for the status bar.
     let report = if parts.profile_used {
@@ -112,10 +194,87 @@ pub async fn apply_singbox_restart(
     Ok(report)
 }
 
+async fn persist_dns_override_state(state: Option<&clash_verge_core::config::DnsOverrideState>) {
+    let Some(state) = state else { return };
+    if let Err(error) = clash_verge_core::config::IVerge::persist_dns_override_after_apply(state).await {
+        tracing::warn!(target: "config", "DNS override applied but confirmation persistence failed: {error}");
+    }
+}
+
+fn private_candidate_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path.with_file_name(format!(
+        ".singbox.candidate-{}-{}.json",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
+/// Own staged files and restore the previous bytes if an apply future is
+/// cancelled after installation. Rename and state recording contain no await.
+struct RuntimeCandidate {
+    formal: std::path::PathBuf,
+    candidate: std::path::PathBuf,
+    previous: Option<Vec<u8>>,
+    installed: bool,
+}
+
+impl RuntimeCandidate {
+    fn new(formal: std::path::PathBuf, candidate: std::path::PathBuf, previous: Option<Vec<u8>>) -> Self {
+        Self {
+            formal,
+            candidate,
+            previous,
+            installed: false,
+        }
+    }
+    fn install(&mut self) -> Result<(), String> {
+        std::fs::rename(&self.candidate, &self.formal)
+            .map_err(|error| format!("failed to atomically install validated sing-box config: {error}"))?;
+        self.installed = true;
+        Ok(())
+    }
+    fn commit(&mut self) {
+        self.installed = false;
+    }
+    fn rollback(&mut self) -> Result<(), String> {
+        if !self.installed {
+            return Ok(());
+        }
+        if let Some(previous) = &self.previous {
+            use std::io::Write as _;
+            let mut staged =
+                tempfile::NamedTempFile::new_in(self.formal.parent().ok_or("runtime config has no parent")?)
+                    .map_err(|error| error.to_string())?;
+            staged.write_all(previous).map_err(|error| error.to_string())?;
+            staged.as_file().sync_all().map_err(|error| error.to_string())?;
+            staged.persist(&self.formal).map_err(|error| error.to_string())?;
+        } else {
+            match std::fs::remove_file(&self.formal) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.installed = false;
+        Ok(())
+    }
+}
+
+impl Drop for RuntimeCandidate {
+    fn drop(&mut self) {
+        if let Err(error) = self.rollback() {
+            tracing::error!(target: "config", "cancelled config apply rollback failed: {error}");
+        }
+        let _ = std::fs::remove_file(&self.candidate);
+    }
+}
+
 /// Task 8.1/7.5 helper: regenerate from the ACTIVE profile (not a caller
 /// snapshot) and restart sing-box so DNS/rule-set edits take effect.
 pub async fn apply_singbox_active_reload(manager: &crate::mihomo_manager::MihomoManager) -> Result<String, String> {
-    let yaml = crate::mihomo_manager::ManagerInner::active_profile_yaml().await;
+    let yaml = crate::mihomo_manager::ManagerInner::active_profile_yaml()
+        .await
+        .map_err(|error| error.to_string())?;
     let enable_tun = crate::mihomo_manager::manager::runtime_tun_enabled()
         .await
         .unwrap_or(false);
@@ -126,15 +285,20 @@ pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::
     let config_path = path
         .to_str()
         .ok_or_else(|| format!("config path is not valid UTF-8: {}", path.display()))?;
+    let mut endpoint = api.path_url(&["configs"]).map_err(|error| error.to_string())?;
+    endpoint.query_pairs_mut().append_pair("force", "true");
     let response = api
         .client
-        .put("http://localhost/configs?force=true")
+        .put(endpoint)
         .json(&serde_json::json!({ "path": config_path, "payload": "" }))
         .send()
         .await
         .map_err(|error| error.to_string())?;
 
     if response.status().is_success() {
+        api.version()
+            .await
+            .map_err(|error| format!("config reload accepted but controller readiness failed: {error}"))?;
         Ok(())
     } else {
         let status = response.status();
@@ -186,6 +350,26 @@ async fn compose_remote_profile(
     let mut profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
 
+    if item
+        .option
+        .as_ref()
+        .and_then(|option| option.script.as_deref())
+        .is_some()
+    {
+        return Err(
+            "profile script execution is unsupported; remove the script override or use a preprocessed profile".into(),
+        );
+    }
+    if let Some(merge_uid) = item.option.as_ref().and_then(|option| option.merge.as_deref()) {
+        let merge_item = all_items
+            .iter()
+            .find(|entry| entry.uid.as_deref() == Some(merge_uid))
+            .ok_or_else(|| format!("merge fragment profile not found: {merge_uid}"))?;
+        let chain = crate::chain::resolve_chain(merge_item, profiles_dir)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::chain::apply_chain_to_config(&mut profile, &chain).map_err(|error| error.to_string())?;
+    }
     let Some(rules_uid) = item.option.as_ref().and_then(|option| option.rules.as_deref()) else {
         return Ok(profile);
     };
@@ -272,26 +456,34 @@ where
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let app_config = clash_verge_core::config::IClashTemp::new().await.0;
     let config = build(app_config)?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let previous = if core_running && path.exists() {
-        Some(
-            tokio::fs::read(&path)
-                .await
-                .map_err(|error| format!("failed to back up {}: {error}", path.display()))?,
-        )
+    let (config, dns_state) = if let Some(uid) = restore_item.and_then(|item| item.uid.as_deref()) {
+        let (config, state) = crate::services::profile::prepare_profile_dns_from_settings(uid, config).await?;
+        (config, Some(state))
     } else {
-        None
+        (config, None)
     };
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    let previous = match tokio::fs::read(&path).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("failed to back up {}: {error}", path.display())),
+    };
+    let mut transaction = RuntimeCandidate::new(path.clone(), private_candidate_path(&path), previous);
 
     write_runtime_config_unlocked(config, enable_tun).await?;
+    transaction.installed = true;
     if !core_running {
         // Keep the newly selected runtime config for the next Start; do not API-reload
         // (or roll it back) while no controller is available.
+        transaction.commit();
+        persist_dns_override_state(dns_state.as_ref()).await;
         return Ok(path);
     }
     if let Err(error) = reload_config_file(api, &path).await {
-        if let Some(previous) = previous {
-            let _ = tokio::fs::write(&path, previous).await;
+        transaction
+            .rollback()
+            .map_err(|rollback_error| format!("{error}; rollback failed: {rollback_error}"))?;
+        if transaction.previous.is_some() {
             let _ = reload_config_file(api, &path).await;
             return Err(format!("{error}; restored the previous config"));
         }
@@ -300,6 +492,8 @@ where
     if let Some(item) = restore_item {
         restore_selected_nodes(api, item).await;
     }
+    transaction.commit();
+    persist_dns_override_state(dns_state.as_ref()).await;
     Ok(path)
 }
 
@@ -313,37 +507,14 @@ pub async fn write_runtime_config_unlocked(
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
-    let temporary_path = path.with_extension(format!("yaml.tui-runtime.{}.tmp", uuid::Uuid::new_v4()));
-
-    #[cfg(unix)]
-    let permissions = {
-        use std::os::unix::fs::PermissionsExt;
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            tokio::fs::metadata(&path).await.ok().map(|meta| meta.permissions())
-        } else {
-            Some(std::fs::Permissions::from_mode(0o600))
-        }
-    };
-
-    tokio::fs::write(&temporary_path, yaml)
-        .await
-        .map_err(|error| format!("failed to stage {}: {error}", temporary_path.display()))?;
-
-    #[cfg(unix)]
-    if let Some(permissions) = permissions {
-        tokio::fs::set_permissions(&temporary_path, permissions)
-            .await
-            .map_err(|error| format!("failed to set permissions on {}: {error}", temporary_path.display()))?;
-    }
-
-    #[cfg(windows)]
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|error| format!("failed to remove {}: {error}", path.display()))?;
-    }
-    tokio::fs::rename(&temporary_path, &path)
-        .await
+    use std::io::Write as _;
+    let parent = path.parent().ok_or("runtime config has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
+    staged.write_all(yaml.as_bytes()).map_err(|error| error.to_string())?;
+    staged.as_file().sync_all().map_err(|error| error.to_string())?;
+    staged
+        .persist(&path)
         .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
     Ok(path)
 }
@@ -360,6 +531,101 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn accepted_hot_reload_requires_controller_readiness_before_success() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for ready in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for step in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0; 8192];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..count]);
+                    assert!(request.starts_with(if step == 0 {
+                        "PUT /configs?force=true "
+                    } else {
+                        "GET /version "
+                    }));
+                    let (status, body) = if step == 0 {
+                        ("204 No Content", "")
+                    } else if ready {
+                        ("200 OK", r#"{"version":"v1.19.32"}"#)
+                    } else {
+                        ("503 Unavailable", "unavailable")
+                    };
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            });
+            let api = crate::mihomo_api::MihomoApi::with_transport(crate::mihomo_api::Transport::Tcp(addr), "fixture")
+                .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let result = reload_config_file(&api, &dir.path().join("candidate.yaml")).await;
+            assert_eq!(result.is_ok(), ready);
+            if !ready {
+                assert!(result.unwrap_err().contains("readiness failed"));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_apply_restores_previous_runtime_and_removes_staged_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let formal = dir.path().join("runtime.json");
+        let candidate = private_candidate_path(&formal);
+        std::fs::write(&formal, b"old").unwrap();
+        std::fs::write(&candidate, b"new").unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let formal_owned = formal.clone();
+        let candidate_owned = candidate.clone();
+        let apply = tokio::spawn(async move {
+            let mut transaction = RuntimeCandidate::new(formal_owned, candidate_owned, Some(b"old".to_vec()));
+            transaction.install().unwrap();
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        assert_eq!(std::fs::read(&formal).unwrap(), b"new");
+        apply.abort();
+        assert!(apply.await.unwrap_err().is_cancelled());
+        assert_eq!(std::fs::read(&formal).unwrap(), b"old");
+        assert!(!candidate.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejected_candidate_and_completed_apply_have_distinct_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let formal = dir.path().join("runtime.json");
+        let candidate = private_candidate_path(&formal);
+        std::fs::write(&formal, b"old").unwrap();
+        std::fs::write(&candidate, b"invalid").unwrap();
+        drop(RuntimeCandidate::new(
+            formal.clone(),
+            candidate.clone(),
+            Some(b"old".to_vec()),
+        ));
+        assert_eq!(std::fs::read(&formal).unwrap(), b"old");
+        assert!(!candidate.exists());
+        std::fs::write(&candidate, b"valid").unwrap();
+        let mut transaction = RuntimeCandidate::new(formal.clone(), candidate, Some(b"old".to_vec()));
+        transaction.install().unwrap();
+        transaction.commit();
+        drop(transaction);
+        assert_eq!(std::fs::read(formal).unwrap(), b"valid");
+    }
 
     /// Unique temp profiles dir per test. `compose_remote_profile` takes the
     /// profiles dir and the profile items explicitly, so tests need no global
@@ -528,6 +794,22 @@ mod tests {
             ReloadStrategy::for_core(crate::mihomo_manager::CoreKind::SingBox),
             ReloadStrategy::Restart
         );
+    }
+
+    #[test]
+    fn candidate_paths_are_private_and_unique() {
+        let config = std::path::Path::new("/tmp/singbox.json");
+        let first = private_candidate_path(config);
+        let second = private_candidate_path(config);
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".singbox.candidate-")
+        );
+        assert_eq!(first.parent(), config.parent());
     }
 
     #[tokio::test]

@@ -1,7 +1,9 @@
 use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::{
-    ConnectionsData, MihomoVersion, ProxyData, ProxyDelay, RuleProvidersResponse, RulesResponse, SelectProxyRequest,
+    ConnectionsData, MihomoVersion, ProxyData, ProxyDelay, ProxyProvidersResponse, RuleProvidersResponse,
+    RulesResponse, SelectProxyRequest,
 };
+use reqwest::Url;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -59,9 +61,42 @@ pub struct MihomoApi {
     stream_client: reqwest::Client,
     transport: Transport,
     base_url: String,
+    singbox: bool,
+    provider_timeout: Duration,
 }
 
 impl MihomoApi {
+    pub fn for_core(mut self, kind: crate::mihomo_manager::CoreKind) -> Self {
+        self.singbox = kind == crate::mihomo_manager::CoreKind::SingBox;
+        self
+    }
+
+    pub fn core_kind(&self) -> crate::mihomo_manager::CoreKind {
+        if self.singbox {
+            crate::mihomo_manager::CoreKind::SingBox
+        } else {
+            crate::mihomo_manager::CoreKind::Mihomo
+        }
+    }
+
+    pub fn supports_providers(&self) -> bool {
+        !self.singbox
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn transport(&self) -> &Transport {
+        &self.transport
+    }
+
+    /// Set the provider refresh deadline. Defaults to 30 seconds; accepted
+    /// values range from 1 ms through 120 seconds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_provider_timeout(mut self, timeout: Duration) -> Result<Self, MihomoError> {
+        validate_provider_timeout(timeout)?;
+        self.provider_timeout = timeout;
+        Ok(self)
+    }
+
     /// Build a new client targeting the mihomo unix socket at `socket_path`
     /// with bearer `secret`.
     ///
@@ -87,11 +122,13 @@ impl MihomoApi {
         headers.insert(AUTHORIZATION, header_value);
 
         let mut short_builder = reqwest::Client::builder()
+            .no_proxy()
             .default_headers(headers.clone())
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(2))
             .pool_max_idle_per_host(4);
         let mut stream_builder = reqwest::Client::builder()
+            .no_proxy()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(2))
             .pool_max_idle_per_host(4);
@@ -115,6 +152,8 @@ impl MihomoApi {
             stream_client,
             transport,
             base_url,
+            singbox: false,
+            provider_timeout: DEFAULT_PROVIDER_TIMEOUT,
         })
     }
 
@@ -176,10 +215,10 @@ impl MihomoApi {
     /// `PUT /proxies/:group` — select a proxy node for a group.
     pub async fn select_proxy(&self, group: &str, name: &str) -> Result<(), MihomoError> {
         let req = SelectProxyRequest { name: name.to_string() };
-        let path = format!("{}/proxies/{group}", self.base_url);
+        let path = self.path_url(&["proxies", group])?;
         let resp = self
             .client
-            .put(&path)
+            .put(path)
             .json(&req)
             .send()
             .await
@@ -271,12 +310,24 @@ impl MihomoApi {
 
     /// `GET /proxies/:name/delay?timeout=N&url=U` — test delay for a node.
     pub async fn delay_test(&self, name: &str, test_url: &str, timeout_ms: u64) -> Result<ProxyDelay, MihomoError> {
+        let normalized = self.singbox.then(|| crate::core_api::singbox::force_https(test_url));
+        let test_url = normalized.as_deref().unwrap_or(test_url);
+        let deadline = operation_deadline(timeout_ms)?;
         let url = delay_test_url(&self.base_url, name, test_url, timeout_ms)?;
-        let resp = self.client.get(url).send().await.map_err(|e| self.map_http_err(e))?;
+        let resp = self
+            .stream_client
+            .get(url)
+            .timeout(deadline)
+            .send()
+            .await
+            .map_err(|e| self.map_operation_http_err(e, "delay test"))?;
 
         let status = resp.status();
         if status.is_success() {
-            let body = resp.text().await?;
+            let body = resp
+                .text()
+                .await
+                .map_err(|error| self.map_operation_http_err(error, "delay test"))?;
             return serde_json::from_str(&body).map_err(|e| MihomoError::Parse(e.to_string()));
         }
         let body = resp.text().await.unwrap_or_default();
@@ -286,11 +337,69 @@ impl MihomoApi {
         })
     }
 
+    /// Mihomo v1.19.32 provider-scoped node healthcheck. Names are resolved
+    /// only within `provider`, so equal display names from other providers
+    /// cannot redirect the request.
+    pub async fn provider_proxy_delay_test(
+        &self,
+        provider: &str,
+        name: &str,
+        test_url: &str,
+        timeout_ms: u64,
+    ) -> Result<ProxyDelay, MihomoError> {
+        self.require_provider_support("proxy provider healthcheck")?;
+        let mut url = self.path_url(&["providers", "proxies", provider, name, "healthcheck"])?;
+        url.query_pairs_mut()
+            .append_pair("timeout", &timeout_ms.to_string())
+            .append_pair("url", test_url);
+        let deadline = operation_deadline(timeout_ms)?;
+        let response = self
+            .stream_client
+            .get(url)
+            .timeout(deadline)
+            .send()
+            .await
+            .map_err(|error| self.map_operation_http_err(error, "provider healthcheck"))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.map_operation_http_err(error, "provider healthcheck"))?;
+        if status.is_success() {
+            serde_json::from_str(&body).map_err(|error| MihomoError::Parse(error.to_string()))
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
+    /// Build a URL while encoding every dynamic path component as one segment.
+    pub fn path_url(&self, segments: &[&str]) -> Result<Url, MihomoError> {
+        let mut url = Url::parse(&self.base_url).map_err(|error| MihomoError::InvalidUri(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|_| MihomoError::InvalidUri("base URL cannot hold path segments".into()))?
+            .extend(segments.iter().copied());
+        Ok(url)
+    }
+
     fn map_http_err(&self, e: reqwest::Error) -> MihomoError {
-        if e.is_connect() || e.is_timeout() {
+        if e.is_connect() {
             self.core_down()
         } else {
             MihomoError::Http(e)
+        }
+    }
+
+    fn map_operation_http_err(&self, error: reqwest::Error, operation: &str) -> MihomoError {
+        if error.is_timeout() {
+            MihomoError::OperationTimeout {
+                core: self.core_name().into(),
+                operation: operation.into(),
+            }
+        } else {
+            self.map_http_err(error)
         }
     }
 
@@ -298,6 +407,45 @@ impl MihomoApi {
         MihomoError::CoreDown {
             endpoint: self.transport.endpoint_label(),
         }
+    }
+
+    fn core_name(&self) -> &'static str {
+        match self.core_kind() {
+            crate::mihomo_manager::CoreKind::SingBox => "sing-box",
+            crate::mihomo_manager::CoreKind::Mihomo => "mihomo",
+        }
+    }
+
+    fn require_provider_support(&self, operation: &str) -> Result<(), MihomoError> {
+        if self.singbox {
+            return Err(MihomoError::UnsupportedCoreOperation {
+                core: self.core_name().into(),
+                operation: operation.into(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn confirm_ready(&self, client: &reqwest::Client, operation: &str) -> Result<(), MihomoError> {
+        let response = client
+            .get(format!("{}/version", self.base_url))
+            .send()
+            .await
+            .map_err(|error| self.map_operation_http_err(error, operation))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body: response.text().await.unwrap_or_default(),
+            });
+        }
+        let body = response
+            .text()
+            .await
+            .map_err(|error| self.map_operation_http_err(error, operation))?;
+        serde_json::from_str::<MihomoVersion>(&body)
+            .map(|_| ())
+            .map_err(|error| MihomoError::Parse(error.to_string()))
     }
 
     /// Open Mihomo's newline-delimited real-time traffic stream.
@@ -323,10 +471,10 @@ impl MihomoApi {
     }
 
     pub async fn close_connection(&self, id: &str) -> Result<(), MihomoError> {
-        let path = format!("{}/connections/{id}", self.base_url);
+        let path = self.path_url(&["connections", id])?;
         let resp = self
             .client
-            .delete(&path)
+            .delete(path)
             .send()
             .await
             .map_err(|e| self.map_http_err(e))?;
@@ -384,7 +532,30 @@ impl MihomoApi {
     }
 
     /// `GET /providers/rules` — fetch all rule providers.
+    pub async fn get_proxy_providers(&self) -> Result<ProxyProvidersResponse, MihomoError> {
+        self.require_provider_support("list proxy providers")?;
+        let path = self.path_url(&["providers", "proxies"])?;
+        let resp = self
+            .client
+            .get(path)
+            .send()
+            .await
+            .map_err(|error| self.map_http_err(error))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str(&body).map_err(|error| MihomoError::Parse(error.to_string()))
+        } else {
+            Err(MihomoError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
+    /// `GET /providers/rules` — fetch all rule providers.
     pub async fn get_rule_providers(&self) -> Result<RuleProvidersResponse, MihomoError> {
+        self.require_provider_support("list rule providers")?;
         let resp = self
             .client
             .get(format!("{}/providers/rules", self.base_url))
@@ -405,10 +576,25 @@ impl MihomoApi {
 
     /// `PUT /providers/rules/:name` — update a rule provider.
     pub async fn update_rule_provider(&self, name: &str) -> Result<(), MihomoError> {
-        let path = format!("{}/providers/rules/{name}", self.base_url);
-        let resp = self.client.put(&path).send().await.map_err(|e| self.map_http_err(e))?;
+        self.update_rule_provider_with_timeout(name, self.provider_timeout)
+            .await
+    }
+
+    /// Refresh a provider with an explicit bounded deadline, then confirm
+    /// the controller still answers `/version` before reporting success.
+    pub async fn update_rule_provider_with_timeout(&self, name: &str, timeout: Duration) -> Result<(), MihomoError> {
+        self.require_provider_support("refresh rule provider")?;
+        validate_provider_timeout(timeout)?;
+        let path = self.path_url(&["providers", "rules", name])?;
+        let resp = self
+            .stream_client
+            .put(path)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|error| self.map_operation_http_err(error, "rule provider refresh"))?;
         if resp.status().is_success() {
-            Ok(())
+            self.confirm_ready(&self.client, "rule provider refresh").await
         } else {
             Err(MihomoError::HttpStatus {
                 status: resp.status().as_u16(),
@@ -446,12 +632,26 @@ fn delay_test_url(base: &str, name: &str, test_url: &str, timeout_ms: u64) -> Re
     Ok(url)
 }
 
-/// Helper trait for building a client from anything path-like.
-impl MihomoApi {
-    #[allow(dead_code)]
-    pub fn transport(&self) -> &Transport {
-        &self.transport
+const DEFAULT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn validate_provider_timeout(timeout: Duration) -> Result<(), MihomoError> {
+    if timeout.is_zero() || timeout > MAX_PROVIDER_TIMEOUT {
+        return Err(MihomoError::InvalidUri(format!(
+            "provider timeout must be in 1 ms..={} s, got {timeout:?}",
+            MAX_PROVIDER_TIMEOUT.as_secs()
+        )));
     }
+    Ok(())
+}
+
+fn operation_deadline(timeout_ms: u64) -> Result<Duration, MihomoError> {
+    if !(1..=32_767).contains(&timeout_ms) {
+        return Err(MihomoError::InvalidUri(format!(
+            "delay timeout must be in 1..=32767 ms, got {timeout_ms}"
+        )));
+    }
+    Ok(Duration::from_millis(timeout_ms + 5_000))
 }
 
 #[cfg(test)]
@@ -507,14 +707,180 @@ mod tests {
         assert_eq!(query.get("url"), Some(&test_url.to_string()));
     }
 
+    #[test]
+    fn provider_path_encodes_dynamic_segments_and_deadline_is_bounded() {
+        let api = MihomoApi::with_transport(Transport::Tcp("127.0.0.1:9090".parse().unwrap()), "s").unwrap();
+        let url = api
+            .path_url(&["providers", "proxies", "a/b", "node #1", "healthcheck"])
+            .unwrap();
+        assert!(url.path().contains("a%2Fb"));
+        assert!(url.path().contains("node%20%231"));
+        assert_eq!(operation_deadline(32_767).unwrap(), Duration::from_millis(37_767));
+        assert!(operation_deadline(0).is_err());
+        assert!(operation_deadline(32_768).is_err());
+    }
+
+    #[test]
+    fn provider_healthcheck_encodes_each_path_segment() {
+        let api = MihomoApi::with_transport(Transport::Tcp("127.0.0.1:9090".parse().unwrap()), "s").unwrap();
+        let url = api
+            .path_url(&["providers", "proxies", "provider/a", "node #1", "healthcheck"])
+            .unwrap();
+        assert!(url.path().contains("provider%2Fa"), "{}", url.path());
+        assert!(url.path().contains("node%20%231"), "{}", url.path());
+        assert_eq!(
+            api.path_url(&["proxies", "group/a#b"]).unwrap().path(),
+            "/proxies/group%2Fa%23b"
+        );
+    }
+
+    #[test]
+    fn delay_deadline_rejects_values_outside_controller_integer_range() {
+        assert_eq!(operation_deadline(32_767).unwrap(), Duration::from_millis(37_767));
+        assert!(operation_deadline(0).is_err());
+        assert!(operation_deadline(32_768).is_err());
+        assert_eq!(operation_deadline(6_000).unwrap(), Duration::from_secs(11));
+    }
+
+    #[test]
+    fn provider_deadline_defaults_to_30_seconds_and_rejects_out_of_range_values() {
+        let api = MihomoApi::with_transport(Transport::Tcp("127.0.0.1:9090".parse().unwrap()), "s").unwrap();
+        assert_eq!(api.provider_timeout, Duration::from_secs(30));
+        assert!(validate_provider_timeout(Duration::ZERO).is_err());
+        assert!(validate_provider_timeout(Duration::from_secs(121)).is_err());
+        let api = MihomoApi::with_transport(Transport::Tcp("127.0.0.1:9090".parse().unwrap()), "s").unwrap();
+        assert_eq!(
+            api.with_provider_timeout(Duration::from_secs(45))
+                .unwrap()
+                .provider_timeout,
+            Duration::from_secs(45)
+        );
+    }
+
+    #[tokio::test]
+    async fn singbox_provider_operations_are_rejected_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s")
+            .unwrap()
+            .for_core(crate::mihomo_manager::CoreKind::SingBox);
+        assert_eq!(api.core_kind(), crate::mihomo_manager::CoreKind::SingBox);
+        assert!(!api.supports_providers());
+        for result in [
+            api.get_rule_providers().await.map(|_| ()),
+            api.get_proxy_providers().await.map(|_| ()),
+            api.update_rule_provider("p").await,
+            api.provider_proxy_delay_test("p", "n", "https://example.test", 500)
+                .await
+                .map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(MihomoError::UnsupportedCoreOperation { .. })));
+        }
+        let listener = listener.into_std().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+    }
+
+    #[tokio::test]
+    async fn singbox_delay_client_normalizes_http_url_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            assert!(request.contains("url=https%3A%2F%2Fexample.test%2Fprobe"), "{request}");
+            write_response(&mut stream, "200 OK", r#"{"delay":8}"#).await;
+        });
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s")
+            .unwrap()
+            .for_core(crate::mihomo_manager::CoreKind::SingBox);
+        assert_eq!(
+            api.delay_test("node", "http://example.test/probe", 500)
+                .await
+                .unwrap()
+                .delay,
+            8
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_encodes_path_waits_for_version_and_reports_success_after_readiness() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (status, body) in [("204 No Content", ""), ("200 OK", r#"{"version":"1.19.32"}"#)] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                write_response(&mut stream, status, body).await;
+            }
+            requests
+        });
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s").unwrap();
+        api.update_rule_provider_with_timeout("provider/name #1", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].starts_with("PUT /providers/rules/provider%2Fname%20%231 "),
+            "{}",
+            requests[0]
+        );
+        assert!(requests[1].starts_with("GET /version "), "{}", requests[1]);
+    }
+
+    #[tokio::test]
+    async fn provider_request_timeout_is_not_classified_as_core_down() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await;
+            std::future::pending::<()>().await;
+        });
+        let api = MihomoApi::with_transport(Transport::Tcp(addr), "s").unwrap();
+        let error = api
+            .update_rule_provider_with_timeout("provider", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, MihomoError::OperationTimeout { ref core, ref operation }
+            if core == "mihomo" && operation == "rule provider refresh"),
+            "{error:?}"
+        );
+        server.abort();
+    }
+
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 512];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 8192 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    async fn write_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_version_against_missing_socket() {
-        // Pick a path that almost certainly does not exist.
-        let path = PathBuf::from("/tmp/nonexistent-uds-for-mihomo-api-test.sock");
-        if path.exists() {
-            eprintln!("skipping: {} unexpectedly exists", path.display());
-            return;
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.sock");
 
         let api = MihomoApi::new(path.clone(), "secret").expect("build");
         let res = api.version().await;
@@ -528,14 +894,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_version_against_missing_tcp_endpoint() {
-        // Port 1 on loopback is never the controller in practice.
-        let addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
-        let api = MihomoApi::with_transport(Transport::Tcp(addr), "secret").expect("build");
+    async fn test_version_unavailable_endpoint_is_core_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.sock");
+        let api = MihomoApi::new(path.clone(), "secret").expect("build");
         let res = api.version().await;
         match res {
             Err(MihomoError::CoreDown { endpoint }) => {
-                assert_eq!(endpoint, "127.0.0.1:1");
+                assert_eq!(endpoint, path.display().to_string());
             }
             Err(other) => panic!("expected CoreDown, got {other:?}"),
             Ok(v) => panic!("expected CoreDown, got Ok({v:?})"),
@@ -547,8 +913,8 @@ mod tests {
         // Bind a temp Unix socket, accept one connection, read the
         // request bytes, assert the Authorization header is present,
         // and reply with a minimal /version body.
-        let tmp = std::env::temp_dir().join(format!("mihomo-api-test-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("controller.sock");
 
         let listener = UnixListener::bind(&tmp).expect("bind uds");
         let ready = Arc::new(Notify::new());

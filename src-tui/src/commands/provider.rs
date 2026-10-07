@@ -3,6 +3,7 @@
 use crate::mihomo_manager::manager::MihomoManager;
 
 pub async fn list(manager: &MihomoManager, json: bool) -> anyhow::Result<()> {
+    ensure_provider_api(manager)?;
     let api = super::running_api(manager).await?;
     let mut providers: Vec<_> = api.get_rule_providers().await?.providers.into_values().collect();
     providers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -31,6 +32,7 @@ pub async fn list(manager: &MihomoManager, json: bool) -> anyhow::Result<()> {
 }
 
 pub async fn update(manager: &MihomoManager, name: Option<&str>, all: bool) -> anyhow::Result<()> {
+    ensure_provider_api(manager)?;
     let api = super::running_api(manager).await?;
     let names: Vec<String> = if all {
         let mut names: Vec<String> = api.get_rule_providers().await?.providers.into_keys().collect();
@@ -54,6 +56,15 @@ pub async fn update(manager: &MihomoManager, name: Option<&str>, all: bool) -> a
     }
     if failed > 0 {
         anyhow::bail!("{failed} of {} rule provider update(s) failed", names.len());
+    }
+    Ok(())
+}
+
+fn ensure_provider_api(manager: &MihomoManager) -> anyhow::Result<()> {
+    if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+        anyhow::bail!(
+            "rule-provider listing and refresh are unsupported by the sing-box clash_api; use sing-box native route/rule-set configuration"
+        );
     }
     Ok(())
 }

@@ -40,15 +40,18 @@ impl ProfileStore {
     ///
     /// Prevents a late-failing concurrent switch from overwriting a successful one.
     pub async fn restore_current_if_matches(expected: &str, previous: Option<&str>) -> anyhow::Result<()> {
-        let Some(previous) = previous else {
-            return Ok(());
-        };
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
         if store.current_uid().as_deref() != Some(expected) {
             return Ok(());
         }
-        store.set_current(previous).await
+        match previous {
+            Some(previous) => store.set_current(previous).await,
+            None => {
+                store.profiles.current = None;
+                store.profiles.save_file().await
+            }
+        }
     }
 
     /// Import a subscription URL under the shared IO lock.
@@ -159,7 +162,7 @@ impl ProfileStore {
 
     /// Unlocked load — callers that mutate must use the `*_locked` helpers.
     async fn load_unlocked() -> anyhow::Result<Self> {
-        let profiles = IProfiles::new().await;
+        let profiles = IProfiles::new().await?;
         Ok(Self { profiles })
     }
 
@@ -205,6 +208,7 @@ impl ProfileStore {
         self.profiles.patch_config(&IProfiles {
             current: Some(uid),
             items: None,
+            ..Default::default()
         });
         self.profiles
             .save_file()
@@ -343,7 +347,9 @@ pub(crate) mod tests {
 
     /// The single test app-home root shared by every disk-backed test.
     pub(crate) fn test_app_home_root() -> std::path::PathBuf {
-        std::env::temp_dir().join("clash-verge-cli-tui-tests")
+        static ROOT: std::sync::LazyLock<tempfile::TempDir> =
+            std::sync::LazyLock::new(|| tempfile::tempdir().expect("isolated test app home"));
+        ROOT.path().to_path_buf()
     }
 
     /// Overrides the process-global app home under `TEST_APP_HOME_DIR_LOCK` via
@@ -367,6 +373,35 @@ pub(crate) mod tests {
         ProfileStore {
             profiles: IProfiles::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_first_switch_restores_unselected_state_without_overwriting_a_later_switch() {
+        let root = test_app_home_root();
+        let _guard = claim_test_app_home(root.clone()).await;
+        let profiles = IProfiles {
+            current: Some("failed".into()),
+            items: Some(vec![
+                PrfItem {
+                    uid: Some("failed".into()),
+                    ..Default::default()
+                },
+                PrfItem {
+                    uid: Some("later".into()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        profiles.save_file().await.unwrap();
+        ProfileStore::restore_current_if_matches("failed", None).await.unwrap();
+        assert!(ProfileStore::snapshot().await.unwrap().current_uid().is_none());
+        ProfileStore::replace_current_locked("later").await.unwrap();
+        ProfileStore::restore_current_if_matches("failed", None).await.unwrap();
+        assert_eq!(
+            ProfileStore::snapshot().await.unwrap().current_uid().as_deref(),
+            Some("later")
+        );
     }
 
     #[tokio::test]
@@ -510,6 +545,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                 ]),
+                ..Default::default()
             },
         };
 
@@ -543,6 +579,7 @@ pub(crate) mod tests {
                         ..Default::default()
                     },
                 ]),
+                ..Default::default()
             },
         };
 

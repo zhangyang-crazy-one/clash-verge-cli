@@ -18,7 +18,10 @@ use crate::tui::handlers::{self, Ctx, Flow};
 
 pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let guard = std::sync::Arc::new(tokio::sync::Mutex::new(TerminalGuard::new()?));
-    let (action_tx, mut action_rx) = mpsc::unbounded_channel::<Action>();
+    let (action_tx, mut action_rx) = mpsc::channel::<Action>(256);
+    let (traffic_tx, mut traffic_rx) = tokio::sync::watch::channel(None);
+    let (log_tx, mut log_rx) = tokio::sync::mpsc::channel(256);
+    let dropped_logs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let manager = crate::commands::build_manager(config_dir).await?;
     manager.set_action_tx(action_tx.clone());
@@ -52,9 +55,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         guard.lock().await.enable_mouse()?;
     }
 
+    let local_actions = std::sync::Arc::new(parking_lot::Mutex::new(handlers::LocalActionQueue::new()));
+    let action_sender = crate::tui::background::EventSender::new(action_tx)
+        .with_manager(manager.inner())
+        .with_local(local_actions.clone());
     let ctx = Ctx {
         manager,
-        tx: action_tx,
+        tx: action_sender,
+        traffic_tx,
+        log_tx,
+        dropped_logs: dropped_logs.clone(),
+        local_actions,
         guard,
         keys: tui_config.keys,
     };
@@ -76,18 +87,22 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
         crate::subscribe::scheduler::AutoUpdateScheduler::new(),
     ));
     let mut rendered_view = app.view;
+    let mut dirty = true;
+    let mut work_generation = ctx.tx.current_generation();
 
     // Detect a core the CLI itself started earlier (standalone socket).
     // The GUI is never probed.
     let api = ctx.manager.api();
-    let tx = ctx.tx.clone();
-    tokio::spawn(async move {
+    let tx = ctx.tx.for_current();
+    ctx.tx.for_current().spawn(async move {
         if api.version().await.is_ok() {
-            let _ = tx.send(Action::CoreStarted {
-                version: None,
-                binary_path: None,
-                binary_source: None,
-            });
+            let _ = tx
+                .send(Action::CoreStarted {
+                    version: None,
+                    binary_path: None,
+                    binary_source: None,
+                })
+                .await;
         }
         // If no controller is available, the user can press s to start one.
     });
@@ -97,15 +112,17 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     // candidate; refreshes again on CoreStarted / after explicit setup.
     {
         let manager = ctx.manager.clone();
-        let tx = ctx.tx.clone();
-        tokio::spawn(async move {
+        let tx = ctx.tx.for_current();
+        ctx.tx.for_current().spawn(async move {
             let binary = manager
                 .binary_path()
                 .or_else(crate::mihomo_manager::binary::candidate_without_install);
             if let Some(path) = binary {
-                let _ = tx.send(Action::TunCapabilityState(
-                    crate::commands::privilege::has_tun_capability(&path),
-                ));
+                let _ = tx
+                    .send(Action::TunCapabilityState(
+                        crate::commands::privilege::has_tun_capability(&path),
+                    ))
+                    .await;
             }
         });
     }
@@ -116,13 +133,51 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     let mut loop_error: Option<anyhow::Error> = None;
 
     loop {
+        if work_generation != ctx.tx.current_generation() {
+            work_generation = ctx.tx.current_generation();
+            auto_update_in_flight = false;
+        }
+        if ctx.local_actions.lock().take_overflow() {
+            app.status_msg = Some("Too many local requests; retry the last operation".into());
+            dirty = true;
+        }
+        let mut quit_after_local = false;
+        while let Some(action) = ctx.take_local_action() {
+            dirty = true;
+            if handlers::handle_event(&mut app, &ctx, action).await == Flow::Quit {
+                loop_error = None;
+                quit_after_local = true;
+                break;
+            }
+        }
+        if quit_after_local {
+            break;
+        }
         tokio::select! {
+            changed = traffic_rx.changed() => if changed.is_ok() {
+                if let Some((generation, core_generation, traffic)) = traffic_rx.borrow_and_update().clone()
+                    && generation == ctx.tx.current_generation()
+                    && core_generation == ctx.manager.current_generation() {
+                    handlers::handle_event(&mut app, &ctx, Action::TrafficFetched(traffic)).await;
+                    dirty = true;
+                }
+            },
+            Some((generation, core_generation, log)) = log_rx.recv() => {
+                if generation != ctx.tx.current_generation() || core_generation != ctx.manager.current_generation() { continue; }
+                let dropped = dropped_logs.swap(0, std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    app.status_msg = Some(format!("dropped {dropped} live log entries under load"));
+                }
+                handlers::handle_event(&mut app, &ctx, Action::LogReceived(log)).await;
+                dirty = true;
+            },
             maybe_event = events.next() => match maybe_event {
                 Some(Ok(Event::Resize(_, _))) => {
                     if let Err(error) = ctx.guard.lock().await.reset_screen() {
                         loop_error = Some(error);
                         break;
                     }
+                    dirty = true;
                 }
                 Some(Ok(Event::Mouse(mouse))) => {
                     let screen = match ctx.guard.lock().await.terminal_mut().size() {
@@ -134,11 +189,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     };
                     let screen = ratatui::layout::Rect::new(0, 0, screen.width, screen.height);
                     handlers::handle_mouse(&mut app, &ctx, mouse, screen).await;
+                    dirty = true;
                 }
                 Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => {
                     // Sing-box / rule-edit prompt buffers are typed text —
                     // the key map does not know their grammar, so handle
                     // them here before the global dispatch.
+                    dirty = true;
                     if handle_singbox_input_mode(&mut app, &ctx, key.code) {
                         // Input-mode key consumed; do not propagate.
                     } else {
@@ -146,6 +203,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                         if flow == Flow::Quit {
                             break;
                         }
+                        dirty = true;
                     }
                 }
                 Some(Err(_)) | None => break,
@@ -156,15 +214,21 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 // Loop-owned state: the auto-update round guard.
                 Some(Action::AutoUpdateFinished) => auto_update_in_flight = false,
                 Some(action) => {
+                    let Some(action) = ctx.tx.accept(action) else { continue; };
+                    if matches!(action, Action::AutoUpdateFinished) { auto_update_in_flight = false; continue; }
                     let flow = handlers::handle_event(&mut app, &ctx, action).await;
                     if flow == Flow::Quit {
                         break;
                     }
+                    dirty = true;
                 }
                 None => break,
             },
 
             _ = render_tick.tick() => {
+                if !dirty {
+                    continue;
+                }
                 if app.view != rendered_view {
                     // Orca's terminal renderer can retain differential cells across
                     // alternate-screen view changes. Force one clean repaint per route.
@@ -178,24 +242,25 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                     loop_error = Some(error.into());
                     break;
                 }
+                dirty = false;
             }
 
             _ = runtime_refresh_tick.tick(), if app.core_state == CoreState::Running => {
-                let _ = ctx.tx.send(Action::TrafficRefresh);
+                ctx.send(Action::TrafficRefresh);
                 match app.view {
                     View::Connections => {
-                        let _ = ctx.tx.send(Action::ConnectionsRefresh);
+                        ctx.send(Action::ConnectionsRefresh);
                     }
                     View::Logs => {
-                        let _ = ctx.tx.send(Action::LogsRefresh);
+                        ctx.send(Action::LogsRefresh);
                     }
                     _ => {}
                 }
             }
 
             _ = home_refresh_tick.tick(), if app.core_state == CoreState::Running && app.view == View::Home => {
-                let _ = ctx.tx.send(Action::ProxiesRefresh);
-                let _ = ctx.tx.send(Action::ConnectionsRefresh);
+                ctx.send(Action::ProxiesRefresh);
+                ctx.send(Action::ConnectionsRefresh);
             }
 
             _ = auto_update_tick.tick(), if !auto_update_in_flight => {
@@ -208,6 +273,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
                 // take effect without restarting the TUI.
                 if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
                     app.load_profiles(&store);
+                    dirty = true;
                 }
             }
         }
@@ -218,16 +284,28 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     // runs on EVERY exit path — clean quit AND render/reset errors captured
     // in `loop_error` above. A core adopted from `clash-verge-cli start`
     // keeps running under its own supervisor.
-    if ctx.manager.owns_child() {
-        let _ = ctx.manager.stop().await;
-    }
+    action_rx.close();
+    ctx.tx.cancel_and_wait().await;
+    finish_loop(loop_error, async {
+        if ctx.manager.owns_child() {
+            ctx.manager.stop().await?;
+        }
+        Ok(())
+    })
+    .await
+}
 
-    // Surface any loop error only after the owned core has been stopped.
-    if let Some(error) = loop_error {
-        return Err(error);
+/// Draw/reset failures still await owned cleanup before returning the error.
+async fn finish_loop<F>(loop_error: Option<anyhow::Error>, cleanup: F) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let cleanup_result = cleanup.await;
+    match (loop_error, cleanup_result) {
+        (Some(error), Err(cleanup)) => Err(error.context(format!("owned core cleanup also failed: {cleanup}"))),
+        (Some(error), Ok(())) => Err(error),
+        (None, result) => result,
     }
-
-    Ok(())
 }
 
 /// Handle a key while a sing-box / rule-edit input-mode prompt is open.
@@ -392,12 +470,20 @@ fn handle_rule_set_prompt(app: &mut App, code: KeyCode, buffer: ModeBuffer) {
                     entry["path"] = serde_json::json!(loc);
                 }
                 if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
-                    let mut sets = crate::singbox::load_rule_sets(&home);
-                    sets.push(entry);
-                    let _ = crate::singbox::save_rule_sets(&home, &sets);
-                    app.rule_sets_edit = sets;
-                    app.rules_edit_dirty = true;
-                    app.status_msg = Some(format!("rule-set added: {tag}"));
+                    match crate::singbox::load_rule_sets(&home) {
+                        Ok(mut sets) => {
+                            sets.push(entry);
+                            match crate::singbox::save_rule_sets(&home, &sets) {
+                                Ok(()) => {
+                                    app.rule_sets_edit = sets;
+                                    app.rules_edit_dirty = true;
+                                    app.status_msg = Some(format!("rule-set added: {tag}"));
+                                }
+                                Err(error) => app.status_msg = Some(format!("rule-set save failed: {error}")),
+                            }
+                        }
+                        Err(error) => app.status_msg = Some(format!("rule-set load failed: {error}")),
+                    }
                 }
             } else {
                 app.status_msg = Some("expected tag|remote|url or tag|local|path".into());
@@ -568,6 +654,19 @@ fn handle_dns_resolver_prompt(app: &mut App, ctx: &Ctx, code: KeyCode, buffer: M
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn render_failure_waits_for_cleanup_and_preserves_both_errors() {
+        let cleaned = std::sync::atomic::AtomicBool::new(false);
+        let result = finish_loop(Some(anyhow::anyhow!("draw failed")), async {
+            cleaned.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(anyhow::anyhow!("cleanup failed"))
+        })
+        .await;
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("draw failed") && message.contains("cleanup failed"));
+    }
+
     #[test]
     fn mode_buffer_pop_and_push_round_trip() {
         let buffer = ModeBuffer::RuleSet("a|b".to_string());
@@ -622,10 +721,14 @@ mod tests {
     }
 
     fn dummy_ctx() -> Ctx {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
         Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx,
+            tx: tx.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(handlers::LocalActionQueue::new())),
             guard: std::sync::Arc::new(tokio::sync::Mutex::new(TerminalGuard::detached())),
             keys: crate::tui::keymap::KeyMap::default(),
         }

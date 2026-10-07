@@ -361,6 +361,25 @@ rules: [MATCH,PROXY]
     }
 
     #[test]
+    fn use_tun_preserves_an_explicit_fake_ip_range6() {
+        let config = use_tun(
+            mapping(
+                r#"{ipv6: true, tun: {enable: false}, dns: {ipv6: true, enhanced-mode: fake-ip, fake-ip-range6: "fd12:3456:789a::1/64"}}"#,
+            ),
+            true,
+        );
+        assert_eq!(
+            config
+                .get("dns")
+                .and_then(Value::as_mapping)
+                .and_then(|dns| dns.get("fake-ip-range6"))
+                .and_then(Value::as_str),
+            Some("fd12:3456:789a::1/64"),
+            "an explicit profile IPv6 fake-IP range must survive TUN enhancement"
+        );
+    }
+
+    #[test]
     fn use_tun_sets_enable_flag() {
         let config = use_tun(mapping(r#"{tun: {enable: false}, ipv6: true}"#), true);
         assert_eq!(

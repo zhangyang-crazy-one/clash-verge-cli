@@ -1,4 +1,4 @@
-use super::prfitem::PrfItem;
+use super::prfitem::{PrfItem, merge_unknown_fields};
 use crate::utils::{dirs, help};
 use anyhow::{Context as _, Result, bail};
 use compact_str::CompactString as String;
@@ -36,6 +36,10 @@ pub struct IProfiles {
 
     /// profile list
     pub items: Option<Vec<PrfItem>>,
+
+    /// Preserve profile metadata written by newer GUI versions.
+    #[serde(flatten)]
+    pub extra: Mapping,
 }
 
 pub struct IProfilePreview<'a> {
@@ -53,24 +57,22 @@ pub struct CleanupResult {
 }
 
 impl IProfiles {
-    pub async fn new() -> Self {
-        let path = match dirs::profiles_path() {
-            Ok(p) => p,
-            Err(_) => return Self::default(),
+    pub async fn new() -> Result<Self> {
+        let path = dirs::profiles_path()?;
+        let mut profiles = match fs::metadata(&path).await {
+            Ok(_) => help::read_yaml::<Self>(&path)
+                .await
+                .with_context(|| format!("cannot load profile config {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
         };
-
-        match help::read_yaml::<Self>(&path).await {
-            Ok(mut profiles) => {
-                let items = profiles.items.get_or_insert_with(Vec::new);
-                for item in items.iter_mut() {
-                    if item.uid.is_none() {
-                        item.uid = Some(help::get_uid("d").into());
-                    }
-                }
-                profiles
+        let items = profiles.items.get_or_insert_with(Vec::new);
+        for item in items.iter_mut() {
+            if item.uid.is_none() {
+                item.uid = Some(help::get_uid("d").into());
             }
-            Err(_) => Self::default(),
         }
+        Ok(profiles)
     }
 
     pub async fn save_file(&self) -> Result<()> {
@@ -194,14 +196,21 @@ impl IProfiles {
                     each.selected = Some(selected.clone());
                 }
                 if let Some(extra) = &item.extra {
-                    each.extra = Some(*extra);
+                    let mut updated = extra.clone();
+                    if let Some(current) = &each.extra {
+                        let mut unknown = current.unknown_fields.clone();
+                        merge_unknown_fields(&mut unknown, &updated.unknown_fields);
+                        updated.unknown_fields = unknown;
+                    }
+                    each.extra = Some(updated);
                 }
                 if let Some(updated) = &item.updated {
                     each.updated = Some(*updated);
                 }
                 if let Some(option) = &item.option {
-                    each.option = Some(option.clone());
+                    each.option = PrfOption::merge(each.option.as_ref(), Some(option));
                 }
+                merge_unknown_fields(&mut each.unknown_fields, &item.unknown_fields);
 
                 self.items = Some(items);
                 return self.save_file().await;
@@ -243,7 +252,16 @@ impl IProfiles {
 
             for each in items.iter_mut() {
                 if each.uid == some_uid {
-                    each.extra = item.extra;
+                    if let Some(mut updated) = item.extra.clone() {
+                        if let Some(current) = &each.extra {
+                            let mut unknown = current.unknown_fields.clone();
+                            merge_unknown_fields(&mut unknown, &updated.unknown_fields);
+                            updated.unknown_fields = unknown;
+                        }
+                        each.extra = Some(updated);
+                    } else {
+                        each.extra = None;
+                    }
                     each.updated = item.updated;
                     each.home = item.home.to_owned();
                     each.option = PrfOption::merge(each.option.as_ref(), item.option.as_ref());
@@ -457,6 +475,81 @@ impl IProfiles {
 
     fn is_profile_file(filename: &str) -> bool {
         profile_file_regex().is_match(filename)
+    }
+}
+
+#[cfg(test)]
+mod lossless_config_tests {
+    use super::IProfiles;
+    use serde_yaml_ng::Value;
+
+    #[test]
+    fn typed_profile_edits_keep_unknown_root_and_nested_yaml() {
+        let source = r#"
+future_root:
+  mode: strict
+  sequence: [one, two]
+current: R1
+items:
+  - uid: R1
+    type: remote
+    name: old
+    future_item:
+      nested: [kept]
+    selected:
+      - name: Auto
+        now: Tokyo
+        future_selection: true
+    extra:
+      upload: 1
+      download: 2
+      total: 3
+      expire: 4
+      future_usage: [kept]
+    option:
+      user_agent: old-agent
+      future_option:
+        retry: 5
+"#;
+        let mut profiles: IProfiles = serde_yaml_ng::from_str(source).unwrap();
+        let item = profiles.items.as_mut().unwrap().first_mut().unwrap();
+        item.name = Some("edited".into());
+        item.option.as_mut().unwrap().user_agent = Some("new-agent".into());
+
+        let output = serde_yaml_ng::to_string(&profiles).unwrap();
+        let actual: Value = serde_yaml_ng::from_str(&output).unwrap();
+        let original: Value = serde_yaml_ng::from_str(source).unwrap();
+        assert_eq!(actual["future_root"], original["future_root"]);
+        assert_eq!(actual["items"][0]["future_item"], original["items"][0]["future_item"]);
+        assert_eq!(
+            actual["items"][0]["selected"][0]["future_selection"],
+            original["items"][0]["selected"][0]["future_selection"]
+        );
+        assert_eq!(
+            actual["items"][0]["extra"]["future_usage"],
+            original["items"][0]["extra"]["future_usage"]
+        );
+        assert_eq!(
+            actual["items"][0]["option"]["future_option"],
+            original["items"][0]["option"]["future_option"]
+        );
+        assert_eq!(actual["items"][0]["name"], Value::from("edited"));
+        assert_eq!(actual["items"][0]["option"]["user_agent"], Value::from("new-agent"));
+    }
+
+    #[test]
+    fn profile_option_merge_keeps_base_unknowns_and_applies_override_unknowns() {
+        let base: super::PrfOption =
+            serde_yaml_ng::from_str("user_agent: base\nfuture: {base: true, shared: base}\n").unwrap();
+        let overlay: super::PrfOption =
+            serde_yaml_ng::from_str("timeout_seconds: 12\nfuture: {shared: overlay, added: true}\n").unwrap();
+        let merged = super::PrfOption::merge(Some(&base), Some(&overlay)).unwrap();
+        let value: Value = serde_yaml_ng::to_value(merged).unwrap();
+        assert_eq!(value["user_agent"], Value::from("base"));
+        assert_eq!(value["timeout_seconds"], Value::from(12));
+        assert_eq!(value["future"]["base"], Value::from(true));
+        assert_eq!(value["future"]["shared"], Value::from("overlay"));
+        assert_eq!(value["future"]["added"], Value::from(true));
     }
 }
 

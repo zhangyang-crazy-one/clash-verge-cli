@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 /// Managed (auto-downloaded) mihomo stable version — compile-time fallback
 /// when GitHub API is unreachable.
-pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.29";
+pub const MIHOMO_FALLBACK_VERSION: &str = "v1.19.32";
 
 const MIHOMO_REPO: &str = "MetaCubeX/mihomo";
 
@@ -46,15 +46,24 @@ pub async fn latest_mihomo_version() -> &'static str {
 /// `$XDG_DATA_HOME/clash-verge-cli/mihomo` with a fallback to
 /// `~/.local/share/clash-verge-cli/mihomo` for systems without XDG.
 pub fn mihomo_binary_path() -> PathBuf {
-    if let Some(data_dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_dir).join("clash-verge-cli").join("mihomo");
+    managed_binary_path(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        "mihomo",
+    )
+}
+
+/// Pure XDG/HOME resolver so path policy can be tested without mutating the
+/// process environment (which is shared by unrelated tests and callers).
+pub(crate) fn managed_binary_path(xdg_data_home: Option<&Path>, home: Option<&Path>, name: &str) -> PathBuf {
+    if let Some(data_dir) = xdg_data_home {
+        return data_dir.join("clash-verge-cli").join(name);
     }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home)
+    home.unwrap_or_else(|| Path::new(""))
         .join(".local")
         .join("share")
         .join("clash-verge-cli")
-        .join("mihomo")
+        .join(name)
 }
 
 /// Best-effort system mihomo fallback. Checks standard XDG `bin` first,
@@ -127,7 +136,15 @@ pub struct ResolvedMihomo {
 /// 2. Managed data-dir binary at the detected latest version (download/upgrade as needed)
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     if let Some(system) = system_mihomo() {
-        let version = read_mihomo_version(&system).await?.unwrap_or_else(|| "unknown".into());
+        let version = read_mihomo_version(&system)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("mihomo at {} did not report a valid version", system.display()))?;
+        if !super::core_policy::is_compatible("mihomo", &version, super::core_policy::MIHOMO_POLICY_VERSION)? {
+            anyhow::bail!(
+                "{}",
+                super::core_policy::incompatibility("mihomo", &version, super::core_policy::MIHOMO_POLICY_VERSION)
+            );
+        }
         return Ok(ResolvedMihomo {
             path: system,
             source: MihomoBinarySource::System,
@@ -135,9 +152,10 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
         });
     }
 
-    // Only the managed binary depends on the latest release; a system
-    // binary must not wait on the GitHub API.
-    let target_version = latest_mihomo_version().await;
+    // Latest is update-discovery data only; launch selection stays pinned to
+    // the compatibility baseline until its tested policy is deliberately moved.
+    let target_version = MIHOMO_FALLBACK_VERSION;
+    let _discovered_latest = latest_mihomo_version().await;
     let managed = mihomo_binary_path();
     // Hold both locks across check → download → install so concurrent
     // starts (TUI + CLI + systemd service) never race on the managed path.
@@ -145,7 +163,7 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     let _in_process = INSTALL_LOCK.lock().await;
     let _cross_process = lock_install(&managed).await?;
 
-    if let Some(version) = managed_version_if_current(&managed, target_version).await {
+    if let Some(version) = managed_version_if_compatible(&managed).await? {
         ensure_executable(&managed).await?;
         return Ok(ResolvedMihomo {
             path: managed,
@@ -154,6 +172,14 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
         });
     }
 
+    if let Some(observed) = read_mihomo_version(&managed).await? {
+        if super::core_policy::is_newer_than(&observed, target_version)? {
+            anyhow::bail!(
+                "{}",
+                super::core_policy::incompatibility("mihomo", &observed, super::core_policy::MIHOMO_POLICY_VERSION)
+            );
+        }
+    }
     download_managed_mihomo(&managed, target_version).await?;
     Ok(ResolvedMihomo {
         path: managed,
@@ -162,12 +188,78 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedMihomo> {
     })
 }
 
-async fn managed_version_if_current(managed: &Path, target_version: &str) -> Option<String> {
+async fn managed_version_if_compatible(managed: &Path) -> anyhow::Result<Option<String>> {
     if !managed.exists() {
-        return None;
+        return Ok(None);
     }
-    let version = read_mihomo_version(managed).await.ok().flatten()?;
-    version_matches_target(&version, target_version).then_some(version)
+    let Some(version) = read_mihomo_version(managed).await? else {
+        return Ok(None);
+    };
+    if super::core_policy::is_compatible("mihomo", &version, super::core_policy::MIHOMO_POLICY_VERSION)? {
+        if verify_cached_digest(managed).await? {
+            Ok(Some(version))
+        } else {
+            Ok(None)
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) async fn verify_cached_digest(path: &Path) -> anyhow::Result<bool> {
+    let bytes = tokio::fs::read(path).await?;
+    let expected = sha256_hex(&bytes);
+    let qualified_receipt = digest_receipt_path(path, &expected);
+    match tokio::fs::read_to_string(&qualified_receipt).await {
+        Ok(value) if value.trim() == format!("sha256:{expected}") => return Ok(true),
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read digest receipt {}", qualified_receipt.display()));
+        }
+    }
+
+    // Legacy single-receipt format remains readable for caches installed by
+    // earlier versions. New installs never replace this file.
+    let legacy_receipt = path.with_extension("sha256");
+    match tokio::fs::read_to_string(&legacy_receipt).await {
+        Ok(value) => Ok(verify_sha256(&bytes, value.trim()).is_ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to read digest receipt {}", legacy_receipt.display())),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn digest_receipt_path(binary: &Path, digest_hex: &str) -> PathBuf {
+    binary.with_extension(format!("sha256.{digest_hex}"))
+}
+
+/// Publish an immutable digest-qualified receipt before atomically replacing
+/// a managed binary. A failed/cancelled binary rename leaves the old binary's
+/// receipt available and the candidate receipt is harmlessly reusable.
+pub(crate) async fn write_digest_receipt(binary: &Path, bytes: &[u8], prefix: &str) -> anyhow::Result<()> {
+    let digest = sha256_hex(bytes);
+    let receipt_path = digest_receipt_path(binary, &digest);
+    let parent = binary.parent().context("managed binary path has no parent")?;
+    let receipt_tmp = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempfile_in(parent)
+        .context("failed to create digest receipt staging file")?;
+    tokio::fs::write(receipt_tmp.path(), format!("sha256:{digest}"))
+        .await
+        .context("failed to write digest receipt")?;
+    receipt_tmp
+        .into_temp_path()
+        .persist(&receipt_path)
+        .with_context(|| format!("failed to install digest receipt to {}", receipt_path.display()))?;
+    Ok(())
 }
 
 /// Lock file guarding the managed binary across processes.
@@ -177,7 +269,7 @@ fn install_lock_path(managed: &Path) -> PathBuf {
 
 /// Take an exclusive `flock` on the install lock file. The lock is released
 /// when the returned file is dropped (or the process dies).
-async fn lock_install(managed: &Path) -> anyhow::Result<std::fs::File> {
+pub(crate) async fn lock_install(managed: &Path) -> anyhow::Result<std::fs::File> {
     let lock_path = install_lock_path(managed);
     if let Some(parent) = lock_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -248,20 +340,34 @@ async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<(
         .error_for_status()
         .with_context(|| format!("mihomo download returned error for {url}"))?;
 
-    let compressed = response.bytes().await.context("failed to read mihomo download body")?;
-
-    match crate::subscribe::client_meta::fetch_release_asset_digest(MIHOMO_REPO, version, &asset_file).await {
-        Some(expected) => {
-            verify_sha256(&compressed, &expected).with_context(|| format!("integrity check failed for {url}"))?;
-            tracing::info!(target: "mihomo", "verified sha256 of {asset_file}");
-        }
-        None => tracing::warn!(
-            target: "mihomo",
-            "no published sha256 digest for {asset_file} (GitHub API unreachable?); relying on the version check"
-        ),
+    let expected = crate::subscribe::client_meta::fetch_release_asset_digest(MIHOMO_REPO, version, &asset_file)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "trusted sha256 metadata unavailable for {asset_file}; preserving the existing mihomo binary"
+            )
+        })?;
+    use tokio_stream::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut compressed = Vec::new();
+    let mut hasher = sha2::Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read mihomo download stream")?;
+        hasher.update(&chunk);
+        compressed.extend_from_slice(&chunk);
     }
+    let actual = format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    verify_sha256_digest(&actual, &expected).with_context(|| format!("integrity check failed for {url}"))?;
+    tracing::info!(target: "mihomo", "verified sha256 of {asset_file}");
 
-    let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
+    let mut decoder = flate2::read::GzDecoder::new(compressed.as_slice());
     let mut binary = Vec::new();
     decoder
         .read_to_end(&mut binary)
@@ -298,6 +404,7 @@ async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<(
         anyhow::bail!("downloaded mihomo reports version {reported}, expected {version}; refusing to install");
     }
 
+    write_digest_receipt(dest, &binary, ".mihomo-receipt-").await?;
     staged
         .persist(dest)
         .with_context(|| format!("failed to install mihomo to {}", dest.display()))?;
@@ -307,14 +414,22 @@ async fn download_managed_mihomo(dest: &Path, version: &str) -> anyhow::Result<(
 }
 
 /// Compare `data` against a GitHub asset digest (`sha256:<hex>`).
-fn verify_sha256(data: &[u8], expected: &str) -> anyhow::Result<()> {
+pub(crate) fn verify_sha256(data: &[u8], expected: &str) -> anyhow::Result<()> {
+    let actual = format!(
+        "sha256:{}",
+        sha2::Sha256::digest(data)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    verify_sha256_digest(&actual, expected)
+}
+
+pub(crate) fn verify_sha256_digest(actual: &str, expected: &str) -> anyhow::Result<()> {
     let expected_hex = expected
         .strip_prefix("sha256:")
         .with_context(|| format!("unsupported digest format: {expected}"))?;
-    let actual_hex: String = sha2::Sha256::digest(data)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let actual_hex = actual.strip_prefix("sha256:").unwrap_or(actual);
     if !actual_hex.eq_ignore_ascii_case(expected_hex) {
         anyhow::bail!("sha256 mismatch: expected {expected_hex}, got {actual_hex}");
     }
@@ -350,6 +465,14 @@ async fn read_mihomo_version(path: &Path) -> anyhow::Result<Option<String>> {
         .await
         .with_context(|| format!("failed to execute {}", path.display()))?;
 
+    if !output.status.success() {
+        anyhow::bail!(
+            "mihomo version probe exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
     let text = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{text}{err}");
@@ -358,16 +481,25 @@ async fn read_mihomo_version(path: &Path) -> anyhow::Result<Option<String>> {
 
 fn extract_version_token(text: &str) -> Option<String> {
     // Examples: "Mihomo Meta v1.19.29", "v1.19.29"
+    let mut found = Vec::new();
     for token in text.split_whitespace() {
         let trimmed = token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
-        if trimmed.starts_with('v') && trimmed.contains('.') {
-            return Some(trimmed.to_string());
-        }
-        if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains('.') {
-            return Some(format!("v{trimmed}"));
+        let candidate = if trimmed.starts_with('v') {
+            trimmed.to_string()
+        } else if trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            format!("v{trimmed}")
+        } else {
+            continue;
+        };
+        if super::core_policy::Version::parse(&candidate).is_ok() {
+            found.push(candidate);
         }
     }
-    None
+    if found.is_empty() || found.iter().any(|v| v != &found[0]) {
+        None
+    } else {
+        found.into_iter().next()
+    }
 }
 
 fn version_matches_target(version: &str, target: &str) -> bool {
@@ -388,47 +520,23 @@ pub(crate) mod tests {
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_mihomo_binary_path_uses_xdg_data_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var_os("XDG_DATA_HOME");
-        // SAFETY: this is a single-threaded test runner for these tests.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/test-xdg");
-        }
-
-        let path = mihomo_binary_path();
+    fn mihomo_managed_path_prefers_xdg_data_home_without_environment_mutation() {
+        let path = managed_binary_path(
+            Some(Path::new("/tmp/test-xdg")),
+            Some(Path::new("/ignored-home")),
+            "mihomo",
+        );
         assert!(path.ends_with("clash-verge-cli/mihomo"), "got {path:?}");
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
+        assert!(path.starts_with("/tmp/test-xdg"));
     }
 
     #[test]
-    fn test_mihomo_binary_path_falls_back_to_home() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
-        let prev_home = std::env::var_os("HOME");
-        unsafe {
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::set_var("HOME", "/tmp/fake-home");
-        }
-
-        let path = mihomo_binary_path();
+    fn mihomo_managed_path_uses_home_fallback_without_environment_mutation() {
+        let path = managed_binary_path(None, Some(Path::new("/tmp/fake-home")), "mihomo");
         assert!(
             path.starts_with("/tmp/fake-home/.local/share/clash-verge-cli/mihomo"),
             "got {path:?}"
         );
-
-        match prev_xdg {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
-        match prev_home {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
     }
 
     #[test]
@@ -440,6 +548,54 @@ pub(crate) mod tests {
         assert_eq!(extract_version_token("v1.19.29"), Some("v1.19.29".into()));
         assert!(version_matches_target("v1.19.29", "v1.19.29"));
         assert!(!version_matches_target("v1.19.25", "v1.19.29"));
+    }
+
+    #[test]
+    fn cached_binary_requires_a_matching_strict_digest_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture-core");
+        let bytes = b"test-owned fixture bytes";
+        std::fs::write(&path, bytes).unwrap();
+        let receipt = format!(
+            "sha256:{}",
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        std::fs::write(path.with_extension("sha256"), receipt).unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(verify_cached_digest(&path).await.unwrap());
+            std::fs::write(&path, b"changed fixture bytes").unwrap();
+            assert!(!verify_cached_digest(&path).await.unwrap());
+            std::fs::write(path.with_extension("sha256"), "sha256:not-a-digest").unwrap();
+            assert!(!verify_cached_digest(&path).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn failed_or_cancelled_binary_replace_keeps_old_digest_receipt_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture-core");
+        let old_bytes = b"old cached fixture binary";
+        let candidate_bytes = b"new staged fixture binary";
+        std::fs::write(&path, old_bytes).unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            write_digest_receipt(&path, old_bytes, ".fixture-receipt-")
+                .await
+                .unwrap();
+            assert!(verify_cached_digest(&path).await.unwrap());
+
+            // Model cancellation or a failed final rename after the candidate
+            // receipt is durable but before the binary replacement commits.
+            write_digest_receipt(&path, candidate_bytes, ".fixture-receipt-")
+                .await
+                .unwrap();
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), old_bytes);
+            assert!(verify_cached_digest(&path).await.unwrap());
+        });
     }
 
     #[test]

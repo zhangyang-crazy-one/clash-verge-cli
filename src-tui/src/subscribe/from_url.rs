@@ -103,10 +103,12 @@ pub async fn from_url(
             timeout_seconds: option.and_then(|o| o.timeout_seconds),
             danger_accept_invalid_certs: option.and_then(|o| o.danger_accept_invalid_certs),
             trusted_hosts: option.and_then(|o| o.trusted_hosts.clone()),
+            unknown_fields: option.map(|o| o.unknown_fields.clone()).unwrap_or_default(),
         }),
         home,
         updated: Some(chrono::Local::now().timestamp() as usize),
         file_data: Some(CompactString::from(data)),
+        ..Default::default()
     };
 
     Ok(RemoteProfileBundle { item, fragments })
@@ -203,6 +205,7 @@ pub fn parse_subscription_userinfo(headers: &HashMap<String, String>) -> Option<
                 download: help::parse_str(value, "download").unwrap_or(0),
                 total: help::parse_str(value, "total").unwrap_or(0),
                 expire: help::parse_str(value, "expire").unwrap_or(0),
+                ..Default::default()
             });
         }
     }

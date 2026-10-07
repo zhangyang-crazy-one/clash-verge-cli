@@ -1,9 +1,12 @@
 use crate::config::DEFAULT_PAC;
 use crate::utils::{dirs, help};
-use anyhow::Result;
+use anyhow::{Context as _, Result, bail};
 use compact_str::CompactString as String;
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
+use serde_yaml_ng::{Mapping, Value};
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 
 /// ### `verge.yaml` schema
 #[derive(Default, Debug, Clone, Deserialize, Serialize)]
@@ -245,6 +248,150 @@ pub struct IVerge {
 
     /// enable external controller
     pub enable_external_controller: Option<bool>,
+
+    /// DNS override state keyed by profile UID. A source confirmation only
+    /// applies to the exact provider DNS fields from which it was derived.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profile_dns_settings: BTreeMap<std::string::String, ProfileDnsSettings>,
+
+    /// Fields introduced by newer GUI versions are kept when this config is
+    /// edited and saved by the CLI.
+    #[serde(flatten)]
+    pub extra: Mapping,
+
+    /// Prevent a fallback instance created after a malformed read from
+    /// overwriting the only persisted copy.
+    #[serde(skip)]
+    persistence_error: Option<std::string::String>,
+}
+
+/// Persisted per-profile DNS override preference.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProfileDnsSettings {
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<std::string::String>,
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
+}
+
+const PROVIDER_DNS_FIELDS: [&str; 3] = [
+    "proxy-server-nameserver",
+    "proxy-server-nameserver-policy",
+    "nameserver-policy",
+];
+
+/// Produce a stable, credential-free identity for the provider DNS fields in
+/// a profile config. Reordering YAML keys or unrelated fields does not change
+/// the identity; changing the UID or any non-empty provider DNS field does.
+pub fn dns_override_source(profile_uid: &str, config: &Mapping) -> anyhow::Result<Option<std::string::String>> {
+    let Some(dns_value) = config.get("dns") else {
+        return Ok(None);
+    };
+    let dns = dns_value
+        .as_mapping()
+        .ok_or_else(|| anyhow::anyhow!("profile dns section must be a mapping"))?;
+    let fields: Mapping = PROVIDER_DNS_FIELDS
+        .iter()
+        .filter_map(|key| {
+            let value = dns.get(*key)?;
+            let nonempty = match value {
+                Value::Sequence(values) => !values.is_empty(),
+                Value::Mapping(values) => !values.is_empty(),
+                Value::String(value) => !value.trim().is_empty(),
+                _ => false,
+            };
+            nonempty.then(|| (Value::from(*key), value.clone()))
+        })
+        .collect();
+    if fields.is_empty() {
+        return Ok(None);
+    }
+
+    let mut canonical = serde_json::to_value(fields)?;
+    canonical.sort_all_objects();
+    let mut digest = Sha256::new();
+    digest.update(profile_uid.as_bytes());
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&canonical)?);
+    Ok(Some(
+        digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect(),
+    ))
+}
+
+/// Runtime decision for a profile's confirmed provider DNS override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsOverrideState {
+    profile_uid: std::string::String,
+    pub source: Option<std::string::String>,
+    pub enabled: bool,
+    requested: bool,
+    confirmation: Option<std::string::String>,
+}
+
+impl DnsOverrideState {
+    pub fn new(
+        profile_uid: &str,
+        source: Option<std::string::String>,
+        requested: bool,
+        confirmation: Option<std::string::String>,
+    ) -> Self {
+        let enabled = requested && (source.is_none() || source == confirmation);
+        Self {
+            profile_uid: profile_uid.into(),
+            source,
+            enabled,
+            requested,
+            confirmation,
+        }
+    }
+
+    /// Profile UID this confirmation belongs to.
+    pub fn profile_uid(&self) -> &str {
+        &self.profile_uid
+    }
+
+    /// The user's requested setting before source-confirmation protection.
+    pub const fn requested(&self) -> bool {
+        self.requested
+    }
+
+    /// Confirmation currently stored for the profile, if any.
+    pub fn confirmation(&self) -> Option<&str> {
+        self.confirmation.as_deref()
+    }
+
+    /// Apply a state only when it still matches the user's latest persisted
+    /// preference. A changed UID/source invalidates only this profile's proof.
+    pub fn apply_to(&self, verge: &mut IVerge) -> bool {
+        if self.profile_uid.is_empty() {
+            return false;
+        }
+        let current = verge.dns_settings_for(&self.profile_uid);
+        if (current.enabled, current.confirmation.as_ref()) != (self.requested, self.confirmation.as_ref()) {
+            return false;
+        }
+        let clear_confirmation = self.confirmation.is_some() && self.source != self.confirmation;
+        if self.enabled == self.requested
+            && !clear_confirmation
+            && verge.profile_dns_settings.contains_key(&self.profile_uid)
+        {
+            return false;
+        }
+        verge.profile_dns_settings.insert(
+            self.profile_uid.clone(),
+            ProfileDnsSettings {
+                enabled: self.enabled,
+                confirmation: if clear_confirmation {
+                    None
+                } else {
+                    self.confirmation.clone()
+                },
+                unknown_fields: current.unknown_fields,
+            },
+        );
+        true
+    }
 }
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize)]
@@ -253,6 +400,8 @@ pub struct IVergeTestItem {
     pub name: Option<String>,
     pub icon: Option<String>,
     pub url: Option<String>,
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
 }
 
 #[derive(Default, Debug, Clone, Deserialize, Serialize)]
@@ -269,9 +418,51 @@ pub struct IVergeTheme {
 
     pub font_family: Option<String>,
     pub css_injection: Option<String>,
+
+    #[serde(flatten)]
+    pub unknown_fields: Mapping,
 }
 
 impl IVerge {
+    /// Resolve the effective DNS override decision for a profile config.
+    /// `config` is the effective mapping after profile/merge composition.
+    /// Its source digest contains only the provider DNS fields and UID, never
+    /// a subscription URL.
+    pub fn dns_override_for(&self, profile_uid: &str, config: &Mapping) -> Result<DnsOverrideState> {
+        let settings = self.dns_settings_for(profile_uid);
+        let source = dns_override_source(profile_uid, config)?;
+        Ok(DnsOverrideState::new(
+            profile_uid,
+            source,
+            settings.enabled,
+            settings.confirmation,
+        ))
+    }
+
+    pub fn dns_settings_for(&self, profile_uid: &str) -> ProfileDnsSettings {
+        self.profile_dns_settings
+            .get(profile_uid)
+            .cloned()
+            .unwrap_or(ProfileDnsSettings {
+                enabled: self.enable_dns_settings.unwrap_or(false),
+                confirmation: None,
+                ..Default::default()
+            })
+    }
+
+    /// Persist a runtime-confirmed decision only after the candidate config
+    /// has applied successfully. Reload the latest file first so unrelated
+    /// profile settings survive; malformed existing data is surfaced instead
+    /// of being replaced by a template.
+    pub async fn persist_dns_override_after_apply(state: &DnsOverrideState) -> Result<bool> {
+        let mut latest = Self::try_new().await?;
+        if !state.apply_to(&mut latest) {
+            return Ok(false);
+        }
+        latest.save_file().await?;
+        Ok(true)
+    }
+
     /// 有效的clash核心名称
     pub const VALID_CLASH_CORES: &'static [&'static str] = &["verge-mihomo", "verge-mihomo-alpha"];
 
@@ -288,21 +479,33 @@ impl IVerge {
         }
     }
     pub async fn new() -> Self {
-        match dirs::verge_path() {
-            Ok(path) => match help::read_yaml::<Self>(&path).await {
-                Ok(mut config) => {
-                    // compatibility
-                    if let Some(start_page) = config.start_page.clone()
-                        && start_page == "/home"
-                    {
-                        config.start_page = Some(String::from("/"));
-                    }
-                    config
-                }
-                Err(_) => Self::template(),
-            },
-            Err(_) => Self::template(),
+        match Self::try_new().await {
+            Ok(config) => config,
+            Err(error) => {
+                let mut fallback = Self::template();
+                fallback.persistence_error = Some(error.to_string());
+                fallback
+            }
         }
+    }
+
+    /// Load persisted settings without converting read or parse failures into
+    /// a successful template. Callers that replace live settings should only
+    /// install the returned value after this succeeds.
+    pub async fn try_new() -> Result<Self> {
+        let path = dirs::verge_path()?;
+        let mut config = match tokio::fs::metadata(&path).await {
+            Ok(_) => help::read_yaml::<Self>(&path)
+                .await
+                .with_context(|| format!("cannot load {}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::template()),
+            Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+        };
+        // compatibility
+        if config.start_page.as_deref() == Some("/home") {
+            config.start_page = Some(String::from("/"));
+        }
+        Ok(config)
     }
 
     pub fn template() -> Self {
@@ -380,6 +583,9 @@ impl IVerge {
 
     /// Save IVerge App Config
     pub async fn save_file(&self) -> Result<()> {
+        if let Some(error) = &self.persistence_error {
+            bail!("refusing to overwrite verge.yaml after a failed read: {error}");
+        }
         help::save_yaml(&dirs::verge_path()?, &self, Some("# Clash Verge Config")).await
     }
 
@@ -411,7 +617,12 @@ fn system_language() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::IVerge;
+    use super::{DnsOverrideState, IVerge, ProfileDnsSettings, dns_override_source};
+    use serde_yaml_ng::{Mapping, Value};
+
+    fn mapping(yaml: &str) -> Mapping {
+        serde_yaml_ng::from_str(yaml).expect("valid config fixture")
+    }
 
     #[test]
     fn proxy_core_defaults_to_mihomo_and_rejects_unknown() {
@@ -428,5 +639,107 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(v.get_valid_proxy_core(), "mihomo");
+    }
+
+    #[test]
+    fn provider_dns_source_is_stable_and_profile_scoped() {
+        let original = mapping("dns: {nameserver-policy: {a.example: 1.1.1.1, b.example: [8.8.8.8]}}");
+        let reordered =
+            mapping("dns:\n  nameserver-policy:\n    b.example: [8.8.8.8]\n    a.example: 1.1.1.1\nport: 7890");
+        let source = dns_override_source("one", &original).unwrap();
+        assert_eq!(source, dns_override_source("one", &reordered).unwrap());
+        let different_subscription_url = mapping(
+            "url: https://user:other-secret@example.test/subscription\ndns: {nameserver-policy: {b.example: [8.8.8.8], a.example: 1.1.1.1}}",
+        );
+        assert_eq!(source, dns_override_source("one", &different_subscription_url).unwrap());
+        assert_ne!(source, dns_override_source("two", &original).unwrap());
+
+        let changed = mapping("dns: {nameserver-policy: {a.example: 9.9.9.9}}");
+        assert_ne!(source, dns_override_source("one", &changed).unwrap());
+        for empty in [
+            "{}",
+            "dns: {nameserver: [1.1.1.1]}",
+            "dns: {proxy-server-nameserver: [], proxy-server-nameserver-policy: null, nameserver-policy: {}}",
+        ] {
+            assert_eq!(dns_override_source("one", &mapping(empty)).unwrap(), None);
+        }
+        assert!(dns_override_source("one", &mapping("dns: invalid-scalar")).is_err());
+        for field in [
+            "proxy-server-nameserver: [https://doh.example/dns-query]",
+            "proxy-server-nameserver-policy: {node.example: 1.1.1.1}",
+            "nameserver-policy: {+.example: [8.8.8.8]}",
+        ] {
+            assert!(
+                dns_override_source("one", &mapping(&format!("dns: {{{field}}}")))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn effective_dns_decision_is_uid_scoped_and_contains_no_source_url() {
+        let candidate = mapping("dns:\n  proxy-server-nameserver: ['https://user:secret@example.test/dns-query']\n");
+        let source = dns_override_source("profile-a", &candidate).unwrap();
+        let mut verge = IVerge::default();
+        verge.profile_dns_settings.insert(
+            "profile-a".into(),
+            ProfileDnsSettings {
+                enabled: true,
+                confirmation: source.clone(),
+                ..Default::default()
+            },
+        );
+
+        let confirmed = verge.dns_override_for("profile-a", &candidate).unwrap();
+        assert!(confirmed.enabled);
+        assert_eq!(confirmed.profile_uid(), "profile-a");
+        assert!(!format!("{confirmed:?}").contains("secret"));
+
+        let other_profile = verge.dns_override_for("profile-b", &candidate).unwrap();
+        assert!(!other_profile.enabled);
+    }
+
+    #[test]
+    fn profile_dns_confirmation_persists_and_invalidates_only_its_profile() {
+        let source = Some("confirmed-source".to_owned());
+        let mut settings = IVerge {
+            profile_dns_settings: [(
+                "profile-a".to_owned(),
+                ProfileDnsSettings {
+                    enabled: true,
+                    confirmation: source.clone(),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let saved = serde_yaml_ng::to_string(&settings).unwrap();
+        let restarted: IVerge = serde_yaml_ng::from_str(&saved).unwrap();
+        assert!(restarted.dns_settings_for("profile-a").enabled);
+        assert!(!restarted.dns_settings_for("profile-b").enabled);
+
+        let stale = DnsOverrideState::new("profile-a", Some("changed-source".into()), true, source);
+        assert!(stale.apply_to(&mut settings));
+        assert!(!settings.dns_settings_for("profile-a").enabled);
+        assert!(settings.dns_settings_for("profile-a").confirmation.is_none());
+    }
+
+    #[test]
+    fn unknown_root_and_dns_settings_fields_survive_typed_edit() {
+        let mut parsed: IVerge = serde_yaml_ng::from_str(
+            "future_root: {enabled: true, nested: [one, two]}\nprofile_dns_settings:\n  abc:\n    enabled: true\n    confirmation: source\n    future_setting: {mode: preserve}\n",
+        )
+        .unwrap();
+        parsed.language = Some("en".into());
+        let written = serde_yaml_ng::to_string(&parsed).unwrap();
+        let reparsed: Value = serde_yaml_ng::from_str(&written).unwrap();
+        assert_eq!(reparsed["future_root"]["nested"][1], Value::from("two"));
+        assert_eq!(
+            reparsed["profile_dns_settings"]["abc"]["future_setting"]["mode"],
+            Value::from("preserve")
+        );
+        assert_eq!(reparsed["language"], Value::from("en"));
     }
 }

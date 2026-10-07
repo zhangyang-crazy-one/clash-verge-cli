@@ -16,6 +16,7 @@ pub fn draw(
     rows: &[ProxyDisplayRow],
     selected_flat_index: usize,
     delay_map: &HashMap<String, Option<u64>>,
+    delay_keys: &HashMap<(String, String), Vec<crate::mihomo_api::types::ProxyDelayTarget>>,
     core_state: &CoreState,
     loading: bool,
     error: Option<&str>,
@@ -44,13 +45,14 @@ pub fn draw(
                 }
                 items.push(ListItem::new(Line::from(spans)));
             }
-            ProxyDisplayRow::Node { name, current, .. } => {
+            ProxyDisplayRow::Node { group, name, current } => {
                 let display_name = crate::ui::terminal_text::display(name);
-                let delay = match delay_map.get(name) {
-                    Some(Some(milliseconds)) => format!("{milliseconds}ms"),
-                    Some(None) => tr(language, "common.failed").to_string(),
-                    None => "-".to_string(),
-                };
+                let delay = target_delays(
+                    delay_map,
+                    delay_keys.get(&(group.clone(), name.clone())).map(Vec::as_slice),
+                    name,
+                    tr(language, "common.failed"),
+                );
                 let suffix = if *current { " selected" } else { "" };
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled(
@@ -94,4 +96,49 @@ pub fn draw(
         .highlight_symbol("> ");
 
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Each provider identity keeps its own label and delay in a shared-name row.
+pub(crate) fn target_delays(
+    values: &HashMap<String, Option<u64>>,
+    targets: Option<&[crate::mihomo_api::types::ProxyDelayTarget]>,
+    fallback_name: &str,
+    failed: &str,
+) -> String {
+    let delay = |key: &str| match values.get(key) {
+        Some(Some(ms)) => format!("{ms}ms"),
+        Some(None) => failed.to_owned(),
+        None => "-".to_owned(),
+    };
+    match targets {
+        Some(targets) => targets
+            .iter()
+            .map(|target| {
+                if targets.len() > 1 {
+                    format!(
+                        "{}: {}",
+                        crate::ui::terminal_text::display(&target.label),
+                        delay(&target.key)
+                    )
+                } else {
+                    delay(&target.key)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · "),
+        None => delay(fallback_name),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn one_shared_name_row_keeps_both_provider_outcomes() {
+        let a = crate::services::proxy::provider_target("A", "JP");
+        let b = crate::services::proxy::provider_target("B", "JP");
+        let values = HashMap::from([(a.key.clone(), Some(41)), (b.key.clone(), None)]);
+        let text = target_delays(&values, Some(&[a, b]), "JP", "failed");
+        assert_eq!(text, "A/JP: 41ms · B/JP: failed");
+    }
 }

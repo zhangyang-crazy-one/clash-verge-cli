@@ -410,6 +410,7 @@ mod tests {
             download: 1024,
             total: 4096,
             expire: 0,
+            ..Default::default()
         });
         let row = ProfileRow::of(&item, None);
         assert!(!row.current);

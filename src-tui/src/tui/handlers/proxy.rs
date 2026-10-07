@@ -2,23 +2,84 @@
 //! the clash mode.
 
 use serde_yaml_ng::Value;
+use std::sync::Arc;
 
 use crate::app::{Action, App, CoreState, ProxyDisplayRow, first_selectable_proxy_group, proxy_display_rows};
+use crate::mihomo_api::types::{ProxyDelayTarget, ProxyGroup, ProxyProvidersResponse};
+use crate::mihomo_manager::manager::CoreKind;
 use crate::runtime_config::commit_runtime_config;
 use crate::services::mode::{apply_clash_mode, next_clash_mode};
-use crate::services::proxy::{DELAY_TEST_TIMEOUT_MS, DELAY_TEST_URL, MAX_DELAY_CONCURRENCY};
+use crate::services::proxy::{
+    DELAY_TEST_TIMEOUT_MS, DELAY_TEST_URL, DelayTargetResolution, delay_many, delay_many_with_progress,
+    display_target_keys, has_proxy_provider_scope, is_group, native_target, rejected_target, resolve_delay_targets,
+};
 
 use super::Ctx;
 
 pub(super) fn refresh(app: &mut App, ctx: &Ctx) {
     app.runtime_loading.proxies = true;
     app.runtime_errors.proxies = None;
+    app.proxy_delay_keys.clear();
     let api = ctx.manager.api();
-    ctx.spawn_result(
-        async move { api.get_proxies().await },
-        |data| Action::ProxiesFetched(data.proxies),
-        |error| Action::ProxiesFailed(error.to_string()),
-    );
+    let core_kind = ctx.manager.core_kind();
+    let effective_config = app.core_config.0.clone();
+    ctx.spawn(|tx| async move {
+        match api.get_proxies().await {
+            Ok(data) => {
+                let providers = if core_kind == CoreKind::Mihomo && has_proxy_provider_scope(&effective_config) {
+                    api.get_proxy_providers()
+                        .await
+                        .unwrap_or_else(|_| ProxyProvidersResponse {
+                            providers: std::collections::HashMap::new(),
+                        })
+                } else {
+                    ProxyProvidersResponse {
+                        providers: std::collections::HashMap::new(),
+                    }
+                };
+                let keys = if core_kind == CoreKind::SingBox {
+                    native_display_keys(&data.proxies)
+                } else {
+                    display_target_keys(&data.proxies, &effective_config, &providers)
+                };
+                let _ = tx.send(Action::ProxiesFetched(data.proxies)).await;
+                let _ = tx.send(Action::ProxyDelayKeysFetched(keys)).await;
+            }
+            Err(error) => {
+                let _ = tx.send(Action::ProxiesFailed(error.to_string())).await;
+            }
+        }
+    });
+}
+
+fn native_display_keys(
+    groups: &std::collections::HashMap<String, ProxyGroup>,
+) -> std::collections::HashMap<(String, String), Vec<ProxyDelayTarget>> {
+    groups
+        .iter()
+        .filter_map(|(group_name, group)| group.all.as_ref().map(|members| (group_name, members)))
+        .flat_map(|(group_name, members)| {
+            members.iter().filter_map(|name| {
+                (!crate::services::proxy::POLICY_PSEUDO_NODES.contains(&name.as_str()) && !is_group(groups, name))
+                    .then(|| ((group_name.clone(), name.clone()), vec![native_target(name)]))
+            })
+        })
+        .collect()
+}
+
+async fn load_provider_inventory(
+    api: &crate::mihomo_api::MihomoApi,
+    core_kind: CoreKind,
+    effective_config: &serde_yaml_ng::Mapping,
+) -> Result<ProxyProvidersResponse, String> {
+    if core_kind != CoreKind::Mihomo || !has_proxy_provider_scope(effective_config) {
+        return Ok(ProxyProvidersResponse {
+            providers: std::collections::HashMap::new(),
+        });
+    }
+    api.get_proxy_providers().await.map_err(|error| {
+        format!("cannot resolve mihomo proxy-provider membership; no delay requests were sent: {error}")
+    })
 }
 
 pub(super) fn note_fetched(
@@ -77,6 +138,14 @@ pub(super) fn activate_selected(app: &mut App, ctx: &Ctx) {
     let Some((group, name)) = selected_node(app) else {
         return;
     };
+    if app
+        .proxy_delay_keys
+        .get(&(group.clone(), name.clone()))
+        .is_some_and(|targets| targets.len() > 1)
+    {
+        app.status_msg = Some("Cannot select this duplicate name uniquely: use a group scoped to one provider".into());
+        return;
+    }
     if app.chain_mode {
         if !app.chain_nodes.contains(&name) {
             app.chain_nodes.push(name);
@@ -95,52 +164,132 @@ pub(super) fn activate_selected(app: &mut App, ctx: &Ctx) {
 
 /// `t`: delay-test the selected node.
 pub(super) fn test_selected_delay(app: &mut App, ctx: &Ctx) {
-    let Some((_, name)) = selected_node(app) else {
+    let Some((group, name)) = selected_node(app) else {
         return;
     };
     app.status_msg = Some(format!("Testing delay for {name}..."));
     let api = ctx.manager.api();
+    let core_kind = ctx.manager.core_kind();
+    let groups = app.proxy_groups.clone();
+    let effective_config = app.core_config.0.clone();
     ctx.spawn(|tx| async move {
-        let _ = tx.send(
-            match api.delay_test(&name, DELAY_TEST_URL, DELAY_TEST_TIMEOUT_MS).await {
-                Ok(d) => Action::DelayResult(name, Some(d.delay)),
-                Err(error) => Action::DelayFailed(name, error.to_string()),
-            },
-        );
+        let providers = match load_provider_inventory(&api, core_kind, &effective_config).await {
+            Ok(providers) => providers,
+            Err(error) => {
+                let _ = tx.send(Action::DelayFailed(rejected_target(&name), error)).await;
+                return;
+            }
+        };
+        let resolution = if core_kind == CoreKind::SingBox {
+            DelayTargetResolution {
+                targets: vec![native_target(&name)],
+                rejected: Vec::new(),
+            }
+        } else {
+            resolve_delay_targets(
+                &groups,
+                std::slice::from_ref(&name),
+                &effective_config,
+                &providers,
+                Some(&group),
+            )
+        };
+        let keys = if core_kind == CoreKind::SingBox {
+            native_display_keys(&groups)
+        } else {
+            display_target_keys(&groups, &effective_config, &providers)
+        };
+        let _ = tx.send(Action::ProxyDelayKeysFetched(keys)).await;
+        for rejected in resolution.rejected {
+            let _ = tx
+                .send(Action::DelayFailed(rejected_target(&rejected.name), rejected.reason))
+                .await;
+        }
+        for (target, result) in delay_many(
+            Arc::new(api),
+            resolution.targets,
+            DELAY_TEST_URL.into(),
+            DELAY_TEST_TIMEOUT_MS,
+        )
+        .await
+        {
+            let action = match result {
+                Ok(delay) => Action::DelayResult(target, Some(delay)),
+                Err(error) => Action::DelayFailed(target, error),
+            };
+            let _ = tx.send(action).await;
+        }
     });
 }
 
-/// `T`: delay-test every real node, at most [`MAX_DELAY_CONCURRENCY`] at a
+/// `T`: delay-test every real node, at most [`crate::services::proxy::MAX_DELAY_CONCURRENCY`] at a
 /// time.
 pub(super) fn test_all_delays(app: &mut App, ctx: &Ctx) {
     match begin_batch_delay(app) {
         BatchDelayOutcome::Started { targets } => {
             app.status_msg = Some(format!("{}: 0/{}", app.tr("proxies.batch_delay"), targets.len()));
-            let api = std::sync::Arc::new(ctx.manager.api());
+            let api = ctx.manager.api();
+            let core_kind = ctx.manager.core_kind();
+            let groups = app.proxy_groups.clone();
+            let effective_config = app.core_config.0.clone();
             ctx.spawn(|tx| async move {
-                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_DELAY_CONCURRENCY));
-                let mut handles = Vec::new();
-                for name in targets {
-                    let permit = match semaphore.clone().acquire_owned().await {
-                        Ok(permit) => permit,
-                        // Semaphore closed: stop scheduling further requests.
-                        Err(_) => break,
-                    };
-                    let api = api.clone();
-                    let tx = tx.clone();
-                    handles.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let _ = tx.send(
-                            match api.delay_test(&name, DELAY_TEST_URL, DELAY_TEST_TIMEOUT_MS).await {
-                                Ok(d) => Action::BatchDelayResult(name, Some(d.delay)),
-                                Err(error) => Action::BatchDelayFailed(name, error.to_string()),
-                            },
-                        );
-                    }));
+                let providers = match load_provider_inventory(&api, core_kind, &effective_config).await {
+                    Ok(providers) => providers,
+                    Err(error) => {
+                        let total = targets.len();
+                        let _ = tx
+                            .send(Action::ProxyDelayKeysFetched(std::collections::HashMap::new()))
+                            .await;
+                        let _ = tx.send(Action::BatchDelayResolved(total)).await;
+                        for name in targets {
+                            let _ = tx
+                                .send(Action::BatchDelayFailed(rejected_target(&name), error.clone()))
+                                .await;
+                        }
+                        return;
+                    }
+                };
+                let resolution = if core_kind == CoreKind::SingBox {
+                    DelayTargetResolution {
+                        targets: targets.iter().map(|name| native_target(name)).collect(),
+                        rejected: Vec::new(),
+                    }
+                } else {
+                    resolve_delay_targets(&groups, &targets, &effective_config, &providers, None)
+                };
+                let keys = if core_kind == CoreKind::SingBox {
+                    native_display_keys(&groups)
+                } else {
+                    display_target_keys(&groups, &effective_config, &providers)
+                };
+                let _ = tx.send(Action::ProxyDelayKeysFetched(keys)).await;
+                let total = resolution.targets.len() + resolution.rejected.len();
+                let _ = tx.send(Action::BatchDelayResolved(total)).await;
+                for rejected in resolution.rejected {
+                    let _ = tx
+                        .send(Action::BatchDelayFailed(
+                            rejected_target(&rejected.name),
+                            rejected.reason,
+                        ))
+                        .await;
                 }
-                for handle in handles {
-                    let _ = handle.await;
-                }
+                delay_many_with_progress(
+                    Arc::new(api),
+                    resolution.targets,
+                    DELAY_TEST_URL.into(),
+                    DELAY_TEST_TIMEOUT_MS,
+                    |target, result| {
+                        let tx = tx.clone();
+                        async move {
+                            let action = match result {
+                                Ok(delay) => Action::BatchDelayResult(target, Some(delay)),
+                                Err(error) => Action::BatchDelayFailed(target, error),
+                            };
+                            let _ = tx.send(action).await;
+                        }
+                    },
+                )
+                .await;
             });
         }
         BatchDelayOutcome::InProgress { done, total } => {
@@ -176,11 +325,11 @@ pub(super) fn apply_chain(app: &mut App, ctx: &Ctx) {
     ctx.spawn(|tx| async move {
         match apply_chain_config(&api, &nodes, enable_tun).await {
             Ok(_) => {
-                let _ = tx.send(Action::ChainApplied(nodes));
-                let _ = tx.send(Action::ProxiesRefresh);
+                let _ = tx.send(Action::ChainApplied(nodes)).await;
+                let _ = tx.send(Action::ProxiesRefresh).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::ChainFailed(error));
+                let _ = tx.send(Action::ChainFailed(error)).await;
             }
         }
     });
@@ -368,35 +517,36 @@ pub(super) fn advance_batch(app: &mut App) {
 /// Record one single-node delay result in the shared delay map and status bar.
 /// Never touches batch progress: a single-node `t` result must not advance or
 /// clear the active batch.
-pub(super) fn note_delay_result(app: &mut App, name: String, delay: Option<u64>) {
+pub(super) fn note_delay_result(app: &mut App, target: ProxyDelayTarget, delay: Option<u64>) {
     // Sorted by delay, a new result can move rows: keep the cursor's node.
     let keep = app.proxy_rows().get(app.node_selected_index).cloned();
-    app.delay_map.insert(name, delay);
+    let label = target.label.clone();
+    app.delay_map.insert(target.key, delay);
     reselect(app, keep.as_ref());
     if let Some(delay) = delay {
-        app.status_msg = Some(format!("Delay: {delay}ms"));
+        app.status_msg = Some(format!("Delay for {label}: {delay}ms"));
     }
 }
 
 /// Record one single-node delay failure. Same contract as [`note_delay_result`].
-pub(super) fn note_delay_failed(app: &mut App, name: String, error: String) {
+pub(super) fn note_delay_failed(app: &mut App, target: ProxyDelayTarget, error: String) {
     let keep = app.proxy_rows().get(app.node_selected_index).cloned();
-    app.delay_map.insert(name.clone(), None);
+    app.delay_map.insert(target.key, None);
     reselect(app, keep.as_ref());
-    app.status_msg = Some(format!("Delay failed for {name}: {error}"));
+    app.status_msg = Some(format!("Delay failed for {}: {error}", target.label));
 }
 
 /// Record one batch delay result: identical per-node rendering to the
 /// single-node path, then advance the active batch progress.
-pub(super) fn note_batch_delay_result(app: &mut App, name: String, delay: Option<u64>) {
-    note_delay_result(app, name, delay);
+pub(super) fn note_batch_delay_result(app: &mut App, target: ProxyDelayTarget, delay: Option<u64>) {
+    note_delay_result(app, target, delay);
     advance_batch(app);
 }
 
 /// Record one batch delay failure: identical per-node rendering to the
 /// single-node path, then advance the active batch progress.
-pub(super) fn note_batch_delay_failed(app: &mut App, name: String, error: String) {
-    note_delay_failed(app, name, error);
+pub(super) fn note_batch_delay_failed(app: &mut App, target: ProxyDelayTarget, error: String) {
+    note_delay_failed(app, target, error);
     advance_batch(app);
 }
 
@@ -526,9 +676,9 @@ mod tests {
         app.proxy_groups.insert("Tokyo".to_string(), proxy_group(None));
 
         // A single-node `t` result lands while the batch is still running.
-        note_delay_result(&mut app, "Tokyo".to_string(), Some(42));
+        note_delay_result(&mut app, native_target("Tokyo"), Some(42));
         assert_eq!(
-            app.delay_map.get("Tokyo"),
+            app.delay_map.get(&native_target("Tokyo").key),
             Some(&Some(42)),
             "single-node result still renders"
         );
@@ -544,7 +694,7 @@ mod tests {
         );
 
         // The batch's own result still advances progress.
-        note_batch_delay_result(&mut app, "Tokyo".to_string(), Some(43));
+        note_batch_delay_result(&mut app, native_target("Tokyo"), Some(43));
         assert_eq!(app.batch_delay, Some((2, 5)));
     }
 
@@ -553,9 +703,9 @@ mod tests {
         let mut app = App::new();
         app.batch_delay = Some((3, 4));
 
-        note_delay_failed(&mut app, "Tokyo".to_string(), "timeout".to_string());
+        note_delay_failed(&mut app, native_target("Tokyo"), "timeout".to_string());
         assert_eq!(
-            app.delay_map.get("Tokyo"),
+            app.delay_map.get(&native_target("Tokyo").key),
             Some(&None),
             "failure state still renders as failed"
         );
@@ -566,7 +716,7 @@ mod tests {
         );
 
         // The batch's own failure completes the batch and clears the guard.
-        note_batch_delay_failed(&mut app, "Singapore".to_string(), "timeout".to_string());
+        note_batch_delay_failed(&mut app, native_target("Singapore"), "timeout".to_string());
         assert_eq!(app.batch_delay, None, "batch failure on the last node clears the guard");
     }
 }

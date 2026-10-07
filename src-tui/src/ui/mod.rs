@@ -323,6 +323,7 @@ mod tests {
                 total: 50 * 1024 * 1024 * 1024,
                 // Far enough ahead to render as days left, in any time zone.
                 expire: u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default() + 30 * 86_400,
+                ..Default::default()
             }),
             ..Default::default()
         });

@@ -81,15 +81,19 @@ pub async fn core_running(api: &MihomoApi) -> bool {
 /// answers with an error (wrong secret, bad response) is reported as such.
 pub async fn running_api(manager: &MihomoManager) -> anyhow::Result<MihomoApi> {
     let api = manager.api();
+    let core = match manager.core_kind() {
+        crate::mihomo_manager::CoreKind::Mihomo => "mihomo",
+        crate::mihomo_manager::CoreKind::SingBox => "sing-box",
+    };
     match api.version().await {
         Ok(_) => Ok(api),
         Err(MihomoError::CoreDown { .. } | MihomoError::Io(_)) => Err(crate::exit::CoreNotRunning(format!(
-            "mihomo is not running (controller {} not reachable); start it with `clash-verge-cli start`",
+            "{core} is not running (controller {} not reachable); start it with `clash-verge-cli start`",
             manager.socket_path().display()
         ))
         .into()),
         Err(error) => Err(anyhow::Error::new(error).context(format!(
-            "mihomo controller {} answered with an error",
+            "{core} controller {} answered with an error",
             manager.socket_path().display()
         ))),
     }

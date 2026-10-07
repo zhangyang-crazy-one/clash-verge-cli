@@ -1,3 +1,4 @@
+mod background;
 pub mod event_loop;
 mod handlers;
 pub mod input;

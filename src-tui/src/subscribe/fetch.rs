@@ -46,14 +46,7 @@ pub async fn fetch_subscription(
     };
 
     let mode = proxy_mode_from_option(option);
-    let mut builder = reqwest::Client::builder()
-        .cookie_store(true)
-        .gzip(true)
-        .user_agent(user_agent)
-        .timeout(Duration::from_secs(timeout))
-        .connect_timeout(Duration::from_secs(10.min(timeout)))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .danger_accept_invalid_certs(accept_invalid);
+    let mut builder = subscription_client_builder(user_agent, Duration::from_secs(timeout), accept_invalid);
 
     match mode {
         ProxyMode::None => {
@@ -98,6 +91,26 @@ pub async fn fetch_subscription(
         headers,
         final_url,
     })
+}
+
+/// Build the subscription client with a protocol floor that rejects TLS 1.0
+/// and 1.1 while retaining TLS 1.2 and 1.3. The rustls backend is selected in
+/// `Cargo.toml`; this function makes the policy explicit instead of depending
+/// on a backend default.
+fn subscription_client_builder(
+    user_agent: String,
+    timeout: Duration,
+    accept_invalid_certs: bool,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .cookie_store(true)
+        .gzip(true)
+        .user_agent(user_agent)
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10).min(timeout))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .danger_accept_invalid_certs(accept_invalid_certs)
+        .tls_version_min(reqwest::tls::Version::TLS_1_2)
 }
 
 /// Strip URL userinfo into an Authorization header.
@@ -171,6 +184,73 @@ pub fn redact_url(raw: &str) -> String {
 mod tests {
     use super::*;
     use clash_verge_core::config::PrfOption;
+
+    #[test]
+    fn subscription_client_builds_with_explicit_tls_12_minimum() {
+        // This pins the configured reqwest policy. It does not claim to
+        // exercise a negotiated TLS handshake.
+        subscription_client_builder("test-agent".into(), Duration::from_secs(5), false)
+            .build()
+            .expect("TLS 1.2 minimum is supported by the configured rustls backend");
+    }
+
+    #[test]
+    fn legacy_tls_protocol_version_error_is_classified_for_guidance() {
+        let error = std::io::Error::other("alert: protocol version");
+        assert!(is_legacy_tls_protocol_error(&error));
+        let unrelated = std::io::Error::other("connection reset");
+        assert!(!is_legacy_tls_protocol_error(&unrelated));
+    }
+
+    #[tokio::test]
+    async fn gzip_subscription_response_is_decoded() {
+        use std::io::Write as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(b"proxies: []\n").expect("compress fixture");
+        let compressed = encoder.finish().expect("finish gzip fixture");
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test request");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let read = stream.read(&mut chunk).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/yaml\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            stream.write_all(headers.as_bytes()).await.expect("write headers");
+            stream.write_all(&compressed).await.expect("write compressed body");
+            let _ = stream.shutdown().await;
+        });
+
+        let option = PrfOption {
+            user_agent: Some("fixture-test".into()),
+            ..Default::default()
+        };
+        let result = fetch_subscription(
+            &format!("http://{address}/subscription.yaml"),
+            Some(&option),
+            &["127.0.0.1".to_owned()],
+        )
+        .await
+        .expect("local fixture response should be fetched and decoded");
+        assert_eq!(result.body, "proxies: []\n");
+        server.await.expect("test server task");
+    }
 
     #[test]
     fn proxy_mode_prefers_self_proxy() {

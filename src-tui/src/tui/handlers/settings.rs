@@ -83,10 +83,10 @@ async fn toggle_auto_launch(app: &mut App, ctx: &Ctx) {
     ctx.spawn(move |tx| async move {
         match toggle_autostart(enabled, &binary_path, &config_dir).await {
             Ok(()) => {
-                let _ = tx.send(Action::AutoLaunchChanged { enabled });
+                let _ = tx.send(Action::AutoLaunchChanged { enabled }).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::AutoLaunchFailed(error));
+                let _ = tx.send(Action::AutoLaunchFailed(error)).await;
             }
         }
     });
@@ -305,11 +305,11 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
     ctx.spawn(|tx| async move {
         match apply_tun_runtime(&manager, owns_core, enabled).await {
             Ok(_) if !owns_core => {
-                let _ = tx.send(Action::ProxiesRefresh);
+                let _ = tx.send(Action::ProxiesRefresh).await;
             }
             Ok(_) => {}
             Err(error) => {
-                let _ = tx.send(Action::CoreError(error));
+                let _ = tx.send(Action::CoreError(error)).await;
             }
         }
     });
@@ -330,13 +330,15 @@ fn begin_tun_setup(app: &mut App, ctx: &Ctx) {
         return;
     }
     ctx.spawn(|tx| async move {
-        let _ = tx.send(match crate::mihomo_manager::binary::resolve_or_install().await {
-            Ok(resolved) if crate::commands::privilege::has_tun_capability(&resolved.path) => {
-                Action::TunCapabilityState(true)
-            }
-            Ok(resolved) => Action::TunSetupRequested(resolved.path),
-            Err(error) => Action::CoreError(error.to_string()),
-        });
+        let _ = tx
+            .send(match crate::mihomo_manager::binary::resolve_or_install().await {
+                Ok(resolved) if crate::commands::privilege::has_tun_capability(&resolved.path) => {
+                    Action::TunCapabilityState(true)
+                }
+                Ok(resolved) => Action::TunSetupRequested(resolved.path),
+                Err(error) => Action::CoreError(error.to_string()),
+            })
+            .await;
     });
 }
 
@@ -511,7 +513,11 @@ mod tests {
         app.overlay = None;
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(dir.path().to_path_buf()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -559,7 +565,11 @@ mod tests {
         app.service_installed = true;
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -725,7 +735,11 @@ mod tests {
         app.gui_config.proxy_core = Some("mihomo".into());
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -783,7 +797,11 @@ mod tests {
         app.gui_config.proxy_core = Some("singbox".into());
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -830,7 +848,11 @@ mod tests {
         app.gui_config.proxy_core = Some("mihomo".into());
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
@@ -885,7 +907,11 @@ mod tests {
 
         let ctx = Ctx {
             manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::unbounded_channel().0,
+            tx: tokio::sync::mpsc::channel(256).0.into(),
+            traffic_tx: tokio::sync::watch::channel(None).0,
+            log_tx: tokio::sync::mpsc::channel(8).0,
+            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };

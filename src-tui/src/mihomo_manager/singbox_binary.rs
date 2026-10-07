@@ -12,15 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::Context;
+use sha2::Digest as _;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-/// Managed sing-box stable version — compile-time fallback when the GitHub
-/// API is unreachable. Anchored to the 1.13.x stable line: DNS configuration
-/// switched to the new typed-server format in 1.12 and legacy `address`
-/// syntax is removed in 1.14, so 1.13.x is the supported target window
-/// (see add-singbox-dual-core design.md, F4).
-pub const SINGBOX_FALLBACK_VERSION: &str = "v1.13.15";
+/// Pinned sing-box policy target. Release discovery is informational and does
+/// not select a launch version; moving this pin requires explicit review of
+/// the supported configuration capabilities.
+pub const SINGBOX_FALLBACK_VERSION: &str = "v1.14.2";
 
 const SINGBOX_REPO: &str = "SagerNet/sing-box";
 
@@ -57,15 +56,11 @@ pub async fn latest_singbox_version() -> &'static str {
 /// Managed binary path, parallel to mihomo:
 /// `$XDG_DATA_HOME/clash-verge-cli/sing-box`.
 pub fn singbox_binary_path() -> PathBuf {
-    if let Some(data_dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(data_dir).join("clash-verge-cli").join("sing-box");
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("clash-verge-cli")
-        .join("sing-box")
+    super::binary::managed_binary_path(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        "sing-box",
+    )
 }
 
 /// Best-effort system sing-box fallback: `verge-sing-box` in standard bin
@@ -142,11 +137,19 @@ pub struct ResolvedSingBox {
 ///
 /// Preference order:
 /// 1. System binary (`verge-sing-box`, or `sing-box` on PATH)
-/// 2. Managed data-dir binary at the detected latest stable version
+/// 2. Validated managed cache, or the pinned managed build
 pub async fn resolve_or_install() -> anyhow::Result<ResolvedSingBox> {
-    let target_version = latest_singbox_version().await;
+    let target_version = SINGBOX_FALLBACK_VERSION;
     if let Some(system) = system_singbox() {
-        let version = read_singbox_version(&system).await?.unwrap_or_else(|| "unknown".into());
+        let version = read_singbox_version(&system)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("sing-box at {} did not report a valid version", system.display()))?;
+        if !super::core_policy::is_compatible("sing-box", &version, super::core_policy::SINGBOX_POLICY_VERSION)? {
+            anyhow::bail!(
+                "{}",
+                super::core_policy::incompatibility("sing-box", &version, super::core_policy::SINGBOX_POLICY_VERSION)
+            );
+        }
         return Ok(ResolvedSingBox {
             path: system,
             source: SingboxBinarySource::System,
@@ -154,25 +157,43 @@ pub async fn resolve_or_install() -> anyhow::Result<ResolvedSingBox> {
         });
     }
 
+    // Latest is displayed as update information; it never selects the binary
+    // that this process launches.
+    let _discovered_latest = latest_singbox_version().await;
     let managed = singbox_binary_path();
-    if managed.exists()
-        && let Ok(Some(version)) = read_singbox_version(&managed).await
-        && version_matches_target(&version, target_version)
-    {
-        super::binary::ensure_executable(&managed).await?;
-        return Ok(ResolvedSingBox {
-            path: managed,
-            source: SingboxBinarySource::ManagedCached,
-            version,
-        });
+    let _in_process = DOWNLOAD_LOCK.lock().await;
+    let _cross_process = super::binary::lock_install(&managed).await?;
+    if managed.exists() {
+        if let Some(version) = read_singbox_version(&managed).await? {
+            if super::core_policy::is_compatible("sing-box", &version, super::core_policy::SINGBOX_POLICY_VERSION)?
+                && super::binary::verify_cached_digest(&managed).await?
+            {
+                super::binary::ensure_executable(&managed).await?;
+                return Ok(ResolvedSingBox {
+                    path: managed,
+                    source: SingboxBinarySource::ManagedCached,
+                    version,
+                });
+            }
+            if super::core_policy::is_newer_than(&version, target_version)? {
+                anyhow::bail!(
+                    "{}",
+                    super::core_policy::incompatibility(
+                        "sing-box",
+                        &version,
+                        super::core_policy::SINGBOX_POLICY_VERSION
+                    )
+                );
+            }
+        }
     }
 
-    download_managed_singbox(&managed, target_version).await?;
+    let installed_version = download_managed_singbox(&managed, target_version).await?;
     super::binary::ensure_executable(&managed).await?;
     Ok(ResolvedSingBox {
         path: managed,
         source: SingboxBinarySource::Downloaded,
-        version: target_version.to_string(),
+        version: installed_version,
     })
 }
 
@@ -187,7 +208,14 @@ pub async fn read_singbox_version(path: &Path) -> anyhow::Result<Option<String>>
         .with_context(|| format!("failed to execute {}", path.display()))?;
 
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(extract_version_token(&text))
+    if !output.status.success() {
+        anyhow::bail!(
+            "sing-box version exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_singbox_version_output(&text).map(Some)
 }
 
 /// Parse `sing-box version` output. Example:
@@ -196,30 +224,43 @@ pub async fn read_singbox_version(path: &Path) -> anyhow::Result<Option<String>>
 /// Environment: linux, amd64
 /// Tags: with_gvisor,with_quic,...
 /// ```
-fn extract_version_token(text: &str) -> Option<String> {
+fn parse_singbox_version_output(text: &str) -> anyhow::Result<String> {
+    let mut found = Vec::new();
     for line in text.lines() {
-        let Some(value) = line.strip_prefix("Version:") else {
-            continue;
-        };
-        let value = value.trim();
-        if !value.is_empty() {
-            return Some(value.to_string());
+        let line = line.trim();
+        let candidate = line.strip_prefix("Version:").map(str::trim).or_else(|| {
+            line.strip_prefix("sing-box version ")
+                .map(|s| s.split_whitespace().next().unwrap_or(""))
+        });
+        if let Some(value) = candidate {
+            let value = value.trim_start_matches('v');
+            super::core_policy::Version::parse(value)
+                .with_context(|| format!("malformed sing-box version output line: {line}"))?;
+            found.push(value.to_string());
         }
     }
-    None
+    if found.is_empty() {
+        anyhow::bail!("sing-box version output omitted a complete version")
+    }
+    if found.iter().any(|v| v != &found[0]) {
+        anyhow::bail!(
+            "sing-box version output contains conflicting versions: {}",
+            found.join(", ")
+        )
+    }
+    Ok(found.remove(0))
 }
 
-/// Compare an installed version string (`1.13.12`) against a target tag
+/// Compare an installed version string (`1.14.2`) against a target tag
 /// (`v1.13.12`), tolerating the missing/extra leading `v`.
 fn version_matches_target(version: &str, target: &str) -> bool {
-    let normalize = |s: &str| s.strip_prefix('v').unwrap_or(s).to_string();
-    normalize(version) == normalize(target)
+    super::core_policy::Version::parse(version).ok() == super::core_policy::Version::parse(target).ok()
 }
 
-async fn download_managed_singbox(dest: &Path, version: &str) -> anyhow::Result<()> {
+async fn download_managed_singbox(dest: &Path, version: &str) -> anyhow::Result<String> {
     let arch = linux_arch_name().context("unsupported CPU architecture for auto-install")?;
     // Release assets carry the version WITHOUT the leading `v`:
-    // https://github.com/SagerNet/sing-box/releases/download/v1.13.12/sing-box-1.13.12-linux-amd64.tar.gz
+    // https://github.com/SagerNet/sing-box/releases/download/v1.14.2/sing-box-1.14.2-linux-amd64.tar.gz
     let bare = version.strip_prefix('v').unwrap_or(version);
     let asset_dir = format!("sing-box-{bare}-linux-{arch}");
     let url = format!("https://github.com/{SINGBOX_REPO}/releases/download/{version}/{asset_dir}.tar.gz");
@@ -240,18 +281,37 @@ async fn download_managed_singbox(dest: &Path, version: &str) -> anyhow::Result<
         .error_for_status()
         .with_context(|| format!("sing-box download returned error for {url}"))?;
 
-    let compressed = response
-        .bytes()
+    let asset_file = format!("{asset_dir}.tar.gz");
+    let digest = crate::subscribe::client_meta::fetch_release_asset_digest(SINGBOX_REPO, version, &asset_file)
         .await
-        .context("failed to read sing-box download body")?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "trusted sha256 metadata unavailable for {asset_file}; preserving the existing sing-box binary"
+            )
+        })?;
+    use tokio_stream::StreamExt as _;
+    let mut stream = response.bytes_stream();
+    let mut compressed = Vec::new();
+    let mut hasher = sha2::Sha256::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed to read sing-box download stream")?;
+        hasher.update(&chunk);
+        compressed.extend_from_slice(&chunk);
+    }
+    let actual = format!(
+        "sha256:{}",
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    super::binary::verify_sha256_digest(&actual, &digest).context("sing-box archive integrity check failed")?;
 
-    let guard = DOWNLOAD_LOCK.lock().await;
-    let result = extract_tar_gz_binary(&compressed, dest).await;
-    drop(guard);
-    result?;
+    let installed_version = extract_tar_gz_binary(&compressed, dest, version).await?;
 
     tracing::info!(target: "singbox", "installed sing-box {version}");
-    Ok(())
+    Ok(installed_version)
 }
 
 /// Extract the core binary from a sing-box release tarball.
@@ -259,7 +319,7 @@ async fn download_managed_singbox(dest: &Path, version: &str) -> anyhow::Result<
 /// The archive contains a top-level versioned directory holding the
 /// `sing-box` binary; we locate any entry whose file name is exactly
 /// `sing-box` regardless of directory depth.
-async fn extract_tar_gz_binary(compressed: &[u8], dest: &Path) -> anyhow::Result<()> {
+async fn extract_tar_gz_binary(compressed: &[u8], dest: &Path, expected_version: &str) -> anyhow::Result<String> {
     let decoder = flate2::read::GzDecoder::new(compressed);
     let mut archive = tar::Archive::new(decoder);
 
@@ -291,14 +351,40 @@ async fn extract_tar_gz_binary(compressed: &[u8], dest: &Path) -> anyhow::Result
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let tmp = dest.with_extension("download");
-    tokio::fs::write(&tmp, &payload)
+    let staged = tempfile::Builder::new()
+        .prefix(".sing-box-")
+        .suffix(".download")
+        .tempfile_in(
+            dest.parent()
+                .ok_or_else(|| anyhow::anyhow!("managed sing-box path has no parent"))?,
+        )
+        .context("failed to create sing-box staging file")?;
+    tokio::fs::write(staged.path(), &payload)
         .await
-        .with_context(|| format!("failed to write {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, dest)
+        .with_context(|| format!("failed to write {}", staged.path().display()))?;
+    let staged = staged.into_temp_path();
+    super::binary::ensure_executable(&staged)
         .await
+        .context("failed to set sing-box executable permissions")?;
+    let observed = read_singbox_version(&staged)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("staged sing-box reported no valid version"))?;
+    if !version_matches_target(&observed, expected_version) {
+        anyhow::bail!(
+            "downloaded sing-box reports version {observed}, expected {expected_version}; refusing to install"
+        );
+    }
+    if !super::core_policy::is_compatible("sing-box", &observed, super::core_policy::SINGBOX_POLICY_VERSION)? {
+        anyhow::bail!(
+            "{}",
+            super::core_policy::incompatibility("sing-box", &observed, super::core_policy::SINGBOX_POLICY_VERSION)
+        );
+    }
+    super::binary::write_digest_receipt(dest, &payload, ".sing-box-receipt-").await?;
+    staged
+        .persist(dest)
         .with_context(|| format!("failed to install sing-box to {}", dest.display()))?;
-    Ok(())
+    Ok(observed)
 }
 
 fn linux_arch_name() -> Option<&'static str> {
@@ -312,27 +398,25 @@ fn linux_arch_name() -> Option<&'static str> {
 }
 
 #[cfg(test)]
-pub(crate) fn tests_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    match super::binary::tests::ENV_LOCK.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
-#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write as _;
 
     #[test]
-    fn extracts_version_from_singbox_output() {
-        let output = "Version: 1.13.12\nEnvironment: linux, amd64\nTags: with_gvisor,with_quic\n";
-        assert_eq!(extract_version_token(output), Some("1.13.12".into()));
-        assert!(
-            extract_version_token("no version here").is_none(),
-            "should parse nothing but must not panic"
+    fn parses_official_and_installed_singbox_output_shapes() {
+        assert_eq!(
+            parse_singbox_version_output("sing-box version 1.14.2 (go1.24.2 linux/amd64)\nTags: with_gvisor\n")
+                .unwrap(),
+            "1.14.2"
         );
+        assert_eq!(
+            parse_singbox_version_output("Version: 1.14.2\nEnvironment: linux, amd64\n").unwrap(),
+            "1.14.2"
+        );
+        assert!(parse_singbox_version_output("no version here").is_err());
+        assert!(parse_singbox_version_output("sing-box version 1.14\n").is_err());
+        assert!(parse_singbox_version_output("sing-box version 1.14.2\nVersion: 1.13.21\n").is_err());
     }
 
     #[test]
@@ -350,32 +434,22 @@ mod tests {
     }
 
     #[test]
-    fn test_singbox_binary_path_uses_xdg_data_home() {
-        // Share the env-var lock with binary.rs tests — concurrent
-        // XDG_DATA_HOME mutation races other env-sensitive tests.
-        let _guard = super::tests_env_lock();
-        let prev = std::env::var_os("XDG_DATA_HOME");
-        // SAFETY: single-threaded mutation guarded by serial test runner.
-        unsafe {
-            std::env::set_var("XDG_DATA_HOME", "/tmp/test-xdg-sb");
-        }
-
-        let path = singbox_binary_path();
+    fn singbox_managed_path_uses_xdg_data_home_without_environment_mutation() {
+        let path = super::super::binary::managed_binary_path(
+            Some(Path::new("/tmp/test-xdg-sb")),
+            Some(Path::new("/ignored-home")),
+            "sing-box",
+        );
         assert!(path.ends_with("clash-verge-cli/sing-box"), "got {path:?}");
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("XDG_DATA_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
-        }
+        assert!(path.starts_with("/tmp/test-xdg-sb"));
     }
 
     #[test]
     fn extracts_nested_singbox_binary_from_tarball() {
-        // Build an in-memory tar.gz shaped like a real release asset:
-        // sing-box-1.13.12-linux-amd64/sing-box
-        let versioned_dir = "sing-box-1.13.12-linux-amd64";
+        // Build an in-memory tar.gz shaped like a release asset.
+        let versioned_dir = "sing-box-1.14.2-linux-amd64";
         let mut builder = tar::Builder::new(Vec::new());
-        let payload = b"#!/bin/sh\necho fake-sing-box\n";
+        let payload = b"#!/bin/sh\n[ \"$1\" = version ] && echo 'sing-box version 1.14.2'\n";
         let mut header = tar::Header::new_gnu();
         header.set_size(payload.len() as u64);
         header.set_mode(0o755);
@@ -392,11 +466,22 @@ mod tests {
         let dest = std::env::temp_dir().join(format!("sb-extract-test-{}", uuid::Uuid::new_v4()));
 
         tokio::runtime::Runtime::new().expect("rt").block_on(async {
-            extract_tar_gz_binary(&compressed, &dest).await.expect("extract");
+            extract_tar_gz_binary(&compressed, &dest, "v1.14.2")
+                .await
+                .expect("extract");
         });
 
         let installed = std::fs::read(&dest).expect("installed file");
         assert_eq!(installed, payload);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(super::super::binary::verify_cached_digest(&dest).await.unwrap());
+        });
+        let digest = sha2::Sha256::digest(&installed)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let receipt_path = dest.with_extension(format!("sha256.{digest}"));
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(receipt_path);
     }
 }

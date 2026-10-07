@@ -27,7 +27,7 @@ async fn load_edit_buffer_from_active_profile(app: &mut App) -> Result<(), Strin
     let rules = crate::routing::load_profile_rules(&yaml).map_err(|e| e.to_string())?;
     app.rules_edit_buffer = rules;
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
-        app.rule_sets_edit = crate::singbox::load_rule_sets(&home);
+        app.rule_sets_edit = crate::singbox::load_rule_sets(&home)?;
     }
     app.rules_selected_index = 0;
     app.rules_edit_mode = true;
@@ -70,6 +70,13 @@ pub(super) fn note_rules(app: &mut App, rules: Vec<crate::mihomo_api::types::Rul
 }
 
 pub(super) fn refresh_providers(app: &mut App, ctx: &Ctx) {
+    if ctx.manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+        app.rule_providers_loading = false;
+        app.rule_providers_error = Some(
+            "rule providers are not exposed by the sing-box clash_api; configure native route/rule-sets instead".into(),
+        );
+        return;
+    }
     app.rule_providers_loading = true;
     app.rule_providers_error = None;
     let api = ctx.manager.api();
@@ -92,6 +99,10 @@ pub(super) fn note_providers(app: &mut App, mut providers: Vec<crate::mihomo_api
 
 /// `Enter` with the providers panel focused: update that provider.
 pub(super) fn update_selected_provider(app: &mut App, ctx: &Ctx) {
+    if ctx.manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
+        app.status_msg = Some("rule provider refresh is unsupported by the sing-box clash_api".into());
+        return;
+    }
     if !app.rules_focus_providers {
         return;
     }
@@ -102,13 +113,15 @@ pub(super) fn update_selected_provider(app: &mut App, ctx: &Ctx) {
     app.status_msg = Some(format!("Updating rule provider {name}..."));
     let api = ctx.manager.api();
     ctx.spawn(|tx| async move {
-        let _ = tx.send(match api.update_rule_provider(&name).await {
-            Ok(()) => Action::RuleProviderUpdated(name),
-            Err(error) => Action::RuleProviderUpdateFailed {
-                name,
-                error: error.to_string(),
-            },
-        });
+        let _ = tx
+            .send(match api.update_rule_provider(&name).await {
+                Ok(()) => Action::RuleProviderUpdated(name),
+                Err(error) => Action::RuleProviderUpdateFailed {
+                    name,
+                    error: error.to_string(),
+                },
+            })
+            .await;
     });
 }
 
@@ -153,14 +166,23 @@ pub(super) fn delete_rule_set(app: &mut App) {
         return;
     }
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
-        let mut sets = crate::singbox::load_rule_sets(&home);
+        let mut sets = match crate::singbox::load_rule_sets(&home) {
+            Ok(sets) => sets,
+            Err(error) => {
+                app.status_msg = Some(format!("rule-set load failed: {error}"));
+                return;
+            }
+        };
         if sets.is_empty() {
             app.status_msg = Some("no rule-sets defined".into());
             return;
         }
         let i = app.rules_selected_index.min(sets.len().saturating_sub(1));
         sets.remove(i);
-        let _ = crate::singbox::save_rule_sets(&home, &sets);
+        if let Err(error) = crate::singbox::save_rule_sets(&home, &sets) {
+            app.status_msg = Some(format!("rule-set save failed: {error}"));
+            return;
+        }
         app.rule_sets_edit = sets;
         app.status_msg = Some("rule-set removed".into());
     }
@@ -218,7 +240,7 @@ pub(super) fn save_rules(app: &mut App, ctx: &Ctx) {
     } else {
         let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
         let m = ctx.manager.clone();
-        let tx = ctx.tx.clone();
+        let tx = ctx.tx.for_current();
         let buffer = std::mem::take(&mut app.rules_edit_buffer);
         spawn_rules_save(m, enable_tun, buffer, tx);
     }
@@ -232,7 +254,7 @@ pub(super) fn confirm_save_rules(app: &mut App, ctx: &Ctx) {
     app.overlay = None;
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let m = ctx.manager.clone();
-    let tx = ctx.tx.clone();
+    let tx = ctx.tx.for_current();
     let buffer = std::mem::take(&mut app.rules_edit_buffer);
     spawn_rules_save(m, enable_tun, buffer, tx);
 }
@@ -259,7 +281,7 @@ pub(super) fn note_rules_saved(app: &mut App, ctx: &Ctx, message: String) {
     app.rules_edit_buffer.clear();
     app.rules_edit_mode = false;
     app.status_msg = Some(message);
-    let _ = ctx.tx.send(Action::RulesRefresh);
+    ctx.send(Action::RulesRefresh);
 }
 
 /// Channel-receive side: a save failed; the buffer is cleared so the user
@@ -278,9 +300,9 @@ fn spawn_rules_save(
     manager: crate::mihomo_manager::MihomoManager,
     enable_tun: bool,
     buffer: Vec<crate::routing::IRouteRule>,
-    tx: tokio::sync::mpsc::UnboundedSender<Action>,
+    tx: crate::tui::background::EventSender,
 ) {
-    tokio::spawn(async move {
+    tx.clone().spawn(async move {
         let is_singbox = manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox;
         let outcome = async {
             let store = crate::profile_store::store::ProfileStore::snapshot()
@@ -322,15 +344,15 @@ fn spawn_rules_save(
                 };
                 match report {
                     Ok(message) => {
-                        let _ = tx.send(Action::RulesEditSaved(message));
+                        let _ = tx.send(Action::RulesEditSaved(message)).await;
                     }
                     Err(error) => {
-                        let _ = tx.send(Action::RulesEditFailed(error));
+                        let _ = tx.send(Action::RulesEditFailed(error)).await;
                     }
                 }
             }
             Err(error) => {
-                let _ = tx.send(Action::RulesEditFailed(error));
+                let _ = tx.send(Action::RulesEditFailed(error)).await;
             }
         }
     });
@@ -345,11 +367,20 @@ pub(super) fn toggle_dns_edit(app: &mut App) {
         app.status_msg = Some("sing-box DNS editor off".into());
         return;
     }
-    let home = clash_verge_core::utils::dirs::app_home_dir();
-    app.dns_spec_edit = home
-        .ok()
-        .and_then(|home| crate::singbox::load_dns_spec(&home))
-        .unwrap_or_default();
+    let home = match clash_verge_core::utils::dirs::app_home_dir() {
+        Ok(home) => home,
+        Err(error) => {
+            app.status_msg = Some(format!("sing-box DNS settings unavailable: {error}"));
+            return;
+        }
+    };
+    app.dns_spec_edit = match crate::singbox::load_dns_spec(&home) {
+        Ok(spec) => spec,
+        Err(error) => {
+            app.status_msg = Some(format!("sing-box DNS settings invalid: {error}"));
+            return;
+        }
+    };
     app.dns_cursor = 0;
     app.dns_focus_rules = false;
     app.dns_edit_mode = true;
@@ -429,14 +460,14 @@ pub(super) fn apply_dns_edit(app: &mut App, ctx: &Ctx) {
         return;
     }
     let m = ctx.manager.clone();
-    let tx = ctx.tx.clone();
-    tokio::spawn(async move {
+    let tx = ctx.tx.for_current();
+    tx.clone().spawn(async move {
         match crate::runtime_config::apply_singbox_active_reload(&m).await {
             Ok(message) => {
-                let _ = tx.send(Action::DnsApplied(message));
+                let _ = tx.send(Action::DnsApplied(message)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::DnsApplyFailed(error));
+                let _ = tx.send(Action::DnsApplyFailed(error)).await;
             }
         }
     });

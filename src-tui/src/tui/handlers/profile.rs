@@ -2,6 +2,7 @@
 //! automatic subscription updates.
 
 use crossterm::event::KeyCode;
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, InputMode, Overlay, TrustPending};
@@ -63,10 +64,10 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
         // the switch.
         match crate::services::profile::switch_profile_for_core(&manager, &item, enable_tun, core_running).await {
             Ok(()) => {
-                let _ = tx.send(Action::ProfileSwitched(uid));
+                let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::CoreError(error));
+                let _ = tx.send(Action::CoreError(error)).await;
             }
         }
     });
@@ -116,7 +117,7 @@ pub(super) fn confirm_import(ctx: &Ctx, url: String) {
     ctx.spawn(|tx| async move {
         match ssrf_blocked_host(&url) {
             Some(host) => {
-                let _ = tx.send(Action::ImportNeedsTrust { url, host });
+                let _ = tx.send(Action::ImportNeedsTrust { url, host }).await;
             }
             None => spawn_import(&tx, url, None),
         }
@@ -174,7 +175,7 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
             CoreKind::SingBox => apply_imported_profile_to_singbox(&manager, &item, enable_tun).await,
         };
         if let Err(error) = apply_result {
-            let _ = tx.send(Action::CoreError(error));
+            let _ = tx.send(Action::CoreError(error)).await;
             return;
         }
         // The core now runs the imported profile: record it as current so
@@ -182,10 +183,10 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
         match ProfileStore::replace_current_locked(&uid).await {
             // Refreshes the proxies when the core is running.
             Ok(_) => {
-                let _ = tx.send(Action::ProfileSwitched(uid));
+                let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::CoreError(format!("profile switch: {error}")));
+                let _ = tx.send(Action::CoreError(format!("profile switch: {error}"))).await;
             }
         }
         if !core_running {
@@ -245,11 +246,11 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
             .await
         {
             Ok(()) if core_running => {
-                let _ = tx.send(Action::ProxiesRefresh);
+                let _ = tx.send(Action::ProxiesRefresh).await;
             }
             Ok(()) => {}
             Err(error) => {
-                let _ = tx.send(Action::CoreError(format!("profile reload: {error}")));
+                let _ = tx.send(Action::CoreError(format!("profile reload: {error}"))).await;
             }
         }
     });
@@ -279,13 +280,13 @@ pub(in crate::tui) fn spawn_auto_update(
             )
         };
         for (uid, is_current) in outcome.updated {
-            let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+            let _ = tx.send(Action::ProfileUpdated { uid, is_current }).await;
         }
         for (_uid, error) in outcome.failed {
-            let _ = tx.send(Action::ProfileUpdateFailed(error));
+            let _ = tx.send(Action::ProfileUpdateFailed(error)).await;
         }
         if let Some(error) = outcome.errored {
-            let _ = tx.send(Action::ProfileUpdateFailed(error));
+            let _ = tx.send(Action::ProfileUpdateFailed(error)).await;
         }
         if probe.forced_refresh {
             let notice = if probe.rolled_back {
@@ -295,9 +296,9 @@ pub(in crate::tui) fn spawn_auto_update(
             } else {
                 "probe: node recovered — subscription refreshed"
             };
-            let _ = tx.send(Action::ProbeNotice(notice.to_string()));
+            let _ = tx.send(Action::ProbeNotice(notice.to_string())).await;
         }
-        let _ = tx.send(Action::AutoUpdateFinished);
+        let _ = tx.send(Action::AutoUpdateFinished).await;
     });
 }
 
@@ -334,18 +335,18 @@ pub(super) fn ssrf_blocked_host(url: &str) -> Option<String> {
 /// protection (`option` is `None` for ordinary imports). Results arrive back
 /// as `ProfileImported` / `ProfileImportFailed`.
 pub(super) fn spawn_import(
-    action_tx: &mpsc::UnboundedSender<Action>,
+    action_tx: &crate::tui::background::EventSender,
     url: String,
     option: Option<clash_verge_core::config::PrfOption>,
 ) {
     let tx = action_tx.clone();
-    tokio::spawn(async move {
+    tx.clone().spawn(async move {
         match crate::profile_store::store::ProfileStore::import_url_locked(&url, None, option.as_ref()).await {
             Ok(_) => {
-                let _ = tx.send(Action::ProfileImported);
+                let _ = tx.send(Action::ProfileImported).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::ProfileImportFailed(error.to_string()));
+                let _ = tx.send(Action::ProfileImportFailed(error.to_string())).await;
             }
         }
     });
@@ -361,7 +362,7 @@ pub(super) fn spawn_import(
 /// that profile's stored `option.trusted_hosts` (merge + save `profiles.yaml`),
 /// then retry the update; the re-read allowlist unblocks the fetch. The uid is
 /// required so trust lands on the existing profile, never on a new one.
-pub(super) fn handle_confirm_trust(app: &mut App, action_tx: &mpsc::UnboundedSender<Action>) {
+pub(super) fn handle_confirm_trust(app: &mut App, action_tx: &crate::tui::background::EventSender) {
     let Some(pending) = app.pending_trust.take() else {
         // Stale duplicate `y` after the prompt already closed: ignore instead
         // of retrying an import the user may have cancelled.
@@ -372,19 +373,21 @@ pub(super) fn handle_confirm_trust(app: &mut App, action_tx: &mpsc::UnboundedSen
         let host = pending.host;
         app.status_msg = Some(format!("Updating profile {uid} (trusted host)..."));
         let tx = action_tx.clone();
-        tokio::spawn(async move {
+        tx.clone().spawn(async move {
             if let Err(error) = crate::profile_store::store::ProfileStore::add_trusted_host_locked(&uid, &host).await {
-                let _ = tx.send(Action::ProfileUpdateFailed(format!("trust persist: {error}")));
+                let _ = tx
+                    .send(Action::ProfileUpdateFailed(format!("trust persist: {error}")))
+                    .await;
                 return;
             }
             // update_remote_locked re-reads profiles.yaml, so the persisted
             // (merged) allowlist is what unblocks this retry.
             match crate::profile_store::store::ProfileStore::update_remote_locked(&uid, None).await {
                 Ok(is_current) => {
-                    let _ = tx.send(Action::ProfileUpdated { uid, is_current });
+                    let _ = tx.send(Action::ProfileUpdated { uid, is_current }).await;
                 }
                 Err(error) => {
-                    let _ = tx.send(Action::ProfileUpdateFailed(error.to_string()));
+                    let _ = tx.send(Action::ProfileUpdateFailed(error.to_string())).await;
                 }
             }
         });
@@ -536,8 +539,8 @@ mod tests {
         app.overlay = Some(Overlay::TrustConfirmation); // stale overlay
         app.pending_trust = None;
 
-        let (tx, _rx) = mpsc::unbounded_channel::<Action>();
-        handle_confirm_trust(&mut app, &tx);
+        let (tx, _rx) = mpsc::channel::<Action>(64);
+        handle_confirm_trust(&mut app, &tx.into());
 
         assert!(app.pending_trust.is_none());
         assert_eq!(app.overlay, Some(Overlay::TrustConfirmation));
@@ -685,8 +688,8 @@ mod tests {
             uid: Some(uid.to_string()),
         });
         app.overlay = Some(Overlay::TrustConfirmation);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Action>();
-        handle_confirm_trust(&mut app, &tx);
+        let (tx, mut rx) = mpsc::channel::<Action>(64);
+        handle_confirm_trust(&mut app, &tx.into());
 
         // Confirm must persist the host into the EXISTING profile's stored
         // option and retry the update; the allowlist lets the loopback fetch

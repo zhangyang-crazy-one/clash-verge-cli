@@ -1,0 +1,27 @@
+current: R1
+future_profiles:
+  mode: strict
+  sequence: [one, two]
+items:
+  - uid: R1
+    type: remote
+    name: Before edit
+    future_item:
+      nested: [kept]
+    selected:
+      - name: Auto
+        now: Tokyo
+        future_selection: true
+    extra:
+      upload: 1
+      download: 2
+      total: 3
+      expire: 4
+      future_usage: [kept]
+    option:
+      user_agent: before-agent
+      future_option:
+        retry:
+          max: 5
+      dns:
+        nameserver: []

@@ -16,15 +16,24 @@ use super::tun::tun_start_offers_setup;
 /// the TUI-native setup confirm is offered inline instead of hard-blocking or
 /// relying on system dialogs.
 pub(super) fn start(app: &mut App, ctx: &Ctx) {
+    ctx.cancel_background();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     app.core_state = CoreState::Starting;
     app.status_msg = Some(app.tr("home.starting_core").into());
     let manager = ctx.manager.clone();
     ctx.spawn(|tx| async move {
         if enable_tun {
-            match crate::mihomo_manager::binary::resolve_or_install().await {
-                Ok(resolved) => {
-                    let capable = crate::commands::privilege::has_tun_capability(&resolved.path);
+            let resolved_path = match manager.core_kind() {
+                crate::mihomo_manager::CoreKind::Mihomo => crate::mihomo_manager::binary::resolve_or_install()
+                    .await
+                    .map(|resolved| resolved.path),
+                crate::mihomo_manager::CoreKind::SingBox => crate::mihomo_manager::singbox_binary::resolve_or_install()
+                    .await
+                    .map(|resolved| resolved.path),
+            };
+            match resolved_path {
+                Ok(path) => {
+                    let capable = crate::commands::privilege::has_tun_capability(&path);
                     let root = crate::commands::privilege::running_as_root();
                     let needs_setup =
                         tun_start_offers_setup(capable, root, crate::commands::privilege::resolve1_rule_needed(true));
@@ -37,37 +46,45 @@ pub(super) fn start(app: &mut App, ctx: &Ctx) {
                         } else {
                             TunSetupReason::MissingCapability
                         };
-                        let _ = tx.send(Action::TunSetupPrompt {
-                            binary: resolved.path,
-                            enable_tun,
-                            reason,
-                        });
+                        let _ = tx
+                            .send(Action::TunSetupPrompt {
+                                binary: path,
+                                enable_tun,
+                                reason,
+                            })
+                            .await;
                         return;
                     }
                 }
                 Err(error) => {
-                    let _ = tx.send(Action::CoreError(error.to_string()));
+                    let _ = tx.send(Action::CoreError(error.to_string())).await;
                     return;
                 }
             }
         }
         if let Err(error) = start_core_with_tun(&manager, enable_tun).await {
-            let _ = tx.send(Action::CoreError(error));
+            let _ = tx.send(Action::CoreError(error)).await;
         }
         // On success, the manager emits CoreStarted.
     });
 }
 
 /// `S` on Home.
-pub(super) fn stop(ctx: &Ctx) {
+pub(super) fn stop(app: &mut App, ctx: &Ctx) {
+    app.clear_runtime_caches();
+    app.core_state = CoreState::Stopped;
+    ctx.cancel_background();
     let manager = ctx.manager.clone();
-    tokio::spawn(async move {
-        let _ = manager.stop().await;
+    ctx.spawn(|tx| async move {
+        if let Err(error) = manager.stop().await {
+            let _ = tx.send(Action::CoreError(error.to_string())).await;
+        }
     });
 }
 
 /// `r` on Home.
 pub(super) fn restart(app: &mut App, ctx: &Ctx) {
+    ctx.cancel_background();
     app.core_state = CoreState::Starting;
     app.status_msg = Some(app.tr("home.starting_core").into());
     let manager = ctx.manager.clone();
@@ -75,11 +92,11 @@ pub(super) fn restart(app: &mut App, ctx: &Ctx) {
     ctx.spawn(|tx| async move {
         let config = clash_verge_core::config::IClashTemp::new().await.0;
         if let Err(error) = write_runtime_config(config, enable_tun).await {
-            let _ = tx.send(Action::CoreError(error));
+            let _ = tx.send(Action::CoreError(error)).await;
             return;
         }
         if let Err(error) = manager.restart().await {
-            let _ = tx.send(Action::CoreError(error.to_string()));
+            let _ = tx.send(Action::CoreError(error.to_string())).await;
         }
     });
 }
@@ -89,7 +106,7 @@ pub(super) fn resume_start(ctx: &Ctx, enable_tun: bool) {
     let manager = ctx.manager.clone();
     ctx.spawn(|tx| async move {
         if let Err(error) = start_core_with_tun(&manager, enable_tun).await {
-            let _ = tx.send(Action::CoreError(error));
+            let _ = tx.send(Action::CoreError(error)).await;
         }
         // On success, the manager emits CoreStarted.
     });
@@ -104,6 +121,7 @@ pub(super) fn note_started(
     binary_path: Option<String>,
     binary_source: Option<String>,
 ) {
+    app.clear_runtime_caches();
     app.core_state = CoreState::Running;
     app.core_pid = ctx.manager.pid();
     // Re-assert the system proxy once the controller actually answers: the
@@ -136,7 +154,7 @@ pub(super) fn note_started(
             // owns this core.
             loop {
                 if api.version().await.is_ok() {
-                    let _ = tx.send(Action::SysProxyReassert);
+                    let _ = tx.send(Action::SysProxyReassert).await;
                     break;
                 }
                 if probe_manager.pid().is_none() {
@@ -163,11 +181,13 @@ pub(super) fn note_started(
         let api = ctx.manager.api();
         ctx.spawn(|tx| async move {
             if let Ok(v) = api.version().await {
-                let _ = tx.send(Action::CoreStarted {
-                    version: Some(v.version),
-                    binary_path: None,
-                    binary_source: None,
-                });
+                let _ = tx
+                    .send(Action::CoreStarted {
+                        version: Some(v.version),
+                        binary_path: None,
+                        binary_source: None,
+                    })
+                    .await;
             }
         });
     }
@@ -204,7 +224,7 @@ pub(super) fn note_started(
     let api = ctx.manager.api();
     ctx.spawn(|tx| async move {
         if let Ok(mode) = api.get_mode().await {
-            let _ = tx.send(Action::ModeChanged { mode, announce: false });
+            let _ = tx.send(Action::ModeChanged { mode, announce: false }).await;
         }
     });
 }

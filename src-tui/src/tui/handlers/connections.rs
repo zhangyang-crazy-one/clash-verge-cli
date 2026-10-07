@@ -15,11 +15,16 @@ pub(super) fn refresh_traffic(app: &mut App, ctx: &Ctx) {
     app.runtime_loading.traffic = true;
     app.runtime_errors.traffic = None;
     let api = ctx.manager.api();
-    ctx.spawn(|tx| async move {
-        if let Err(error) = receive_traffic_stream(api, tx.clone()).await {
-            let _ = tx.send(Action::TrafficFailed(error));
+    let latest = ctx.traffic_tx.clone();
+    let core_generation = ctx.manager.current_generation();
+    let task = ctx.spawn(|tx| async move {
+        if let Err(error) = receive_traffic_stream(api, latest, tx.generation(), core_generation).await {
+            let _ = tx.send(Action::TrafficFailed(error)).await;
         }
     });
+    if let Some(previous) = app.traffic_stream.replace(task.abort_handle()) {
+        previous.abort();
+    }
 }
 
 pub(super) fn refresh_connections(app: &mut App, ctx: &Ctx) {
@@ -88,13 +93,15 @@ pub(super) fn close_connection(app: &mut App, ctx: &Ctx, id: String) {
     app.overlay = None;
     let api = ctx.manager.api();
     ctx.spawn(|tx| async move {
-        let _ = tx.send(match api.close_connection(&id).await {
-            Ok(()) => Action::ConnectionClosed(id),
-            Err(error) => Action::CloseConnectionFailed {
-                id,
-                error: error.to_string(),
-            },
-        });
+        let _ = tx
+            .send(match api.close_connection(&id).await {
+                Ok(()) => Action::ConnectionClosed(id),
+                Err(error) => Action::CloseConnectionFailed {
+                    id,
+                    error: error.to_string(),
+                },
+            })
+            .await;
     });
 }
 
@@ -113,11 +120,14 @@ pub(super) fn refresh_logs(app: &mut App, ctx: &Ctx) {
     app.runtime_loading.logs = true;
     app.runtime_errors.logs = None;
     let api = ctx.manager.api();
-    let tx = ctx.tx.clone();
+    let tx = ctx.tx.for_current();
+    let logs = ctx.log_tx.clone();
+    let core_generation = ctx.manager.current_generation();
+    let dropped = ctx.dropped_logs.clone();
     let level = app.log_level.clone();
-    let task = tokio::spawn(async move {
-        if let Err(error) = receive_log_stream(api, &level, tx.clone()).await {
-            let _ = tx.send(Action::LogsFailed(error));
+    let task = tx.clone().spawn(async move {
+        if let Err(error) = receive_log_stream(api, &level, logs, tx.generation(), core_generation, dropped).await {
+            let _ = tx.send(Action::LogsFailed(error)).await;
         }
     });
     if let Some(previous) = app.log_stream.replace(task.abort_handle()) {
@@ -250,7 +260,9 @@ pub(super) fn drain_ndjson<T: serde::de::DeserializeOwned>(
 
 pub(super) async fn receive_traffic_stream(
     api: crate::mihomo_api::client::MihomoApi,
-    tx: mpsc::UnboundedSender<Action>,
+    latest: tokio::sync::watch::Sender<Option<(u64, u64, TrafficData)>>,
+    generation: u64,
+    core_generation: u64,
 ) -> Result<(), String> {
     let response = api.stream_traffic().await.map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
@@ -259,9 +271,7 @@ pub(super) async fn receive_traffic_stream(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         for traffic in drain_ndjson::<TrafficData>(&mut buffer, &chunk)? {
-            if tx.send(Action::TrafficFetched(traffic)).is_err() {
-                return Ok(());
-            }
+            latest.send_replace(Some((generation, core_generation, traffic)));
         }
     }
 
@@ -271,7 +281,10 @@ pub(super) async fn receive_traffic_stream(
 pub(super) async fn receive_log_stream(
     api: crate::mihomo_api::client::MihomoApi,
     level: &str,
-    tx: mpsc::UnboundedSender<Action>,
+    tx: mpsc::Sender<(u64, u64, LogEntry)>,
+    generation: u64,
+    core_generation: u64,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     let response = api.stream_logs(level).await.map_err(|error| error.to_string())?;
     let mut stream = response.bytes_stream();
@@ -280,13 +293,46 @@ pub(super) async fn receive_log_stream(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| error.to_string())?;
         for log in drain_ndjson::<LogEntry>(&mut buffer, &chunk)? {
-            if tx.send(Action::LogReceived(log)).is_err() {
-                return Ok(());
+            if tx.try_send((generation, core_generation, log)).is_err() {
+                dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
 
     Err("Mihomo log stream closed".into())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod bounded_stream_tests {
+    use super::*;
+
+    #[test]
+    fn latest_traffic_slot_coalesces_to_the_most_recent_sample() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        tx.send_replace(Some(TrafficData { up: 1, down: 2 }));
+        tx.send_replace(Some(TrafficData { up: 3, down: 4 }));
+        assert_eq!(
+            rx.borrow().as_ref().map(|sample| (sample.up, sample.down)),
+            Some((3, 4))
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_log_queue_counts_dropped_entries() {
+        let (tx, mut rx) = mpsc::channel::<LogEntry>(1);
+        let dropped = std::sync::atomic::AtomicU64::new(0);
+        let log = LogEntry {
+            level: String::new(),
+            payload: String::new(),
+        };
+        tx.try_send(log.clone()).unwrap();
+        if tx.try_send(log).is_err() {
+            dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(rx.recv().await.is_some());
+    }
 }
 
 #[cfg(test)]

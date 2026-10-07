@@ -1,0 +1,10 @@
+language: zh
+future_verge:
+  mode: strict
+  nested: [kept]
+profile_dns_settings:
+  R1:
+    enabled: true
+    confirmation: 0123456789abcdef
+    future_setting:
+      source: gui
