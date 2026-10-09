@@ -645,9 +645,14 @@ impl ManagerInner {
     pub(crate) async fn write_singbox_full(config_dir: &Path) -> anyhow::Result<PathBuf> {
         let yaml = Self::active_profile_yaml().await?;
         let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
-        Ok(Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun)
-            .await?
-            .0)
+        let (path, parts) = Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun).await?;
+        // Start, restart and crash auto-restart all funnel through here, so
+        // this is where the losses of the config the core is about to run
+        // become known: the TUI notice and `status --json` read the record.
+        // A native sing-box subscription passes through untouched and
+        // records nothing.
+        crate::runtime_config::record_singbox_degradation(&parts).await;
+        Ok(path)
     }
 
     /// Persist a sing-box runtime config assembled from the given profile
@@ -1252,6 +1257,9 @@ impl MihomoManager {
             Vec::new()
         };
         preflight_tun_capability(&prepared.path, enable_tun)?;
+        // Kept out of the arm so a committed core switch can report what the
+        // conversion lost, like the apply path does.
+        let mut converted_parts: Option<SingboxParts> = None;
         match prepared.kind {
             CoreKind::SingBox => {
                 let yaml = ManagerInner::active_profile_yaml().await?;
@@ -1259,6 +1267,7 @@ impl MihomoManager {
                     ManagerInner::write_singbox_assembled_to(&self.config_dir, yaml.as_deref(), enable_tun, &candidate)
                         .await?;
                 validate_guided_conversion(&parts.conversion)?;
+                converted_parts = Some(parts);
                 crate::runtime_config::prevalidate_singbox_config(&prepared.path, &candidate)
                     .await
                     .map_err(anyhow::Error::msg)?;
@@ -1432,6 +1441,13 @@ impl MihomoManager {
             && stopped.load(Ordering::SeqCst)
         {
             *self.inner.state.lock() = CoreState::Error(error.to_string());
+        }
+        // Only a committed switch may claim losses; a rolled-back one must
+        // leave the previous report standing.
+        if outcome.is_ok()
+            && let Some(parts) = converted_parts
+        {
+            crate::runtime_config::record_singbox_degradation(&parts).await;
         }
         outcome
     }
