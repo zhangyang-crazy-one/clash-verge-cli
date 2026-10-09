@@ -45,6 +45,11 @@ pub enum Command {
         #[arg(long, value_name = "SECS", default_value_t = 15, requires = "wait")]
         timeout: u64,
     },
+    /// Show or switch the proxy core (mihomo or sing-box)
+    Core {
+        #[command(subcommand)]
+        action: Option<CoreCommand>,
+    },
     /// Manage subscription profiles
     Profile {
         #[command(subcommand)]
@@ -111,6 +116,17 @@ pub enum Command {
     /// Internal: sudo askpass helper (SUDO_ASKPASS target).
     #[command(hide = true)]
     Askpass,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum CoreCommand {
+    /// Show the selected and the running core (default)
+    Show,
+    /// Switch to another core, restarting it when one is running
+    Use {
+        /// Core to select: mihomo or singbox
+        core: crate::mihomo_manager::CoreKind,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

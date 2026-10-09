@@ -6,6 +6,11 @@
 //! function below; the classifiers are what the tests pin down. Sites change
 //! their pages without notice, so an unrecognized answer is reported as a
 //! failure with the reason instead of a guess.
+//!
+//! The port itself is core-agnostic on purpose (issue #58): mihomo's
+//! `/configs` reports it, while sing-box always reports `mixed-port: 0`, so
+//! the effective mixed port the CLI generated is the fallback for both the
+//! CLI command and the TUI Unlock page.
 
 use std::time::Duration;
 
@@ -139,7 +144,7 @@ pub async fn run(api: &crate::mihomo_api::MihomoApi, services: &[Service]) -> an
     } else {
         services
     };
-    let port = api.http_proxy_port().await?;
+    let port = resolve_proxy_port(api).await?;
     let exit = match (api.get_proxies().await, api.get_mode().await) {
         (Ok(proxies), Ok(mode)) => crate::app::outbound_chain(&proxies.proxies, &mode),
         _ => Vec::new(),
@@ -149,6 +154,39 @@ pub async fn run(api: &crate::mihomo_api::MihomoApi, services: &[Service]) -> an
         exit,
         results: check_all(&client, services).await,
     })
+}
+
+/// The HTTP proxy port every check must be sent through.
+///
+/// The running core's own answer wins when it reports one, but sing-box's
+/// clash_api always answers `mixed-port: 0` (issue #58), which made `unlock`
+/// fail with "the core has no mixed-port or port for HTTP proxying" under
+/// sing-box even though the generated `singbox.json` binds a mixed inbound.
+/// Fall back to the effective mixed port the CLI itself generated — the very
+/// value [`crate::enhance::effective_mixed_port`] hands to both cores.
+pub async fn resolve_proxy_port(api: &crate::mihomo_api::MihomoApi) -> anyhow::Result<u16> {
+    match api.http_proxy_port().await {
+        Ok(port) if port > 0 => Ok(port),
+        // sing-box (or an unreadable /configs): fall back to the CLI's own
+        // effective mixed port instead of failing the whole run.
+        _ => select_proxy_port(None, crate::enhance::effective_mixed_port().await),
+    }
+}
+
+/// The decision behind [`resolve_proxy_port`], kept pure so it can be pinned
+/// down in tests. Fail-closed: when neither source yields a usable port the
+/// run is refused, because sending the checks anywhere but the exit node
+/// would report the wrong region instead of an honest error.
+pub fn select_proxy_port(reported: Option<u16>, effective: u16) -> anyhow::Result<u16> {
+    reported
+        .filter(|port| *port > 0)
+        .or_else(|| (effective > 0).then_some(effective))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no HTTP proxy port to check through: the core reports none and the configured mixed \
+                 port is 0 (set `mixed-port` in config.yaml, or `verge_mixed_port` in verge.yaml)"
+            )
+        })
 }
 
 /// An HTTP client that sends everything through the core's proxy port.
@@ -409,6 +447,25 @@ fn classify_tiktok(page: &Page) -> CheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_port_wins_when_the_core_answers() {
+        assert_eq!(select_proxy_port(Some(7897), 9999).unwrap(), 7897);
+    }
+
+    #[test]
+    fn sing_box_reports_no_port_so_the_effective_one_is_used() {
+        // sing-box's clash_api always answers `mixed-port: 0` (#58).
+        assert_eq!(select_proxy_port(None, 7897).unwrap(), 7897);
+        assert_eq!(select_proxy_port(Some(0), 7897).unwrap(), 7897);
+    }
+
+    #[test]
+    fn no_usable_port_anywhere_fails_closed() {
+        let error = select_proxy_port(Some(0), 0).unwrap_err().to_string();
+        assert!(error.contains("no HTTP proxy port"), "{error}");
+        assert!(select_proxy_port(None, 0).is_err());
+    }
 
     fn page(status: u16, url: &str, body: &str) -> Page {
         Page {

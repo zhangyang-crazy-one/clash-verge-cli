@@ -494,6 +494,32 @@ pub struct ProfileConversion {
     pub skipped: Vec<String>,
     /// Per-node degradation lines ("node.field").
     pub degraded: Vec<String>,
+    /// Informational notes about conversions that lost nothing:
+    /// approximated group semantics, pruned members of a group whose
+    /// target no longer exists, dropped modifiers (#52). These do NOT
+    /// block a core switch — they are reported by `status`/the profile
+    /// commands so CLI and TUI behave the same way.
+    pub notes: Vec<String>,
+}
+
+impl ProfileConversion {
+    /// Every tag a route rule may target: converted nodes, group tags and
+    /// the built-in policy outbounds. Used to drop rules pointing at a
+    /// group the conversion could not produce instead of generating a
+    /// dangling `outbound` reference (#52).
+    pub fn outbound_tags(&self) -> std::collections::HashSet<String> {
+        let mut tags: std::collections::HashSet<String> = self
+            .outbounds
+            .iter()
+            .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        tags.extend(self.groups.iter().map(|group| group.name.clone()));
+        for builtin in ["direct", "block", "DIRECT", "REJECT"] {
+            tags.insert(builtin.to_string());
+        }
+        tags
+    }
 }
 
 /// Convert an entire clash config document (proxies + proxy-groups).
@@ -529,6 +555,21 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
     }
 
     if let Some(Yaml::Sequence(groups)) = map.get(Yaml::String("proxy-groups".into())) {
+        // Every declared name, converted or not: a member referencing a
+        // group that was itself skipped is pruned instead of becoming a
+        // dangling outbound reference (#52).
+        let declared_groups: std::collections::HashSet<String> = groups
+            .iter()
+            .filter_map(|group| group.get(Yaml::String("name".into())).and_then(Yaml::as_str))
+            .map(str::to_owned)
+            .collect();
+        let node_tags: std::collections::HashSet<String> = result
+            .outbounds
+            .iter()
+            .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect();
+
         for group in groups {
             let Yaml::Mapping(g) = group else { continue };
             let name = g
@@ -543,23 +584,178 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
             let kind = match gtype {
                 "select" => crate::singbox::GroupKind::Selector,
                 "url-test" => crate::singbox::GroupKind::UrlTest,
+                // #52: `fallback` and `load-balance` are health-check
+                // groups; sing-box's `urltest` is the closest equivalent
+                // (it keeps picking the fastest reachable member). The
+                // difference — fallback never leaves a working node,
+                // load-balance spreads traffic — is recorded as a note,
+                // not a reason to drop the group (the CLI used to drop it
+                // silently, the TUI refused to switch at all).
+                "fallback" | "load-balance" => {
+                    result.notes.push(format!(
+                        "{name}: group type '{gtype}' converted to urltest (health-check semantics approximated)"
+                    ));
+                    crate::singbox::GroupKind::UrlTest
+                }
+                // `relay` chains nodes through each other; sing-box
+                // expresses that with per-outbound `detour`, which cannot
+                // be derived from a proxy-group member list. Refused
+                // loudly rather than silently replaced.
                 other => {
                     result.skipped.push(format!("{name}: group type '{other}' unsupported"));
                     continue;
                 }
             };
-            let members: Vec<String> = g
+            let raw_members: Vec<String> = g
                 .get(Yaml::String("proxies".into()))
                 .and_then(Yaml::as_sequence)
                 .map(|seq| seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
                 .unwrap_or_default();
+            // Prune members whose target did not survive conversion, and
+            // de-duplicate (a member listed twice, or `DIRECT` which the
+            // generator always appends to selectors, used to show up as
+            // two identical entries in `proxy list`).
+            let mut members: Vec<String> = Vec::with_capacity(raw_members.len());
+            for member in raw_members {
+                if member.eq_ignore_ascii_case("direct") && kind == crate::singbox::GroupKind::Selector {
+                    result.notes.push(format!(
+                        "{name}: dropped redundant DIRECT member (selectors always expose direct)"
+                    ));
+                    continue;
+                }
+                let known = node_tags.contains(&member)
+                    || declared_groups.contains(&member)
+                    || member.eq_ignore_ascii_case("direct")
+                    || member.eq_ignore_ascii_case("reject")
+                    || member.eq_ignore_ascii_case("block");
+                if !known {
+                    result.notes.push(format!(
+                        "{name}: dropped member '{member}' (not convertible to sing-box)"
+                    ));
+                    continue;
+                }
+                if members.contains(&member) {
+                    result
+                        .notes
+                        .push(format!("{name}: dropped duplicate member '{member}'"));
+                    continue;
+                }
+                members.push(member);
+            }
             if members.is_empty() {
+                result
+                    .skipped
+                    .push(format!("{name}: group has no member left after conversion"));
                 continue;
             }
             result.groups.push(crate::singbox::GroupSpec { name, kind, members });
         }
     }
 
+    Ok(result)
+}
+
+// ---------- rule-sets derived from a clash profile (#52) ----------
+
+/// Base URLs of the official sing-box geo rule-set repositories.
+const GEOIP_RULE_SET_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
+const GEOSITE_RULE_SET_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
+
+/// The remote `.srs` rule-set definition for a `geoip-*` / `geosite-*` tag
+/// produced by [`crate::routing::from_clash_rule_str`], or `None` for any
+/// other tag.
+pub fn geo_rule_set(tag: &str) -> Option<Value> {
+    let (kind, name) = tag
+        .strip_prefix("geoip-")
+        .map(|name| ("geoip", name))
+        .or_else(|| tag.strip_prefix("geosite-").map(|name| ("geosite", name)))?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let base = if kind == "geoip" {
+        GEOIP_RULE_SET_BASE
+    } else {
+        GEOSITE_RULE_SET_BASE
+    };
+    Some(json!({
+        "type": "remote",
+        "tag": tag,
+        "format": "binary",
+        "url": format!("{base}/{tag}.srs"),
+        // Fetching the geo lists must never recurse through the proxy
+        // chain they are about to shape.
+        "download_detour": "direct",
+        "update_interval": "168h",
+    }))
+}
+
+/// Outcome of converting a clash `rule-providers` block.
+#[derive(Debug, Clone, Default)]
+pub struct RuleProviderConversion {
+    /// sing-box `route.rule_set` entries.
+    pub rule_sets: Vec<Value>,
+    /// Providers that cannot be represented, with the reason.
+    pub skipped: Vec<String>,
+}
+
+/// Convert `rule-providers` into sing-box `route.rule_set` entries so a
+/// profile's `RULE-SET,<name>,<policy>` rules stay resolvable (#52).
+///
+/// Only providers that already publish a sing-box `.srs` payload can be
+/// mapped: clash's `classical`/`yaml` payloads have no sing-box equivalent
+/// and would need to be converted by downloading and re-serialising them,
+/// which this pass never does. Those are reported, and the rules that
+/// reference them are dropped by the caller instead of failing the whole
+/// config with a missing-rule-set error.
+pub fn convert_rule_providers(config_yaml: &str) -> Result<RuleProviderConversion, String> {
+    let doc: Yaml = serde_yaml_ng::from_str(config_yaml).map_err(|error| format!("invalid YAML: {error}"))?;
+    let mut result = RuleProviderConversion::default();
+    let Yaml::Mapping(map) = &doc else {
+        return Ok(result);
+    };
+    let Some(providers) = map.get(Yaml::String("rule-providers".into())) else {
+        return Ok(result);
+    };
+    // clash spells `rule-providers` as a mapping of name → definition; some
+    // generators emit a list with an explicit `name` field instead.
+    let entries: Vec<(String, &Yaml)> = match providers {
+        Yaml::Mapping(providers) => providers
+            .iter()
+            .filter_map(|(name, entry)| Some((name.as_str()?.to_string(), entry)))
+            .collect(),
+        Yaml::Sequence(providers) => providers
+            .iter()
+            .filter_map(|provider| {
+                Some((
+                    provider.get(Yaml::String("name".into()))?.as_str()?.to_string(),
+                    provider,
+                ))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (name, provider) in entries {
+        let Yaml::Mapping(entry) = provider else { continue };
+        let url = entry.get(Yaml::String("url".into())).and_then(Yaml::as_str);
+        match url {
+            Some(url) if url.ends_with(".srs") => result.rule_sets.push(json!({
+                "type": "remote",
+                "tag": name,
+                "format": "binary",
+                "url": url,
+                "download_detour": "direct",
+                "update_interval": "168h",
+            })),
+            _ => result.skipped.push(format!(
+                "{name}: rule-provider is not a sing-box .srs payload ({}); \
+RULE-SET rules referencing it are skipped",
+                entry
+                    .get(Yaml::String("behavior".into()))
+                    .and_then(Yaml::as_str)
+                    .unwrap_or("unknown behavior")
+            )),
+        }
+    }
     Ok(result)
 }
 
@@ -585,8 +781,8 @@ proxy-groups:
   - name: PROXY
     type: select
     proxies: [ok-node]
-  - name: fallback-g
-    type: fallback
+  - name: relay-g
+    type: relay
     proxies: [ok-node]
 "#;
         let result = convert_profile(yaml).expect("convert profile");
@@ -598,10 +794,137 @@ proxy-groups:
         assert_eq!(
             result.skipped.len(),
             2,
-            "bad node + fallback group: {:?}",
+            "bad node + refused relay group: {:?}",
             result.skipped
         );
         assert!(result.skipped[0].starts_with("bad-node:"), "{:?}", result.skipped);
+        assert!(
+            result.skipped.iter().any(|line| line.contains("relay-g")),
+            "{:?}",
+            result.skipped
+        );
+    }
+
+    #[test]
+    fn fallback_and_load_balance_groups_become_urltests_with_a_note() {
+        // #52: these groups used to land in `skipped`, so the CLI dropped
+        // them silently and the TUI refused to switch cores.
+        let yaml = r#"
+proxies:
+  - {name: n1, type: http, server: a.example, port: 443}
+  - {name: n2, type: http, server: b.example, port: 443}
+proxy-groups:
+  - {name: Auto, type: fallback, proxies: [n1, n2]}
+  - {name: Spread, type: load-balance, proxies: [n1, n2]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        assert!(result.skipped.is_empty(), "{:?}", result.skipped);
+        assert_eq!(result.groups.len(), 2);
+        for group in &result.groups {
+            assert_eq!(group.kind, crate::singbox::GroupKind::UrlTest, "{group:?}");
+        }
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("Auto") && note.contains("urltest")),
+            "{:?}",
+            result.notes
+        );
+        assert!(
+            result.notes.iter().any(|note| note.contains("Spread")),
+            "{:?}",
+            result.notes
+        );
+    }
+
+    #[test]
+    fn dangling_group_members_are_pruned_so_references_stay_valid() {
+        // A group naming a node the converter skipped (and one naming a
+        // group that no longer exists) must not survive as a reference —
+        // validate_references rejects those, which used to abort `start`.
+        let yaml = r#"
+proxies:
+  - {name: ok, type: http, server: a.example, port: 443}
+  - {name: gone, type: mieru, server: b.example, port: 443}
+proxy-groups:
+  - {name: Missing, type: select, proxies: [ok]}
+  - {name: PROXY, type: select, proxies: [ok, gone, Missing, nope, DIRECT, ok]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        let proxy = result.groups.iter().find(|group| group.name == "PROXY").expect("PROXY");
+        // `Missing` is a group that converted fine, so it stays a member.
+        assert_eq!(
+            proxy.members,
+            vec!["ok".to_string(), "Missing".to_string()],
+            "{:?}",
+            proxy.members
+        );
+        assert!(
+            result.notes.iter().any(|note| note.contains("dropped member 'gone'")),
+            "{:?}",
+            result.notes
+        );
+        assert!(
+            result.notes.iter().any(|note| note.contains("dropped member 'nope'")),
+            "{:?}",
+            result.notes
+        );
+        // Every surviving member resolves to a tag the config will have.
+        let tags = result.outbound_tags();
+        assert!(proxy.members.iter().all(|member| tags.contains(member)));
+    }
+
+    #[test]
+    fn a_group_left_without_members_is_reported_not_emitted() {
+        let yaml = r#"
+proxies:
+  - {name: gone, type: mieru, server: b.example, port: 443}
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [gone]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        assert!(result.groups.is_empty(), "{:?}", result.groups);
+        assert!(
+            result.skipped.iter().any(|line| line.contains("no member left")),
+            "{:?}",
+            result.skipped
+        );
+    }
+
+    #[test]
+    fn geo_rule_sets_point_at_the_official_srs_repositories() {
+        let ip = geo_rule_set("geoip-cn").expect("geoip");
+        assert_eq!(ip["url"], format!("{GEOIP_RULE_SET_BASE}/geoip-cn.srs"));
+        assert_eq!(ip["download_detour"], "direct");
+        let site = geo_rule_set("geosite-geolocation-!cn").expect("geosite");
+        assert_eq!(
+            site["url"],
+            format!("{GEOSITE_RULE_SET_BASE}/geosite-geolocation-!cn.srs")
+        );
+        assert!(geo_rule_set("some-local-set").is_none());
+        assert!(geo_rule_set("geoip-").is_none());
+    }
+
+    #[test]
+    fn rule_providers_convert_only_when_they_publish_srs() {
+        let yaml = r#"
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    url: https://example.com/ads.srs
+  cn:
+    type: http
+    behavior: classical
+    url: https://example.com/cn.list
+"#;
+        let result = convert_rule_providers(yaml).expect("convert");
+        assert_eq!(result.rule_sets.len(), 1, "{:?}", result.rule_sets);
+        assert_eq!(result.rule_sets[0]["tag"], "ads");
+        assert_eq!(result.rule_sets[0]["url"], "https://example.com/ads.srs");
+        assert_eq!(result.skipped.len(), 1, "{:?}", result.skipped);
+        assert!(result.skipped[0].contains("classical"), "{:?}", result.skipped);
     }
 
     #[test]

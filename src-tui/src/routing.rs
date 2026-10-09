@@ -105,24 +105,87 @@ fn field_from_clash_str(kind: &str, value: &str) -> Option<MatchField> {
         "DST-PORT" => MatchField::Port(value.parse().ok()?),
         "PROCESS-NAME" => MatchField::Process(value.into()),
         "RULE-SET" => MatchField::RuleSet(value.into()),
+        // #52: the geo databases have no sing-box route field; they are
+        // official SagerNet `.srs` rule-sets. The caller turns the tag into
+        // a `route.rule_set` entry so the reference stays resolvable.
+        "GEOIP" => MatchField::RuleSet(geo_rule_set_tag("geoip", value)?),
+        "GEOSITE" => MatchField::RuleSet(geo_rule_set_tag("geosite", value)?),
         _ => return None,
     })
 }
 
+/// sing-box rule-set tag for a clash `GEOIP,<code>` / `GEOSITE,<name>`
+/// value, or `None` for a form that cannot be expressed as a single
+/// positive rule-set reference (a negated set such as `!cn`).
+fn geo_rule_set_tag(kind: &str, value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('!') {
+        return None;
+    }
+    // `geosite-geolocation-!cn`-style values keep their inner `!`: the
+    // SagerNet repositories publish them under that exact name.
+    Some(format!("{kind}-{}", value.to_ascii_lowercase()))
+}
+
+/// Clash modifiers that only affect clash's own resolution behaviour and
+/// carry no sing-box equivalent — and therefore need no warning beyond the
+/// conversion report.
+///
+/// `no-resolve` is the common one: sing-box never resolves a domain for an
+/// `ip_cidr` rule, which is exactly what `no-resolve` asks for.
+const TOLERATED_MODIFIERS: &[&str] = &["no-resolve"];
+
+/// Split a clash rule string into its fields and modifiers.
+///
+/// Clash appends modifiers after the target (`IP-CIDR,10.0.0.0/8,DIRECT,
+/// no-resolve`) or before it (`IP-CIDR,10.0.0.0/8,no-resolve,DIRECT`);
+/// both spellings occur in real subscriptions. Returns
+/// `(fields, modifiers)` where `fields` still has the target last.
+pub fn split_clash_rule(rule: &str) -> (Vec<String>, Vec<String>) {
+    let parts: Vec<String> = rule.split(',').map(str::trim).map(str::to_string).collect();
+    let mut modifiers: Vec<String> = Vec::new();
+    let mut fields: Vec<String> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        let is_modifier = TOLERATED_MODIFIERS
+            .iter()
+            .any(|modifier| part.eq_ignore_ascii_case(modifier));
+        // The first field is the rule kind and can never be a modifier; the
+        // last non-modifier part is the target.
+        if is_modifier && index > 0 {
+            modifiers.push(part.clone());
+        } else {
+            fields.push(part.clone());
+        }
+    }
+    (fields, modifiers)
+}
+
 /// Parse a clash rule string. Unrecognized kinds become Raw passthrough.
+///
+/// Trailing modifiers (`no-resolve`) are dropped — sing-box applies the
+/// equivalent behaviour by default for IP rules (#52) — so an
+/// `IP-CIDR,...,DIRECT,no-resolve` rule converts like its plain form
+/// instead of degenerating into a rule targeting `no-resolve`.
 pub fn from_clash_rule_str(rule: &str) -> IRouteRule {
-    let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
+    let (mut parts, _modifiers) = split_clash_rule(rule);
     if parts.len() < 2 {
         return IRouteRule::Raw { clash_raw: rule.into() };
     }
     // SUB-RULE and other exotic headers pass through verbatim.
-    if matches!(parts[0], "SUB-RULE" | "AND" | "OR" | "NOT") {
+    if matches!(parts[0].as_str(), "SUB-RULE" | "AND" | "OR" | "NOT") {
         return IRouteRule::Raw { clash_raw: rule.into() };
     }
-    let Some(target) = target_from_clash_str(parts[parts.len() - 1]) else {
+    let target = parts.pop().expect("length checked above");
+    let Some(target) = target_from_clash_str(&target) else {
         return IRouteRule::Raw { clash_raw: rule.into() };
     };
-    let Some(field) = field_from_clash_str(parts[0], parts[1]) else {
+    if parts.len() != 2 {
+        // More than one match field in one clash rule (or a modifier we do
+        // not tolerate) has no representation in this model.
+        return IRouteRule::Raw { clash_raw: rule.into() };
+    }
+    let value = parts.pop().expect("length checked above");
+    let Some(field) = field_from_clash_str(&parts[0], &value) else {
         return IRouteRule::Raw { clash_raw: rule.into() };
     };
     IRouteRule::Simple {
@@ -346,6 +409,48 @@ mod tests {
             clash_raw: "SUB-RULE,x,DIRECT".into(),
         };
         assert!(to_singbox_json(&raw).is_none());
+    }
+
+    #[test]
+    fn no_resolve_modifier_is_dropped_and_the_rule_still_converts() {
+        // #52: `no-resolve` is the most common modifier in real
+        // subscriptions and sing-box never resolves domains for an
+        // ip_cidr rule anyway, so the plain form is the correct mapping.
+        for (rule, cidr) in [
+            ("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "10.0.0.0/8"),
+            ("IP-CIDR,10.0.0.0/8,no-resolve,DIRECT", "10.0.0.0/8"),
+            ("IP-CIDR6,2001:db8::/32,REJECT,no-resolve", "2001:db8::/32"),
+        ] {
+            let model = from_clash_rule_str(rule);
+            let json = to_singbox_json(&model).unwrap_or_else(|| panic!("{rule} must convert: {model:?}"));
+            assert_eq!(json["ip_cidr"], json!([cidr]), "{rule}");
+        }
+        // The clash form is preserved without the modifier it no longer needs.
+        assert_eq!(
+            to_clash_rule_str(&from_clash_rule_str("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve")),
+            "IP-CIDR,10.0.0.0/8,DIRECT"
+        );
+    }
+
+    #[test]
+    fn geoip_and_geosite_map_to_official_rule_set_tags() {
+        let json = to_singbox_json(&from_clash_rule_str("GEOIP,CN,DIRECT")).expect("geoip");
+        assert_eq!(json["rule_set"], json!(["geoip-cn"]));
+        let json = to_singbox_json(&from_clash_rule_str("GEOSITE,geolocation-!cn,REJECT")).expect("geosite");
+        assert_eq!(json["rule_set"], json!(["geosite-geolocation-!cn"]));
+        // A negated geo set has no positive rule-set reference.
+        assert!(to_singbox_json(&from_clash_rule_str("GEOIP,!cn,DIRECT")).is_none());
+        assert!(to_singbox_json(&from_clash_rule_str("GEOSITE,!cn,DIRECT")).is_none());
+    }
+
+    #[test]
+    fn multiple_match_fields_in_one_clash_rule_stay_raw() {
+        // e.g. `IP-CIDR,10.0.0.0/8,udp,DIRECT`: the protocol qualifier has
+        // no sing-box route-rule equivalent, so the rule is not silently
+        // reinterpreted as something weaker.
+        let model = from_clash_rule_str("IP-CIDR,10.0.0.0/8,udp,DIRECT");
+        assert!(model.is_raw(), "{model:?}");
+        assert_eq!(to_clash_rule_str(&model), "IP-CIDR,10.0.0.0/8,udp,DIRECT");
     }
 }
 
