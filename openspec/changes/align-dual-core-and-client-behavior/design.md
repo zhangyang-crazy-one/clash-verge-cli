@@ -10,6 +10,10 @@ Failures restore exact prior configuration/marker bytes, binary selection, share
 
 The user reported no visible effect when switching to sing-box and is currently running the GUI. Developer verification uses captured version output, temporary files and mock endpoints only; real binaries, GUI/configuration, controllers, network downloads and privileged installation are untouched. Fresh verification evidence is appended to `evidence.md`; previous 22 tasks and their 588-test baseline remain historical.
 
+### Stale controller socket regression (2026-10-09)
+
+The first guided ownership check treated socket-path existence as proof of a live external controller. Normal PID-record cleanup can leave the Unix socket file behind, so both verified target cores were rejected before reaching spawn cleanup. A filesystem path alone is insufficient: lifecycle checks must classify the endpoint using passive kernel state and reject live, unknown or unsafe endpoints independently of a stale PID record. Stale-file cleanup must be confined to an inspected CLI-private socket and rechecked at the cleanup boundary, without connecting to or deleting a foreign controller. This follow-up is verified with disposable Unix listeners rather than running a core.
+
 ## Context
 
 The project is a Linux Rust CLI/TUI sharing clash-verge-rev YAML configuration while speaking to either mihomo or sing-box. Review on 2026-10-07 verified that the managed-binary fallbacks currently query latest versions unconditionally, while actual sing-box output is `sing-box version 1.13.12`; the compatibility baseline is mihomo 1.19.32 and sing-box 1.14.2. A synthetic check against sing-box 1.13.12 showed `rule_set` is accepted under `route` and rejected at the root. Existing daemon refresh, provider probing, delay timeout, DNS persistence, backup allowlists, duplicate identity, and TUI event flow have corresponding gaps. The pending `openspec/changes/add-singbox-dual-core` change remains separate and untouched.

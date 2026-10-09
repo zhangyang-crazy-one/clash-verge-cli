@@ -115,3 +115,43 @@ openspec validate align-dual-core-and-client-behavior --strict
 构建产物仅为 `target/debug/clash-verge-cli`，SHA-256 `1f39a9db1e612fd92bdebbc10b4e3e98ee3299408019de938905d5c0da61fb62`。没有安装到 `/usr/local/bin`，没有覆盖 GUI 实际核心/已安装 CLI；用户实际运行入口仍未确认。没有运行 app、`cargo run`、真实核心 version/check、服务/提权安装、真实控制端请求或 process signal。
 
 TUI 使用启动 `s`、重启 `r` 或 Settings 的 Proxy Core 行启动检查；`y`/Enter 授权下载，验证后显示实际版本/来源/路径，再以 `y`/Enter 确认配置准备和应用；`n`/Esc 取消，结果以 Enter/Esc 关闭。GUI 运行时允许检查与经授权下载、验证 CLI 自有候选；实际应用时会显示持久可关闭的所有权解释并拒绝启动/切换，不通过停止 GUI 实现切换。准备失败保留旧核心；commit/boot 失败执行自有回滚。联网下载、真实核心启动/切换、协议/TLS/TUN与权限仍未验证，mock 通过不能替代真实认证。
+
+## Stale controller socket 修复（2026-10-09）
+
+用户确认两个已验证缓存核心均因无 PID 记录的 controller socket 被拒绝。只读现场检查发现 `/run/user/1000/clash-verge-cli/external-controller.sock` 是 uid1000、inode269 的非符号链接 Unix socket；相邻 `mihomo.pid` 不存在，父目录和 runtime 目录均为 uid1000/0700。内核表中无精确路径，也无绝对路径对应同 dev/inode 的别名绑定。检查只读取元数据与 `/proc/net/unix`，没有连接、删除 socket 或操作进程。
+
+根因：旧 `guided_record_check` 用 `exists()` 判断外部控制端，在 spawn 的遗留文件清理之前就拒绝两个目标核心；正常退出清理 PID 记录后仍可能留下 socket 文件。源码 `da535daa` 增加 `mihomo_manager/controller_socket.rs`，区分 Missing/Bound/Stale；检查 socket 类型、私有真实父目录、UID、可读取且可解析的内核状态，以及路径/文件身份别名。缺失路径仍检查残留绑定；旧 dead PID 记录不能豁免活跃端点。spawn barrier 在删除前复查内核状态与 dev/inode，拒绝错误向上传播并带实际路径。仅清理程序确认的私有遗留文件；开发期间未清理用户文件。
+
+新增9项单测，最终13项 socket 聚焦测试包含既有回归。原始两项 fixture RED：exit101；缺失但仍绑定端点另有 RED：exit101。最终 GREEN：13 passed。目录权限修正及追加边界前的630项 suite 为中间结果，不作为最终证据。两个目标 kind 的实际 wrapper 均覆盖遗留放行、live/dead-record 拒绝、状态读取/解析失败、已 unlink 但仍绑定端点及应用边界重查；分类/清理 fixture 覆盖别名、含空格路径、非 socket、symlink、非私有目录和活跃文件保留。
+
+最终验证使用 `/tmp/clash-stale-socket-validation/{data,runtime,config,bin}` 作为四个 XDG roots，`CARGO_BUILD_JOBS=2`，沿用项目 Cargo 缓存。未重设 HOME/CARGO_HOME。精确命令：
+
+```bash
+XDG_DATA_HOME=/tmp/clash-stale-socket-validation/data \
+XDG_RUNTIME_DIR=/tmp/clash-stale-socket-validation/runtime \
+XDG_CONFIG_HOME=/tmp/clash-stale-socket-validation/config \
+XDG_BIN_HOME=/tmp/clash-stale-socket-validation/bin \
+CARGO_BUILD_JOBS=2 \
+cargo test --workspace --all-targets --locked -- --test-threads=1 --skip real_sing_box_spawns_and_answers_controller
+
+# With the same four temporary XDG values and CARGO_BUILD_JOBS=2:
+cargo build --workspace --locked
+cargo build --workspace --release --locked
+cargo fmt --all --check
+git diff --check
+openspec validate align-dual-core-and-client-behavior --strict
+```
+
+| 日志（`/tmp/clash-stale-socket-validation/logs/`） | 结果 | SHA-256 |
+|---|---|---|
+| `red.log` | exit101；2 failed | `4f8edb3f6d8634923150d7cfe6ef86153929338277b1d45fd074a2f840020f51` |
+| `unlinked-red.log` | exit101；1 failed | `abfd642f693daa609ff65bbfe94d2f463c5fd731661064575c651ad691246a6a` |
+| `green.log` | exit0；13 passed | `f9ffdb7a48db87b18174753de157f52f6d9cd63a5fc3e42e2a13f24d318e0b48` |
+| `full-suite.log` | exit0；614 CLI +4 integration +13 core = **631 passed**，0 failed，1 filtered；无 warnings | `0ddebd1441bf829d89a48bf9e48c348758ed868e48f4d838a4e9116707a62b4d` |
+| `build-debug.log` | exit0；复用最终源码编译缓存 | `22e0df986057b9ba5be07526ac5fb348862a3dedef42108383cc3e088acbb889` |
+| `build-release.log` | exit0；optimized build，1m05s | `b6e759df364741ce761092ebba2168301c31205e2ad21b02d9fe2655ff286f7f` |
+| `parent-fmt.log` | exit0 | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `parent-diff.log` | exit0 | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `parent-openspec.log` | exit0；strict valid | `e34801d7350adbe5d185a626ad0d6452e3b914065571d94bffe1cbd63e24a253` |
+
+产物：`target/debug/clash-verge-cli` SHA-256 `07ff3f8ffe67eb6c4eb316fa2e3d7b25ed64a8d7861a9b5a753a009c8841dbc5`；`target/release/clash-verge-cli` SHA-256 `b40f38672c6d875bbeb1d25367d88ab03004151b42d2b4a85d07f118bdfc15cd`。仅构建，未执行或安装产物，未触碰用户运行的 TUI/GUI、核心、配置、现有端点和系统 binary；真实核心启动/切换、下载、TUN/权限及协议互通仍未验证。源码由 parent 独立审查；开发实现与隔离验证完成，真实使用结果须区分于这些 fixture 证据。

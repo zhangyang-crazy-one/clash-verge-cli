@@ -19,6 +19,14 @@ The TUI MUST perform core inspection and consent-gated acquisition asynchronousl
 - **WHEN** a GUI instance, adopted supervisor, changed live CLI record or unowned controller socket blocks a requested lifecycle apply
 - **THEN** the TUI shows a dismissible explanation and neither signals nor adopts nor sends controller requests to that foreign owner
 
+#### Scenario: stale Unix socket without a PID record
+- **WHEN** a CLI-private controller socket file remains after its owner has exited and passive kernel endpoint inspection confirms it is no longer bound
+- **THEN** either core can proceed through guided apply without treating the file as a live foreign controller, and any stale-file cleanup is limited to the verified CLI-private path
+
+#### Scenario: active or unverified Unix endpoint
+- **WHEN** the endpoint is actively bound without a current owned record, including when an old record names a dead PID, or passive inspection cannot establish that the path is safe
+- **THEN** guided apply refuses before lifecycle mutation or unlink, preserves the endpoint and shows its path and a specific ownership or inspection diagnostic
+
 #### Scenario: prepare a binary while GUI supplies the network
 - **WHEN** the GUI is running and the user requests inspection or confirms a core download
 - **THEN** the TUI can inspect and verify a CLI-owned candidate and display its actual version without changing the GUI lifecycle, and ownership is checked before applying it

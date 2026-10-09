@@ -46,3 +46,11 @@ All 22 tasks are complete for the authorized offline implementation and verifica
 - [x] 6.5 Validate exclusively with isolated fixtures/mock endpoints and temporary XDG paths; explicitly skip the real-core E2E, run locked suite/build and format/diff/OpenSpec checks, and record fresh counts/log digests independently from historical 588-test evidence.
 
 Follow-up: 5/5 complete under the isolated implementation scope; 27/27 total tracked implementation tasks. Code: `7b9a5136`, `bdf06fe6`, `dcf03232`, `71ba7ccb`. Fresh evidence follows the historical record in [evidence.md](evidence.md).
+
+## 7. Stale controller socket regression follow-up
+
+- [x] 7.1 Distinguish a stale CLI-private Unix socket file from a bound foreign endpoint using passive inspection; preserve live/unknown/unsafe endpoints and reject active sockets even with a dead PID record.
+- [x] 7.2 Cover both guided target cores with test-owned stale and active Unix sockets, inspection failure and unsafe-path fixtures; capture a failing regression before the repair.
+- [x] 7.3 Run the isolated serialized suite and locked dev/release builds without executing any real core/application or changing user runtime resources; record fresh evidence and artifact identities.
+
+Socket regression: 3/3 complete; 30/30 tracked implementation tasks. Source: `da535daa`. Final isolated suite: 631 passed; locked dev/release builds passed. Live core startup remains unverified; see [evidence.md](evidence.md).
