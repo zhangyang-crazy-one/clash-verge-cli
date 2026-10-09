@@ -35,6 +35,10 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
     for key in map.keys() {
         if let Yaml::String(k) = key
             && !RESERVED_FIELDS.contains(&k.as_str())
+            && !PROTOCOL_MAPS
+                .iter()
+                .find(|(kind, _)| **kind == ptype)
+                .is_some_and(|(_, (_, fields))| fields.iter().any(|(field, _)| *field == k))
         {
             dropped.push(format!("{name}.{k}"));
         }

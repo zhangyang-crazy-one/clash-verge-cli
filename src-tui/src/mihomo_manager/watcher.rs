@@ -103,6 +103,14 @@ pub fn spawn_watcher(
             ExitDisposition::Crash => {}
         }
 
+        // Guided switching owns recovery until commit/rollback finishes.
+        // A prepared target exiting here must not restart the committed old
+        // kind concurrently with the transaction's rollback.
+        if inner.restarting.load(Ordering::SeqCst) {
+            *inner.state.lock() = CoreState::Error(format!("target exited {exit_code} during core transaction"));
+            return;
+        }
+
         if inner.should_auto_restart() {
             inner.record_restart();
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;

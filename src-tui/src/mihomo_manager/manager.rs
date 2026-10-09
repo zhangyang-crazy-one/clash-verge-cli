@@ -335,6 +335,45 @@ impl ManagerInner {
         config_path: Option<PathBuf>,
         inner: Arc<ManagerInner>,
     ) -> anyhow::Result<()> {
+        let kind = inner.core_kind();
+        Self::spawn_core_as(
+            kind,
+            resolved_path,
+            _version,
+            source,
+            config_dir,
+            socket_path,
+            config_path,
+            inner,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_core_as(
+        kind: CoreKind,
+        resolved_path: &Path,
+        _version: &str,
+        source: &str,
+        config_dir: &Path,
+        socket_path: &Path,
+        config_path: Option<PathBuf>,
+        inner: Arc<ManagerInner>,
+        publish: bool,
+    ) -> anyhow::Result<()> {
+        let config_path = config_path.or_else(|| match kind {
+            CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path().ok(),
+            CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path().ok(),
+        });
+        // Validate control-plane auth before a child exists; errors here
+        // cannot leak an unsupervised process or invalidate rollback.
+        let probe_api = api_for_core(
+            kind,
+            socket_path,
+            inner.singbox_controller(),
+            controller_secret_from_config(config_path.as_deref())?,
+        )?;
         // TUN disabled → no capability needed. If the config cannot be read
         // we assume TUN is off and let mihomo fail on its own if it is not.
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
@@ -353,10 +392,13 @@ impl ManagerInner {
 
         *inner.resolved_binary.lock() = Some(resolved_path.to_path_buf());
         let mut command = Command::new(resolved_path);
-        match inner.core_kind() {
+        match kind {
             CoreKind::Mihomo => {
                 command.arg("-d").arg(config_dir);
-                if let Ok(config_path) = clash_verge_core::utils::dirs::clash_path()
+                if let Ok(config_path) = config_path
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(clash_verge_core::utils::dirs::clash_path)
                     && config_path.exists()
                 {
                     command.arg("-f").arg(config_path);
@@ -394,7 +436,7 @@ impl ManagerInner {
         let pid = child.id().expect("child must have PID after spawn");
 
         let started_at = Utc::now();
-        let core_kind = inner.core_kind();
+        let core_kind = kind;
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
         *inner.started_at.lock() = Some(started_at);
@@ -425,14 +467,6 @@ impl ManagerInner {
         // answers with the expected core type. A broken config makes the
         // child exit immediately; probing catches that here so callers can
         // roll back instead of reporting a healthy core.
-        let probe_api = crate::mihomo_api::MihomoApi::with_transport(
-            match core_kind {
-                CoreKind::Mihomo => crate::mihomo_api::Transport::UnixSocket(socket_path.to_path_buf()),
-                CoreKind::SingBox => crate::mihomo_api::Transport::Tcp(inner.singbox_controller()),
-            },
-            String::new(),
-        )
-        .map_err(|e| anyhow::anyhow!("readiness probe client build failed: {e}"))?;
         let probed_version = match probe_readiness(&probe_api, core_kind, READINESS_PROBE_TIMEOUT).await {
             Ok(v) => v,
             Err(error) => {
@@ -449,13 +483,16 @@ impl ManagerInner {
             }
         };
 
-        inner
-            .send_action(Action::CoreStarted {
-                version: Some(probed_version),
-                binary_path: Some(resolved_path.display().to_string()),
-                binary_source: Some(source.to_string()),
-            })
-            .await;
+        if publish {
+            inner.set_core_kind(kind);
+            inner
+                .send_action(Action::CoreStarted {
+                    version: Some(probed_version),
+                    binary_path: Some(resolved_path.display().to_string()),
+                    binary_source: Some(source.to_string()),
+                })
+                .await;
+        }
 
         // The desktop proxy follows the core (no-op unless
         // `enable_system_proxy` is on). Apply before the watcher exists so a
@@ -748,7 +785,6 @@ pub struct MihomoManager {
     config_dir: PathBuf,
     socket_path: PathBuf,
     secret: String,
-    core_kind: CoreKind,
     /// sing-box clash_api TCP endpoint (used when `core_kind == SingBox`).
     singbox_controller: std::net::SocketAddr,
 }
@@ -765,14 +801,12 @@ impl MihomoManager {
             config_dir,
             socket_path,
             secret: String::new(),
-            core_kind: CoreKind::default(),
             singbox_controller: "127.0.0.1:9090".parse().expect("static addr"),
         }
     }
 
     /// Select which core this manager owns. Must be set before `start()`.
-    pub fn with_core_kind(mut self, kind: CoreKind) -> Self {
-        self.core_kind = kind;
+    pub fn with_core_kind(self, kind: CoreKind) -> Self {
         self.inner.set_core_kind(kind);
         self
     }
@@ -784,8 +818,8 @@ impl MihomoManager {
         self
     }
 
-    pub const fn core_kind(&self) -> CoreKind {
-        self.core_kind
+    pub fn core_kind(&self) -> CoreKind {
+        self.inner.core_kind()
     }
 
     pub fn with_socket(mut self, socket_path: PathBuf) -> Self {
@@ -902,7 +936,7 @@ impl MihomoManager {
     }
 
     pub fn api(&self) -> MihomoApi {
-        let result = match self.core_kind {
+        let result = match self.core_kind() {
             CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
             CoreKind::SingBox => MihomoApi::with_transport(
                 crate::mihomo_api::Transport::Tcp(self.singbox_controller),
@@ -911,7 +945,257 @@ impl MihomoManager {
         };
         result
             .expect("MihomoApi construction failed — secret may contain invalid header characters")
-            .for_core(self.core_kind)
+            .for_core(self.core_kind())
+    }
+
+    /// A guided operation never takes lifecycle ownership of an adopted core.
+    /// Kept separate from the GUI scan so tests exercise the policy without /proc.
+    pub fn guided_owner_check(&self, gui_running: bool) -> anyhow::Result<()> {
+        if gui_running {
+            anyhow::bail!(
+                "A Clash Verge GUI instance is running. Exit the GUI before changing a core; its process and configuration were left untouched."
+            );
+        }
+        if self.pid().is_some() && !self.owns_child() {
+            anyhow::bail!(
+                "This core belongs to another supervisor. Change it through its owner; the TUI cannot stop or switch an attached core."
+            );
+        }
+        Ok(())
+    }
+
+    fn guided_record_check(&self, target: CoreKind) -> anyhow::Result<()> {
+        let record = pidfile::read_record(&pidfile::path_for(&self.socket_path));
+        let live = record.as_ref().is_some_and(|record| pidfile::is_running(record.pid));
+        check_guided_record(
+            record.as_ref().map(|record| record.pid),
+            live,
+            self.pid(),
+            self.owns_child(),
+            self.socket_path.exists(),
+        )?;
+        if target == CoreKind::SingBox
+            && !(self.core_kind() == CoreKind::SingBox && self.owns_child() && self.pid().is_some())
+        {
+            // Binding a temporary listener detects a foreign owner without
+            // sending HTTP to, adopting, or signalling that controller.
+            std::net::TcpListener::bind(self.singbox_controller)
+                .context("sing-box controller port belongs to another process; stop it through its owner")?;
+        }
+        Ok(())
+    }
+
+    /// Consume the exact verified candidate. All preparation precedes stop;
+    /// cancellation after stop is cooperative so rollback finishes before exit.
+    pub async fn apply_prepared_core(
+        &self,
+        prepared: &binary::PreparedCore,
+        start_if_stopped: bool,
+        enable_tun: bool,
+        cancelled: &AtomicBool,
+        stages: Option<mpsc::Sender<()>>,
+    ) -> anyhow::Result<()> {
+        let _config_lock = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
+        self.guided_owner_check(super::ownership::gui_process_running())?;
+        self.guided_record_check(prepared.kind)?;
+        let generation = self.current_generation();
+        let old_kind = self.core_kind();
+        let was_running = self.state() == CoreState::Running;
+        let old_binary = self.binary_path();
+        if was_running && old_binary.is_none() {
+            anyhow::bail!("Cannot switch: the owned core executable is unknown; no process was stopped.");
+        }
+        let home = clash_verge_core::utils::dirs::app_home_dir()?;
+        let target_config = match prepared.kind {
+            CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path()?,
+            CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path()?,
+        };
+        std::fs::create_dir_all(&home)?;
+        let candidate = tempfile::NamedTempFile::new_in(&home)?.into_temp_path();
+        let files = GuidedFileSnapshot::capture([
+            target_config.clone(),
+            clash_verge_core::utils::dirs::verge_path()?,
+            home.join(super::ownership::OWNERSHIP_MARKER),
+        ])?;
+        let selections: Vec<(String, String)> = if was_running {
+            self.api()
+                .get_proxies()
+                .await?
+                .proxies
+                .into_iter()
+                .filter(|(group, data)| group != "GLOBAL" && data.group_type.eq_ignore_ascii_case("selector"))
+                .filter_map(|(group, data)| data.now.map(|node| (group, node)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        preflight_tun_capability(&prepared.path, enable_tun)?;
+        match prepared.kind {
+            CoreKind::SingBox => {
+                let yaml = ManagerInner::active_profile_yaml().await?;
+                let (_, parts) =
+                    ManagerInner::write_singbox_assembled_to(&self.config_dir, yaml.as_deref(), enable_tun, &candidate)
+                        .await?;
+                validate_guided_conversion(&parts.conversion)?;
+                crate::runtime_config::prevalidate_singbox_config(&prepared.path, &candidate)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            CoreKind::Mihomo => {
+                let yaml = ManagerInner::active_profile_yaml().await?;
+                let mut config = match yaml {
+                    Some(yaml) if crate::subscribe::from_url::is_singbox_json_profile(&yaml) => {
+                        anyhow::bail!("Selected native sing-box JSON has no lossless Clash conversion; select a Clash subscription before switching to mihomo");
+                    }
+                    Some(yaml) => serde_yaml_ng::from_str::<serde_yaml_ng::Mapping>(&yaml)
+                        .context("Selected native sing-box JSON has no lossless Clash conversion; select a Clash subscription before switching to mihomo")?,
+                    None => clash_verge_core::config::IClashTemp::new().await.0,
+                };
+                crate::enhance::apply_verge_ports(&mut config).await;
+                let config = crate::enhance::prepare_runtime_config(config, enable_tun);
+                std::fs::write(&candidate, serde_yaml_ng::to_string(&config)?)?;
+            }
+        }
+        let target_selections = guided_target_selections(prepared.kind, &candidate, &selections)?;
+        let target_api = api_for_core(
+            prepared.kind,
+            &self.socket_path,
+            self.singbox_controller,
+            controller_secret_from_config(Some(&candidate))?,
+        )?;
+        check_guided_cancel(cancelled)?;
+        self.guided_owner_check(super::ownership::gui_process_running())?;
+        if generation != self.current_generation() {
+            anyhow::bail!("Core ownership/generation changed during preparation; retry. No process was stopped.");
+        }
+        if let Some(stages) = stages {
+            let _ = stages.try_send(());
+        }
+        if self.inner.restarting.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("A core lifecycle operation is already in progress");
+        }
+        struct Busy<'a>(&'a AtomicBool);
+        impl Drop for Busy<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _busy = Busy(&self.inner.restarting);
+        let launch = was_running || start_if_stopped;
+        let stopped = AtomicBool::new(false);
+        let target_started = AtomicBool::new(false);
+        let outcome = orchestrate_guided_switch(
+            || async {
+                check_guided_cancel(cancelled)?;
+                self.guided_owner_check(super::ownership::gui_process_running())?;
+                self.guided_record_check(prepared.kind)?;
+                if generation != self.current_generation() {
+                    anyhow::bail!("Core ownership/generation changed before switching; retry");
+                }
+                Ok(())
+            },
+            was_running,
+            || async {
+                self.stop().await?;
+                stopped.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                check_guided_cancel(cancelled)?;
+                std::fs::rename(&candidate, &target_config)?;
+                if launch {
+                    crate::enhance::ensure_mixed_port_available()
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                    ManagerInner::spawn_core_as(
+                        prepared.kind,
+                        &prepared.path,
+                        &prepared.version,
+                        &prepared.source,
+                        &self.config_dir,
+                        &self.socket_path,
+                        Some(target_config.clone()),
+                        self.inner(),
+                        false,
+                    )
+                    .await?;
+                    target_started.store(true, Ordering::SeqCst);
+                    for (group, node) in &target_selections {
+                        target_api.select_proxy(group, node).await?;
+                    }
+                }
+                Ok(())
+            },
+            || async {
+                check_guided_cancel(cancelled)?;
+                self.guided_owner_check(super::ownership::gui_process_running())?;
+                if launch && (self.pid().is_none() || self.state() != CoreState::Running) {
+                    anyhow::bail!("Prepared target exited before the selection could be committed");
+                }
+                // Fresh read retains all unknown YAML fields and unrelated edits.
+                let mut config = clash_verge_core::config::IVerge::new().await;
+                config.proxy_core = Some(
+                    match prepared.kind {
+                        CoreKind::Mihomo => "mihomo",
+                        CoreKind::SingBox => "singbox",
+                    }
+                    .into(),
+                );
+                config.save_file().await?;
+                check_guided_cancel(cancelled)?;
+                if prepared.kind == CoreKind::SingBox {
+                    super::ownership::write_ownership_marker_at(&home, "singbox")?;
+                } else {
+                    let marker = home.join(super::ownership::OWNERSHIP_MARKER);
+                    match std::fs::remove_file(marker) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                check_guided_cancel(cancelled)?;
+                self.inner.set_core_kind(prepared.kind);
+                *self.inner.resolved_binary.lock() = Some(prepared.path.clone());
+                if !launch {
+                    *self.inner.state.lock() = CoreState::Stopped;
+                }
+                Ok(())
+            },
+            || async {
+                if target_started.load(Ordering::SeqCst) {
+                    self.stop().await?;
+                }
+                files.restore()?;
+                self.inner.set_core_kind(old_kind);
+                *self.inner.resolved_binary.lock() = old_binary.clone();
+                if stopped.load(Ordering::SeqCst) && was_running {
+                    let old_binary = old_binary.as_ref().context("Old executable missing for rollback")?;
+                    ManagerInner::spawn_core_as(
+                        old_kind,
+                        old_binary,
+                        "",
+                        "rollback",
+                        &self.config_dir,
+                        &self.socket_path,
+                        None,
+                        self.inner(),
+                        false,
+                    )
+                    .await?;
+                    for (group, node) in &selections {
+                        self.api().select_proxy(group, node).await?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .await;
+        if let Err(error) = &outcome {
+            if self.pid().is_none() && stopped.load(Ordering::SeqCst) {
+                *self.inner.state.lock() = CoreState::Error(error.to_string());
+            }
+        }
+        outcome
     }
 
     /// D1: resolve the next mihomo binary and run the read-only TUN
@@ -1388,6 +1672,194 @@ stop it first before starting {}",
     )
 }
 
+fn check_guided_cancel(cancelled: &AtomicBool) -> anyhow::Result<()> {
+    if cancelled.load(Ordering::SeqCst) {
+        anyhow::bail!("Core operation cancelled; previous selection retained");
+    }
+    Ok(())
+}
+
+fn check_guided_record(
+    record_pid: Option<u32>,
+    record_live: bool,
+    tracked_pid: Option<u32>,
+    owns_child: bool,
+    socket_exists: bool,
+) -> anyhow::Result<()> {
+    if tracked_pid.is_some() && (!owns_child || record_pid != tracked_pid || !record_live) {
+        anyhow::bail!(
+            "Owned core record changed or disappeared; no lifecycle mutation is allowed. Retry after checking the owner."
+        );
+    }
+    if tracked_pid.is_none() && record_live {
+        anyhow::bail!(
+            "A core belongs to another CLI supervisor; manage it through its owner. No process or controller was contacted."
+        );
+    }
+    if tracked_pid.is_none() && socket_exists && record_pid.is_none() {
+        anyhow::bail!(
+            "An external controller socket has no CLI ownership record; manage it through its owner. The socket was left untouched."
+        );
+    }
+    Ok(())
+}
+
+fn controller_secret_from_config(path: Option<&Path>) -> anyhow::Result<String> {
+    let Some(path) = path else {
+        return Ok(String::new());
+    };
+    let text = std::fs::read_to_string(path)?;
+    let value: serde_json::Value = if text.trim_start().starts_with('{') {
+        serde_json::from_str(&text)?
+    } else {
+        serde_yaml_ng::from_str(&text)?
+    };
+    Ok(value
+        .get("secret")
+        .or_else(|| value.pointer("/experimental/clash_api/secret"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn api_for_core(
+    kind: CoreKind,
+    socket: &Path,
+    controller: std::net::SocketAddr,
+    secret: String,
+) -> anyhow::Result<MihomoApi> {
+    MihomoApi::with_transport(
+        match kind {
+            CoreKind::Mihomo => crate::mihomo_api::Transport::UnixSocket(socket.to_path_buf()),
+            CoreKind::SingBox => crate::mihomo_api::Transport::Tcp(controller),
+        },
+        secret,
+    )
+    .map(|api| api.for_core(kind))
+    .map_err(Into::into)
+}
+
+fn guided_target_selections(
+    kind: CoreKind,
+    config: &Path,
+    selections: &[(String, String)],
+) -> anyhow::Result<Vec<(String, String)>> {
+    if kind == CoreKind::Mihomo {
+        return Ok(selections.to_vec());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
+    let groups = value["outbounds"]
+        .as_array()
+        .context("Prepared sing-box config has no outbounds")?;
+    let mut mapped = Vec::new();
+    for (group, node) in selections {
+        let selector = groups
+            .iter()
+            .find(|value| value["tag"].as_str() == Some(group.as_str()) && value["type"] == "selector")
+            .with_context(|| {
+                format!("Selected group {group:?} has no compatible sing-box selector; old core remains running")
+            })?;
+        let node = match node.as_str() {
+            "DIRECT" => "direct".into(),
+            "REJECT" => "block".into(),
+            _ => node.clone(),
+        };
+        if !selector["outbounds"]
+            .as_array()
+            .is_some_and(|members| members.iter().any(|member| member.as_str() == Some(node.as_str())))
+        {
+            anyhow::bail!("Selected node {node:?} is missing from converted group {group:?}; old core remains running");
+        }
+        mapped.push((group.clone(), node));
+    }
+    Ok(mapped)
+}
+
+fn validate_guided_conversion(conversion: &crate::singbox::convert::ProfileConversion) -> anyhow::Result<()> {
+    if !conversion.skipped.is_empty() || !conversion.degraded.is_empty() {
+        anyhow::bail!(
+            "Current subscription cannot be converted without losing fields. Skipped: {}; unsupported/degraded: {}. Old core remains unchanged.",
+            conversion.skipped.join("; "),
+            conversion.degraded.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Snapshot exact bytes, including unknown YAML/JSON fields. Only transaction
+/// owned paths are restored; binaries are version-addressed and remain usable.
+struct GuidedFileSnapshot(Vec<(PathBuf, Option<Vec<u8>>)>);
+
+impl GuidedFileSnapshot {
+    fn capture(paths: impl IntoIterator<Item = PathBuf>) -> anyhow::Result<Self> {
+        let mut files = Vec::new();
+        for path in paths {
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            files.push((path, bytes));
+        }
+        Ok(Self(files))
+    }
+
+    fn restore(&self) -> anyhow::Result<()> {
+        use std::io::Write as _;
+        for (path, previous) in &self.0 {
+            if let Some(bytes) = previous {
+                let mut candidate =
+                    tempfile::NamedTempFile::new_in(path.parent().context("snapshot path has no parent")?)?;
+                candidate.write_all(bytes)?;
+                candidate.as_file().sync_all()?;
+                candidate.persist(path)?;
+            } else {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Existing injected orchestration extended with commit and awaited rollback.
+/// Production and tests share this exact ordering, without executing a core.
+async fn orchestrate_guided_switch<P, S, L, C, R>(
+    recheck: impl FnOnce() -> P,
+    was_running: bool,
+    stop: impl FnOnce() -> S,
+    launch: impl FnOnce() -> L,
+    commit: impl FnOnce() -> C,
+    rollback: impl FnOnce() -> R,
+) -> anyhow::Result<()>
+where
+    P: Future<Output = anyhow::Result<()>>,
+    S: Future<Output = anyhow::Result<()>>,
+    L: Future<Output = anyhow::Result<()>>,
+    C: Future<Output = anyhow::Result<()>>,
+    R: Future<Output = anyhow::Result<()>>,
+{
+    recheck().await?;
+    let outcome = async {
+        if was_running {
+            stop().await?;
+        }
+        launch().await?;
+        commit().await
+    }
+    .await;
+    if let Err(error) = outcome {
+        return match rollback().await {
+            Ok(()) => Err(error.context("Previous core selection restored")),
+            Err(restore) => Err(error.context(format!("Rollback also failed: {restore}"))),
+        };
+    }
+    Ok(())
+}
+
 /// Restart orchestration with injectable steps, so the exact ordering and
 /// short-circuit behavior can be tested with zero processes, network, or
 /// lifecycle side effects. Contract:
@@ -1476,6 +1948,327 @@ pub struct CoreStatus {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn guided_core_unadopted_live_record_and_external_socket_refuse_without_mutation() {
+        assert!(check_guided_record(Some(10), true, None, false, true).is_err());
+        assert!(check_guided_record(None, false, None, false, true).is_err());
+        assert!(check_guided_record(Some(11), true, Some(10), true, true).is_err());
+        assert!(check_guided_record(Some(10), true, Some(10), true, true).is_ok());
+        assert!(check_guided_record(Some(10), false, None, false, true).is_ok());
+    }
+
+    #[test]
+    fn guided_core_explicit_target_transport_does_not_publish_shared_selection() {
+        let manager = MihomoManager::new(std::env::temp_dir());
+        let target = api_for_core(
+            CoreKind::SingBox,
+            manager.socket_path(),
+            "127.0.0.1:12345".parse().unwrap(),
+            "fixture-secret".into(),
+        )
+        .unwrap();
+        assert_eq!(target.core_kind(), CoreKind::SingBox);
+        assert!(matches!(target.transport(), crate::mihomo_api::Transport::Tcp(_)));
+        assert_eq!(manager.clone().core_kind(), CoreKind::Mihomo);
+        assert!(matches!(
+            manager.api().transport(),
+            crate::mihomo_api::Transport::UnixSocket(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guided_core_cancellation_during_commit_restores_prior_contents() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("verge.yaml");
+        std::fs::write(&path, "proxy_core: mihomo\nunknown: preserved").unwrap();
+        let files = GuidedFileSnapshot::capture([path.clone()]).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let result = orchestrate_guided_switch(
+            || async { Ok(()) },
+            false,
+            || async { Ok(()) },
+            || async { Ok(()) },
+            || async {
+                std::fs::write(&path, "proxy_core: singbox").unwrap();
+                cancelled.store(true, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                check_guided_cancel(&cancelled)
+            },
+            || async { files.restore() },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "proxy_core: mihomo\nunknown: preserved"
+        );
+    }
+    #[tokio::test]
+    async fn guided_core_clash_subscription_prepares_nodes_groups_match_dns_before_stop() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+        let root = test_app_home_root();
+        let _home = claim_test_app_home(root.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("prepared.json");
+        let yaml = "proxies:\n  - {name: edge, type: ss, server: edge.example, port: 443, cipher: aes-128-gcm, password: fixture}\nproxy-groups:\n  - {name: PROXY, type: select, proxies: [edge, DIRECT]}\nrules: [MATCH,PROXY]\ndns:\n  enable: true\n  nameserver: [8.8.8.8]\n";
+        // MATCH contains a comma and is a single rule string.
+        let yaml = yaml.replace("rules: [MATCH,PROXY]", "rules: ['MATCH,PROXY']");
+        let (path, parts) = ManagerInner::write_singbox_assembled_to(&root, Some(&yaml), false, &staged)
+            .await
+            .unwrap();
+        validate_guided_conversion(&parts.conversion).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(
+            config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["tag"] == "edge")
+        );
+        assert!(
+            config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["tag"] == "PROXY" && node["type"] == "selector")
+        );
+        assert!(
+            config["route"]["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["outbound"] == "PROXY")
+        );
+        assert!(
+            config["dns"]["servers"]
+                .as_array()
+                .is_some_and(|servers| !servers.is_empty())
+        );
+        assert_eq!(
+            guided_target_selections(CoreKind::SingBox, &staged, &[("PROXY".into(), "DIRECT".into())]).unwrap(),
+            [("PROXY".into(), "direct".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_core_critical_subscription_fields_fail_without_formal_file_mutation() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+        let root = test_app_home_root();
+        let _home = claim_test_app_home(root.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let formal = dir.path().join("singbox.json");
+        std::fs::write(&formal, "prior config").unwrap();
+        let candidate = dir.path().join("prepared.json");
+        let yaml = "dns:\n  enable: true\n  nameserver: [8.8.8.8]\n  fallback-filter: {geoip: true}\n";
+        let result = ManagerInner::write_singbox_assembled_to(&root, Some(yaml), false, &candidate).await;
+        assert!(result.is_err(), "unsupported critical DNS must reject preparation");
+        assert_eq!(std::fs::read_to_string(formal).unwrap(), "prior config");
+        assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn guided_core_readiness_secret_is_taken_from_prepared_control_plane() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("candidate");
+        std::fs::write(&path, "secret: fixture-controller-secret").unwrap();
+        assert_eq!(
+            controller_secret_from_config(Some(&path)).unwrap(),
+            "fixture-controller-secret"
+        );
+        std::fs::write(
+            &path,
+            r#"{"experimental":{"clash_api":{"secret":"fixture-json-secret"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            controller_secret_from_config(Some(&path)).unwrap(),
+            "fixture-json-secret"
+        );
+    }
+
+    #[test]
+    fn guided_core_unsupported_tls_conversion_has_concrete_visible_diagnostic() {
+        let yaml = "proxies:\n  - {name: secure-edge, type: vless, server: edge.example, port: 443, uuid: 00000000-0000-0000-0000-000000000000, tls: true, skip-cert-verify: invalid-fixture}\n";
+        let conversion = crate::singbox::convert::convert_profile(yaml).unwrap();
+        let message = validate_guided_conversion(&conversion).unwrap_err().to_string();
+        assert!(message.contains("skip-cert-verify"));
+        assert!(message.contains("Old core remains unchanged"));
+    }
+    #[tokio::test]
+    async fn guided_core_switch_rechecks_then_stops_launches_and_commits() {
+        let calls = parking_lot::Mutex::new(Vec::new());
+        orchestrate_guided_switch(
+            || async {
+                calls.lock().push("recheck");
+                Ok(())
+            },
+            true,
+            || async {
+                calls.lock().push("stop");
+                Ok(())
+            },
+            || async {
+                calls.lock().push("launch-ready");
+                Ok(())
+            },
+            || async {
+                calls.lock().push("commit");
+                Ok(())
+            },
+            || async {
+                calls.lock().push("rollback");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock(), ["recheck", "stop", "launch-ready", "commit"]);
+    }
+
+    #[tokio::test]
+    async fn guided_core_failed_recheck_has_zero_mutation_hooks() {
+        let touched = AtomicBool::new(false);
+        let result = orchestrate_guided_switch(
+            || async { anyhow::bail!("generation changed") },
+            true,
+            || async {
+                touched.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                touched.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                touched.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async {
+                touched.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!touched.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn guided_core_each_late_failure_restores_bytes_kind_and_selection() {
+        for failure in ["stop", "launch", "commit"] {
+            let home = tempfile::tempdir().unwrap();
+            let config = home.path().join("config");
+            let marker = home.path().join("marker");
+            std::fs::write(&config, "proxy_core: mihomo\nunknown: preserved\nselector: node-a").unwrap();
+            std::fs::write(&marker, "prior owner").unwrap();
+            let snapshot = GuidedFileSnapshot::capture([config.clone(), marker.clone()]).unwrap();
+            let manager = MihomoManager::new(home.path().into());
+            let clone = manager.clone();
+            let calls = parking_lot::Mutex::new(Vec::new());
+            let result = orchestrate_guided_switch(
+                || async { Ok(()) },
+                true,
+                || async {
+                    calls.lock().push("stop");
+                    if failure == "stop" {
+                        anyhow::bail!("stop failed");
+                    }
+                    Ok(())
+                },
+                || async {
+                    calls.lock().push("launch");
+                    std::fs::write(&config, "target config").unwrap();
+                    manager.inner.set_core_kind(CoreKind::SingBox);
+                    if failure == "launch" {
+                        anyhow::bail!("readiness failed");
+                    }
+                    Ok(())
+                },
+                || async {
+                    calls.lock().push("commit");
+                    std::fs::write(&marker, "target marker").unwrap();
+                    anyhow::bail!("config-save/marker failed")
+                },
+                || async {
+                    calls.lock().push("restore/restart-old");
+                    snapshot.restore()?;
+                    manager.inner.set_core_kind(CoreKind::Mihomo);
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.lock().last(), Some(&"restore/restart-old"));
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                "proxy_core: mihomo\nunknown: preserved\nselector: node-a"
+            );
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "prior owner");
+            assert_eq!(clone.core_kind(), CoreKind::Mihomo);
+            assert!(matches!(
+                clone.api().transport(),
+                crate::mihomo_api::Transport::UnixSocket(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_core_stopped_switch_never_calls_stop() {
+        let stopped = AtomicBool::new(false);
+        orchestrate_guided_switch(
+            || async { Ok(()) },
+            false,
+            || async {
+                stopped.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            || async { Ok(()) },
+            || async { Ok(()) },
+            || async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert!(!stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn guided_core_rollback_failure_is_separately_reported() {
+        let result = orchestrate_guided_switch(
+            || async { Ok(()) },
+            true,
+            || async { Ok(()) },
+            || async { anyhow::bail!("target boot failed") },
+            || async { Ok(()) },
+            || async { anyhow::bail!("old boot failed") },
+        )
+        .await
+        .unwrap_err();
+        let error = format!("{result:#}");
+        assert!(error.contains("target boot failed"));
+        assert!(error.contains("Rollback also failed: old boot failed"));
+    }
+
+    #[test]
+    fn guided_core_gui_and_foreign_owners_are_read_only_rejections() {
+        let manager = MihomoManager::new(std::env::temp_dir());
+        assert!(
+            manager
+                .guided_owner_check(true)
+                .unwrap_err()
+                .to_string()
+                .contains("GUI")
+        );
+        *manager.inner.pid.lock() = Some(1234);
+        assert!(
+            manager
+                .guided_owner_check(false)
+                .unwrap_err()
+                .to_string()
+                .contains("another supervisor")
+        );
+        assert_eq!(manager.pid(), Some(1234));
+        assert_eq!(manager.current_generation(), 0);
+    }
     #[test]
     fn guided_core_shared_selection_updates_every_clone_and_transport() {
         let manager = super::MihomoManager::new(std::env::temp_dir());
