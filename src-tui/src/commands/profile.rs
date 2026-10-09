@@ -565,11 +565,9 @@ mod tests {
 
     #[tokio::test]
     async fn use_profile_dispatches_to_mihomo_branch_via_switch_profile() {
-        // mihomo manager + missing file → mihomo's
-        // `compose_remote_profile` reports "profile file not found".
-        // The mihomo branch of `use_profile` calls `switch_profile` which
-        // routes through `load_remote_profile_with_rules`, so seeing this
-        // message proves the dispatcher took the mihomo branch.
+        // Stopped mihomo validates the selected source before writing its
+        // next runtime config. Both cores now share source composition, so
+        // assert the concrete missing file and absence of persistent changes.
         let root = crate::profile_store::store::tests::test_app_home_root();
         let _dir_guard = crate::profile_store::store::tests::claim_test_app_home(root.clone()).await;
 
@@ -578,19 +576,20 @@ mod tests {
 
         let bogus_socket = std::env::temp_dir().join(format!("cv-no-sock-{}.sock", uuid::Uuid::new_v4()));
         let mgr = MihomoManager::new(root.clone()).with_socket(bogus_socket);
+        let previous_profiles = std::fs::read(root.join("profiles.yaml")).expect("seeded profile metadata");
 
         let error = use_profile(&mgr, uid)
             .await
             .expect_err("missing profile file must surface as an error");
         let text = error.to_string();
         assert!(
-            text.contains("profile file not found"),
-            "mihomo branch surfaces load_remote_profile_with_rules' error: {text}"
+            text.contains("failed to read profile") && text.contains(&format!("{uid}.yaml")),
+            "mihomo branch must reject the missing selected source: {text}"
         );
-        assert!(
-            !text.contains("failed to read"),
-            "must NOT route through the sing-box branch: {text}"
-        );
+        assert_eq!(std::fs::read(root.join("profiles.yaml")).unwrap(), previous_profiles);
+        assert_eq!(mgr.core_kind(), CoreKind::Mihomo);
+        assert!(mgr.pid().is_none());
+        assert!(mgr.binary_path().is_none());
 
         let _ = std::fs::remove_dir_all(&root);
     }

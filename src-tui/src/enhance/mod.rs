@@ -195,12 +195,16 @@ pub async fn apply_verge_ports(config: &mut Mapping) {
         && let Some(port) = verge.verge_socks_port
     {
         config.insert("socks-port".into(), port.into());
+    } else if verge.verge_socks_enabled == Some(false) {
+        config.remove("socks-port");
     }
 
     if verge.verge_http_enabled == Some(true)
         && let Some(port) = verge.verge_port
     {
         config.insert("port".into(), port.into());
+    } else if verge.verge_http_enabled == Some(false) {
+        config.remove("port");
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -208,6 +212,8 @@ pub async fn apply_verge_ports(config: &mut Mapping) {
         && let Some(port) = verge.verge_redir_port
     {
         config.insert("redir-port".into(), port.into());
+    } else if verge.verge_redir_enabled == Some(false) {
+        config.remove("redir-port");
     }
 
     #[cfg(target_os = "linux")]
@@ -215,6 +221,8 @@ pub async fn apply_verge_ports(config: &mut Mapping) {
         && let Some(port) = verge.verge_tproxy_port
     {
         config.insert("tproxy-port".into(), port.into());
+    } else if verge.verge_tproxy_enabled == Some(false) {
+        config.remove("tproxy-port");
     }
 }
 

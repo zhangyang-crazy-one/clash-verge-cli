@@ -12,6 +12,7 @@ mod i18n;
 mod logging;
 mod mihomo_api;
 mod mihomo_manager;
+mod profile_script;
 mod profile_store;
 mod routing;
 mod runtime_config;

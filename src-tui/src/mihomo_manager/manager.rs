@@ -564,24 +564,13 @@ impl ManagerInner {
             .into_iter()
             .find(|item| item.uid.as_deref() == Some(uid.as_str()))
             .ok_or_else(|| anyhow::anyhow!("selected profile {uid} is missing"))?;
-        let file = item.file.as_deref().context("selected profile has no file")?;
-        let path = clash_verge_core::utils::dirs::app_profiles_dir()?.join(file);
-        let raw = tokio::fs::read_to_string(&path)
+        let raw = crate::runtime_config::load_profile_yaml(&item)
             .await
-            .with_context(|| format!("failed to read profile {}", path.display()))?;
+            .map_err(anyhow::Error::msg)?;
         if crate::subscribe::from_url::is_singbox_json_profile(&raw) {
             return Ok(Some(raw));
         }
-        let mapping = if item.itype.as_deref() == Some("remote") {
-            crate::runtime_config::load_remote_profile_with_rules(&item)
-                .await
-                .map_err(anyhow::Error::msg)?
-        } else {
-            let mut mapping = clash_verge_core::config::IClashTemp::new().await.0;
-            let chain = crate::chain::resolve_chain(&item, path.parent().context("profile directory missing")?).await?;
-            crate::chain::apply_chain_to_config(&mut mapping, &chain)?;
-            mapping
-        };
+        let mapping = serde_yaml_ng::from_str(&raw).context("invalid composed profile YAML")?;
         let (mapping, _) = crate::services::profile::prepare_profile_dns_from_settings(&uid, mapping)
             .await
             .map_err(anyhow::Error::msg)?;
@@ -629,7 +618,7 @@ impl ManagerInner {
         let core_config = clash_verge_core::config::IClashTemp::new().await;
         let tun = profile_tun_settings(yaml, &core_config.0).map_err(anyhow::Error::msg)?;
         let clash_api = crate::singbox::ClashApiSettings {
-            listen: "127.0.0.1:9090".parse().expect("static addr"),
+            listen: configured_singbox_controller(&core_config.0)?,
             secret: core_config.get_client_info().secret.unwrap_or_default(),
         };
 
@@ -944,9 +933,15 @@ impl MihomoManager {
     /// Kept separate from the GUI scan so tests exercise the policy without /proc.
     pub fn guided_owner_check(&self, gui_running: bool) -> anyhow::Result<()> {
         if gui_running {
-            anyhow::bail!(
-                "A Clash Verge GUI instance is running. Exit the GUI before changing a core; its process and configuration were left untouched."
-            );
+            super::gui_isolation::check(
+                &self.config_dir,
+                &self.socket_path,
+                if self.owns_child() { self.pid() } else { None },
+                None,
+            )
+            .context(
+                "A Clash Verge GUI instance is running; changing this core requires explicitly isolated CLI resources",
+            )?;
         }
         if self.pid().is_some() && !self.owns_child() {
             anyhow::bail!(
@@ -968,6 +963,49 @@ impl MihomoManager {
         self.guided_record_check(target)
     }
 
+    /// Read-only guard for choosing the next core while no CLI core is active.
+    /// GUI coexistence is safe here: no GUI lifecycle or runtime file is used.
+    fn stopped_selection_preflight(&self, generation: u64, old_kind: CoreKind, target: CoreKind) -> anyhow::Result<()> {
+        if generation != self.current_generation()
+            || old_kind != self.core_kind()
+            || !matches!(self.state(), CoreState::Stopped | CoreState::Error(_))
+            || self.pid().is_some()
+        {
+            anyhow::bail!("Core ownership/generation or selection changed; retry the stopped selection");
+        }
+        self.guided_record_check(target)?;
+        if old_kind == CoreKind::SingBox && target != CoreKind::SingBox {
+            self.guided_record_check(CoreKind::SingBox)?;
+        }
+        Ok(())
+    }
+
+    fn commit_stopped_selection(
+        &self,
+        generation: u64,
+        old_kind: CoreKind,
+        target: CoreKind,
+        cancelled: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        check_guided_cancel(cancelled)?;
+        self.stopped_selection_preflight(generation, old_kind, target)?;
+        if self.inner.restarting.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("A core lifecycle operation is already in progress");
+        }
+        let _busy = LifecycleBusy(&self.inner.restarting);
+        let home = clash_verge_core::utils::dirs::app_home_dir()?;
+        persist_stopped_selection(&home, target, || {
+            check_guided_cancel(cancelled)?;
+            self.stopped_selection_preflight(generation, old_kind, target)
+        })?;
+        self.inner.set_core_kind(target);
+        *self.inner.state.lock() = CoreState::Stopped;
+        // A committed choice invalidates older confirmations even though no
+        // process was spawned. Shared clones observe the same selection epoch.
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
     fn guided_record_check_with(
         &self,
         target: CoreKind,
@@ -985,13 +1023,62 @@ impl MihomoManager {
             socket == super::controller_socket::SocketState::Bound,
         )
         .map_err(|error| anyhow::anyhow!("Controller socket {}: {error:#}", self.socket_path.display()))?;
-        if target == CoreKind::SingBox
-            && !(self.core_kind() == CoreKind::SingBox && self.owns_child() && self.pid().is_some())
-        {
+        self.guided_tcp_controller_check_with(
+            target,
+            |pid, address| super::gui_isolation::owns_listener(pid, address, "tcp"),
+            super::ownership::gui_process_running,
+        )
+    }
+
+    fn guided_tcp_controller_check_with(
+        &self,
+        target: CoreKind,
+        owns_listener: impl FnOnce(u32, std::net::SocketAddr) -> anyhow::Result<bool>,
+        gui_running: impl FnOnce() -> bool,
+    ) -> anyhow::Result<()> {
+        // Retain the existing owned SingBox restart policy. Capability-bearing
+        // children may be non-dumpable even to their unprivileged supervisor;
+        // the record guard above still protects attached/changed ownership.
+        if self.core_kind() == CoreKind::SingBox && self.owns_child() && self.pid().is_some() {
+            return Ok(());
+        }
+        if target == CoreKind::SingBox {
             // Binding a temporary listener detects a foreign owner without
             // sending HTTP to, adopting, or signalling that controller.
-            std::net::TcpListener::bind(self.singbox_controller)
-                .context("sing-box controller port belongs to another process; stop it through its owner")?;
+            if let Err(error) = std::net::TcpListener::bind(self.singbox_controller) {
+                let owned = if error.kind() == std::io::ErrorKind::AddrInUse
+                    && self.owns_child()
+                    && let Some(pid) = self.pid()
+                {
+                    match owns_listener(pid, self.singbox_controller) {
+                        Ok(owned) => owned,
+                        Err(error)
+                            if self.core_kind() == CoreKind::Mihomo
+                                && error
+                                    .downcast_ref::<std::io::Error>()
+                                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+                                && !gui_running() =>
+                        {
+                            // A capability-bearing owned child may be non-dumpable.
+                            // Defer this one check; launch always verifies that the
+                            // target TCP port is free after the owned stop, before
+                            // starting or contacting any replacement.
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return Err(error).context(
+                                "cannot verify owned predecessor's controller listener; no process was stopped",
+                            );
+                        }
+                    }
+                } else {
+                    false
+                };
+                if !owned {
+                    return Err(error)
+                        .context("sing-box controller port belongs to another process; stop it through its owner");
+                }
+            }
         }
         Ok(())
     }
@@ -1007,10 +1094,13 @@ impl MihomoManager {
         cancelled: &AtomicBool,
         stages: Option<mpsc::Sender<()>>,
     ) -> anyhow::Result<()> {
+        let old_kind = self.core_kind();
         let _config_lock = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
+        if !start_if_stopped && self.state() != CoreState::Running {
+            return self.commit_stopped_selection(expected_generation, old_kind, prepared.kind, cancelled);
+        }
         self.guided_preflight(expected_generation, prepared.kind)?;
         let generation = expected_generation;
-        let old_kind = self.core_kind();
         let was_running = self.state() == CoreState::Running;
         let old_binary = self.binary_path();
         if was_running && old_binary.is_none() {
@@ -1068,6 +1158,18 @@ impl MihomoManager {
             }
         }
         let target_selections = guided_target_selections(prepared.kind, &candidate, &selections)?;
+        if super::ownership::gui_process_running() {
+            super::gui_isolation::check(
+                &self.config_dir,
+                &self.socket_path,
+                if was_running && self.owns_child() {
+                    self.pid()
+                } else {
+                    None
+                },
+                Some((&candidate, prepared.kind)),
+            )?;
+        }
         let target_api = api_for_core(
             prepared.kind,
             &self.socket_path,
@@ -1085,13 +1187,7 @@ impl MihomoManager {
         if self.inner.restarting.swap(true, Ordering::SeqCst) {
             anyhow::bail!("A core lifecycle operation is already in progress");
         }
-        struct Busy<'a>(&'a AtomicBool);
-        impl Drop for Busy<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::SeqCst);
-            }
-        }
-        let _busy = Busy(&self.inner.restarting);
+        let _busy = LifecycleBusy(&self.inner.restarting);
         let launch = was_running || start_if_stopped;
         let stopped = AtomicBool::new(false);
         let target_started = AtomicBool::new(false);
@@ -1115,6 +1211,15 @@ impl MihomoManager {
                 check_guided_cancel(cancelled)?;
                 std::fs::rename(&candidate, &target_config)?;
                 if launch {
+                    ensure_guided_controller_released(prepared.kind, self.singbox_controller)?;
+                    if super::ownership::gui_process_running() {
+                        super::gui_isolation::check(
+                            &self.config_dir,
+                            &self.socket_path,
+                            None,
+                            Some((&target_config, prepared.kind)),
+                        )?;
+                    }
                     crate::enhance::ensure_mixed_port_available()
                         .await
                         .map_err(anyhow::Error::msg)?;
@@ -1733,6 +1838,29 @@ fn controller_secret_from_config(path: Option<&Path>) -> anyhow::Result<String> 
         .to_string())
 }
 
+fn ensure_guided_controller_released(kind: CoreKind, controller: std::net::SocketAddr) -> anyhow::Result<()> {
+    if kind == CoreKind::SingBox {
+        std::net::TcpListener::bind(controller)
+            .context("target sing-box controller is still occupied after the owned stop; no target was started")?;
+    }
+    Ok(())
+}
+
+pub(crate) fn configured_singbox_controller(config: &serde_yaml_ng::Mapping) -> anyhow::Result<std::net::SocketAddr> {
+    let address = config
+        .get("external-controller")
+        .and_then(serde_yaml_ng::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:9090");
+    let address: std::net::SocketAddr = address.parse().context("invalid sing-box controller address")?;
+    // Sing-box retains its existing fixed IPv4 loopback host. Share the saved
+    // controller port without restricting mihomo's independent Unix/TCP setup.
+    Ok(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        if address.port() == 0 { 9090 } else { address.port() },
+    )))
+}
+
 fn api_for_core(
     kind: CoreKind,
     socket: &Path,
@@ -1755,33 +1883,96 @@ fn guided_target_selections(
     config: &Path,
     selections: &[(String, String)],
 ) -> anyhow::Result<Vec<(String, String)>> {
-    if kind == CoreKind::Mihomo {
-        return Ok(selections.to_vec());
+    if selections.is_empty() {
+        return Ok(Vec::new());
     }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
-    let groups = value["outbounds"]
-        .as_array()
-        .context("Prepared sing-box config has no outbounds")?;
+    let bytes = std::fs::read(config)?;
+    let mut declared = std::collections::HashSet::<String>::new();
+    let mut selectors = std::collections::HashMap::<String, Vec<String>>::new();
+    match kind {
+        CoreKind::Mihomo => {
+            let value: serde_yaml_ng::Mapping = serde_yaml_ng::from_slice(&bytes)?;
+            declared.extend(["DIRECT".into(), "REJECT".into()]);
+            for key in ["proxies", "proxy-groups"] {
+                for entry in value
+                    .get(key)
+                    .and_then(serde_yaml_ng::Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(name) = entry.get("name").and_then(serde_yaml_ng::Value::as_str) {
+                        declared.insert(name.into());
+                        if key == "proxy-groups"
+                            && entry
+                                .get("type")
+                                .and_then(serde_yaml_ng::Value::as_str)
+                                .is_some_and(|kind| {
+                                    kind.eq_ignore_ascii_case("select") || kind.eq_ignore_ascii_case("selector")
+                                })
+                        {
+                            let members = entry
+                                .get("proxies")
+                                .and_then(serde_yaml_ng::Value::as_sequence)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(serde_yaml_ng::Value::as_str)
+                                .map(str::to_owned)
+                                .collect();
+                            selectors.insert(name.into(), members);
+                        }
+                    }
+                }
+            }
+        }
+        CoreKind::SingBox => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            let outbounds = value["outbounds"]
+                .as_array()
+                .context("Prepared sing-box config has no outbounds")?;
+            for entry in outbounds {
+                if let Some(tag) = entry["tag"].as_str() {
+                    declared.insert(tag.into());
+                    if entry["type"] == "selector" {
+                        let members = entry["outbounds"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect();
+                        selectors.insert(tag.into(), members);
+                    }
+                }
+            }
+        }
+    }
     let mut mapped = Vec::new();
     for (group, node) in selections {
-        let selector = groups
-            .iter()
-            .find(|value| value["tag"].as_str() == Some(group.as_str()) && value["type"] == "selector")
-            .with_context(|| {
-                format!("Selected group {group:?} has no compatible sing-box selector; old core remains running")
-            })?;
-        let node = match node.as_str() {
-            "DIRECT" => "direct".into(),
-            "REJECT" => "block".into(),
-            _ => node.clone(),
+        let members = selectors.get(group).with_context(|| {
+            format!(
+                "Selected group {group:?} has no compatible {} selector; old core remains running",
+                kind.as_str()
+            )
+        })?;
+        let legal = |name: &str| declared.contains(name) && members.iter().any(|member| member == name);
+        // A user-defined, case-sensitive name wins over a reserved-name alias.
+        let alias = match (kind, node.as_str()) {
+            (CoreKind::SingBox, "DIRECT") => Some("direct"),
+            (CoreKind::SingBox, "REJECT") => Some("block"),
+            (CoreKind::Mihomo, "direct") => Some("DIRECT"),
+            (CoreKind::Mihomo, "block") => Some("REJECT"),
+            _ => None,
         };
-        if !selector["outbounds"]
-            .as_array()
-            .is_some_and(|members| members.iter().any(|member| member.as_str() == Some(node.as_str())))
-        {
-            anyhow::bail!("Selected node {node:?} is missing from converted group {group:?}; old core remains running");
-        }
-        mapped.push((group.clone(), node));
+        let target = if legal(node) {
+            node.as_str()
+        } else if let Some(alias) = alias.filter(|alias| legal(alias)) {
+            alias
+        } else {
+            anyhow::bail!(
+                "Selected node {node:?} has no declared member in target group {group:?}; old core remains running"
+            );
+        };
+        mapped.push((group.clone(), target.into()));
     }
     Ok(mapped)
 }
@@ -1800,6 +1991,78 @@ fn validate_guided_conversion(conversion: &crate::singbox::convert::ProfileConve
 /// Snapshot exact bytes, including unknown YAML/JSON fields. Only transaction
 /// owned paths are restored; binaries are version-addressed and remain usable.
 struct GuidedFileSnapshot(Vec<(PathBuf, Option<Vec<u8>>)>);
+
+struct LifecycleBusy<'a>(&'a AtomicBool);
+impl Drop for LifecycleBusy<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Only the CLI selection and its marker participate. Parse the raw mapping
+/// strictly, retaining GUI/unknown fields; stage each replacement atomically
+/// and restore exact old bytes if either write or the final guard fails.
+fn persist_stopped_selection(
+    home: &Path,
+    kind: CoreKind,
+    mut guard: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let verge = home.join("verge.yaml");
+    let marker = home.join(super::ownership::OWNERSHIP_MARKER);
+    let files = GuidedFileSnapshot::capture([verge.clone(), marker.clone()])?;
+    let original = &files.0[0].1;
+    let mut config: serde_yaml_ng::Mapping = match original {
+        Some(bytes) => serde_yaml_ng::from_slice(bytes)
+            .context("cannot select core: invalid verge.yaml; existing settings left untouched")?,
+        None => serde_yaml_ng::Mapping::new(),
+    };
+    config.insert("proxy_core".into(), kind.as_str().into());
+    let mut config_candidate = tempfile::NamedTempFile::new_in(home)?;
+    config_candidate.write_all(serde_yaml_ng::to_string(&config)?.as_bytes())?;
+    config_candidate.as_file().sync_all()?;
+    let mut marker_candidate = if kind == CoreKind::SingBox {
+        let mut file = tempfile::NamedTempFile::new_in(home)?;
+        let record = super::ownership::OwnershipMarker {
+            owner: "tui".into(),
+            core: "singbox".into(),
+            pid: std::process::id(),
+        };
+        file.write_all(&serde_json::to_vec(&record)?)?;
+        file.as_file().sync_all()?;
+        Some(file)
+    } else {
+        None
+    };
+    guard()?;
+    // Detect another writer before publishing anything, including GUI changes.
+    let fresh = GuidedFileSnapshot::capture([verge.clone(), marker.clone()])?;
+    if fresh.0 != files.0 {
+        anyhow::bail!("Core selection settings changed during preparation; retry");
+    }
+    let outcome = (|| -> anyhow::Result<()> {
+        if let Some(candidate) = marker_candidate.take() {
+            candidate.persist(&marker)?;
+        } else {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        guard()?;
+        config_candidate.persist(&verge)?;
+        guard()?;
+        Ok(())
+    })();
+    if let Err(error) = outcome {
+        return match files.restore() {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(anyhow::anyhow!("{error:#}; selection rollback failed: {rollback:#}")),
+        };
+    }
+    Ok(())
+}
 
 impl GuidedFileSnapshot {
     fn capture(paths: impl IntoIterator<Item = PathBuf>) -> anyhow::Result<Self> {
@@ -1959,6 +2222,265 @@ pub struct CoreStatus {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[tokio::test]
+    async fn stopped_selection_ignores_profiles_tun_and_candidate_without_starting() {
+        let home = private_socket_fixture();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: missing\nitems: [{uid: missing, type: remote, file: absent.yaml}]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "proxy_core: singbox\nenable_tun_mode: true\nfuture: {keep: yes}\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("config.yaml"), "previous mihomo runtime").unwrap();
+        std::fs::write(home.path().join("singbox.json"), "previous singbox runtime").unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(home.path().join("controller.sock"))
+            .with_singbox_controller("127.0.0.1:0".parse().unwrap())
+            .with_core_kind(CoreKind::SingBox);
+        let shared = manager.clone();
+        let prepared = binary::PreparedCore {
+            kind: CoreKind::Mihomo,
+            path: home.path().join("not-an-executable"),
+            source: "fixture".into(),
+            version: "v1.19.27".into(),
+        };
+        manager
+            .apply_prepared_core(
+                &prepared,
+                manager.current_generation(),
+                false,
+                true,
+                &AtomicBool::new(false),
+                None,
+            )
+            .await
+            .expect("stopped selection does not prepare config or require TUN");
+        assert_eq!(shared.core_kind(), CoreKind::Mihomo);
+        assert_eq!(manager.state(), CoreState::Stopped);
+        assert!(manager.pid().is_none());
+        assert!(
+            manager.binary_path().is_none(),
+            "selection must not mutate executable cache"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("config.yaml")).unwrap(),
+            "previous mihomo runtime"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("singbox.json")).unwrap(),
+            "previous singbox runtime"
+        );
+        let verge: serde_yaml_ng::Mapping =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(home.path().join("verge.yaml")).unwrap()).unwrap();
+        assert_eq!(verge["proxy_core"], serde_yaml_ng::Value::from("mihomo"));
+        assert_eq!(verge["future"]["keep"], serde_yaml_ng::Value::from("yes"));
+        assert_eq!(shared.current_generation(), 1);
+        let stale = manager
+            .apply_prepared_core(&prepared, 0, false, false, &AtomicBool::new(false), None)
+            .await;
+        assert!(stale.unwrap_err().to_string().contains("generation"));
+        assert_eq!(manager.current_generation(), 1);
+        let prepared = binary::PreparedCore {
+            kind: CoreKind::SingBox,
+            ..prepared
+        };
+        *manager.inner.state.lock() = CoreState::Error("earlier startup failed".into());
+        manager
+            .apply_prepared_core(&prepared, 1, false, true, &AtomicBool::new(false), None)
+            .await
+            .unwrap();
+        assert_eq!(shared.core_kind(), CoreKind::SingBox);
+        assert_eq!(shared.current_generation(), 2);
+        assert_eq!(
+            super::super::ownership::read_ownership_marker_at(home.path())
+                .unwrap()
+                .core,
+            "singbox"
+        );
+        assert!(manager.pid().is_none());
+        assert!(manager.binary_path().is_none());
+        assert_eq!(manager.state(), CoreState::Stopped);
+    }
+
+    #[test]
+    fn stopped_selection_transaction_rolls_back_marker_and_exact_yaml_at_each_failure() {
+        for target in [CoreKind::Mihomo, CoreKind::SingBox] {
+            for fail_at in [1, 2, 3] {
+                let home = tempfile::tempdir().unwrap();
+                let yaml = b"# retain exact old bytes\nproxy_core: mihomo\nfuture: {keep: yes}\n";
+                let marker = b"previous ownership marker";
+                std::fs::write(home.path().join("verge.yaml"), yaml).unwrap();
+                std::fs::write(home.path().join(super::super::ownership::OWNERSHIP_MARKER), marker).unwrap();
+                let mut checks = 0;
+                let result = persist_stopped_selection(home.path(), target, || {
+                    checks += 1;
+                    if checks == fail_at {
+                        anyhow::bail!("fixture commit failure");
+                    }
+                    Ok(())
+                });
+                assert!(result.is_err());
+                assert_eq!(std::fs::read(home.path().join("verge.yaml")).unwrap(), yaml);
+                assert_eq!(
+                    std::fs::read(home.path().join(super::super::ownership::OWNERSHIP_MARKER)).unwrap(),
+                    marker
+                );
+                assert_eq!(
+                    std::fs::read_dir(home.path()).unwrap().count(),
+                    2,
+                    "temporary candidates cleaned up"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_selection_rejects_cancel_busy_foreign_endpoint_and_record_without_mutation() {
+        let home = private_socket_fixture();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let yaml = b"proxy_core: mihomo\nfuture: {keep: true}\n";
+        std::fs::write(home.path().join("verge.yaml"), yaml).unwrap();
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(socket.clone())
+            .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+        let prepared = binary::PreparedCore {
+            kind: CoreKind::SingBox,
+            path: home.path().join("absent"),
+            source: "fixture".into(),
+            version: "1.14.2".into(),
+        };
+        assert!(
+            manager
+                .apply_prepared_core(&prepared, 0, false, true, &AtomicBool::new(true), None)
+                .await
+                .is_err()
+        );
+        manager.inner.restarting.store(true, Ordering::SeqCst);
+        assert!(
+            manager
+                .apply_prepared_core(&prepared, 0, false, true, &AtomicBool::new(false), None)
+                .await
+                .is_err()
+        );
+        manager.inner.restarting.store(false, Ordering::SeqCst);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(
+            manager
+                .apply_prepared_core(&prepared, 0, false, true, &AtomicBool::new(false), None)
+                .await
+                .is_err()
+        );
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        pidfile::write(
+            &pidfile::path_for(&socket),
+            pidfile::CoreRecord::with_kind(std::process::id(), Utc::now(), CoreKind::Mihomo),
+        )
+        .unwrap();
+        assert!(
+            manager
+                .apply_prepared_core(&prepared, 0, false, true, &AtomicBool::new(false), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(home.path().join("verge.yaml")).unwrap(), yaml);
+        assert_eq!(manager.core_kind(), CoreKind::Mihomo);
+        assert_eq!(manager.current_generation(), 0);
+        assert!(manager.binary_path().is_none());
+        assert!(!home.path().join(super::super::ownership::OWNERSHIP_MARKER).exists());
+    }
+
+    #[test]
+    fn singbox_controller_uses_configured_loopback_port() {
+        let config: serde_yaml_ng::Mapping = serde_yaml_ng::from_str("external-controller: 127.0.0.1:49715\n").unwrap();
+        assert_eq!(configured_singbox_controller(&config).unwrap().port(), 49715);
+        for controller in ["0.0.0.0:9097", "[::1]:9097", "192.0.2.1:9097"] {
+            let config: serde_yaml_ng::Mapping =
+                serde_yaml_ng::from_str(&format!("external-controller: '{controller}'\n")).unwrap();
+            assert_eq!(
+                configured_singbox_controller(&config).unwrap().to_string(),
+                "127.0.0.1:9097"
+            );
+        }
+    }
+
+    #[test]
+    fn guided_selection_builtin_direct_block_roundtrip_matches_target_members() {
+        let home = tempfile::tempdir().unwrap();
+        let mihomo = home.path().join("mihomo.yaml");
+        let singbox = home.path().join("singbox.json");
+        std::fs::write(&mihomo, "proxy-groups:\n  - {name: DirectGroup, type: select, proxies: [DIRECT]}\n  - {name: RejectGroup, type: select, proxies: [REJECT]}\n").unwrap();
+        std::fs::write(&singbox, r#"{"outbounds":[{"tag":"direct","type":"direct"},{"tag":"block","type":"block"},{"tag":"DirectGroup","type":"selector","outbounds":["direct"]},{"tag":"RejectGroup","type":"selector","outbounds":["block"]}]}"#).unwrap();
+        let selections = vec![
+            ("DirectGroup".into(), "DIRECT".into()),
+            ("RejectGroup".into(), "REJECT".into()),
+        ];
+        let to_box = guided_target_selections(CoreKind::SingBox, &singbox, &selections).unwrap();
+        assert_eq!(
+            to_box,
+            vec![
+                ("DirectGroup".into(), "direct".into()),
+                ("RejectGroup".into(), "block".into())
+            ]
+        );
+        assert_eq!(
+            guided_target_selections(CoreKind::Mihomo, &mihomo, &to_box).unwrap(),
+            selections
+        );
+    }
+
+    #[test]
+    fn guided_selection_legal_exact_names_take_precedence_over_builtin_aliases() {
+        let home = tempfile::tempdir().unwrap();
+        let mihomo = home.path().join("mihomo.yaml");
+        let singbox = home.path().join("singbox.json");
+        std::fs::write(&mihomo, "proxies: [{name: direct, type: ss}, {name: block, type: ss}, {name: Direct, type: ss}]\nproxy-groups: [{name: G, type: select, proxies: [direct, block, Direct, DIRECT, REJECT]}]\n").unwrap();
+        std::fs::write(&singbox, r#"{"outbounds":[{"tag":"direct","type":"direct"},{"tag":"block","type":"block"},{"tag":"DIRECT","type":"socks"},{"tag":"REJECT","type":"socks"},{"tag":"Direct","type":"socks"},{"tag":"G","type":"selector","outbounds":["DIRECT","REJECT","Direct","direct","block"]}]}"#).unwrap();
+        for name in ["direct", "block", "Direct"] {
+            let selection = vec![("G".into(), name.into())];
+            assert_eq!(
+                guided_target_selections(CoreKind::Mihomo, &mihomo, &selection).unwrap(),
+                selection
+            );
+        }
+        for name in ["DIRECT", "REJECT", "Direct"] {
+            let selection = vec![("G".into(), name.into())];
+            assert_eq!(
+                guided_target_selections(CoreKind::SingBox, &singbox, &selection).unwrap(),
+                selection
+            );
+        }
+    }
+
+    #[test]
+    fn guided_selection_missing_group_member_or_leaf_is_rejected_before_switching() {
+        let home = tempfile::tempdir().unwrap();
+        for (kind, raw) in [
+            (
+                CoreKind::Mihomo,
+                "proxy-groups: [{name: G, type: select, proxies: [ghost, DIRECT]}]\n",
+            ),
+            (
+                CoreKind::SingBox,
+                r#"{"outbounds":[{"tag":"direct","type":"direct"},{"tag":"G","type":"selector","outbounds":["ghost","direct"]}]}"#,
+            ),
+        ] {
+            let config = home.path().join(kind.as_str());
+            std::fs::write(&config, raw).unwrap();
+            for selection in [("missing", "DIRECT"), ("G", "missing"), ("G", "ghost")] {
+                let error = guided_target_selections(kind, &config, &[(selection.0.into(), selection.1.into())])
+                    .expect_err("missing selector membership or declared node must fail before stop");
+                assert!(error.to_string().contains("old core remains running"));
+            }
+        }
+    }
+
     fn private_socket_fixture() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
@@ -2078,6 +2600,160 @@ mod tests {
     }
 
     #[test]
+    fn guided_controller_owned_mihomo_listener_allows_singbox_target_but_foreign_refuses() {
+        let home = private_socket_fixture();
+        let socket = home.path().join("controller.sock");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(socket.clone())
+            .with_singbox_controller(address);
+        let record = pidfile::CoreRecord::with_kind(std::process::id(), Utc::now(), CoreKind::Mihomo);
+        pidfile::write(&pidfile::path_for(&socket), record).unwrap();
+        *manager.inner.pid.lock() = Some(std::process::id());
+        *manager.inner.state.lock() = CoreState::Running;
+        manager.inner.owns_child.store(true, Ordering::SeqCst);
+        manager
+            .guided_record_check(CoreKind::SingBox)
+            .expect("actual socket inode proves this owned Mihomo predecessor holds the target port");
+        assert_eq!(manager.core_kind(), CoreKind::Mihomo);
+        assert_eq!(manager.pid(), Some(std::process::id()));
+        assert_eq!(manager.current_generation(), 0);
+        let foreign = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(home.path().join("other.sock"))
+            .with_singbox_controller(address);
+        assert!(
+            foreign.guided_record_check(CoreKind::SingBox).is_err(),
+            "an unowned listener must still refuse"
+        );
+        assert_eq!(listener.local_addr().unwrap(), address);
+    }
+
+    #[test]
+    fn guided_controller_owned_singbox_keeps_restart_without_new_fd_inspection() {
+        let home = private_socket_fixture();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_singbox_controller(listener.local_addr().unwrap())
+            .with_core_kind(CoreKind::SingBox);
+        *manager.inner.pid.lock() = Some(std::process::id());
+        manager.inner.owns_child.store(true, Ordering::SeqCst);
+        manager
+            .guided_tcp_controller_check_with(
+                CoreKind::SingBox,
+                |_, _| anyhow::bail!("new FD inspection must not run on the existing owned SingBox restart path"),
+                || panic!("existing owned SingBox restart must not invoke the new permission fallback"),
+            )
+            .unwrap();
+        manager.inner.owns_child.store(false, Ordering::SeqCst);
+        assert!(
+            manager
+                .guided_tcp_controller_check_with(
+                    CoreKind::SingBox,
+                    |_, _| panic!("attached cores must not get an ownership proof hook"),
+                    || false
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn guided_controller_capability_permission_denial_defers_only_owned_mihomo_without_gui() {
+        let home = private_socket_fixture();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_singbox_controller(address);
+        *manager.inner.pid.lock() = Some(std::process::id());
+        manager.inner.owns_child.store(true, Ordering::SeqCst);
+        let permission = |_, _| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into());
+        manager
+            .guided_tcp_controller_check_with(CoreKind::SingBox, permission, || false)
+            .unwrap();
+        assert!(
+            manager
+                .guided_tcp_controller_check_with(CoreKind::SingBox, permission, || true)
+                .is_err()
+        );
+        assert!(
+            manager
+                .guided_tcp_controller_check_with(CoreKind::SingBox, |_, _| Ok(false), || false)
+                .is_err()
+        );
+        assert!(
+            manager
+                .guided_tcp_controller_check_with(
+                    CoreKind::SingBox,
+                    |_, _| Err(std::io::Error::from(std::io::ErrorKind::NotFound).into()),
+                    || false
+                )
+                .is_err()
+        );
+        manager.inner.owns_child.store(false, Ordering::SeqCst);
+        assert!(
+            manager
+                .guided_tcp_controller_check_with(CoreKind::SingBox, permission, || false)
+                .is_err()
+        );
+        assert!(
+            ensure_guided_controller_released(CoreKind::SingBox, address).is_err(),
+            "deferred permission never bypasses the mandatory post-stop port guard"
+        );
+        drop(listener);
+        ensure_guided_controller_released(CoreKind::SingBox, address).unwrap();
+    }
+
+    #[tokio::test]
+    async fn guided_controller_deferred_port_failure_rolls_back_before_any_target_spawn() {
+        let home = tempfile::tempdir().unwrap();
+        let settings = home.path().join("verge.yaml");
+        std::fs::write(&settings, "proxy_core: mihomo\nfuture: {keep: true}\n").unwrap();
+        let snapshot = GuidedFileSnapshot::capture([settings.clone()]).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let events = parking_lot::Mutex::new(Vec::new());
+        let result = orchestrate_guided_switch(
+            || async {
+                events.lock().push("prevalidated");
+                Ok(())
+            },
+            true,
+            || async {
+                events.lock().push("stop-owned");
+                Ok(())
+            },
+            || async {
+                events.lock().push("port-check");
+                ensure_guided_controller_released(CoreKind::SingBox, address)?;
+                events.lock().push("spawn-target");
+                Ok(())
+            },
+            || async {
+                events.lock().push("commit");
+                Ok(())
+            },
+            || async {
+                events.lock().push("rollback-owned");
+                snapshot.restore()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            *events.lock(),
+            ["prevalidated", "stop-owned", "port-check", "rollback-owned"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            "proxy_core: mihomo\nfuture: {keep: true}\n"
+        );
+        assert_eq!(
+            listener.local_addr().unwrap(),
+            address,
+            "foreign listener is never contacted, stopped or replaced"
+        );
+    }
+
+    #[test]
     fn guided_core_explicit_target_transport_does_not_publish_shared_selection() {
         let manager = MihomoManager::new(std::env::temp_dir());
         let target = api_for_core(
@@ -2168,6 +2844,59 @@ mod tests {
             guided_target_selections(CoreKind::SingBox, &staged, &[("PROXY".into(), "DIRECT".into())]).unwrap(),
             [("PROXY".into(), "direct".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn script_composition_reaches_mihomo_yaml_and_singbox_conversion_for_local_and_remote() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(home.path().join("verge.yaml"), "enable_tun_mode: false\nverge_mixed_port: 35123\nverge_socks_enabled: false\nverge_http_enabled: false\nverge_redir_enabled: false\nverge_tproxy_enabled: false\n").unwrap();
+        std::fs::write(home.path().join("config.yaml"), "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: fixture\nmode: rule\ntun: {enable: false}\n").unwrap();
+        let source = "proxies:\n  - {name: edge, type: ss, server: edge.example, port: 443, cipher: aes-128-gcm, password: fixture}\nproxy-groups:\n  - {name: PROXY, type: select, proxies: [edge, DIRECT]}\nrules: ['MATCH,PROXY']\nfuture: {preserved: true}\n";
+        std::fs::write(home.path().join("profiles/base.yaml"), source).unwrap();
+        std::fs::write(home.path().join("profiles/hook.js"), "function main(c, n) { c.proxies[0].server = 'script.example'; c.rules.unshift('DOMAIN,script.example,DIRECT'); c.future.name = n; c['mixed-port'] = 1; return c; }").unwrap();
+        for kind in ["local", "remote"] {
+            std::fs::write(home.path().join("profiles.yaml"), format!("current: base\nitems:\n  - {{uid: base, type: {kind}, name: fixture, file: base.yaml, option: {{script: sHook}}}}\n  - {{uid: sHook, type: script, file: hook.js}}\n")).unwrap();
+            let yaml = ManagerInner::active_profile_yaml().await.unwrap().unwrap();
+            let mihomo: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&yaml).unwrap();
+            assert_eq!(
+                mihomo["proxies"][0]["server"],
+                serde_yaml_ng::Value::from("script.example")
+            );
+            assert_eq!(
+                mihomo["rules"][0],
+                serde_yaml_ng::Value::from("DOMAIN,script.example,DIRECT")
+            );
+            assert_eq!(mihomo["future"]["preserved"], serde_yaml_ng::Value::from(true));
+            assert_eq!(mihomo["future"]["name"], serde_yaml_ng::Value::from("fixture"));
+            assert_eq!(mihomo["mixed-port"], serde_yaml_ng::Value::from(35123));
+            let destination = home.path().join("fixture-candidate.json");
+            let (_, parts) = ManagerInner::write_singbox_assembled_to(home.path(), Some(&yaml), false, &destination)
+                .await
+                .unwrap();
+            validate_guided_conversion(&parts.conversion).unwrap();
+            let singbox: serde_json::Value = serde_json::from_slice(&std::fs::read(&destination).unwrap()).unwrap();
+            assert!(
+                singbox["outbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|outbound| outbound["tag"] == "edge" && outbound["server"] == "script.example")
+            );
+            assert!(singbox["route"]["rules"].as_array().unwrap().iter().any(|rule| {
+                rule["domain"]
+                    .as_array()
+                    .is_some_and(|domains| domains.iter().any(|domain| domain == "script.example"))
+            }));
+            assert_eq!(
+                singbox["experimental"]["clash_api"]["external_controller"],
+                "127.0.0.1:49715"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("profiles/base.yaml")).unwrap(),
+                source
+            );
+        }
     }
 
     #[tokio::test]

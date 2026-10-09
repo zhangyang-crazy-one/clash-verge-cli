@@ -12,10 +12,10 @@ use std::path::Path;
 /// Supported chain types loaded from profile enhancement files.
 pub enum ChainType {
     Merge(Mapping),
-    Script,
-    Rules(Vec<Mapping>),
-    Proxies(Vec<Mapping>),
-    Groups(Vec<Mapping>),
+    Script { source: String, path: std::path::PathBuf },
+    Rules(RulesFragment),
+    Proxies(SequenceFragment),
+    Groups(SequenceFragment),
 }
 
 /// Resolve the enhancement chain described by a local profile.
@@ -34,30 +34,174 @@ pub async fn resolve_chain(item: &PrfItem, profiles_dir: &Path) -> anyhow::Resul
 
     match itype {
         "merge" => {
-            let map: Mapping =
+            let value: Value =
                 serde_yaml_ng::from_str(&raw).with_context(|| format!("invalid YAML in {}", path.display()))?;
+            let map = match value {
+                Value::Null => Mapping::new(),
+                Value::Mapping(map) => map,
+                _ => anyhow::bail!("merge fragment must be a mapping in {}", path.display()),
+            };
             Ok(ChainType::Merge(map))
         }
-        "script" => Ok(ChainType::Script),
-        "rules" | "proxies" | "groups" => {
-            let seq: Vec<Mapping> =
-                serde_yaml_ng::from_str(&raw).with_context(|| format!("invalid YAML in {}", path.display()))?;
-
-            match itype {
-                "rules" => Ok(ChainType::Rules(seq)),
-                "proxies" => Ok(ChainType::Proxies(seq)),
-                "groups" => Ok(ChainType::Groups(seq)),
-                _ => unreachable!("chain type was matched above"),
-            }
-        }
+        "script" => Ok(ChainType::Script { source: raw, path }),
+        "rules" | "proxies" | "groups" => match itype {
+            "rules" => Ok(ChainType::Rules(parse_rules_fragment(&raw, &path)?)),
+            "proxies" => Ok(ChainType::Proxies(parse_sequence_fragment(&raw, &path)?)),
+            "groups" => Ok(ChainType::Groups(parse_sequence_fragment(&raw, &path)?)),
+            _ => unreachable!("chain type was matched above"),
+        },
         _ => anyhow::bail!("unsupported chain type: {itype}"),
     }
 }
 
+/// GUI sequence enhancements and the standalone legacy whole-list form.
+pub enum SequenceFragment {
+    Patch {
+        prepend: Sequence,
+        append: Sequence,
+        delete: Vec<String>,
+    },
+    Replace(Sequence),
+}
+
+fn parse_sequence_fragment(raw: &str, path: &Path) -> anyhow::Result<SequenceFragment> {
+    let value: Value = serde_yaml_ng::from_str(raw).with_context(|| format!("invalid YAML in {}", path.display()))?;
+    match value {
+        Value::Sequence(seq) => Ok(SequenceFragment::Replace(seq)),
+        Value::Mapping(mut map) => {
+            if map
+                .keys()
+                .any(|key| !key.as_str().is_some_and(|key| MAPPING_KEYS.contains(&key)))
+            {
+                anyhow::bail!("unsupported sequence fragment key in {}", path.display());
+            }
+            let mut sequence = |key: &str| -> anyhow::Result<Sequence> {
+                match map.remove(key) {
+                    None => Ok(Vec::new()),
+                    Some(Value::Sequence(seq)) => Ok(seq),
+                    _ => anyhow::bail!("{key} must be an array in {}", path.display()),
+                }
+            };
+            let prepend = sequence("prepend")?;
+            let append = sequence("append")?;
+            let delete = sequence("delete")?;
+            Ok(SequenceFragment::Patch {
+                prepend,
+                append,
+                delete: parse_sequence_of_strings(delete, path)?,
+            })
+        }
+        _ => anyhow::bail!("sequence fragment must be a mapping or sequence in {}", path.display()),
+    }
+}
+
+fn apply_sequence_fragment(config: &mut Mapping, fragment: &SequenceFragment, field: &str) {
+    let SequenceFragment::Patch {
+        prepend,
+        append,
+        delete,
+    } = fragment
+    else {
+        if let SequenceFragment::Replace(seq) = fragment {
+            config.insert(field.into(), seq.clone().into());
+        }
+        return;
+    };
+    let name = |value: &Value| {
+        value
+            .as_str()
+            .or_else(|| {
+                value
+                    .as_mapping()
+                    .and_then(|map| map.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::to_owned)
+    };
+    let old = config
+        .remove(field)
+        .and_then(|value| value.as_sequence().cloned())
+        .unwrap_or_default();
+    let values: Sequence = prepend
+        .iter()
+        .cloned()
+        .chain(
+            old.into_iter()
+                .filter(|value| !name(value).is_some_and(|name| delete.contains(&name))),
+        )
+        .chain(append.iter().cloned())
+        .collect();
+    config.insert(field.into(), values.into());
+    if field != "proxies" {
+        return;
+    }
+    let mut seen = HashSet::new();
+    let added: Vec<String> = prepend
+        .iter()
+        .chain(append.iter())
+        .filter_map(name)
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+    let Some(Value::Sequence(groups)) = config.get_mut("proxy-groups") else {
+        return;
+    };
+    let mut first_selector = true;
+    for group in groups {
+        let Some(group) = group.as_mapping_mut() else {
+            continue;
+        };
+        if let Some(Value::Sequence(proxies)) = group.get_mut("proxies") {
+            proxies.retain(|value| {
+                !value
+                    .as_str()
+                    .is_some_and(|value| delete.iter().any(|name| name == value))
+            });
+        }
+        if first_selector
+            && !added.is_empty()
+            && group
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("select") || kind.eq_ignore_ascii_case("selector"))
+        {
+            let previous = group.remove("proxies");
+            let mut names = HashSet::new();
+            let values = added
+                .iter()
+                .cloned()
+                .map(Value::from)
+                .chain(
+                    previous
+                        .and_then(|value| value.as_sequence().cloned())
+                        .unwrap_or_default(),
+                )
+                .filter(|value| value.as_str().is_none_or(|name| names.insert(name.to_owned())))
+                .collect::<Sequence>();
+            group.insert("proxies".into(), values.into());
+            first_selector = false;
+        }
+    }
+}
+
 /// Copy a merge profile's section into the active Clash configuration.
-pub fn apply_merge(base: &mut Mapping, merge: &Mapping, key: &str) {
-    if let Some(value) = merge.get(key) {
-        base.insert(key.into(), value.clone());
+pub fn is_noop(chain: &ChainType) -> bool {
+    match chain {
+        ChainType::Merge(map) => map.is_empty(),
+        ChainType::Script { source, .. } => source.trim() == clash_verge_core::utils::tmpl::ITEM_SCRIPT.trim(),
+        ChainType::Rules(RulesFragment::Mapping {
+            prepend,
+            append,
+            delete,
+        }) => prepend.is_empty() && append.is_empty() && delete.is_empty(),
+        ChainType::Rules(RulesFragment::Sequence(seq)) => seq.is_empty(),
+        ChainType::Proxies(fragment) | ChainType::Groups(fragment) => match fragment {
+            SequenceFragment::Patch {
+                prepend,
+                append,
+                delete,
+            } => prepend.is_empty() && append.is_empty() && delete.is_empty(),
+            SequenceFragment::Replace(seq) => seq.is_empty(),
+        },
     }
 }
 
@@ -92,6 +236,16 @@ fn merge_mapping_values(base: &mut Mapping, overlay: &Mapping) {
             continue;
         }
         base.insert(key.clone(), overlay_value.clone());
+    }
+}
+
+fn merge_gui_values(base: &mut Mapping, overlay: &Mapping) {
+    for (key, value) in overlay {
+        if let (Some(Value::Mapping(existing)), Value::Mapping(nested)) = (base.get_mut(key), value) {
+            merge_gui_values(existing, nested);
+        } else {
+            base.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -253,42 +407,48 @@ pub fn apply_rules_fragment(config: &mut Mapping, fragment: &RulesFragment) {
 }
 
 /// Apply a resolved profile chain without discarding unrelated configuration.
+#[cfg(test)]
 pub fn apply_chain_to_config(config: &mut Mapping, chain: &ChainType) -> anyhow::Result<()> {
+    apply_chain_to_profile(config, chain, "")
+}
+
+pub fn apply_chain_to_profile(config: &mut Mapping, chain: &ChainType, profile_name: &str) -> anyhow::Result<()> {
     match chain {
         ChainType::Merge(merge) => {
-            for key in ["proxies", "proxy-groups", "rules", "rule-providers", "proxy-providers"] {
-                apply_merge(config, merge, key);
-            }
-            if let Some(dns_value) = merge.get("dns") {
-                let Some(dns) = dns_value.as_mapping() else {
-                    anyhow::bail!("merge profile dns section must be a mapping");
-                };
-                let dns_key = Value::from("dns");
-                let mut base_dns = match config.get(&dns_key) {
-                    Some(value) => value
+            // GUI v2.5.7: lowercase top-level keys; DNS overlays its child
+            // keys, hosts replaces, and other mappings merge recursively.
+            for (key, value) in merge {
+                let key = key
+                    .as_str()
+                    .map(|key| Value::from(key.to_ascii_lowercase()))
+                    .unwrap_or_else(|| key.clone());
+                if key.as_str() == Some("dns") {
+                    let dns = value
                         .as_mapping()
-                        .cloned()
-                        .ok_or_else(|| anyhow::anyhow!("profile dns section must be a mapping"))?,
-                    None => Mapping::new(),
-                };
-                if dns.is_empty() {
-                    config.insert(dns_key, Value::Mapping(Mapping::new()));
+                        .context("merge profile dns section must be a mapping")?;
+                    match config.get_mut(&key) {
+                        Some(Value::Mapping(existing)) => existing.extend(dns.clone()),
+                        Some(_) => anyhow::bail!("profile dns section must be a mapping"),
+                        None => {
+                            config.insert(key, value.clone());
+                        }
+                    }
+                } else if key.as_str() != Some("hosts")
+                    && let (Some(Value::Mapping(existing)), Value::Mapping(overlay)) = (config.get_mut(&key), value)
+                {
+                    merge_gui_values(existing, overlay);
                 } else {
-                    merge_mapping_values(&mut base_dns, dns);
-                    config.insert(dns_key, Value::Mapping(base_dns));
+                    config.insert(key, value.clone());
                 }
             }
         }
-        ChainType::Rules(seq) => {
-            config.insert("rules".into(), seq.clone().into());
+        ChainType::Rules(fragment) => apply_rules_fragment(config, fragment),
+        ChainType::Proxies(fragment) => apply_sequence_fragment(config, fragment, "proxies"),
+        ChainType::Groups(fragment) => apply_sequence_fragment(config, fragment, "proxy-groups"),
+        ChainType::Script { source, path } => {
+            let enhanced = crate::profile_script::evaluate(config, source, profile_name, path)?;
+            *config = enhanced;
         }
-        ChainType::Proxies(seq) => {
-            config.insert("proxies".into(), seq.clone().into());
-        }
-        ChainType::Groups(seq) => {
-            config.insert("proxy-groups".into(), seq.clone().into());
-        }
-        ChainType::Script => anyhow::bail!("script profile chains are unsupported by the standalone TUI"),
     }
     Ok(())
 }
@@ -327,30 +487,52 @@ mod dns_merge_tests {
     }
 
     #[test]
-    fn merge_profile_deeply_overlays_dns_and_unset_fields_inherit() {
+    fn merge_profile_overlays_dns_children_and_unset_fields_inherit() {
         let mut config = parse("dns: {nameserver: [profile], future: {keep: true, change: old}}\n");
         let merge = parse("dns: {future: {change: new}, fallback: [8.8.8.8]}\n");
         apply_chain_to_config(&mut config, &ChainType::Merge(merge)).expect("valid DNS merge");
 
         assert_eq!(config["dns"]["nameserver"][0], Value::from("profile"));
-        assert_eq!(config["dns"]["future"]["keep"], Value::from(true));
+        assert!(config["dns"]["future"].as_mapping().unwrap().get("keep").is_none());
         assert_eq!(config["dns"]["future"]["change"], Value::from("new"));
         assert_eq!(config["dns"]["fallback"][0], Value::from("8.8.8.8"));
     }
 
     #[test]
-    fn explicit_empty_merge_dns_section_clears_inherited_section() {
+    fn empty_merge_dns_inherits_existing_children_like_gui() {
         let mut config = parse("dns: {nameserver: [profile]}\n");
         let merge = parse("dns: {}\n");
         apply_chain_to_config(&mut config, &ChainType::Merge(merge)).expect("valid empty DNS merge");
-        assert_eq!(config["dns"], Value::Mapping(Mapping::new()));
+        assert_eq!(config["dns"]["nameserver"][0], Value::from("profile"));
+    }
+
+    #[test]
+    fn gui_merge_preserves_empty_deep_maps_and_replaces_dns_children_and_hosts() {
+        let mut config = parse(
+            "future: {Nested: {keep: true}}\ndns: {nameserver: [old], nested: {keep: true}}\nhosts: {old: 192.0.2.1}\n",
+        );
+        let merge = parse("FUTURE: {Nested: {}}\nDNS: {nested: {new: true}}\nHOSTS: {}\n");
+        apply_chain_to_config(&mut config, &ChainType::Merge(merge)).unwrap();
+        assert_eq!(config["future"]["Nested"]["keep"], Value::from(true));
+        assert_eq!(config["dns"]["nameserver"][0], Value::from("old"));
+        assert!(config["dns"]["nested"].as_mapping().unwrap().get("keep").is_none());
+        assert_eq!(config["hosts"], Value::Mapping(Mapping::new()));
     }
 
     #[test]
     fn script_chain_is_rejected_before_any_config_mutation() {
         let mut config = parse("dns: {nameserver: [profile]}\n");
         let before = config.clone();
-        assert!(apply_chain_to_config(&mut config, &ChainType::Script).is_err());
+        assert!(
+            apply_chain_to_config(
+                &mut config,
+                &ChainType::Script {
+                    source: "function main(c) { throw new Error('fixture'); }".into(),
+                    path: "fixture.js".into()
+                }
+            )
+            .is_err()
+        );
         assert_eq!(config, before);
     }
 }

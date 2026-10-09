@@ -581,18 +581,13 @@ pub(crate) async fn reload_current_profile_for_manager(
 /// the file is missing — the sing-box path would otherwise fall back to
 /// the skeleton config, which silently produces an empty outbound set.
 async fn read_profile_yaml(item: &PrfItem) -> Result<String, String> {
-    let file = item
-        .file
-        .as_deref()
-        .ok_or_else(|| format!("profile {} has no file", item.uid.as_deref().unwrap_or("?")))?;
-    let profiles_dir =
-        clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| format!("profiles dir: {error}"))?;
-    read_profile_yaml_from(&profiles_dir, file).await
+    crate::runtime_config::load_profile_yaml(item).await
 }
 
 /// Test seam: read a profile file from an explicit directory. The caller-
 /// facing wrapper resolves `app_profiles_dir()` so production code keeps
 /// one path; this lets unit tests avoid the global app-home OnceLock.
+#[cfg(test)]
 async fn read_profile_yaml_from(profiles_dir: &std::path::Path, file: &str) -> Result<String, String> {
     let path = profiles_dir.join(file);
     tokio::fs::read_to_string(&path)

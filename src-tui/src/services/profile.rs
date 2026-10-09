@@ -7,7 +7,7 @@ use serde_yaml_ng::Mapping;
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
-use crate::runtime_config::{commit_runtime_config, reload_remote_profile};
+use crate::runtime_config::commit_runtime_config;
 
 /// Prepare a candidate profile with the shared GUI DNS section applied when
 /// this profile's setting is enabled and its provider DNS source is confirmed.
@@ -133,11 +133,15 @@ pub async fn switch_profile(
     core_running: bool,
 ) -> Result<(), String> {
     let uid = item.uid.as_deref().ok_or("profile switch: profile has no uid")?;
+    let yaml = crate::runtime_config::load_profile_yaml(item).await?;
+    if crate::subscribe::from_url::is_singbox_json_profile(&yaml) {
+        return Err("native sing-box JSON has no lossless Clash conversion; select a Clash YAML profile".into());
+    }
     let previous_uid = ProfileStore::replace_current_locked(uid)
         .await
         .map_err(|error| format!("profile switch: {error}"))?;
 
-    let applied = apply_profile(api, item, enable_tun, core_running).await;
+    let applied = apply_profile(api, item, &yaml, enable_tun, core_running).await;
 
     if applied.is_err() {
         let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
@@ -145,32 +149,21 @@ pub async fn switch_profile(
     applied
 }
 
-async fn apply_profile(api: &MihomoApi, item: &PrfItem, enable_tun: bool, core_running: bool) -> Result<(), String> {
-    if item
-        .option
-        .as_ref()
-        .and_then(|option| option.script.as_deref())
-        .is_some_and(|uid| !uid.is_empty())
-    {
-        return Err("script profile overrides are unsupported by the standalone TUI".into());
-    }
-    if item.itype.as_deref() == Some("remote") {
-        reload_remote_profile(api, item, enable_tun, core_running)
-            .await
-            .map_err(|error| format!("profile reload: {error}"))
-    } else {
-        let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().unwrap_or_default();
-        match crate::chain::resolve_chain(item, &profiles_dir).await {
-            Ok(chain) => commit_runtime_config(api, enable_tun, core_running, Some(item), |mut config| {
-                crate::chain::apply_chain_to_config(&mut config, &chain).map_err(|error| error.to_string())?;
-                Ok(config)
-            })
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("config write: {error}")),
-            Err(error) => Err(format!("chain: {error}")),
-        }
-    }
+async fn apply_profile(
+    api: &MihomoApi,
+    item: &PrfItem,
+    yaml: &str,
+    enable_tun: bool,
+    core_running: bool,
+) -> Result<(), String> {
+    let profile = serde_yaml_ng::from_str(yaml).map_err(|error| format!("invalid profile YAML: {error}"))?;
+    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
+        let control_plane = crate::enhance::snapshot_control_plane(&app_config);
+        Ok(crate::enhance::enforce_control_plane(profile, control_plane))
+    })
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("profile reload: {error}"))
 }
 
 /// Make `item` the current profile and apply it, dispatching by
@@ -193,6 +186,12 @@ pub async fn switch_profile_for_core(
     core_running: bool,
 ) -> Result<(), String> {
     let uid = item.uid.as_deref().ok_or("profile switch: profile has no uid")?;
+    // Complete every hook before changing current UID or creating a runtime
+    // candidate. Script failure has no persistent side effects on either core.
+    let yaml = crate::runtime_config::load_profile_yaml(item).await?;
+    if manager.core_kind() == CoreKind::Mihomo && crate::subscribe::from_url::is_singbox_json_profile(&yaml) {
+        return Err("native sing-box JSON has no lossless Clash conversion; select a Clash YAML profile".into());
+    }
     let previous_uid = ProfileStore::replace_current_locked(uid)
         .await
         .map_err(|error| format!("profile switch: {error}"))?;
@@ -201,25 +200,13 @@ pub async fn switch_profile_for_core(
         match decide_switch_path(manager.core_kind()) {
             // Current UID was captured and replaced above, so do not call
             // `switch_profile` here and replace it a second time.
-            SwitchPath::HotReload => apply_profile(&manager.api(), item, enable_tun, core_running).await,
+            SwitchPath::HotReload => apply_profile(&manager.api(), item, &yaml, enable_tun, core_running).await,
             SwitchPath::SingboxRestart => {
                 // sing-box: read the profile YAML from disk (chain resolution
                 // is a clash-only concept; the sing-box pipeline converts
                 // whatever proxies/proxy-groups are present and skips the
                 // rest). For an unresolvable file we error early so the
                 // current-uid rollback below can run.
-                let file = item.file.as_deref().ok_or_else(|| {
-                    format!(
-                        "profile switch: profile {} has no file",
-                        item.uid.as_deref().unwrap_or("?")
-                    )
-                })?;
-                let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()
-                    .map_err(|error| format!("profile switch: {error}"))?;
-                let path = profiles_dir.join(file);
-                let yaml = tokio::fs::read_to_string(&path)
-                    .await
-                    .map_err(|error| format!("profile switch: failed to read {}: {error}", path.display()))?;
                 crate::runtime_config::apply_singbox_restart_for_profile(
                     manager,
                     Some(yaml.as_str()),
@@ -244,6 +231,130 @@ pub async fn switch_profile_for_core(
 mod tests {
     use super::*;
     use serde_yaml_ng::Value;
+
+    #[tokio::test]
+    async fn failed_script_preserves_exact_profile_runtime_and_sources_for_both_cores() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let profiles = "# profile metadata must not be rewritten on script failure\ncurrent: old\nitems:\n  - {uid: old, type: local, file: old.yaml}\n  - {uid: next, type: local, file: next.yaml, option: {script: sHook}}\n  - {uid: sHook, type: script, file: hook.js}\n";
+        std::fs::write(home.path().join("profiles.yaml"), profiles).unwrap();
+        std::fs::write(home.path().join("verge.yaml"), "enable_tun_mode: false\n").unwrap();
+        let runtime =
+            "mixed-port: 12345\nsecret: fixture\nmode: rule\ntun: {enable: false}\nfuture: {previous: true}\n";
+        std::fs::write(home.path().join("config.yaml"), runtime).unwrap();
+        std::fs::write(home.path().join("singbox.json"), "previous sing-box candidate").unwrap();
+        std::fs::write(
+            home.path().join("profiles/next.yaml"),
+            "rules: [MATCH,DIRECT]\nfuture: {candidate: true}\n",
+        )
+        .unwrap();
+        let script = "function main(c) { c.future.candidate = false; throw new Error('fixture failure'); }";
+        std::fs::write(home.path().join("profiles/hook.js"), script).unwrap();
+        let socket = home.path().join("controller.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let manager = MihomoManager::new(home.path().to_path_buf())
+                .with_core_kind(kind)
+                .with_socket(socket.clone())
+                .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+            let item = ProfileStore::snapshot()
+                .await
+                .unwrap()
+                .items()
+                .into_iter()
+                .find(|item| item.uid.as_deref() == Some("next"))
+                .unwrap()
+                .clone();
+            let error = switch_profile_for_core(&manager, &item, false, false)
+                .await
+                .unwrap_err();
+            assert!(error.contains("runtime error"));
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("profiles.yaml")).unwrap(),
+                profiles
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("config.yaml")).unwrap(),
+                runtime
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("singbox.json")).unwrap(),
+                "previous sing-box candidate"
+            );
+            assert_eq!(
+                std::fs::read_to_string(home.path().join("profiles/hook.js")).unwrap(),
+                script
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "no controller request follows a failed script"
+            );
+            assert!(manager.pid().is_none());
+            assert!(manager.binary_path().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_dns_source_survives_production_noop_script_load_and_single_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let raw = "dns: {proxy-server-nameserver: [https://provider.example/dns], nameserver: [8.8.8.8]}\nfuture: {keep: true}\n";
+        let original: Mapping = serde_yaml_ng::from_str(raw).unwrap();
+        let source = clash_verge_core::config::dns_override_source("Rdns", &original)
+            .unwrap()
+            .unwrap();
+        let mut verge = IVerge::default();
+        verge.enable_tun_mode = Some(false);
+        verge.profile_dns_settings.insert(
+            "Rdns".into(),
+            clash_verge_core::config::ProfileDnsSettings {
+                enabled: true,
+                confirmation: Some(source.clone()),
+                ..Default::default()
+            },
+        );
+        verge.save_file().await.unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mode: rule\nmixed-port: 35123\nsecret: fixture\ntun: {enable: false}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("dns_config.yaml"),
+            "proxy-server-nameserver: [https://global.example/dns]\nnameserver: [1.1.1.1]\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("profiles.yaml"), "current: Rdns\nitems:\n  - {uid: Rdns, type: remote, file: dns.yaml, option: {script: sHook}}\n  - {uid: sHook, type: script, file: hook.js}\n").unwrap();
+        std::fs::write(home.path().join("profiles/dns.yaml"), raw).unwrap();
+        std::fs::write(
+            home.path().join("profiles/hook.js"),
+            clash_verge_core::utils::tmpl::ITEM_SCRIPT,
+        )
+        .unwrap();
+        let item = ProfileStore::snapshot().await.unwrap().items().pop().unwrap();
+        let loaded = crate::runtime_config::load_profile_yaml(&item).await.unwrap();
+        let loaded: Mapping = serde_yaml_ng::from_str(&loaded).unwrap();
+        assert_eq!(
+            clash_verge_core::config::dns_override_source("Rdns", &loaded)
+                .unwrap()
+                .as_deref(),
+            Some(source.as_str())
+        );
+        let api = MihomoApi::new(home.path().join("absent.sock"), "fixture").unwrap();
+        switch_profile(&api, &item, false, false).await.unwrap();
+        let saved = IVerge::try_new().await.unwrap().dns_settings_for("Rdns");
+        assert!(saved.enabled);
+        assert_eq!(saved.confirmation.as_deref(), Some(source.as_str()));
+        let runtime: Mapping =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(home.path().join("config.yaml")).unwrap()).unwrap();
+        assert_eq!(runtime["dns"]["nameserver"][0], Value::from("1.1.1.1"));
+        assert_eq!(
+            runtime["dns"]["proxy-server-nameserver"][0],
+            Value::from("https://global.example/dns")
+        );
+    }
 
     fn item(uid: &str, name: &str) -> PrfItem {
         PrfItem {

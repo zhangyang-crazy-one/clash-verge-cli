@@ -126,6 +126,13 @@ pub(super) fn confirm(app: &mut App, ctx: &Ctx) {
                 intent: update.intent,
                 enable_tun: app.gui_config.enable_tun_mode.unwrap_or(false),
             };
+            if context.intent == CoreIntent::Switch && ctx.manager.state() != crate::app::CoreState::Running {
+                // Selecting a stopped core never requests TUN privileges or
+                // prepares a profile. The manager rechecks ownership/epoch
+                // and commits only the CLI selection and marker.
+                start_apply(app, ctx, context);
+                return;
+            }
             update.phase = CoreUpdatePhase::TunChecking;
             let manager = ctx.manager.clone();
             app.core_operation_task = Some(tokio::spawn(async move {
@@ -478,8 +485,8 @@ pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
                     }
                     .into(),
                 );
-                app.core_version = update.prepared.as_ref().map(|core| core.version.clone());
                 if app.core_state == crate::app::CoreState::Running {
+                    app.core_version = update.prepared.as_ref().map(|core| core.version.clone());
                     let prepared = update.prepared.clone();
                     ctx.cancel_background();
                     super::lifecycle::note_started(
@@ -490,6 +497,7 @@ pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
                         prepared.map(|core| core.source),
                     );
                 } else {
+                    app.core_version = None;
                     app.clear_runtime_caches();
                 }
             } else if app.core_state == crate::app::CoreState::Running
@@ -536,6 +544,56 @@ mod tests {
             version: "1.14.2".into(),
             source: "cached".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_switch_confirmation_commits_selection_without_tun_or_runtime_version() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "proxy_core: mihomo\nenable_tun_mode: true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "this is deliberately not profile metadata",
+        )
+        .unwrap();
+        let (mut ctx, mut rx) = ctx();
+        ctx.manager = crate::mihomo_manager::MihomoManager::new(home.path().to_path_buf())
+            .with_socket(home.path().join("private.sock"))
+            .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+        let mut app = App::new();
+        app.gui_config.enable_tun_mode = Some(true);
+        begin_with(&mut app, &ctx, CoreKind::SingBox, CoreIntent::Switch, async {
+            Ok(CoreInspection::Ready(ready()))
+        });
+        app.core_operation_task.take().unwrap().await.unwrap();
+        event(&mut app, &ctx, rx.recv().await.unwrap());
+        confirm(&mut app, &ctx);
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Preparing);
+        app.core_operation_task.take().unwrap().await.unwrap();
+        let result = rx.recv().await.unwrap();
+        assert!(
+            matches!(&result, Action::CoreUpdateFinished { result: Ok(()), .. }),
+            "{result:?}"
+        );
+        event(&mut app, &ctx, result);
+        assert_eq!(app.gui_config.proxy_core.as_deref(), Some("singbox"));
+        assert_eq!(app.core_state, crate::app::CoreState::Stopped);
+        assert!(app.core_pid.is_none());
+        assert!(app.core_version.is_none());
+        assert!(ctx.manager.binary_path().is_none());
+        assert_eq!(ctx.manager.current_generation(), 1);
+        assert_eq!(
+            app.core_update.as_ref().unwrap().prepared.as_ref().unwrap().version,
+            "1.14.2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join("profiles.yaml")).unwrap(),
+            "this is deliberately not profile metadata"
+        );
     }
 
     #[tokio::test]

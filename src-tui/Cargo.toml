@@ -72,6 +72,8 @@ compact_str = { workspace = true }
 tempfile = "3"
 sha2 = "0.10"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Match the GUI's embedded engine; `fuzz` exposes a finite instruction budget.
+boa_engine = { version = "=0.21.1", features = ["fuzz"] }
 
 [dev-dependencies]
 serde = { workspace = true }

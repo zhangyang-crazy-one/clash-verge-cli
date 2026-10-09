@@ -12,6 +12,7 @@
 pub mod binary;
 mod controller_socket;
 pub mod core_policy;
+mod gui_isolation;
 // `core_policy` and binary parser tests are offline fixture checks. The live
 // sing-box spawn/controller test remains explicitly ignored and must stay out
 // of the safe suite (`real_sing_box_spawns_and_answers_controller`).

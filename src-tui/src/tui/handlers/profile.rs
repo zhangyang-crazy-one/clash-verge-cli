@@ -204,17 +204,7 @@ async fn apply_imported_profile_to_singbox(
     item: &clash_verge_core::config::PrfItem,
     enable_tun: bool,
 ) -> Result<(), String> {
-    let file = item.file.as_deref().ok_or_else(|| {
-        format!(
-            "profile reload: imported profile {} has no file",
-            item.uid.as_deref().unwrap_or("?")
-        )
-    })?;
-    let dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| format!("profile reload: {error}"))?;
-    let path = dir.join(file);
-    let yaml = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|error| format!("profile reload: failed to read {}: {error}", path.display()))?;
+    let yaml = crate::runtime_config::load_profile_yaml(item).await?;
     crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
         .await
         .map(|_report| ())

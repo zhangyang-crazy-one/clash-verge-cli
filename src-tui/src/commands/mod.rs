@@ -45,6 +45,7 @@ pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager>
 
     let mut manager = MihomoManager::new(config_dir)
         .with_socket(socket_path)
+        .with_singbox_controller(crate::mihomo_manager::manager::configured_singbox_controller(&clash.0)?)
         .with_secret(secret);
 
     // proxy_core: "singbox" switches the managed core from verge-mihomo to

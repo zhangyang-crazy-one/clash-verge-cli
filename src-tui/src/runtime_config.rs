@@ -6,8 +6,6 @@ use std::sync::LazyLock;
 
 use tokio::sync::Mutex;
 
-use crate::chain::{apply_rules_fragment, parse_rules_fragment};
-
 /// Serializes all runtime-config read-modify-write sequences (mode switches,
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -321,7 +319,11 @@ pub async fn load_remote_profile_with_rules(
         .await
         .map_err(|error| error.to_string())?
         .all_items();
-    compose_remote_profile(item, &profiles_dir, &all_items).await
+    let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    crate::enhance::apply_verge_ports(&mut app_config).await;
+    let verge = clash_verge_core::config::IVerge::new().await;
+    app_config = crate::enhance::use_tun(app_config, verge.enable_tun_mode.unwrap_or(false));
+    compose_profile_with_controls(item, &profiles_dir, &all_items, Some(&app_config)).await
 }
 
 /// Compose the runtime mapping for a remote profile: the upstream profile
@@ -330,10 +332,20 @@ pub async fn load_remote_profile_with_rules(
 /// `all_items` resolves `option.rules` — a profile UID — to the fragment
 /// item carrying the on-disk `file` name. With no configured rules fragment
 /// the upstream profile is returned unchanged.
+#[cfg(test)]
 async fn compose_remote_profile(
     item: &clash_verge_core::config::PrfItem,
     profiles_dir: &std::path::Path,
     all_items: &[clash_verge_core::config::PrfItem],
+) -> Result<serde_yaml_ng::Mapping, String> {
+    compose_profile_with_controls(item, profiles_dir, all_items, None).await
+}
+
+async fn compose_profile_with_controls(
+    item: &clash_verge_core::config::PrfItem,
+    profiles_dir: &std::path::Path,
+    all_items: &[clash_verge_core::config::PrfItem],
+    app_controls: Option<&serde_yaml_ng::Mapping>,
 ) -> Result<serde_yaml_ng::Mapping, String> {
     let file = item
         .file
@@ -350,48 +362,153 @@ async fn compose_remote_profile(
     let mut profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
 
-    if item
-        .option
-        .as_ref()
-        .and_then(|option| option.script.as_deref())
-        .is_some()
-    {
-        return Err(
-            "profile script execution is unsupported; remove the script override or use a preprocessed profile".into(),
-        );
-    }
-    if let Some(merge_uid) = item.option.as_ref().and_then(|option| option.merge.as_deref()) {
-        let merge_item = all_items
-            .iter()
-            .find(|entry| entry.uid.as_deref() == Some(merge_uid))
-            .ok_or_else(|| format!("merge fragment profile not found: {merge_uid}"))?;
-        let chain = crate::chain::resolve_chain(merge_item, profiles_dir)
+    let option = item.option.as_ref();
+    let profile_name = item.name.as_deref().unwrap_or_default();
+    // GUI v2.5.7 runs sequence fragments first, global Merge/Script next,
+    // then profile Merge/Script. Absent options resolve the literal default
+    // UIDs, including applying global Script again as the profile default.
+    let steps = [
+        ("rules", "Rules", option.and_then(|option| option.rules.as_deref())),
+        (
+            "proxies",
+            "Proxies",
+            option.and_then(|option| option.proxies.as_deref()),
+        ),
+        ("groups", "Groups", option.and_then(|option| option.groups.as_deref())),
+        ("merge", "Merge", None),
+        ("script", "Script", None),
+        ("merge", "Merge", option.and_then(|option| option.merge.as_deref())),
+        ("script", "Script", option.and_then(|option| option.script.as_deref())),
+    ];
+    let mut authority = None;
+    for (index, (expected_type, default_uid, configured_uid)) in steps.into_iter().enumerate() {
+        if index == 3
+            && let Some(app) = app_controls
+        {
+            let mut control = crate::enhance::snapshot_control_plane(app);
+            let mut tun = profile
+                .get("tun")
+                .and_then(serde_yaml_ng::Value::as_mapping)
+                .cloned()
+                .unwrap_or_default();
+            tun.extend(
+                app.get("tun")
+                    .and_then(serde_yaml_ng::Value::as_mapping)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            control.insert("tun".into(), tun.into());
+            profile = crate::enhance::enforce_control_plane(profile, control);
+            // DNS source confirmation and its overlay remain at the runtime
+            // transaction boundary after hooks, exactly once. Applying them
+            // here would re-hash the overlaid DNS later and disable its own
+            // saved confirmation.
+            authority = Some(crate::enhance::snapshot_control_plane(&profile));
+        }
+        let uid = configured_uid.unwrap_or(default_uid);
+        let fragment = all_items.iter().find(|entry| entry.uid.as_deref() == Some(uid));
+        let Some(fragment) = fragment else {
+            if configured_uid.is_some() {
+                return Err(format!(
+                    "{expected_type} fragment profile not found for option.{expected_type}={uid}"
+                ));
+            }
+            continue;
+        };
+        if fragment.itype.as_deref() != Some(expected_type) {
+            return Err(format!(
+                "{expected_type} fragment profile {uid} has wrong type; expected {expected_type}"
+            ));
+        }
+        let chain = crate::chain::resolve_chain(fragment, profiles_dir)
             .await
-            .map_err(|error| error.to_string())?;
-        crate::chain::apply_chain_to_config(&mut profile, &chain).map_err(|error| error.to_string())?;
+            .map_err(|error| format!("{error:#}"))?;
+        crate::chain::apply_chain_to_profile(&mut profile, &chain, profile_name)
+            .map_err(|error| format!("{error:#}"))?;
     }
-    let Some(rules_uid) = item.option.as_ref().and_then(|option| option.rules.as_deref()) else {
-        return Ok(profile);
-    };
-
-    let fragment_item = all_items
-        .iter()
-        .find(|candidate| candidate.uid.as_deref() == Some(rules_uid))
-        .ok_or_else(|| format!("rules fragment profile not found for option.rules={rules_uid}"))?;
-    let fragment_file = fragment_item
-        .file
-        .as_deref()
-        .ok_or_else(|| format!("rules fragment profile {rules_uid} is missing file"))?;
-    let fragment_path = profiles_dir.join(fragment_file);
-    if !fragment_path.exists() {
-        return Err(format!("rules fragment file not found: {}", fragment_path.display()));
+    if let Some(mut authority) = authority {
+        // Protect GUI-known TUN values while retaining profile/script extras.
+        let mut tun = profile
+            .get("tun")
+            .and_then(serde_yaml_ng::Value::as_mapping)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(app) = app_controls
+            .and_then(|app| app.get("tun"))
+            .and_then(serde_yaml_ng::Value::as_mapping)
+        {
+            tun.extend(app.clone());
+        }
+        authority.insert("tun".into(), tun.into());
+        profile = crate::enhance::enforce_control_plane(profile, authority);
     }
-    let fragment_raw = tokio::fs::read_to_string(&fragment_path)
-        .await
-        .map_err(|error| format!("failed to read {}: {error}", fragment_path.display()))?;
-    let fragment = parse_rules_fragment(&fragment_raw, &fragment_path).map_err(|error| error.to_string())?;
-    apply_rules_fragment(&mut profile, &fragment);
     Ok(profile)
+}
+
+/// Shared source loading for either core. Native sing-box JSON bypasses Clash
+/// enhancement only when no hook was configured; no lossy cross-format script
+/// contract is implied. Local Clash profiles use the same pipeline as remote.
+pub async fn load_profile_yaml(item: &clash_verge_core::config::PrfItem) -> Result<String, String> {
+    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| error.to_string())?;
+    let file = item.file.as_deref().ok_or("selected profile has no file")?;
+    let path = profiles_dir.join(file);
+    let raw = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|error| format!("failed to read profile {}: {error}", path.display()))?;
+    if crate::subscribe::from_url::is_singbox_json_profile(&raw) {
+        let all = crate::profile_store::store::ProfileStore::snapshot()
+            .await
+            .map_err(|error| error.to_string())?
+            .all_items();
+        validate_native_profile_hooks(item, &profiles_dir, &all).await?;
+        return Ok(raw);
+    }
+    if !matches!(item.itype.as_deref(), Some("remote" | "local")) {
+        return Err("selected profile must be a local or remote base profile".into());
+    }
+    let mapping = load_remote_profile_with_rules(item).await?;
+    serde_yaml_ng::to_string(&mapping).map_err(|error| error.to_string())
+}
+
+async fn validate_native_profile_hooks(
+    item: &clash_verge_core::config::PrfItem,
+    profiles_dir: &std::path::Path,
+    all: &[clash_verge_core::config::PrfItem],
+) -> Result<(), String> {
+    let option = item.option.as_ref();
+    for (kind, default_uid, explicit) in [
+        ("merge", "Merge", option.and_then(|option| option.merge.as_deref())),
+        ("script", "Script", option.and_then(|option| option.script.as_deref())),
+        ("rules", "Rules", option.and_then(|option| option.rules.as_deref())),
+        (
+            "proxies",
+            "Proxies",
+            option.and_then(|option| option.proxies.as_deref()),
+        ),
+        ("groups", "Groups", option.and_then(|option| option.groups.as_deref())),
+        ("merge", "Merge", None),
+        ("script", "Script", None),
+    ] {
+        let uid = explicit.unwrap_or(default_uid);
+        let Some(fragment) = all.iter().find(|entry| entry.uid.as_deref() == Some(uid)) else {
+            if explicit.is_some() {
+                return Err(format!("{kind} fragment profile not found: {uid}"));
+            }
+            continue;
+        };
+        if fragment.itype.as_deref() != Some(kind) {
+            return Err(format!("{kind} fragment profile {uid} has wrong type"));
+        }
+        let chain = crate::chain::resolve_chain(fragment, profiles_dir)
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+        if !crate::chain::is_noop(&chain) {
+            return Err(format!(
+                "native sing-box JSON cannot use nonempty Clash {kind} enhancement {uid}; select a Clash YAML profile"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Regenerate the runtime config from a refreshed remote profile and reload it.
@@ -679,6 +796,223 @@ mod tests {
             file: Some(file.into()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn profile_script_default_and_real_transform_compose_before_core_conversion() {
+        let dir = test_profiles_dir("script");
+        write_file(&dir, "sub.yaml", "rules: [MATCH,DIRECT]\nfuture: {keep: true}\n");
+        let mut item = remote_item("sub.yaml", None);
+        item.option = Some(PrfOption {
+            script: Some("sHook".into()),
+            ..Default::default()
+        });
+        let script = PrfItem {
+            uid: Some("sHook".into()),
+            itype: Some("script".into()),
+            file: Some("hook.js".into()),
+            ..Default::default()
+        };
+        write_file(&dir, "hook.js", clash_verge_core::utils::tmpl::ITEM_SCRIPT);
+        let unchanged = compose_remote_profile(&item, &dir, &[script.clone()])
+            .await
+            .expect("GUI default script executes");
+        assert_eq!(unchanged["future"]["keep"], Value::from(true));
+        write_file(
+            &dir,
+            "hook.js",
+            "function main(config, profileName) { config.future.name = profileName; config.rules.unshift('DOMAIN,script.example,DIRECT'); return config; }",
+        );
+        let transformed = compose_remote_profile(&item, &dir, &[script])
+            .await
+            .expect("real JavaScript transform executes");
+        assert_eq!(transformed["future"]["name"], Value::from("demo"));
+        assert_eq!(transformed["rules"][0], Value::from("DOMAIN,script.example,DIRECT"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub.yaml")).unwrap(),
+            "rules: [MATCH,DIRECT]\nfuture: {keep: true}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_scripts_follow_gui_sequence_global_profile_order_for_local_and_remote() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path();
+        write_file(
+            dir,
+            "base.yaml",
+            "rules: [base]\nproxies: [{name: old, type: direct}]\nproxy-groups: [{name: G, type: select, proxies: [old]}]\nfuture: {keep: true}\n",
+        );
+        let mut all = Vec::new();
+        for (uid, kind, file, raw) in [
+            (
+                "Rules",
+                "rules",
+                "rules.yaml",
+                "prepend: [seq]\nappend: []\ndelete: []\n",
+            ),
+            (
+                "Proxies",
+                "proxies",
+                "proxies.yaml",
+                "prepend: [{name: new, type: direct}]\nappend: []\ndelete: [old]\n",
+            ),
+            (
+                "Groups",
+                "groups",
+                "groups.yaml",
+                "prepend: []\nappend: [{name: H, type: select, proxies: [new]}]\ndelete: []\n",
+            ),
+            ("Merge", "merge", "merge.yaml", "future: {merged: true}\n"),
+            (
+                "Script",
+                "script",
+                "script.js",
+                "function main(c, n) { if (c.rules[0] !== 'seq' || c['proxy-groups'][0].proxies[0] !== 'new' || c['proxy-groups'].length !== 2 || !c.future.merged) throw new Error('order'); c.future.count = (c.future.count || 0) + 1; c.future.name = n; return c; }",
+            ),
+        ] {
+            write_file(dir, file, raw);
+            all.push(PrfItem {
+                uid: Some(uid.into()),
+                itype: Some(kind.into()),
+                file: Some(file.into()),
+                ..Default::default()
+            });
+        }
+        for kind in ["local", "remote"] {
+            let mut item = remote_item("base.yaml", None);
+            item.itype = Some(kind.into());
+            let result = compose_remote_profile(&item, dir, &all).await.unwrap();
+            assert_eq!(
+                result["future"]["count"],
+                Value::from(2),
+                "default global script also runs as the profile default"
+            );
+            assert_eq!(result["future"]["name"], Value::from("demo"));
+            assert_eq!(result["future"]["keep"], Value::from(true));
+            assert_eq!(result["proxies"][0]["name"], Value::from("new"));
+        }
+    }
+
+    #[tokio::test]
+    async fn scripts_observe_authoritative_app_controls_and_cannot_override_them() {
+        let home = tempfile::tempdir().unwrap();
+        write_file(
+            home.path(),
+            "base.yaml",
+            "mode: global\nmixed-port: 1\ntun: {enable: true, future: inherited}\nfuture: {keep: true}\n",
+        );
+        write_file(
+            home.path(),
+            "script.js",
+            "function main(c) { c.observed = [c.mode, c['mixed-port'], c.tun.enable]; c.mode = 'direct'; c['mixed-port'] = 2; c.secret = 'bad'; c.tun.enable = true; c.tun.extra = 'script'; return c; }",
+        );
+        let mut item = remote_item("base.yaml", None);
+        item.uid = None; // pure fixture: no on-disk DNS settings lookup.
+        item.option = Some(PrfOption {
+            script: Some("sHook".into()),
+            ..Default::default()
+        });
+        let all = [PrfItem {
+            uid: Some("sHook".into()),
+            itype: Some("script".into()),
+            file: Some("script.js".into()),
+            ..Default::default()
+        }];
+        let controls: Mapping = serde_yaml_ng::from_str(
+            "mode: rule\nmixed-port: 35123\nsecret: fixture\ntun: {enable: false, mtu: 1500}\n",
+        )
+        .unwrap();
+        let result = compose_profile_with_controls(&item, home.path(), &all, Some(&controls))
+            .await
+            .unwrap();
+        assert_eq!(result["observed"][0], Value::from("rule"));
+        assert_eq!(result["observed"][1], Value::from(35123));
+        assert_eq!(result["observed"][2], Value::from(false));
+        assert_eq!(result["mode"], Value::from("rule"));
+        assert_eq!(result["mixed-port"], Value::from(35123));
+        assert_eq!(result["secret"], Value::from("fixture"));
+        assert_eq!(result["tun"]["enable"], Value::from(false));
+        assert_eq!(result["tun"]["future"], Value::from("inherited"));
+        assert_eq!(result["tun"]["extra"], Value::from("script"));
+    }
+
+    #[tokio::test]
+    async fn script_references_require_the_correct_uid_type_and_file() {
+        let home = tempfile::tempdir().unwrap();
+        write_file(home.path(), "base.yaml", "future: {keep: true}\n");
+        let mut item = remote_item("base.yaml", None);
+        item.option = Some(PrfOption {
+            script: Some("sHook".into()),
+            ..Default::default()
+        });
+        assert!(
+            compose_remote_profile(&item, home.path(), &[])
+                .await
+                .unwrap_err()
+                .contains("sHook")
+        );
+        let mut hook = PrfItem {
+            uid: Some("sHook".into()),
+            itype: Some("merge".into()),
+            file: Some("missing.js".into()),
+            ..Default::default()
+        };
+        assert!(
+            compose_remote_profile(&item, home.path(), &[hook.clone()])
+                .await
+                .unwrap_err()
+                .contains("wrong type")
+        );
+        hook.itype = Some("script".into());
+        assert!(
+            compose_remote_profile(&item, home.path(), &[hook])
+                .await
+                .unwrap_err()
+                .contains("missing.js")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_json_import_default_fragments_pass_through_but_real_hooks_reject() {
+        let home = tempfile::tempdir().unwrap();
+        let mut all = vec![
+            PrfItem::from_merge(None).unwrap(),
+            PrfItem::from_script(None).unwrap(),
+            PrfItem::from_rules().unwrap(),
+            PrfItem::from_proxies().unwrap(),
+            PrfItem::from_groups().unwrap(),
+        ];
+        for fragment in &mut all {
+            write_file(
+                home.path(),
+                fragment.file.as_deref().unwrap(),
+                fragment.file_data.as_deref().unwrap(),
+            );
+        }
+        let mut item = remote_item("native.json", None);
+        item.option = Some(PrfOption {
+            merge: all[0].uid.clone(),
+            script: all[1].uid.clone(),
+            rules: all[2].uid.clone(),
+            proxies: all[3].uid.clone(),
+            groups: all[4].uid.clone(),
+            ..Default::default()
+        });
+        validate_native_profile_hooks(&item, home.path(), &all)
+            .await
+            .expect("normal importer no-op references are accepted");
+        write_file(
+            home.path(),
+            all[1].file.as_deref().unwrap(),
+            "function main(c) { c.rules = ['MATCH,DIRECT']; return c; }",
+        );
+        assert!(
+            validate_native_profile_hooks(&item, home.path(), &all)
+                .await
+                .unwrap_err()
+                .contains("nonempty Clash script")
+        );
     }
 
     #[tokio::test]

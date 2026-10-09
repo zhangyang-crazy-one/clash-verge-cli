@@ -176,7 +176,7 @@ impl ProfileStore {
             .get_items()
             .into_iter()
             .flatten()
-            .filter(|item| item.itype.as_deref() == Some("remote"))
+            .filter(|item| matches!(item.itype.as_deref(), Some("remote" | "local")))
             .cloned()
             .collect()
     }
@@ -295,6 +295,7 @@ impl ProfileStore {
         let remotes: Vec<(CompactString, Option<CompactString>)> = self
             .items()
             .into_iter()
+            .filter(|item| item.itype.as_deref() == Some("remote"))
             .filter_map(|item| {
                 let uid = item.uid?;
                 Some((uid, item.url))
@@ -578,15 +579,21 @@ pub(crate) mod tests {
                         itype: Some("remote".into()),
                         ..Default::default()
                     },
+                    PrfItem {
+                        uid: Some("local-base".into()),
+                        itype: Some("local".into()),
+                        ..Default::default()
+                    },
                 ]),
                 ..Default::default()
             },
         };
 
         let items = store.items();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0].uid.as_deref(), Some("remote-a"));
         assert_eq!(items[1].uid.as_deref(), Some("remote-b"));
+        assert_eq!(items[2].uid.as_deref(), Some("local-base"));
         assert_eq!(store.selected_index(), 1);
     }
 }
