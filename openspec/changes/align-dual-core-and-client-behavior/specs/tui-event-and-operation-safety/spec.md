@@ -35,6 +35,18 @@ The TUI MUST perform core inspection and consent-gated acquisition asynchronousl
 - **WHEN** cancellation arrives during an awaited commit or the application exits
 - **THEN** the token is checked before final publication, owned rollback completes before shutdown, and ordinary stream cancellation cannot swallow the independent operation result
 
+#### Scenario: verified target needs TUN permission
+- **WHEN** TUN is enabled and the verified candidate lacks required capabilities
+- **THEN** the TUI offers explicit permission setup naming its kind, version and exact path before stopping the old core, executes privileged setup only after user confirmation/password submission, rechecks permission, and resumes the same confirmed operation rather than resolving another core
+
+#### Scenario: TUN setup declined, failed or stale
+- **WHEN** permission setup is declined, cancelled, fails verification or completes for an obsolete operation
+- **THEN** no target core is started, the previous running state and selected core/TUN configuration remain accurate, and a persistent result explains the outcome
+
+#### Scenario: Settings permission setup targets selected core
+- **WHEN** the user requests TUN setup in Settings
+- **THEN** setup inspects the shared selected core and its verified candidate rather than an unconditional mihomo/system fallback, shows the exact authorization target, and neither downloads without confirmation nor implicitly starts or switches a core
+
 ### Requirement: Capability-gated operation deadlines
 Health checks MUST retain a 5-second deadline, delay operations MUST use `timeout_ms` plus a bounded response margin, and provider refresh MUST use a configurable or 30-second default request deadline. A timeout MUST NOT alone classify a core as dead.
 

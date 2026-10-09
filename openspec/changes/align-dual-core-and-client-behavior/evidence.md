@@ -155,3 +155,43 @@ openspec validate align-dual-core-and-client-behavior --strict
 | `parent-openspec.log` | exit0；strict valid | `e34801d7350adbe5d185a626ad0d6452e3b914065571d94bffe1cbd63e24a253` |
 
 产物：`target/debug/clash-verge-cli` SHA-256 `07ff3f8ffe67eb6c4eb316fa2e3d7b25ed64a8d7861a9b5a753a009c8841dbc5`；`target/release/clash-verge-cli` SHA-256 `b40f38672c6d875bbeb1d25367d88ab03004151b42d2b4a85d07f118bdfc15cd`。仅构建，未执行或安装产物，未触碰用户运行的 TUI/GUI、核心、配置、现有端点和系统 binary；真实核心启动/切换、下载、TUN/权限及协议互通仍未验证。源码由 parent 独立审查；开发实现与隔离验证完成，真实使用结果须区分于这些 fixture 证据。
+
+## Guided TUN 授权与继续流程（2026-10-09）
+
+用户再次报告两核心启动失败，错误已转为缺少 TUN capability。被动 `getcap` 确认旧 `/usr/bin/verge-mihomo` 具有 `cap_net_admin,cap_net_raw=eip`，两个新缓存文件没有；`findmnt` 显示所在 `/home` btrfs 未列出 nosuid/noexec。未执行权限授予。根因是 guided Ready 直接进入 manager 只读硬门禁，绕过原 TUN 授权流程；Settings 授权始终解析 mihomo，旧 boolean resume 也不能保留切换目标。
+
+源码 `19902dd1` 引入精确 `GuidedTunContext`，保留 id/generation/完整 PreparedCore/kind/path/version/intent/TUN 快照。所有权与代际在检查、授权前后及 apply 边界复核；权限结果走独立 operation channel，普通流取消不吞结果。授权前复核 managed 文件 receipt；显式确认和密码提交后才调用已有权限事务，成功后对同一路径再查 capability 并继续原启动/重启/切换。拒绝、失败、过期、重复结果和阻塞 worker 异常均不启动错误目标，保留旧运行信息并显示持久结果。
+
+Settings 使用共享 kind 与确切已选文件的离线检查；没有已选文件时经既有下载确认流程，成功只报告有效 TUN 权限，不隐式启动/切换、修改选型或伪造运行版本。既有较旧选中文件可做权限设置，但非 reviewed 版本不能通过该入口启动。Root/capable/TUN-off 路径不触发不必要提权；文案区分有效 root 权限和文件 capability，不宣称二者等同。中英确认与密码窗显示核心/版本/长路径，setup-only 窗口不再显示“选型已提交”。
+
+RED 回归实测取消将旧 Running 错改为 Stopped：exit101。最终新增13项 guided_tun 回归覆盖两核心与三种生命周期意图、精确文件重查、取消/七类过期 context、失败/worker panic、setup-only 状态、root/capable/TUN-off、receipt 和中英渲染。历史 legacy DNS skip 测试可能调用实际 pkcheck；本轮在运行测试前改为注入 rule-needed seam。旧日志不能证明此前该分支从未执行。本轮 privilege/core 结果全部来自注入，不运行 sudo/setcap/pkcheck、真实核心或应用。中间 suite 的文案失败与修改前通过结果均保留为历史，不替代最终日志。
+
+最终四个 XDG roots：`/tmp/clash-guided-tun-validation/{data,runtime,config,bin}`，`CARGO_BUILD_JOBS=2`，沿用项目 Cargo 缓存，不重设 HOME/CARGO_HOME。命令：
+
+```bash
+XDG_DATA_HOME=/tmp/clash-guided-tun-validation/data \
+XDG_RUNTIME_DIR=/tmp/clash-guided-tun-validation/runtime \
+XDG_CONFIG_HOME=/tmp/clash-guided-tun-validation/config \
+XDG_BIN_HOME=/tmp/clash-guided-tun-validation/bin \
+CARGO_BUILD_JOBS=2 \
+cargo test --workspace --all-targets --locked -- --test-threads=1 --skip real_sing_box_spawns_and_answers_controller
+
+# With the same four temporary XDG values and CARGO_BUILD_JOBS=2:
+cargo build --workspace --locked
+cargo build --workspace --release --locked
+cargo fmt --all --check
+git diff --check
+openspec validate align-dual-core-and-client-behavior --strict
+```
+
+| 日志（`/tmp/clash-guided-tun-validation/logs/`） | 结果 | SHA-256 |
+|---|---|---|
+| `red.log` | exit101；1 failed | `8a2709da5896fe205991a467ecc16f6a7b8aede854509543f924abd1eef790ac` |
+| `actual-final-workspace-test.log` | exit0；627 CLI +4 integration +13 core = **644 passed**，0 failed，1 filtered；无 warnings | `109b61bfd83a27627a808cd92dbc1dca05842725cfc509fb0f87b6b2f2914829` |
+| `actual-final-build.log` | exit0；复用最终源码编译缓存 | `22e0df986057b9ba5be07526ac5fb348862a3dedef42108383cc3e088acbb889` |
+| `actual-final-release.log` | exit0；optimized build，1m04s | `134b4bfae09000f3ce4c5143a12334b538dd29f65150580d45182f2c1e7baec5` |
+| `parent-fmt.log` | exit0 | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `parent-diff.log` | exit0 | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| `parent-openspec.log` | exit0；strict valid | `e34801d7350adbe5d185a626ad0d6452e3b914065571d94bffe1cbd63e24a253` |
+
+最终11个源码文件均与 `actual-final-source.sha256` 一致，清单 SHA-256 `54432eb0ac61387d968f06c502d122bbf92697f78719a3d3a91f11047c1b2ca2`。产物：debug CLI SHA-256 `c5687a84f5dc444038793645fe4f47e6039389898375bdbaed14ce321d45091d`；release CLI SHA-256 `3fa59eaf01dd792bc999196af5e266bd8a4e49ad2841d49043b7542c464e4238`。没有执行/安装产物或代用户授予权限，真实授权、核心启动/切换、网络/TUN/协议互通仍未验收；用户需自行重启新版并完成明确的 TUI 授权。本轮实现与隔离验证完成，debug session 保留 `awaiting_human_verify`。

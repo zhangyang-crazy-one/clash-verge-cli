@@ -54,3 +54,11 @@ Follow-up: 5/5 complete under the isolated implementation scope; 27/27 total tra
 - [x] 7.3 Run the isolated serialized suite and locked dev/release builds without executing any real core/application or changing user runtime resources; record fresh evidence and artifact identities.
 
 Socket regression: 3/3 complete; 30/30 tracked implementation tasks. Source: `da535daa`. Final isolated suite: 631 passed; locked dev/release builds passed. Live core startup remains unverified; see [evidence.md](evidence.md).
+
+## 8. Guided TUN permission setup follow-up
+
+- [x] 8.1 Reconnect verified guided candidates to explicit TUN authorization before lifecycle mutation, with kind/version/path and operation identity retained; successful permission verification resumes the same start/restart/switch, and decline/failure/cancellation preserves prior runtime/configuration.
+- [x] 8.2 Make Settings TUN setup select the actual shared core and exact candidate, retain download consent and setup-only semantics, and verify both core kinds, stale results, root/capable/TUN-off gates and persistent diagnostics using injected privilege outcomes.
+- [x] 8.3 Run isolated safe suite and locked dev/release builds, format/diff/OpenSpec checks; record fresh evidence without invoking sudo/setcap/pkcheck, modifying actual capabilities/configuration or operating user instances.
+
+TUN follow-up: 3/3 complete in the authorized implementation/isolated verification scope; 33/33 tracked implementation tasks. Source `19902dd1`; final suite644 passed and locked debug/release builds passed. Actual permission grant and live core acceptance remain unexecuted; see [evidence.md](evidence.md).
