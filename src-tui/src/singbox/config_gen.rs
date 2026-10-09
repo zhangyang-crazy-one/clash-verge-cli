@@ -72,6 +72,69 @@ pub struct ConfigInput {
 
 const TUN_INTERFACE_NAME: &str = "sb-tun0";
 const DIRECT_TAG: &str = "direct";
+
+/// The publicly-known secret shipped by the shared `config.yaml` template.
+/// A controller still carrying it is effectively unauthenticated, so the CLI
+/// rotates it before the core starts (see `enhance::resolve_controller_secret`).
+pub const PLACEHOLDER_SECRET: &str = "set-your-secret";
+
+/// Origins allowed to reach the generated clash_api over CORS.
+///
+/// sing-box defaults `access_control_allow_origin` to `["*"]`, which lets any
+/// web page the user visits drive the local controller cross-origin. The CLI's
+/// own controller client is a loopback TCP client that never sends `Origin`,
+/// so the allow-list is restricted to loopback origins only.
+pub const CLASH_API_ALLOW_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "https://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+];
+
+/// Fail-closed guard for the CLI-owned control plane of a generated config.
+///
+/// Runs only after the CLI has stamped its own `clash_api` block, so it can
+/// assert that the block we just wrote is neither unauthenticated nor
+/// wildcard-permissive. `Ok(())` means the file is safe to hand to the core.
+pub fn validate_control_plane_security(config: &Value) -> Result<(), String> {
+    let Some(clash_api) = config.pointer("/experimental/clash_api") else {
+        return Err("generated sing-box config is missing experimental.clash_api".into());
+    };
+    let secret = clash_api.get("secret").and_then(Value::as_str).unwrap_or_default();
+    if secret.trim().is_empty() || secret == PLACEHOLDER_SECRET {
+        return Err("generated sing-box clash_api carries an empty or template controller secret".into());
+    }
+    let Some(origins) = clash_api.get("access_control_allow_origin").and_then(Value::as_array) else {
+        return Err(
+            "generated sing-box clash_api has no access_control_allow_origin; sing-box defaults it to '*'".into(),
+        );
+    };
+    if origins.iter().any(|origin| origin.as_str() == Some("*")) {
+        return Err("generated sing-box clash_api allows the CORS wildcard origin '*'".into());
+    }
+    if origins.is_empty() {
+        return Err("generated sing-box clash_api has an empty access_control_allow_origin".into());
+    }
+    if clash_api
+        .get("access_control_allow_private_network")
+        .and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err("generated sing-box clash_api must set access_control_allow_private_network to false".into());
+    }
+    Ok(())
+}
+
+/// The `experimental.clash_api` object the CLI owns: loopback listener,
+/// resolved secret and an explicit, non-wildcard CORS policy.
+fn clash_api_json(clash_api: &ClashApiSettings) -> Value {
+    json!({
+        "external_controller": clash_api.listen.to_string(),
+        "secret": clash_api.secret,
+        "access_control_allow_origin": CLASH_API_ALLOW_ORIGINS,
+        "access_control_allow_private_network": false,
+    })
+}
 /// Default urltest probe URL (https mandatory: sing-box silently drops
 /// http URLs and falls back to its own default).
 pub const URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
@@ -187,10 +250,7 @@ pub fn generate_config_for_version(input: &ConfigInput, version: &str) -> Result
             "auto_detect_interface": true,
         },
         "experimental": {
-            "clash_api": {
-                "external_controller": input.clash_api.listen.to_string(),
-                "secret": input.clash_api.secret,
-            }
+            "clash_api": clash_api_json(&input.clash_api),
         }
     });
     if !input.rule_sets.is_empty() {
@@ -535,10 +595,7 @@ pub fn apply_control_plane(
     if !config.get("experimental").is_some_and(Value::is_object) {
         config["experimental"] = json!({});
     }
-    config["experimental"]["clash_api"] = json!({
-        "external_controller": clash_api.listen.to_string(),
-        "secret": clash_api.secret,
-    });
+    config["experimental"]["clash_api"] = clash_api_json(clash_api);
     if !config.get("route").is_some_and(Value::is_object) {
         config["route"] = json!({});
     }
@@ -882,5 +939,127 @@ mod tests {
             "route": {}
         });
         assert!(validate_native_config(&removed).unwrap_err().contains("wireguard"));
+    }
+
+    /// Regression #48: the generated clash_api must never carry the publicly
+    /// known template secret nor a wildcard CORS policy.
+    #[test]
+    fn generated_clash_api_has_no_placeholder_secret_and_no_wildcard_cors() {
+        let config = generate_config(&sample_input()).expect("config");
+        let text = serde_json::to_string(&config).expect("json");
+
+        assert!(
+            !text.contains(PLACEHOLDER_SECRET),
+            "template secret leaked into singbox.json"
+        );
+        assert!(!text.contains("\"secret\":\"\""));
+        assert!(
+            !text.contains("\"*\""),
+            "singbox.json must not contain a wildcard CORS origin: {text}"
+        );
+
+        let clash_api = &config["experimental"]["clash_api"];
+        assert_eq!(clash_api["secret"], "s3cret");
+        assert_eq!(clash_api["access_control_allow_origin"], json!(CLASH_API_ALLOW_ORIGINS));
+        assert_eq!(clash_api["access_control_allow_private_network"], false);
+        validate_control_plane_security(&config).expect("generated control plane is safe");
+    }
+
+    /// The native-JSON passthrough must get the same hardened clash_api.
+    #[test]
+    fn native_passthrough_also_gets_a_restricted_cors_policy() {
+        let mut native = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [{ "outbound": "direct" }] }
+        });
+        let tun = TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        };
+        let clash_api = ClashApiSettings {
+            listen: "127.0.0.1:9090".parse().expect("addr"),
+            secret: "rotated".into(),
+        };
+        apply_control_plane(&mut native, 7897, false, &tun, &clash_api);
+
+        let text = serde_json::to_string(&native).expect("json");
+        assert!(!text.contains(PLACEHOLDER_SECRET));
+        assert!(!text.contains("\"*\""));
+        validate_control_plane_security(&native).expect("passthrough control plane is safe");
+    }
+
+    /// Fail-closed: the guard rejects every shape that would leave the
+    /// controller reachable or unauthenticated.
+    #[test]
+    fn control_plane_security_guard_rejects_weak_or_wildcard_settings() {
+        let base = || {
+            let mut config = json!({
+                "outbounds": [{ "type": "direct", "tag": "direct" }],
+                "route": {}
+            });
+            let tun = TunSettings {
+                stack: "gvisor".into(),
+                mtu: 9000,
+            };
+            apply_control_plane(
+                &mut config,
+                7897,
+                false,
+                &tun,
+                &ClashApiSettings {
+                    listen: "127.0.0.1:9090".parse().expect("addr"),
+                    secret: "rotated".into(),
+                },
+            );
+            config
+        };
+
+        let mut placeholder = base();
+        placeholder["experimental"]["clash_api"]["secret"] = json!(PLACEHOLDER_SECRET);
+        assert!(
+            validate_control_plane_security(&placeholder)
+                .unwrap_err()
+                .contains("template controller secret")
+        );
+
+        let mut empty = base();
+        empty["experimental"]["clash_api"]["secret"] = json!("");
+        assert!(validate_control_plane_security(&empty).unwrap_err().contains("empty"));
+
+        let mut wildcard = base();
+        wildcard["experimental"]["clash_api"]["access_control_allow_origin"] = json!(["*"]);
+        assert!(
+            validate_control_plane_security(&wildcard)
+                .unwrap_err()
+                .contains("wildcard")
+        );
+
+        let mut absent = base();
+        absent["experimental"]["clash_api"]
+            .as_object_mut()
+            .expect("object")
+            .remove("access_control_allow_origin");
+        assert!(
+            validate_control_plane_security(&absent)
+                .unwrap_err()
+                .contains("defaults it to '*'")
+        );
+
+        let mut private_network = base();
+        private_network["experimental"]["clash_api"]["access_control_allow_private_network"] = json!(true);
+        assert!(
+            validate_control_plane_security(&private_network)
+                .unwrap_err()
+                .contains("allow_private_network")
+        );
+
+        let mut missing = json!({ "outbounds": [], "route": {} });
+        assert!(
+            validate_control_plane_security(&missing)
+                .unwrap_err()
+                .contains("missing experimental.clash_api")
+        );
+        missing["experimental"] = json!({ "clash_api": base()["experimental"]["clash_api"] });
+        assert!(validate_control_plane_security(&missing).is_ok());
     }
 }
