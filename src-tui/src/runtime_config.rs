@@ -165,12 +165,12 @@ pub async fn apply_singbox_restart_for_profile(
         transaction
             .rollback()
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
-        if transaction.previous.is_some() {
-            if let Err(rollback_error) = manager.restart().await {
-                return Err(format!(
-                    "{restart_error}; previous configuration restored but fallback restart failed: {rollback_error}"
-                ));
-            }
+        if transaction.previous.is_some()
+            && let Err(rollback_error) = manager.restart().await
+        {
+            return Err(format!(
+                "{restart_error}; previous configuration restored but fallback restart failed: {rollback_error}"
+            ));
         }
         return Err(restart_error.to_string());
     }
@@ -814,7 +814,7 @@ mod tests {
             ..Default::default()
         };
         write_file(&dir, "hook.js", clash_verge_core::utils::tmpl::ITEM_SCRIPT);
-        let unchanged = compose_remote_profile(&item, &dir, &[script.clone()])
+        let unchanged = compose_remote_profile(&item, &dir, std::slice::from_ref(&script))
             .await
             .expect("GUI default script executes");
         assert_eq!(unchanged["future"]["keep"], Value::from(true));

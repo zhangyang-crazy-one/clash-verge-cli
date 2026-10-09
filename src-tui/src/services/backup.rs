@@ -477,7 +477,6 @@ fn replace_all_using(
         Ok(())
     };
     let result = swap();
-    drop(swap);
     let mut rollback_errors = Vec::new();
     if let Err(error) = result {
         for (path, old, had_original) in swapped.iter().rev() {

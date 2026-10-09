@@ -478,6 +478,9 @@ impl IProfiles {
     }
 }
 
+// Re-export PrfOption for callers that referenced it via `super::PrfOption`.
+pub use super::prfitem::PrfOption;
+
 #[cfg(test)]
 mod lossless_config_tests {
     use super::IProfiles;
@@ -552,6 +555,3 @@ items:
         assert_eq!(value["future"]["added"], Value::from(true));
     }
 }
-
-// Re-export PrfOption for callers that referenced it via `super::PrfOption`.
-pub use super::prfitem::PrfOption;

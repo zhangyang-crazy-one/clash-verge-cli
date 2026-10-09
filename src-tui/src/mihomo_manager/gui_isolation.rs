@@ -57,23 +57,21 @@ pub(super) fn check(
         if !address.ip().is_loopback() || address.port() == 0 {
             bail!("GUI coexistence requires explicit loopback listener ports");
         }
-        if let Err(error) = std::net::TcpListener::bind(address) {
-            if !owned_pid
+        if let Err(error) = std::net::TcpListener::bind(address)
+            && !owned_pid
                 .map(|pid| owns_listener(pid, address, "tcp"))
                 .transpose()?
                 .unwrap_or(false)
-            {
-                return Err(error).context("isolated CLI TCP listener belongs to another process");
-            }
+        {
+            return Err(error).context("isolated CLI TCP listener belongs to another process");
         }
-        if let Err(error) = std::net::UdpSocket::bind(address) {
-            if !owned_pid
+        if let Err(error) = std::net::UdpSocket::bind(address)
+            && !owned_pid
                 .map(|pid| owns_listener(pid, address, "udp"))
                 .transpose()?
                 .unwrap_or(false)
-            {
-                return Err(error).context("isolated CLI UDP listener belongs to another process");
-            }
+        {
+            return Err(error).context("isolated CLI UDP listener belongs to another process");
         }
     }
     Ok(())
@@ -117,6 +115,19 @@ fn read_mapping(path: &Path) -> anyhow::Result<Mapping> {
 }
 
 pub(super) fn owns_listener(pid: u32, address: std::net::SocketAddr, protocol: &str) -> anyhow::Result<bool> {
+    owns_listener_with_base(pid, address, protocol, Path::new("/proc/net"))
+}
+
+/// Reads the kernel listener tables from `base` (injectable for tests). Hosts
+/// booted with `ipv6.disable=1` (and minimal containers) have no tcp6/udp6
+/// tables at all: that means "no IPv6 listeners", not a verification
+/// failure — only the IPv4 table is mandatory.
+fn owns_listener_with_base(
+    pid: u32,
+    address: std::net::SocketAddr,
+    protocol: &str,
+    base: &Path,
+) -> anyhow::Result<bool> {
     let mut inodes = HashSet::new();
     for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).context("cannot verify owned core listeners")? {
         let entry = entry?;
@@ -138,8 +149,11 @@ pub(super) fn owns_listener(pid: u32, address: std::net::SocketAddr, protocol: &
     }
     let mut owned = false;
     for family in ["", "6"] {
-        let status = std::fs::read_to_string(format!("/proc/net/{protocol}{family}"))
-            .context("cannot verify kernel listener ownership")?;
+        let status = match std::fs::read_to_string(base.join(format!("{protocol}{family}"))) {
+            Ok(status) => status,
+            Err(error) if family == "6" && error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("cannot verify kernel listener ownership"),
+        };
         for line in status.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() < 10 {
@@ -153,9 +167,9 @@ pub(super) fn owns_listener(pid: u32, address: std::net::SocketAddr, protocol: &
             let (host, port) = fields[1].split_once(':').context("invalid kernel listener address")?;
             let port = u16::from_str_radix(port, 16)?;
             let host = decode_kernel_ip(host)?;
-            if port == address.port()
-                && (host == address.ip() || host.is_unspecified() && host.is_ipv4() == address.is_ipv4())
-            {
+            // An unspecified listener (`0.0.0.0` or dual-stack `[::]`) accepts
+            // the probed address regardless of address family.
+            if port == address.port() && (host == address.ip() || host.is_unspecified()) {
                 if !inodes.contains(fields[9]) {
                     return Ok(false);
                 }
@@ -236,19 +250,18 @@ fn yaml_listeners(config: &Mapping, socket: &Path) -> anyhow::Result<HashSet<Str
             addresses.insert(std::net::SocketAddr::new(bind, port).to_string());
         }
     }
-    if let Some(address) = config.get("external-controller").and_then(Value::as_str) {
-        if !address.is_empty() {
-            addresses.insert(address.to_owned());
-        }
+    if let Some(address) = config.get("external-controller").and_then(Value::as_str)
+        && !address.is_empty()
+    {
+        addresses.insert(address.to_owned());
     }
     if let Some(address) = config
         .get("dns")
         .and_then(|dns| dns.get("listen"))
         .and_then(Value::as_str)
+        && !address.is_empty()
     {
-        if !address.is_empty() {
-            addresses.insert(address.to_owned());
-        }
+        addresses.insert(address.to_owned());
     }
     Ok(addresses)
 }
@@ -413,5 +426,24 @@ mod tests {
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         churn.join().unwrap();
+    }
+
+    #[test]
+    fn owns_listener_tolerates_missing_ipv6_kernel_table() {
+        // Regression: hosts booted with ipv6.disable=1 (and minimal containers)
+        // have no tcp6/udp6 tables. Synthesize a kernel-table directory with
+        // only the IPv4 table; ownership must still verify.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tcp"),
+            std::fs::read_to_string("/proc/net/tcp").unwrap(),
+        )
+        .unwrap();
+        assert!(owns_listener_with_base(std::process::id(), addr, "tcp", dir.path()).unwrap());
+        // The IPv4 table itself missing remains a hard error.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(owns_listener_with_base(std::process::id(), addr, "tcp", empty.path()).is_err());
     }
 }

@@ -154,14 +154,13 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             break;
         }
         tokio::select! {
-            changed = traffic_rx.changed() => if changed.is_ok() {
-                if let Some((generation, core_generation, traffic)) = traffic_rx.borrow_and_update().clone()
+            changed = traffic_rx.changed() => if changed.is_ok()
+                && let Some((generation, core_generation, traffic)) = traffic_rx.borrow_and_update().clone()
                     && generation == ctx.tx.current_generation()
                     && core_generation == ctx.manager.current_generation() {
                     handlers::handle_event(&mut app, &ctx, Action::TrafficFetched(traffic)).await;
                     dirty = true;
-                }
-            },
+                },
             Some((generation, core_generation, log)) = log_rx.recv() => {
                 if generation != ctx.tx.current_generation() || core_generation != ctx.manager.current_generation() { continue; }
                 let dropped = dropped_logs.swap(0, std::sync::atomic::Ordering::Relaxed);
