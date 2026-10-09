@@ -452,7 +452,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         }
 
         // Rule / DNS editing flows.
-        Action::RulesEditToggle => rules::toggle_edit_mode(app).await,
+        Action::RulesEditToggle => rules::toggle_edit_mode(app, ctx).await,
         Action::RulesEditAdd => rules::open_rule_input(app),
         Action::RulesEditAddRuleSet => rules::open_rule_set_input(app),
         Action::RulesEditDeleteRuleSet => rules::delete_rule_set(app),

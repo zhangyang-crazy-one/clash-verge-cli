@@ -8,7 +8,13 @@ use crate::tui::handlers::Ctx;
 /// `toggle_edit_mode` on entry. Kept private to this module so it does not
 /// widen the surface owned by other workers (it never spawns, only reads
 /// the profile store and the YAML file on disk).
-async fn load_edit_buffer_from_active_profile(app: &mut App) -> Result<(), String> {
+///
+/// Logical (AND/OR) rules live in the sing-box sidecar, not in the profile
+/// YAML, so they are appended to the buffer as well (#59): without them a
+/// previously saved logical rule is neither shown nor deletable, and the next
+/// save would overwrite the sidecar and drop it. They are only loaded under
+/// sing-box, because the mihomo save path rejects logical rules outright.
+async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> Result<(), String> {
     let store = crate::profile_store::store::ProfileStore::snapshot()
         .await
         .map_err(|e| e.to_string())?;
@@ -25,13 +31,82 @@ async fn load_edit_buffer_from_active_profile(app: &mut App) -> Result<(), Strin
         .join(file);
     let yaml = std::fs::read_to_string(&path).map_err(|e| format!("read profile: {e}"))?;
     let rules = crate::routing::load_profile_rules(&yaml).map_err(|e| e.to_string())?;
-    app.rules_edit_buffer = rules;
+    app.rules_edit_buffer = compose_edit_buffer(rules, &load_logical_rules(singbox)?);
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
         app.rule_sets_edit = crate::singbox::load_rule_sets(&home)?;
     }
     app.rules_selected_index = 0;
     app.rules_edit_mode = true;
     app.rules_edit_dirty = false;
+    Ok(())
+}
+
+/// Stored logical rules, or none when the active core cannot express them.
+/// A broken sidecar is reported rather than silently dropped: the user must
+/// fix it before saving, or the next save would overwrite it.
+fn load_logical_rules(singbox: bool) -> Result<Vec<crate::routing::IRouteRule>, String> {
+    if !singbox {
+        return Ok(Vec::new());
+    }
+    let home = clash_verge_core::utils::dirs::app_home_dir().map_err(|e| e.to_string())?;
+    crate::singbox::load_logical_rules(&home)
+}
+
+/// Profile rules first, stored logical rules after them — the same order the
+/// sing-box generator appends them in, so the editor list matches the order
+/// the core actually evaluates.
+fn compose_edit_buffer(
+    profile_rules: Vec<crate::routing::IRouteRule>,
+    logical: &[crate::routing::IRouteRule],
+) -> Vec<crate::routing::IRouteRule> {
+    profile_rules.into_iter().chain(logical.iter().cloned()).collect()
+}
+
+/// Persist the split rule buffer: clash rules back into the profile YAML,
+/// logical rules into the sing-box sidecar.
+///
+/// The sidecar is always written, and removed when no logical rule is left
+/// (#59): writing only on a non-empty list left deleted rules in place, and
+/// never writing it lost every rule that was already saved.
+fn persist_rules(
+    path: &std::path::Path,
+    home: &std::path::Path,
+    yaml: &str,
+    buffer: Vec<crate::routing::IRouteRule>,
+) -> Result<(), String> {
+    let (clash_rules, logical): (Vec<_>, Vec<_>) = buffer
+        .into_iter()
+        .partition(|r| !matches!(r, crate::routing::IRouteRule::Logical { .. }));
+    let saved = crate::routing::save_profile_rules(yaml, &clash_rules)?;
+    write_atomic(path, &saved)?;
+    persist_logical_rules(home, &logical)
+}
+
+/// Write the logical sidecar, or delete it when the list is empty so that a
+/// user who removed every logical rule actually loses them.
+fn persist_logical_rules(home: &std::path::Path, logical: &[crate::routing::IRouteRule]) -> Result<(), String> {
+    if logical.is_empty() {
+        return match std::fs::remove_file(home.join(crate::singbox::LOGICAL_RULES_FILE)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "remove {}: {error}",
+                home.join(crate::singbox::LOGICAL_RULES_FILE).display()
+            )),
+        };
+    }
+    crate::singbox::save_logical_rules(home, logical)
+}
+
+/// Write through a temporary file in the same directory and rename over the
+/// target, so an interrupted save cannot leave a truncated profile.
+fn write_atomic(path: &std::path::Path, body: &str) -> Result<(), String> {
+    let temporary = path.with_extension("yaml.tmp");
+    std::fs::write(&temporary, body).map_err(|error| format!("write {}: {error}", temporary.display()))?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("replace {}: {error}", path.display()));
+    }
     Ok(())
 }
 
@@ -128,8 +203,9 @@ pub(super) fn update_selected_provider(app: &mut App, ctx: &Ctx) {
 // --- Task 7.1 / 7.5: profile rule editing -------------------------------
 
 /// `E` on Rules: enter/exit profile rule edit mode. The buffer is loaded
-/// from the current profile's YAML on entry.
-pub(super) async fn toggle_edit_mode(app: &mut App) {
+/// from the current profile's YAML (plus the stored logical rules under
+/// sing-box) on entry.
+pub(super) async fn toggle_edit_mode(app: &mut App, ctx: &Ctx) {
     if app.rules_edit_mode {
         app.rules_edit_mode = false;
         app.rules_edit_buffer.clear();
@@ -137,7 +213,8 @@ pub(super) async fn toggle_edit_mode(app: &mut App) {
         app.status_msg = Some("rule editing off".into());
         return;
     }
-    match load_edit_buffer_from_active_profile(app).await {
+    let singbox = ctx.manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox;
+    match load_edit_buffer_from_active_profile(app, singbox).await {
         Ok(()) => {
             app.status_msg = Some("rule editing ON - D del, J/K move, A raw, F form, W save, E exit".into());
         }
@@ -317,26 +394,27 @@ fn spawn_rules_save(
             let path = clash_verge_core::utils::dirs::app_profiles_dir()
                 .map_err(|e| e.to_string())?
                 .join(file.as_str());
+            let home = clash_verge_core::utils::dirs::app_home_dir().map_err(|e| e.to_string())?;
             let yaml = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let (clash_rules, logical): (Vec<_>, Vec<_>) = buffer
-                .into_iter()
-                .partition(|r| !matches!(r, crate::routing::IRouteRule::Logical { .. }));
-            if !logical.is_empty() && !is_singbox {
+            if buffer
+                .iter()
+                .any(|rule| matches!(rule, crate::routing::IRouteRule::Logical { .. }))
+                && !is_singbox
+            {
                 return Err("logical rules require the sing-box core".into());
             }
-            let saved = crate::routing::save_profile_rules(&yaml, &clash_rules)?;
-            std::fs::write(&path, saved).map_err(|e| e.to_string())?;
-            if !logical.is_empty() {
-                let home = clash_verge_core::utils::dirs::app_home_dir().map_err(|e| e.to_string())?;
-                crate::singbox::save_logical_rules(&home, &logical)?;
-            }
-            Ok((item, yaml))
+            persist_rules(&path, &home, &yaml, buffer)?;
+            Ok(item)
         }
         .await;
         match outcome {
-            Ok((item, yaml)) => {
+            Ok(item) => {
                 let report = if is_singbox {
-                    crate::runtime_config::apply_singbox_restart(&manager, Some(yaml.as_str()), enable_tun).await
+                    // #59: regenerate from the profile as it is NOW on disk.
+                    // Passing the pre-edit snapshot here restarted sing-box
+                    // with the old rules while the status bar already claimed
+                    // the edits were applied.
+                    restart_singbox_with_saved_rules(&manager).await
                 } else {
                     crate::runtime_config::reload_remote_profile(&manager.api(), &item, enable_tun, true)
                         .await
@@ -356,6 +434,16 @@ fn spawn_rules_save(
             }
         }
     });
+}
+
+/// Apply the saved rules to a running sing-box.
+///
+/// Deliberately takes no caller-supplied YAML: the profile was just rewritten,
+/// so the restart must re-read it from disk (`active_profile_yaml`, which also
+/// applies the profile DNS preprocessing). Handing back the pre-edit snapshot
+/// is exactly the bug of issue #59.
+async fn restart_singbox_with_saved_rules(manager: &crate::mihomo_manager::MihomoManager) -> Result<String, String> {
+    crate::runtime_config::apply_singbox_active_reload(manager).await
 }
 
 // --- Task 8.1: sing-box DNS editor --------------------------------------
@@ -482,4 +570,144 @@ pub(super) fn note_dns_applied(app: &mut App, message: String) {
 /// Channel-receive side: sing-box DNS apply failed.
 pub(super) fn note_dns_failed(app: &mut App, error: String) {
     app.status_msg = Some(format!("dns apply failed: {error}"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::{IRouteRule, LogicOp, MatchField, RuleTarget};
+
+    const PROFILE: &str = "proxies: []\nrules:\n  - DOMAIN,a.com,DIRECT\n  - MATCH,PROXY\n";
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rules-handler-test-{}-{name}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    fn simple(domain: &str) -> IRouteRule {
+        IRouteRule::Simple {
+            matches: vec![MatchField::Domain(domain.into())],
+            target: RuleTarget::Direct,
+        }
+    }
+
+    fn logical(domain: &str) -> IRouteRule {
+        IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![simple(domain)],
+            target: RuleTarget::Block,
+        }
+    }
+
+    /// #59: already-saved logical rules must show up in the editor buffer,
+    /// after the profile rules — the order the sing-box generator uses.
+    #[test]
+    fn saved_logical_rules_are_visible_in_the_edit_buffer() {
+        let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &[logical("c.com")]);
+        assert_eq!(buffer.len(), 3);
+        assert!(matches!(buffer[2], IRouteRule::Logical { .. }));
+        assert!(crate::routing::describe(&buffer[2]).contains("OR"));
+    }
+
+    #[test]
+    fn no_logical_rules_means_the_buffer_is_the_profile_rules() {
+        let buffer = compose_edit_buffer(vec![simple("a.com")], &[]);
+        assert_eq!(buffer, vec![simple("a.com")]);
+    }
+
+    /// The save writes the edited rules into the profile YAML the restart
+    /// re-reads, keeping every other section untouched.
+    #[test]
+    fn persisting_rules_writes_the_edited_profile_for_the_restart() {
+        let dir = temp_dir("persist");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        persist_rules(
+            &profile,
+            &home,
+            PROFILE,
+            vec![
+                simple("b.com"),
+                IRouteRule::Raw {
+                    clash_raw: "MATCH,DIRECT".into(),
+                },
+            ],
+        )
+        .expect("persist");
+
+        // This is the file `apply_singbox_active_reload` reads: the pre-edit
+        // rules must be gone from it.
+        let after = std::fs::read_to_string(&profile).expect("reread");
+        assert!(after.contains("DOMAIN,b.com,DIRECT"), "{after}");
+        assert!(after.contains("MATCH,DIRECT"), "{after}");
+        assert!(!after.contains("DOMAIN,a.com,DIRECT"), "{after}");
+        assert!(after.contains("proxies:"), "{after}");
+        // Atomic write: no temporary left behind.
+        assert!(!profile.with_extension("yaml.tmp").exists());
+    }
+
+    /// #59: saving with no logical rule left must clear the sidecar instead
+    /// of keeping the deleted rules alive in it.
+    #[test]
+    fn deleting_all_logical_rules_clears_the_sidecar() {
+        let dir = temp_dir("clear");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+        crate::singbox::save_logical_rules(&home, &[logical("c.com")]).expect("seed sidecar");
+        assert!(home.join(crate::singbox::LOGICAL_RULES_FILE).is_file());
+
+        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")]).expect("persist");
+
+        assert!(!home.join(crate::singbox::LOGICAL_RULES_FILE).exists());
+        assert!(crate::singbox::load_logical_rules(&home).unwrap().is_empty());
+    }
+
+    /// A non-empty logical list still round-trips through the sidecar, so the
+    /// always-write change cannot lose saved rules.
+    #[test]
+    fn persisting_keeps_and_replaces_the_logical_sidecar() {
+        let dir = temp_dir("sidecar");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        persist_rules(&profile, &home, PROFILE, vec![simple("a.com"), logical("c.com")]).expect("first");
+        assert_eq!(
+            crate::singbox::load_logical_rules(&home).unwrap(),
+            vec![logical("c.com")]
+        );
+
+        persist_rules(&profile, &home, PROFILE, vec![simple("a.com"), logical("d.com")]).expect("second");
+        assert_eq!(
+            crate::singbox::load_logical_rules(&home).unwrap(),
+            vec![logical("d.com")]
+        );
+    }
+
+    /// Fail closed: a profile that cannot be re-serialized must leave both
+    /// files untouched instead of half-writing them.
+    #[test]
+    fn unparsable_profile_is_rejected_without_sidecar_changes() {
+        let dir = temp_dir("reject");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        let error = persist_rules(&profile, &home, "rules: [oops\n", vec![logical("c.com")]).expect_err("invalid yaml");
+        assert!(!error.is_empty());
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), PROFILE);
+        assert!(!home.join(crate::singbox::LOGICAL_RULES_FILE).exists());
+    }
 }

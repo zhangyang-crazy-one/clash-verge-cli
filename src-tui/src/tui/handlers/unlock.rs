@@ -1,4 +1,9 @@
 //! Unlock view: service availability checks through the core.
+//!
+//! The checks are sent through the port `services::unlock::resolve_proxy_port`
+//! picks, which falls back to the CLI's effective mixed port when the core
+//! cannot report one (sing-box always reports `mixed-port: 0`, issue #58), so
+//! this page works unchanged under either core.
 
 use crate::app::{Action, App, CoreState};
 
