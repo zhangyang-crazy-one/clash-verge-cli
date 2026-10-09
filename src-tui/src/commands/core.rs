@@ -15,34 +15,45 @@ use std::path::PathBuf;
 
 use crate::mihomo_manager::CoreKind;
 
+/// The core this CLI would actually adopt right now, with its pid.
+///
+/// Uses the same validated read as the lifecycle commands
+/// (`pidfile::read_live_for_kind`): a raw record plus a pid liveness check
+/// accepts a stale record whose pid has been recycled, and reports a core as
+/// running when this process would refuse to manage it.
+fn live_core(socket: &std::path::Path, singbox_controller: std::net::SocketAddr) -> Option<(CoreKind, u32)> {
+    use crate::mihomo_manager::pidfile;
+    let path = pidfile::path_for(socket);
+    [CoreKind::Mihomo, CoreKind::SingBox].into_iter().find_map(|kind| {
+        let endpoint = (kind == CoreKind::SingBox).then_some(singbox_controller);
+        pidfile::read_live_for_kind(&path, socket, kind, endpoint).map(|record| (kind, record.pid))
+    })
+}
+
 /// `clash-verge-cli core` / `core status`: which core is selected, which is
-/// running, and (with `--json`) the pid record behind that answer.
+/// running, and (with `--json`) the pid behind that answer.
 pub async fn show(config_dir: PathBuf, json: bool) -> anyhow::Result<()> {
     let socket = super::active_socket_path().await;
-    let record = crate::mihomo_manager::pidfile::read_record(&crate::mihomo_manager::pidfile::path_for(&socket));
+    let singbox_controller = crate::mihomo_manager::manager::configured_singbox_controller(
+        &clash_verge_core::config::IClashTemp::new().await.0,
+    )?;
+    let live = live_core(&socket, singbox_controller);
     let selected = super::configured_core_kind().await;
-    let running = record
-        .as_ref()
-        .filter(|record| crate::mihomo_manager::pidfile::is_running(record.pid))
-        .map(|record| record.kind);
+    let running = live.map(|(kind, _)| kind);
 
     if json {
         let value = serde_json::json!({
             "selected": selected.as_str(),
             "running": running.map(CoreKind::as_str),
-            "pid": record.as_ref().map(|record| record.pid),
+            "pid": live.map(|(_, pid)| pid),
             "config_dir": config_dir.display().to_string(),
         });
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
     println!("selected core: {}", selected.as_str());
-    match running {
-        Some(kind) => println!(
-            "running core:   {} (pid {})",
-            kind.as_str(),
-            record.as_ref().map(|record| record.pid).unwrap_or_default()
-        ),
+    match live {
+        Some((kind, pid)) => println!("running core:   {} (pid {})", kind.as_str(), pid),
         None => println!("running core:   none"),
     }
     if let (Some(selected), Some(running)) = (Some(selected), running)
@@ -124,5 +135,27 @@ mod tests {
             .select_core_while_stopped(CoreKind::Mihomo)
             .expect_err("a running core must not be re-selected from the stopped path");
         assert!(error.to_string().contains("Core ownership"), "{error}");
+    }
+
+    /// `core status` must go through the validated live-record read: a stale
+    /// record naming a dead pid is not a running core, whatever the raw pid
+    /// file says.
+    #[test]
+    fn a_stale_pid_record_is_not_reported_as_a_running_core() {
+        use crate::mihomo_manager::pidfile::{self, CoreRecord};
+        use chrono::Utc;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = home.path().join("external-controller.sock");
+        let path = pidfile::path_for(&socket);
+        // u32::MAX is not a live pid on this system, so no /proc entry and no
+        // controller cmdline can validate it.
+        pidfile::write(
+            &path,
+            CoreRecord::with_kind_and_exe(u32::MAX, Utc::now(), CoreKind::Mihomo, None),
+        )
+        .expect("write record");
+
+        assert_eq!(live_core(&socket, "127.0.0.1:0".parse().expect("addr")), None);
     }
 }

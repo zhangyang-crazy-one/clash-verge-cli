@@ -151,6 +151,26 @@ pub fn validate_control_plane_security(config: &Value) -> Result<(), String> {
         }
         None => return Err("generated sing-box clash_api has no default_mode; mode switching would be a no-op".into()),
     }
+    // The selection cache records which nodes the user picked. Only the
+    // CLI-owned, owner-private cache may be emitted: a provider-supplied
+    // path would be created by the core itself with 0644.
+    if let Some(cache) = config.pointer("/experimental/cache_file") {
+        let path = cache.get("path").and_then(Value::as_str).unwrap_or_default();
+        let owned = cache_file_path().filter(|owned| owned == Path::new(path));
+        if owned.is_none() {
+            return Err(format!(
+                "generated sing-box experimental.cache_file points outside the CLI-owned selection cache ({path:?})"
+            ));
+        }
+        if cache.get("enabled").and_then(Value::as_bool) != Some(true) {
+            return Err("generated sing-box experimental.cache_file is not enabled".into());
+        }
+        if !cache_file_is_private(Path::new(path)) {
+            return Err(format!(
+                "generated sing-box selection cache {path} is readable beyond its owner"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -294,29 +314,41 @@ pub fn apply_clash_mode_support(config: &mut Value, clash_api: &ClashApiSettings
     config["experimental"]["clash_api"] = clash_api_json(clash_api, &normalize_clash_mode(default_mode));
 }
 
-/// Wire selection persistence (#57). Fails closed when an existing cache file
-/// is readable beyond its owner: rather than persisting node choices into a
-/// world-readable file we let the generation error surface.
-fn apply_cache_file(config: &mut Value) -> Result<(), String> {
-    let Some(path) = cache_file_path() else {
+/// Wire selection persistence (#57). One policy for both generation paths:
+///
+/// - the CLI owns the cache location, so any `experimental.cache_file` a
+///   provider shipped in a native sing-box document is stripped first — it
+///   could point anywhere, and sing-box would create the file itself with
+///   0644, publishing which nodes the user picked;
+/// - when the CLI-owned cache cannot be created with private permissions the
+///   key is left absent (the pre-#57 behaviour: selections do not persist)
+///   rather than failing the whole generation — a config the user cannot
+///   start is worse than a cache that forgets a selection, and pointing the
+///   core at a world-readable path is not an option.
+fn apply_cache_file(config: &mut Value) {
+    apply_cache_file_at(config, cache_file_path());
+}
+
+/// [`apply_cache_file`] against an explicit destination, so the policy is
+/// testable without the process-wide config dir.
+fn apply_cache_file_at(config: &mut Value, path: Option<PathBuf>) {
+    if let Some(experimental) = config.get_mut("experimental").and_then(Value::as_object_mut) {
+        experimental.remove("cache_file");
+    }
+    let Some(path) = path else {
         // No config dir resolved (pure unit test): emit no cache_file rather
         // than guessing a path, which would either land somewhere
         // world-readable or not exist at all. Production runs always have the
         // dir initialized (see `main`), so selections persist there.
-        return Ok(());
+        return;
     };
-    ensure_private_cache_file(&path)?;
-    if !cache_file_is_private(&path) {
-        return Err(format!(
-            "selection cache {} is readable beyond its owner; refusing to persist node selections there",
-            path.display()
-        ));
+    if ensure_private_cache_file(&path).is_err() || !cache_file_is_private(&path) {
+        return;
     }
     if !config.get("experimental").is_some_and(Value::is_object) {
         config["experimental"] = json!({});
     }
     config["experimental"]["cache_file"] = cache_file_json(&path);
-    Ok(())
 }
 /// Default urltest probe URL (https mandatory: sing-box silently drops
 /// http URLs and falls back to its own default).
@@ -447,7 +479,7 @@ pub fn generate_config_for_version(input: &ConfigInput, version: &str) -> Result
         config["route"]["rule_set"] = Value::Array(input.rule_sets.clone());
     }
     // #57: persist selector choices (and the clash mode) across restarts.
-    apply_cache_file(&mut config)?;
+    apply_cache_file(&mut config);
     if let Some(dns) = &input.dns {
         config["dns"] = dns.clone();
     }
@@ -786,10 +818,10 @@ pub fn apply_control_plane(
     // provider document keeps the same silent mode-switch and lost-selection
     // behavior.
     apply_clash_mode_support(config, clash_api, &configured_default_mode());
-    // A cache file we cannot create with private permissions is skipped
-    // rather than pointed at a world-readable path: losing selection
-    // persistence is the pre-#57 behavior, leaking node choices is not.
-    let _ = apply_cache_file(config);
+    // Same cache policy as the converted path: the provider's own
+    // `experimental.cache_file` is stripped, and a cache we cannot create
+    // privately is omitted rather than failing this passthrough.
+    apply_cache_file(config);
     if !config.get("route").is_some_and(Value::is_object) {
         config["route"] = json!({});
     }
@@ -1437,5 +1469,93 @@ mod tests {
         );
         // The resolver itself is the only place that reads the global.
         assert_eq!(normalize_clash_mode(&default_mode_from_yaml("")), DEFAULT_CLASH_MODE);
+    }
+    /// P1-B: the native passthrough used to keep whatever
+    /// `experimental.cache_file` the provider shipped — sing-box would then
+    /// create that path itself with 0644, publishing which nodes the user
+    /// picked. The CLI owns the cache location; anything else is stripped.
+    #[test]
+    fn a_provider_supplied_cache_file_never_survives_the_passthrough() {
+        let tun = TunSettings {
+            stack: "gvisor".into(),
+            mtu: 9000,
+        };
+        let clash_api = ClashApiSettings {
+            listen: "127.0.0.1:9090".parse().expect("addr"),
+            secret: "rotated".into(),
+        };
+        let mut native = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rules": [{ "outbound": "direct" }] },
+            "experimental": { "cache_file": { "enabled": true, "path": "/tmp/provider-owned.db" } }
+        });
+        apply_control_plane(&mut native, 7897, false, &tun, &clash_api);
+
+        let cache = &native["experimental"]["cache_file"];
+        assert_ne!(
+            cache["path"].as_str(),
+            Some("/tmp/provider-owned.db"),
+            "a provider-supplied cache path must never reach the core"
+        );
+        // Either the CLI-owned private cache took over, or none is emitted.
+        match cache["path"].as_str() {
+            Some(path) => assert_eq!(
+                Some(Path::new(path).to_path_buf()),
+                cache_file_path(),
+                "only the CLI-owned cache may be emitted: {path}"
+            ),
+            None => assert!(
+                !native["experimental"]["cache_file"].is_null(),
+                "an absent cache must be absent, not null"
+            ),
+        }
+    }
+
+    /// P1-B, other half of the policy: when the CLI-owned cache cannot be
+    /// created privately the key is omitted and generation still succeeds —
+    /// the same one-policy behaviour the converted path has.
+    #[test]
+    fn an_unusable_cache_location_omits_the_key_instead_of_failing() {
+        let mut config = json!({ "outbounds": [], "route": {} });
+        // A regular file where a directory is required: the cache cannot be
+        // created at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").expect("seed");
+        apply_cache_file_at(&mut config, Some(blocker.join("nested").join(CACHE_FILE_NAME)));
+
+        assert!(
+            config.pointer("/experimental/cache_file").is_none(),
+            "an unusable cache location must leave no cache_file: {config}"
+        );
+        // Omitting is safe; the guard only constrains what is present.
+        config["experimental"] =
+            json!({ "clash_api": config["experimental"].get("clash_api").cloned().unwrap_or(json!({})) });
+        assert!(config.pointer("/experimental/cache_file").is_none());
+
+        // And the converted path keeps working with the same destination.
+        let mut config = json!({});
+        apply_cache_file_at(&mut config, Some(dir.path().join(CACHE_FILE_NAME)));
+        assert_eq!(config["experimental"]["cache_file"]["enabled"], true);
+    }
+
+    /// P1-B: the guard rejects a cache_file that is not the CLI-owned,
+    /// owner-private one — the fail-closed backstop for any future caller
+    /// that forgets to strip a provider path.
+    #[test]
+    fn the_security_guard_rejects_a_foreign_cache_file() {
+        let mut config = generate_config(&sample_input()).expect("config");
+        config["experimental"]["cache_file"] = json!({ "enabled": true, "path": "/tmp/provider-owned.db" });
+        let error = validate_control_plane_security(&config).expect_err("foreign cache path");
+        assert!(error.contains("outside the CLI-owned selection cache"), "{error}");
+
+        let mut config = generate_config(&sample_input()).expect("config");
+        let owned = cache_file_path().expect("config dir");
+        config["experimental"]["cache_file"] = json!({ "enabled": false, "path": owned.to_string_lossy() });
+        assert!(
+            validate_control_plane_security(&config)
+                .unwrap_err()
+                .contains("not enabled")
+        );
     }
 }
