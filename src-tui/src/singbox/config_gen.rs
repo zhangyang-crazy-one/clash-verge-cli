@@ -16,6 +16,7 @@
 
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 
 /// A selector or urltest outbound group derived from the profile.
 #[derive(Debug, Clone)]
@@ -73,6 +74,23 @@ pub struct ConfigInput {
 const TUN_INTERFACE_NAME: &str = "sb-tun0";
 const DIRECT_TAG: &str = "direct";
 
+/// File name of the sing-box selection cache (#57), created inside the CLI
+/// config dir. sing-box 1.14 persists selector choices (and the clash mode)
+/// in this bbolt file whenever `experimental.cache_file` is enabled, so
+/// selections survive the restarts a subscription refresh or rule edit causes.
+pub const CACHE_FILE_NAME: &str = "singbox-cache.db";
+
+/// Mode the core starts in when the shared clash.yaml carries no usable
+/// `mode`. sing-box spells modes capitalized (`Rule` / `Global` / `Direct`)
+/// in both `default_mode` and the `clash_mode` route matcher.
+pub const DEFAULT_CLASH_MODE: &str = "Rule";
+
+/// Every mode sing-box can expose, derived from the `clash_mode` rules in
+/// `route.rules`. Without at least the two non-default rules below,
+/// sing-box reports `mode-list: ["Rule"]` and silently ignores
+/// `PATCH /configs {"mode": ...}` (#53).
+pub const CLASH_MODES: &[&str] = &["Rule", "Global", "Direct"];
+
 /// The publicly-known secret shipped by the shared `config.yaml` template.
 /// A controller still carrying it is effectively unauthenticated, so the CLI
 /// rotates it before the core starts (see `enhance::resolve_controller_secret`).
@@ -122,18 +140,183 @@ pub fn validate_control_plane_security(config: &Value) -> Result<(), String> {
     {
         return Err("generated sing-box clash_api must set access_control_allow_private_network to false".into());
     }
+    // #53: without an explicit default_mode sing-box derives the mode list
+    // from route rules alone and mode switching silently no-ops.
+    match clash_api.get("default_mode").and_then(Value::as_str) {
+        Some(mode) if CLASH_MODES.contains(&mode) => {}
+        Some(mode) => {
+            return Err(format!(
+                "generated sing-box clash_api has unsupported default_mode {mode:?}"
+            ));
+        }
+        None => return Err("generated sing-box clash_api has no default_mode; mode switching would be a no-op".into()),
+    }
     Ok(())
+}
+
+/// Canonicalize a Clash mode name to sing-box's spelling. Unknown values fall
+/// back to [`DEFAULT_CLASH_MODE`] instead of emitting a mode sing-box rejects.
+pub fn normalize_clash_mode(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "global" => "Global".into(),
+        "direct" => "Direct".into(),
+        _ => DEFAULT_CLASH_MODE.into(),
+    }
+}
+
+/// Route rules that make `PATCH /configs {"mode": ...}` effective: sing-box
+/// builds its `mode-list` from the `clash_mode` matchers it finds here, and
+/// `Global`/`Direct` must be prepended so they short-circuit the regular
+/// rule list. `Rule` needs no rule of its own — it falls through to the
+/// generated routing rules.
+pub fn clash_mode_rules(global_target: &str) -> Vec<Value> {
+    vec![
+        json!({ "clash_mode": "Direct", "outbound": DIRECT_TAG }),
+        json!({ "clash_mode": "Global", "outbound": global_target }),
+    ]
+}
+
+/// Read the mode the shared clash.yaml (`config.yaml` / `clash-verge.yaml`)
+/// currently holds; this is what `clash-verge-cli mode <x>` persists, so it
+/// is the mode a freshly spawned sing-box should start in. Unreadable or
+/// missing files fall back to [`DEFAULT_CLASH_MODE`].
+pub fn default_mode_from_yaml(body: &str) -> String {
+    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(body)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("mode")
+                .and_then(serde_yaml_ng::Value::as_str)
+                .map(normalize_clash_mode)
+        })
+        .unwrap_or_else(|| DEFAULT_CLASH_MODE.into())
+}
+
+fn configured_default_mode() -> String {
+    clash_verge_core::utils::dirs::clash_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|body| default_mode_from_yaml(&body))
+        .unwrap_or_else(|| DEFAULT_CLASH_MODE.into())
+}
+
+/// `experimental.cache_file` for a cache path. sing-box 1.14 removed the
+/// 1.13-era `store_selected` switch: with `enabled: true` the core always
+/// persists selector choices (and the clash mode) into this file. Only the
+/// reviewed 1.14.2 capability matrix is supported, so no legacy flag is emitted.
+pub fn cache_file_json(path: &Path) -> Value {
+    json!({
+        "enabled": true,
+        "path": path.to_string_lossy(),
+    })
+}
+
+/// Fail-closed permission guard for the selection cache: it records which
+/// nodes a user picked, so it must never be readable by group/other. A file
+/// sing-box would create itself gets 0644, hence the explicit pre-create
+/// (with 0600) plus a chmod of a pre-existing loose file.
+pub fn ensure_private_cache_file(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    if let Some(parent) = path.parent()
+        && !parent.is_dir()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        return Err(format!("cannot create {}: {error}", parent.display()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            if let Err(error) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                return Err(format!("cannot restrict {}: {error}", path.display()));
+            }
+            file.sync_all()
+                .map_err(|error| format!("sync {}: {error}", path.display()))
+        }
+        Err(error) => Err(format!("cannot create selection cache {}: {error}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn cache_file_is_private(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).is_ok_and(|meta| meta.permissions().mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn cache_file_is_private(_path: &Path) -> bool {
+    true
+}
+
+/// Absolute path of the selection cache under the CLI config dir, when the
+/// config dir is known.
+fn cache_file_path() -> Option<PathBuf> {
+    let home = clash_verge_core::utils::dirs::app_home_dir().ok()?;
+    Some(home.join(CACHE_FILE_NAME))
 }
 
 /// The `experimental.clash_api` object the CLI owns: loopback listener,
 /// resolved secret and an explicit, non-wildcard CORS policy.
-fn clash_api_json(clash_api: &ClashApiSettings) -> Value {
+fn clash_api_json(clash_api: &ClashApiSettings, default_mode: &str) -> Value {
     json!({
         "external_controller": clash_api.listen.to_string(),
         "secret": clash_api.secret,
+        "default_mode": default_mode,
         "access_control_allow_origin": CLASH_API_ALLOW_ORIGINS,
         "access_control_allow_private_network": false,
     })
+}
+
+/// Wire mode switching (#53): stamp `default_mode` and prepend the
+/// `clash_mode` route rules so sing-box exposes all three modes and honours
+/// `PATCH /configs`. Prepending keeps `Global`/`Direct` ahead of the regular
+/// rule list, so they short-circuit it.
+pub fn apply_clash_mode_support(config: &mut Value, clash_api: &ClashApiSettings, default_mode: &str) {
+    if !config.get("route").is_some_and(Value::is_object) {
+        config["route"] = json!({});
+    }
+    if !config.get("experimental").is_some_and(Value::is_object) {
+        config["experimental"] = json!({});
+    }
+    let global_target = config["route"]["final"].as_str().unwrap_or(DIRECT_TAG).to_string();
+    let mut rules = clash_mode_rules(&global_target);
+    if let Some(existing) = config["route"]["rules"].as_array() {
+        rules.extend(existing.iter().cloned());
+    }
+    config["route"]["rules"] = Value::Array(rules);
+    config["experimental"]["clash_api"] = clash_api_json(clash_api, &normalize_clash_mode(default_mode));
+}
+
+/// Wire selection persistence (#57). Fails closed when an existing cache file
+/// is readable beyond its owner: rather than persisting node choices into a
+/// world-readable file we let the generation error surface.
+fn apply_cache_file(config: &mut Value) -> Result<(), String> {
+    let Some(path) = cache_file_path() else {
+        // No config dir resolved (pure unit test): emit no cache_file rather
+        // than guessing a path, which would either land somewhere
+        // world-readable or not exist at all. Production runs always have the
+        // dir initialized (see `main`), so selections persist there.
+        return Ok(());
+    };
+    ensure_private_cache_file(&path)?;
+    if !cache_file_is_private(&path) {
+        return Err(format!(
+            "selection cache {} is readable beyond its owner; refusing to persist node selections there",
+            path.display()
+        ));
+    }
+    if !config.get("experimental").is_some_and(Value::is_object) {
+        config["experimental"] = json!({});
+    }
+    config["experimental"]["cache_file"] = cache_file_json(&path);
+    Ok(())
 }
 /// Default urltest probe URL (https mandatory: sing-box silently drops
 /// http URLs and falls back to its own default).
@@ -238,6 +421,9 @@ pub fn generate_config_for_version(input: &ConfigInput, version: &str) -> Result
     outbounds.push(json!({ "type": "direct", "tag": DIRECT_TAG }));
     outbounds.push(json!({ "type": "block", "tag": "block" }));
 
+    // #53: sing-box only exposes (and honours) mode switching when the route
+    // carries `clash_mode` rules and clash_api declares a default_mode.
+    let default_mode = configured_default_mode();
     let mut config = json!({
         "log": {
             "level": "info",
@@ -250,17 +436,18 @@ pub fn generate_config_for_version(input: &ConfigInput, version: &str) -> Result
             "auto_detect_interface": true,
         },
         "experimental": {
-            "clash_api": clash_api_json(&input.clash_api),
+            "clash_api": clash_api_json(&input.clash_api, &default_mode),
         }
     });
+    let mut mode_rules = clash_mode_rules(final_outbound);
+    mode_rules.extend(input.route_rules.iter().cloned());
+    normalize_rule_targets(&mut mode_rules);
+    config["route"]["rules"] = Value::Array(mode_rules);
     if !input.rule_sets.is_empty() {
         config["route"]["rule_set"] = Value::Array(input.rule_sets.clone());
     }
-    if !input.route_rules.is_empty() {
-        let mut rules = input.route_rules.clone();
-        normalize_rule_targets(&mut rules);
-        config["route"]["rules"] = Value::Array(rules);
-    }
+    // #57: persist selector choices (and the clash mode) across restarts.
+    apply_cache_file(&mut config)?;
     if let Some(dns) = &input.dns {
         config["dns"] = dns.clone();
     }
@@ -595,7 +782,14 @@ pub fn apply_control_plane(
     if !config.get("experimental").is_some_and(Value::is_object) {
         config["experimental"] = json!({});
     }
-    config["experimental"]["clash_api"] = clash_api_json(clash_api);
+    // #53 / #57 also apply to native sing-box subscriptions: without them the
+    // provider document keeps the same silent mode-switch and lost-selection
+    // behavior.
+    apply_clash_mode_support(config, clash_api, &configured_default_mode());
+    // A cache file we cannot create with private permissions is skipped
+    // rather than pointed at a world-readable path: losing selection
+    // persistence is the pre-#57 behavior, leaking node choices is not.
+    let _ = apply_cache_file(config);
     if !config.get("route").is_some_and(Value::is_object) {
         config["route"] = json!({});
     }
@@ -818,7 +1012,13 @@ mod tests {
         input.groups[1].members.push("REJECT".into());
         input.route_rules = vec![json!({ "domain": ["example.org"], "outbound": "REJECT" })];
         let config = generate_config(&input).expect("policy aliases normalized");
-        assert_eq!(config["route"]["rules"][0]["outbound"], "block");
+        let rule = config["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule.get("domain").is_some())
+            .expect("profile rule");
+        assert_eq!(rule["outbound"], "block");
         let proxy = config["outbounds"]
             .as_array()
             .unwrap()
@@ -864,16 +1064,25 @@ mod tests {
         let config = generate_config(&input).expect("config");
         assert_eq!(
             config["route"]["rules"],
-            json!([{ "domain_suffix": ["example.com"], "outbound": "PROXY" }])
+            json!([
+                { "clash_mode": "Direct", "outbound": "direct" },
+                { "clash_mode": "Global", "outbound": "PROXY" },
+                { "domain_suffix": ["example.com"], "outbound": "PROXY" }
+            ]),
+            "clash_mode rules are prepended ahead of the profile rules (#53)"
         );
         // route.final coexists with injected rules.
         assert_eq!(config["route"]["final"], "PROXY");
 
         input.route_rules.clear();
         let config = generate_config(&input).expect("config");
-        assert!(
-            config["route"].get("rules").is_none(),
-            "empty route_rules must be omitted"
+        assert_eq!(
+            config["route"]["rules"],
+            json!([
+                { "clash_mode": "Direct", "outbound": "direct" },
+                { "clash_mode": "Global", "outbound": "PROXY" }
+            ]),
+            "mode rules stay even without profile rules — dropping them is what made mode switching a no-op"
         );
     }
 
@@ -911,9 +1120,15 @@ mod tests {
 
         // Preserved original content
         assert_eq!(native["outbounds"][0]["tag"], "custom-node");
-        assert_eq!(native["route"]["rules"][0]["outbound"], "custom-node");
         assert_eq!(native["dns"]["servers"][0]["tag"], "remote");
         assert_eq!(native["route"]["auto_detect_interface"], true);
+        let preserved = native["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|rule| rule["outbound"] == "custom-node")
+            .expect("provider rule preserved");
+        assert_eq!(preserved, &json!({ "outbound": "custom-node" }));
 
         // Injected CLI control plane
         assert_eq!(native["inbounds"][0]["listen_port"], 7897);
@@ -1061,5 +1276,166 @@ mod tests {
         );
         missing["experimental"] = json!({ "clash_api": base()["experimental"]["clash_api"] });
         assert!(validate_control_plane_security(&missing).is_ok());
+    }
+
+    /// Regression #53: sing-box derives its `mode-list` from `clash_mode`
+    /// route rules plus `default_mode`. Without both, `PATCH /configs` is
+    /// accepted (204) and silently dropped.
+    #[test]
+    fn generated_route_declares_every_clash_mode_and_a_default_mode() {
+        let config = generate_config(&sample_input()).expect("config");
+
+        let modes: Vec<&str> = config["route"]["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .filter_map(|rule| rule.get("clash_mode").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            modes,
+            vec!["Direct", "Global"],
+            "clash_mode rules must lead the rule list (#53)"
+        );
+        assert_eq!(config["route"]["rules"][0]["outbound"], "direct");
+        assert_eq!(
+            config["route"]["rules"][1]["outbound"], "PROXY",
+            "Global must route through the final outbound"
+        );
+        for mode in CLASH_MODES {
+            assert!(
+                *mode == "Rule" || modes.contains(mode),
+                "mode {mode} must be reachable: {modes:?}"
+            );
+        }
+
+        let default_mode = config["experimental"]["clash_api"]["default_mode"]
+            .as_str()
+            .expect("default_mode");
+        assert!(
+            CLASH_MODES.contains(&default_mode),
+            "default_mode {default_mode} is not a sing-box mode"
+        );
+        validate_control_plane_security(&config).expect("generated control plane is safe");
+    }
+
+    /// The startup mode comes from the shared clash.yaml, which is where
+    /// `clash-verge-cli mode <x>` persists it.
+    #[test]
+    fn default_mode_follows_clash_yaml_and_falls_back_to_rule() {
+        assert_eq!(default_mode_from_yaml("mode: global\n"), "Global");
+        assert_eq!(default_mode_from_yaml("mode: Direct\n"), "Direct");
+        assert_eq!(default_mode_from_yaml("port: 7897\n"), DEFAULT_CLASH_MODE);
+        assert_eq!(default_mode_from_yaml("mode: script\n"), DEFAULT_CLASH_MODE);
+        assert_eq!(default_mode_from_yaml("not: [yaml"), DEFAULT_CLASH_MODE);
+        assert_eq!(normalize_clash_mode("GLOBAL"), "Global");
+        assert_eq!(normalize_clash_mode(" direct "), "Direct");
+    }
+
+    /// The guard must reject a clash_api that would silently break switching.
+    #[test]
+    fn control_plane_security_guard_requires_a_usable_default_mode() {
+        let mut config = generate_config(&sample_input()).expect("config");
+        config["experimental"]["clash_api"]
+            .as_object_mut()
+            .expect("clash_api")
+            .remove("default_mode");
+        assert!(
+            validate_control_plane_security(&config)
+                .unwrap_err()
+                .contains("no default_mode")
+        );
+
+        let mut config = generate_config(&sample_input()).expect("config");
+        config["experimental"]["clash_api"]["default_mode"] = json!("script");
+        assert!(
+            validate_control_plane_security(&config)
+                .unwrap_err()
+                .contains("unsupported default_mode")
+        );
+    }
+
+    /// Regression #57: selector choices must survive the restarts a rule
+    /// edit, subscription refresh or TUN toggle causes on sing-box.
+    #[test]
+    fn cache_file_json_and_private_permissions_persist_selections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CACHE_FILE_NAME);
+
+        ensure_private_cache_file(&path).expect("create cache");
+        let cache = cache_file_json(&path);
+        assert_eq!(cache["enabled"], true);
+        assert_eq!(cache["path"], path.to_string_lossy().as_ref());
+        assert!(
+            cache.get("store_selected").is_none(),
+            "sing-box 1.14 removed the store_selected switch; an unknown field makes the core refuse the config"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "selection cache must stay owner-private: {mode:o}");
+        }
+
+        // A cache file left world-readable by an earlier run is tightened
+        // instead of being trusted.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("loosen");
+            ensure_private_cache_file(&path).expect("retighten");
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "pre-existing loose cache must be tightened: {mode:o}");
+        }
+
+        // Missing parent dirs are created, so the cache never has to fall back
+        // to a path the core would create itself.
+        let nested = dir.path().join("nested/deeper").join(CACHE_FILE_NAME);
+        ensure_private_cache_file(&nested).expect("nested create");
+        assert!(nested.is_file());
+    }
+
+    /// End-to-end shape of the generated document with a real config dir:
+    /// `experimental.cache_file` points into the config dir and the guard
+    /// accepts the result.
+    #[tokio::test]
+    async fn generated_config_carries_a_private_cache_file_under_the_config_dir() {
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(
+            crate::profile_store::store::tests::test_app_home_root(),
+        )
+        .await;
+
+        let config = generate_config(&sample_input()).expect("config");
+        let cache = &config["experimental"]["cache_file"];
+        assert_eq!(cache["enabled"], true, "cache_file: {cache}");
+        let path = cache["path"].as_str().expect("cache path");
+        assert!(
+            path.ends_with(CACHE_FILE_NAME),
+            "cache must live under the config dir: {path}"
+        );
+        let home = clash_verge_core::utils::dirs::app_home_dir().expect("home");
+        assert_eq!(Path::new(path), home.join(CACHE_FILE_NAME));
+        assert!(
+            cache_file_is_private(Path::new(path)),
+            "cache file must be owner-private"
+        );
+        validate_references(&config).expect("references stay valid");
+        validate_control_plane_security(&config).expect("control plane stays safe");
+    }
+
+    /// Without a config dir nothing is emitted (no guessed, possibly
+    /// world-readable path); the pre-#57 behaviour is simply unchanged.
+    #[test]
+    fn no_config_dir_means_no_cache_file_rather_than_a_guessed_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = cache_file_json(&dir.path().join(CACHE_FILE_NAME));
+        assert!(
+            cache["path"]
+                .as_str()
+                .expect("path")
+                .starts_with(dir.path().to_str().unwrap())
+        );
+        // The resolver itself is the only place that reads the global.
+        assert_eq!(normalize_clash_mode(&default_mode_from_yaml("")), DEFAULT_CLASH_MODE);
     }
 }
