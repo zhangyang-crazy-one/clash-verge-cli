@@ -19,7 +19,46 @@ pub enum MatchField {
     IpCidr(String),
     Port(u16),
     Process(String),
+    /// A clash `RULE-SET,<provider>` reference (a `rule-providers` entry).
     RuleSet(String),
+    /// A clash `GEOIP,<value>` / `GEOSITE,<value>` reference, kept verbatim.
+    ///
+    /// The geo databases have no sing-box route field — they are official
+    /// SagerNet rule-sets — but the clash spelling must still survive the
+    /// TUI rules editor: the original kind and value are kept on the model
+    /// so `GEOIP,CN,DIRECT` is written back as `GEOIP,CN,DIRECT` instead
+    /// of degenerating into the match-less `DIRECT` (#P0-1).
+    GeoSet {
+        kind: GeoKind,
+        value: String,
+    },
+}
+
+/// Which clash geo database a [`MatchField::GeoSet`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeoKind {
+    /// `GEOIP,<value>` — IP ranges.
+    Ip,
+    /// `GEOSITE,<value>` — domains.
+    Site,
+}
+
+impl GeoKind {
+    /// The clash rule header this kind serializes back to.
+    pub fn clash_header(self) -> &'static str {
+        match self {
+            GeoKind::Ip => "GEOIP",
+            GeoKind::Site => "GEOSITE",
+        }
+    }
+
+    /// The sing-box geo rule-set tag prefix for this kind.
+    pub fn tag_prefix(self) -> &'static str {
+        match self {
+            GeoKind::Ip => "geoip",
+            GeoKind::Site => "geosite",
+        }
+    }
 }
 
 /// What happens when a rule matches.
@@ -92,7 +131,10 @@ fn field_to_clash_str(field: &MatchField) -> Option<String> {
         MatchField::IpCidr(v) => format!("IP-CIDR,{v}"),
         MatchField::Port(v) => format!("DST-PORT,{v}"),
         MatchField::Process(v) => format!("PROCESS-NAME,{v}"),
-        MatchField::RuleSet(_) => return None, // clash uses RULE-SET with provider names; handled by caller mapping
+        // clash's own spelling for a rule-provider reference.
+        MatchField::RuleSet(v) => format!("RULE-SET,{v}"),
+        // The original clash geo spelling, preserved verbatim (#P0-1).
+        MatchField::GeoSet { kind, value } => format!("{},{value}", kind.clash_header()),
     })
 }
 
@@ -106,26 +148,51 @@ fn field_from_clash_str(kind: &str, value: &str) -> Option<MatchField> {
         "PROCESS-NAME" => MatchField::Process(value.into()),
         "RULE-SET" => MatchField::RuleSet(value.into()),
         // #52: the geo databases have no sing-box route field; they are
-        // official SagerNet `.srs` rule-sets. The caller turns the tag into
-        // a `route.rule_set` entry so the reference stays resolvable.
-        "GEOIP" => MatchField::RuleSet(geo_rule_set_tag("geoip", value)?),
-        "GEOSITE" => MatchField::RuleSet(geo_rule_set_tag("geosite", value)?),
+        // official SagerNet `.srs` rule-sets. The clash kind and value stay
+        // on the model so the rule round-trips through the clash
+        // serializer (#P0-1), and `geo_field` gates the value against the
+        // published rule-set names (#P0-2) — an unmappable value (or a
+        // negated set such as `!cn`, which has no positive rule-set
+        // reference) leaves the rule as verbatim Raw.
+        "GEOIP" => geo_field(GeoKind::Ip, value)?,
+        "GEOSITE" => geo_field(GeoKind::Site, value)?,
         _ => return None,
     })
 }
 
-/// sing-box rule-set tag for a clash `GEOIP,<code>` / `GEOSITE,<name>`
-/// value, or `None` for a form that cannot be expressed as a single
-/// positive rule-set reference (a negated set such as `!cn`).
-fn geo_rule_set_tag(kind: &str, value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() || value.starts_with('!') {
-        return None;
+/// Parse one clash geo reference, keeping the original kind and value.
+///
+/// The tag is only ever synthesized from the names published in
+/// `SagerNet/sing-geoip` / `SagerNet/sing-geosite` (plus the explicit
+/// pseudo-code table in [`crate::singbox::convert`]): a guessed tag such as
+/// `geoip-lan` 404s on download and aborts the core. A value with no
+/// sing-box form (or a negated set such as `!cn`, which has no positive
+/// rule-set reference) yields `None`, and the caller keeps the rule as
+/// verbatim Raw — clash keeps working, sing-box reports the drop.
+fn geo_field(kind: GeoKind, value: &str) -> Option<MatchField> {
+    use crate::singbox::convert::{GeoValueMatch, classify_geo_value};
+    match classify_geo_value(kind.tag_prefix(), value)? {
+        GeoValueMatch::RuleSet(_) | GeoValueMatch::PrivateNetworks => Some(MatchField::GeoSet {
+            kind,
+            value: value.to_string(),
+        }),
     }
-    // `geosite-geolocation-!cn`-style values keep their inner `!`: the
-    // SagerNet repositories publish them under that exact name.
-    Some(format!("{kind}-{}", value.to_ascii_lowercase()))
 }
+
+/// The private address ranges clash's `GEOIP,LAN`/`GEOIP,private`
+/// pseudo-databases resolve to (mihomo's GeoIP database).
+const PRIVATE_NETWORK_CIDRS: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
 
 /// Clash modifiers that only affect clash's own resolution behaviour and
 /// carry no sing-box equivalent — and therefore need no warning beyond the
@@ -217,8 +284,13 @@ pub fn to_clash_rule_str(rule: &IRouteRule) -> String {
 
 // ---------- sing-box route rule JSON ----------
 
+/// Write one match field into a sing-box route rule object.
+///
+/// Returns `false` for a field this model cannot express for sing-box, so
+/// the caller drops the whole rule instead of emitting one that silently
+/// matches everything.
 #[allow(dead_code)]
-fn field_to_singbox(field: &MatchField, rule: &mut Value) {
+fn field_to_singbox(field: &MatchField, rule: &mut Value) -> bool {
     let (key, value) = match field {
         MatchField::Domain(v) => ("domain", json!([v])),
         MatchField::DomainSuffix(v) => ("domain_suffix", json!([v])),
@@ -227,6 +299,19 @@ fn field_to_singbox(field: &MatchField, rule: &mut Value) {
         MatchField::Port(v) => ("port", json!([v])),
         MatchField::Process(v) => ("process_name", json!([v])),
         MatchField::RuleSet(v) => ("rule_set", json!([v])),
+        MatchField::GeoSet { kind, value } => {
+            match crate::singbox::convert::classify_geo_value(kind.tag_prefix(), value) {
+                // clash's private-range pseudo-databases have no published
+                // rule-set, so they become the literal ranges they mean.
+                Some(crate::singbox::convert::GeoValueMatch::PrivateNetworks) => {
+                    ("ip_cidr", json!(PRIVATE_NETWORK_CIDRS))
+                }
+                Some(crate::singbox::convert::GeoValueMatch::RuleSet(tag)) => ("rule_set", json!([tag])),
+                // Only reachable for a hand-built model; a clash-parsed rule
+                // was validated at parse time.
+                None => return false,
+            }
+        }
     };
     // Multiple fields of the same kind merge into one array.
     match rule.get(key) {
@@ -239,6 +324,7 @@ fn field_to_singbox(field: &MatchField, rule: &mut Value) {
         }
         _ => rule[key] = value,
     }
+    true
 }
 
 #[allow(dead_code)]
@@ -281,7 +367,11 @@ fn simple_from_singbox(rule: &Value) -> Option<IRouteRule> {
         }
     }
     if let Some(port) = rule.get("port").and_then(Value::as_array).and_then(|a| a.first()) {
-        matches.push(MatchField::Port(port.as_u64()? as u16));
+        // A port outside the u16 range is not a port: truncating it would
+        // silently route a `70000` rule as `4464`, so the object is not
+        // expressible and the caller keeps the raw JSON.
+        let port = u16::try_from(port.as_u64()?).ok()?;
+        matches.push(MatchField::Port(port));
     }
     let target = target_from_singbox(rule)?;
     Some(IRouteRule::Simple { matches, target })
@@ -297,7 +387,9 @@ pub fn to_singbox_json(rule: &IRouteRule) -> Option<Value> {
         IRouteRule::Simple { matches, target } => {
             let mut rule = json!({});
             for field in matches {
-                field_to_singbox(field, &mut rule);
+                if !field_to_singbox(field, &mut rule) {
+                    return None;
+                }
             }
             target_to_singbox(target, &mut rule);
             Some(rule)
@@ -452,6 +544,128 @@ mod tests {
         assert!(model.is_raw(), "{model:?}");
         assert_eq!(to_clash_rule_str(&model), "IP-CIDR,10.0.0.0/8,udp,DIRECT");
     }
+
+    #[test]
+    fn geo_and_rule_set_rules_round_trip_through_clash() {
+        // #P0-1: the rules editor rewrites the whole `rules:` buffer on
+        // save; before this fix every GEOIP/GEOSITE/RULE-SET line was
+        // written back as the bare target string (`DIRECT`), silently
+        // deleting the match condition of every geo rule in the profile.
+        for rule in [
+            "GEOIP,CN,DIRECT",
+            "GEOIP,cn,REJECT",
+            "GEOSITE,category-ads-all,REJECT",
+            "GEOSITE,geolocation-!cn,DIRECT",
+            "RULE-SET,x,PROXY",
+        ] {
+            roundtrip_clash(rule);
+        }
+        // `no-resolve` is dropped (see the test below), but the match
+        // condition must survive: the bug turned this line into `DIRECT`.
+        assert_eq!(
+            to_clash_rule_str(&from_clash_rule_str("GEOIP,CN,DIRECT,no-resolve")),
+            "GEOIP,CN,DIRECT"
+        );
+        assert_eq!(
+            to_clash_rule_str(&from_clash_rule_str("RULE-SET,x,PROXY,no-resolve")),
+            "RULE-SET,x,PROXY"
+        );
+    }
+
+    #[test]
+    fn rule_set_and_geo_set_rules_keep_their_match_condition() {
+        for rule in ["GEOIP,CN,DIRECT", "GEOSITE,category-ads-all,REJECT", "RULE-SET,x,PROXY"] {
+            let back = to_clash_rule_str(&from_clash_rule_str(rule));
+            assert_ne!(back, "DIRECT", "{rule} lost its match condition");
+            assert_ne!(back, "REJECT", "{rule} lost its match condition");
+            assert_eq!(back.split(',').count(), 3, "{rule} -> {back}");
+        }
+    }
+
+    #[test]
+    fn geo_references_keep_their_original_kind_on_the_model() {
+        assert_eq!(
+            from_clash_rule_str("GEOIP,CN,DIRECT"),
+            IRouteRule::Simple {
+                matches: vec![MatchField::GeoSet {
+                    kind: GeoKind::Ip,
+                    value: "CN".into(),
+                }],
+                target: RuleTarget::Direct,
+            }
+        );
+        assert_eq!(
+            from_clash_rule_str("GEOSITE,category-ads-all,REJECT"),
+            IRouteRule::Simple {
+                matches: vec![MatchField::GeoSet {
+                    kind: GeoKind::Site,
+                    value: "category-ads-all".into(),
+                }],
+                target: RuleTarget::Block,
+            }
+        );
+    }
+
+    #[test]
+    fn unpublished_geo_values_stay_raw_instead_of_guessing_a_tag() {
+        // A guessed tag (the old `geoip-<value>` synthesis) 404s at
+        // rule-set initialization and aborts sing-box, so an unmappable
+        // value must stay verbatim Raw: clash keeps the rule, sing-box
+        // reports the drop.
+        for rule in [
+            "GEOIP,ZZ,DIRECT",
+            "GEOIP,telegram,DIRECT",
+            "GEOSITE,not-a-published-site,DIRECT",
+        ] {
+            let model = from_clash_rule_str(rule);
+            assert!(model.is_raw(), "{rule} must not become a rule-set: {model:?}");
+            assert_eq!(to_clash_rule_str(&model), rule);
+            assert!(to_singbox_json(&model).is_none(), "{rule}");
+        }
+    }
+
+    #[test]
+    fn geoip_private_ranges_map_to_literal_cidrs_without_a_download() {
+        // `GEOIP,LAN` is a clash pseudo-database, not a downloadable set:
+        // the SagerNet repositories publish no `geoip-lan`/`geoip-private`
+        // (verified 404), and `geosite-private` would match private
+        // *domains* instead of private IPs. The equivalent literal ranges
+        // keep `GEOIP,LAN,DIRECT` meaning "private traffic goes direct".
+        for rule in ["GEOIP,LAN,DIRECT", "GEOIP,private,REJECT", "GEOIP,local,DIRECT"] {
+            roundtrip_clash(rule);
+            let json = to_singbox_json(&from_clash_rule_str(rule)).unwrap_or_else(|| panic!("{rule}"));
+            let cidrs = json["ip_cidr"].as_array().expect("ip_cidr array").clone();
+            for expected in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] {
+                assert!(cidrs.contains(&json!(expected)), "{rule}: {cidrs:?} lacks {expected}");
+            }
+        }
+        assert!(crate::singbox::convert::geo_rule_set("geoip-lan").is_none());
+        assert!(crate::singbox::convert::geo_rule_set("geoip-private").is_none());
+        assert!(crate::singbox::convert::geo_rule_set("geoip-local").is_none());
+    }
+
+    #[test]
+    fn geosite_private_maps_to_the_published_private_set() {
+        let json = to_singbox_json(&from_clash_rule_str("GEOSITE,private,DIRECT")).expect("geosite");
+        assert_eq!(json["rule_set"], json!(["geosite-private"]));
+        assert!(crate::singbox::convert::geo_rule_set("geosite-private").is_some());
+        roundtrip_clash("GEOSITE,private,DIRECT");
+    }
+
+    #[test]
+    fn singbox_ports_outside_the_u16_range_are_rejected_not_truncated() {
+        // #P2: `port: 70000` used to become `4464`, silently routing on a
+        // different port than the profile asked for.
+        assert_eq!(from_singbox_json(&json!({"port": [70000], "outbound": "direct"})), None);
+        assert_eq!(from_singbox_json(&json!({"port": [65536], "outbound": "direct"})), None);
+        assert_eq!(
+            from_singbox_json(&json!({"port": [443], "outbound": "direct"})),
+            Some(IRouteRule::Simple {
+                matches: vec![MatchField::Port(443)],
+                target: RuleTarget::Direct,
+            })
+        );
+    }
 }
 
 // ---------- Task 7.1 core: profile rules load/save ----------
@@ -550,6 +764,26 @@ mod profile_rules_tests {
     #[test]
     fn profile_without_rules_yields_empty() {
         assert!(load_profile_rules("mode: rule").expect("load").is_empty());
+    }
+
+    #[test]
+    fn geo_rules_survive_the_editor_save_round_trip() {
+        // The rules editor path: load -> (unchanged) -> save must not
+        // rewrite `GEOIP,CN,DIRECT` as the bare `DIRECT`.
+        let profile = "mode: rule\nrules:\n  - GEOIP,CN,DIRECT\n  - GEOSITE,category-ads-all,REJECT\n  - RULE-SET,ads,REJECT\n  - GEOIP,LAN,DIRECT\n";
+        let rules = load_profile_rules(profile).expect("load");
+        assert_eq!(rules.len(), 4);
+        let saved = save_profile_rules(profile, &rules).expect("save");
+        for rule in [
+            "GEOIP,CN,DIRECT",
+            "GEOSITE,category-ads-all,REJECT",
+            "RULE-SET,ads,REJECT",
+            "GEOIP,LAN,DIRECT",
+        ] {
+            assert!(saved.contains(rule), "{rule} was lost:\n{saved}");
+        }
+        // And the reloaded profile is the one the user started with.
+        assert_eq!(load_profile_rules(&saved).expect("reload"), rules);
     }
 }
 

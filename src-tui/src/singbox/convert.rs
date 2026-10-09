@@ -555,14 +555,6 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
     }
 
     if let Some(Yaml::Sequence(groups)) = map.get(Yaml::String("proxy-groups".into())) {
-        // Every declared name, converted or not: a member referencing a
-        // group that was itself skipped is pruned instead of becoming a
-        // dangling outbound reference (#52).
-        let declared_groups: std::collections::HashSet<String> = groups
-            .iter()
-            .filter_map(|group| group.get(Yaml::String("name".into())).and_then(Yaml::as_str))
-            .map(str::to_owned)
-            .collect();
         let node_tags: std::collections::HashSet<String> = result
             .outbounds
             .iter()
@@ -570,6 +562,21 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
             .map(str::to_owned)
             .collect();
 
+        // Every group NAME declared in the document, converted or not: a
+        // member pointing at one that produced no outbound is reported as
+        // such instead of the vaguer "not convertible".
+        let declared: std::collections::HashSet<String> = groups
+            .iter()
+            .filter_map(|group| group.get(Yaml::String("name".into())).and_then(Yaml::as_str))
+            .map(str::to_owned)
+            .collect();
+
+        // Pass 1: classify the declared groups. A member referencing a
+        // group that is itself skipped (relay, or emptied by pruning) must
+        // not survive as a dangling outbound reference, so nothing is
+        // pruned against DECLARED names — only against the tags this pass
+        // will really emit (#P1-3).
+        let mut pending: Vec<PendingGroup> = Vec::new();
         for group in groups {
             let Yaml::Mapping(g) = group else { continue };
             let name = g
@@ -606,53 +613,143 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
                     continue;
                 }
             };
-            let raw_members: Vec<String> = g
-                .get(Yaml::String("proxies".into()))
-                .and_then(Yaml::as_sequence)
-                .map(|seq| seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            // Prune members whose target did not survive conversion, and
-            // de-duplicate (a member listed twice, or `DIRECT` which the
-            // generator always appends to selectors, used to show up as
-            // two identical entries in `proxy list`).
-            let mut members: Vec<String> = Vec::with_capacity(raw_members.len());
-            for member in raw_members {
-                if member.eq_ignore_ascii_case("direct") && kind == crate::singbox::GroupKind::Selector {
-                    result.notes.push(format!(
-                        "{name}: dropped redundant DIRECT member (selectors always expose direct)"
-                    ));
-                    continue;
-                }
-                let known = node_tags.contains(&member)
-                    || declared_groups.contains(&member)
-                    || member.eq_ignore_ascii_case("direct")
-                    || member.eq_ignore_ascii_case("reject")
-                    || member.eq_ignore_ascii_case("block");
-                if !known {
-                    result.notes.push(format!(
-                        "{name}: dropped member '{member}' (not convertible to sing-box)"
-                    ));
-                    continue;
-                }
-                if members.contains(&member) {
-                    result
-                        .notes
-                        .push(format!("{name}: dropped duplicate member '{member}'"));
-                    continue;
-                }
-                members.push(member);
+            pending.push(PendingGroup {
+                name,
+                kind,
+                raw_members: g
+                    .get(Yaml::String("proxies".into()))
+                    .and_then(Yaml::as_sequence)
+                    .map(|seq| seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // Pass 2: decide which groups survive, then prune every group's
+        // members against the EMITTED tags only. The two steps are
+        // mutually dependent (a group survives only if it keeps a member, a
+        // member survives only if its target is emitted), so the emitted
+        // set is iterated to a fixed point — at most one round per group,
+        // and it terminates because each round can only drop groups.
+        let allowed = |emitted: &std::collections::HashSet<String>| -> std::collections::HashSet<String> {
+            let mut allowed = node_tags.clone();
+            allowed.extend(emitted.iter().cloned());
+            allowed
+        };
+        let mut emitted: std::collections::HashSet<String> = pending
+            .iter()
+            .filter(|group| !prune_members(group, &allowed(&Default::default())).is_empty())
+            .map(|group| group.name.clone())
+            .collect();
+        loop {
+            let next: std::collections::HashSet<String> = pending
+                .iter()
+                .filter(|group| !prune_members(group, &allowed(&emitted)).is_empty())
+                .map(|group| group.name.clone())
+                .collect();
+            if next == emitted {
+                break;
             }
+            emitted = next;
+        }
+
+        // Pass 3: emit the survivors and report every prune exactly once.
+        let allowed = allowed(&emitted);
+        for group in &pending {
+            let name = &group.name;
+            let members = prune_members(group, &allowed);
             if members.is_empty() {
                 result
                     .skipped
                     .push(format!("{name}: group has no member left after conversion"));
                 continue;
             }
-            result.groups.push(crate::singbox::GroupSpec { name, kind, members });
+            report_member_prunes(group, &members, &mut result, &declared);
+            result.groups.push(crate::singbox::GroupSpec {
+                name: name.clone(),
+                kind: group.kind,
+                members,
+            });
         }
     }
 
     Ok(result)
+}
+
+/// A declared clash group before its members are pruned.
+struct PendingGroup {
+    name: String,
+    kind: crate::singbox::GroupKind,
+    raw_members: Vec<String>,
+}
+
+/// Policy outbound names clash allows as group members; they always exist
+/// in the generated sing-box config.
+fn is_builtin_member(member: &str) -> bool {
+    matches!(member.to_ascii_uppercase().as_str(), "DIRECT" | "REJECT" | "BLOCK")
+}
+
+/// The members a group keeps once every non-emitted target is pruned.
+///
+/// Emptiness is decided on the RAW list: `{select, proxies: [DIRECT]}`
+/// used to lose its `DIRECT` before the check and the group was dropped,
+/// taking every rule that targeted it with it (#P1-4). `DIRECT` is only
+/// de-duplicated when at least one non-`DIRECT` member survives, because
+/// the generator appends `direct` to every selector anyway.
+fn prune_members(group: &PendingGroup, allowed: &std::collections::HashSet<String>) -> Vec<String> {
+    let selector = group.kind == crate::singbox::GroupKind::Selector;
+    let mut kept: Vec<String> = Vec::with_capacity(group.raw_members.len());
+    for member in &group.raw_members {
+        if !allowed.contains(member) && !is_builtin_member(member) {
+            continue;
+        }
+        if kept.contains(member) {
+            continue;
+        }
+        kept.push(member.clone());
+    }
+    if selector && kept.iter().any(|member| !member.eq_ignore_ascii_case("direct")) {
+        kept.retain(|member| !member.eq_ignore_ascii_case("direct"));
+    }
+    kept
+}
+
+/// One degradation line per pruned member: an unknown node, a duplicate,
+/// a redundant `DIRECT`, or a reference to a group this pass dropped.
+fn report_member_prunes(
+    group: &PendingGroup,
+    members: &[String],
+    result: &mut ProfileConversion,
+    declared: &std::collections::HashSet<String>,
+) {
+    let deduped_direct = group.kind == crate::singbox::GroupKind::Selector
+        && members.iter().any(|member| !member.eq_ignore_ascii_case("direct"));
+    let mut seen: std::collections::HashSet<&String> = Default::default();
+    for member in &group.raw_members {
+        if !seen.insert(member) {
+            result
+                .notes
+                .push(format!("{}: dropped duplicate member '{member}'", group.name));
+            continue;
+        }
+        if deduped_direct && member.eq_ignore_ascii_case("direct") {
+            result.notes.push(format!(
+                "{}: dropped redundant DIRECT member (selectors always expose direct)",
+                group.name
+            ));
+            continue;
+        }
+        if members.contains(member) {
+            continue;
+        }
+        let reason = if declared.contains(member.as_str()) {
+            format!("group '{member}' produced no outbound")
+        } else {
+            "not convertible to sing-box".to_string()
+        };
+        result
+            .notes
+            .push(format!("{}: dropped member '{member}' ({reason})", group.name));
+    }
 }
 
 // ---------- rule-sets derived from a clash profile (#52) ----------
@@ -661,15 +758,319 @@ pub fn convert_profile(config_yaml: &str) -> Result<ProfileConversion, String> {
 const GEOIP_RULE_SET_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
 const GEOSITE_RULE_SET_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
 
+/// Geo rule-set names published in `SagerNet/sing-geoip@rule-set`
+/// (regenerate from the GitHub tree API: `.srs` file names minus the
+/// `geoip-` prefix). Synthesizing a tag that is not in this list produces a
+/// 404 at rule-set initialization, which FATALs the whole core start —
+/// so a clash value outside the list never becomes a tag (#P0-2).
+const PUBLISHED_GEOIP_NAMES: &str = "\
+    ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs
+    bt bw by bz ca cd cf cg ch ci ck cl cm cn co cr cu cv cw cy cz de dj dk dm do dz ec ee eg er es
+    et fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gt gu gw gy hk hn hr ht hu id ie
+    il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu
+    lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl
+    no np nr nu nz om pa pe pf pg ph pk pl pm pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg si
+    sk sl sm sn so sr ss st sv sx sy sz tc td tg th tj tk tl tm tn to tr tt tv tw tz ua ug us uy uz
+    va vc ve vg vi vn vu wf ws ye yt za zm zw
+";
+
+/// Geo rule-set names published in `SagerNet/sing-geosite@rule-set`
+/// (regenerate the same way: `.srs` file names minus `geosite-`).
+const PUBLISHED_GEOSITE_NAMES: &str = "\
+    0x0 115 1337x 17zuoye 18comic 2ch 2gis 2kgames 36kr 36kr@ads 4399 4chan 4pda 4plebs 51job 54647
+    58tongcheng 5ch 6park 7tv 800best 8btc 928plus 9news 9to5 aamgame abc abema accuweather acer
+    acer@cn acfun acfun@ads actalis activision activision-blizzard adblock adblockplus addthis
+    addtoany adguard adidas adidas@cn adjust adjust@ads adobe adobe-activation adobe@ads adobe@cn
+    aerogard aerogard@cn afdian afp agilebits agora aiqicha airbnb airchina airchina@!cn airwick
+    airwick@cn aisiku aixcoder akamai akamai@cn akiko alibaba alibaba@!cn alibaba@ads alibaba@cn
+    alibabacloud alibabacloud@!cn alibabacloud@cn aligames aliyun aliyun-drive aliyun@!cn aliyun@ads
+    aljazeera alphabet alphabet@!cn alphabet@ads alphabet@cn amap amap@ads amazon amazon@ads
+    amazon@cn amazontrust amc amd amd@cn amp amp@cn amplitude amplitude@ads anaconda anandtech
+    android anexia anime anker anker@!cn annas-archive anon-v anthropic ap apa aparat apifox apipost
+    apkcombo apkmirror apkpure apple apple-dev apple-dev@cn apple-intelligence apple-music apple-
+    music@cn apple-pki apple-pki@cn apple-podcasts apple-podcasts@cn apple-tvplus apple-update
+    apple@ads apple@cn appledaily applysquare aptoide archive archiveofourown archivetoday archlinux
+    arphic artstation asahi askdiandian asobo asproex asus asus@cn atlassian att att@cn attwatchtv
+    autodesk autoru auxgroup auxgroup@!cn avaxhome aviasales avito avito@ads avmoo awempire aws aws-
+    cn aws@cn azure azure@cn b3log bahamut baidu baidu@ads baishancloud baltamatica bamtech bandcamp
+    bandwagonhost bangumi barrons bbc bdsmhub beats beats@cn beget beisen bestbuy bestbuy@cn
+    bestchange bestore bestv betboom bethesda betterexplained bilibili bilibili-cdn bilibili-cdn@!cn
+    bilibili-game bilibili2 bilibili@!cn binance bing bing@ads bing@cn bitauto bitflyer bitly
+    bitsquare bitwarden bjyouth blender blizzard blogspot bloomberg bluearchive bluearchive@cn
+    bluepoch bluepoch-games bluesky blurams bmw bmw@cn boboporn boc boc@!cn bohemia bongacams
+    booking booking@cn books boomerang bootcdn bootstrap borneoschematics boslife boxun boylove
+    braveux brazzers bridgestone bridgestone@cn brightcove brilliant broadcom broadcom@cn btdig
+    bttzyw bushiroad buymeacoffee buypass bybit bytedance bytedance-ai-!cn bytedance@!cn
+    bytedance@ads c-span cabletv cainiao cainiao@ads calgoncarbon calgoncarbon@cn cambridge
+    camwhores canon canon@cn canonical canva capitalonline carrotquest carrotquest@ads cas casimages
+    catchplay category-acg category-ads category-ads-all category-ads-all@ads category-ads-ir
+    category-ai-!cn category-ai-!cn@ads category-ai-!cn@telemetry category-ai-chat-!cn category-ai-
+    chat-!cn@ads category-ai-chat-!cn@telemetry category-ai-cn category-ai-ru category-android-app-
+    download category-anticensorship category-antivirus category-antivirus@cn category-automobile-cn
+    category-bank-cn category-bank-ir category-bank-jp category-bank-mm category-bank-ru category-
+    bank-ru@ads category-betting-ru category-blog-cn category-bourse-ir category-browser-!cn
+    category-cas category-cas@cn category-cdn-!cn category-cdn-cn category-collaborate-cn category-
+    communication category-communication@ads category-companies category-companies@!cn category-
+    companies@ads category-companies@cn category-companies@telemetry category-consent-management
+    category-container category-cryptocurrency category-cryptocurrency@cn category-ddns category-dev
+    category-dev-cn category-dev-cn@ads category-dev@ads category-dev@cn category-dev@telemetry
+    category-documents-cn category-doh category-ecommerce category-ecommerce-ru category-ecommerce-
+    ru@ads category-ecommerce@ads category-ecommerce@cn category-education-cn category-education-
+    cn@ads category-education-ir category-education-ru category-electronic-cn category-emby
+    category-enhance-gaming category-enhance-gaming@cn category-enterprise-query-platform-cn
+    category-entertainment category-entertainment-cn category-entertainment-cn@ads category-
+    entertainment-ru category-entertainment@!cn category-entertainment@ads category-entertainment@cn
+    category-finance category-finance@ads category-finance@cn category-food-cn category-food-cn@ads
+    category-forums category-forums-ir category-forums-ru category-forums@ads category-game-
+    accelerator-cn category-game-platforms-download category-game-platforms-download@cn category-
+    games category-games-!cn category-games-!cn@ads category-games-cn category-games-cn@ads
+    category-games@ads category-games@cn category-gov-ir category-gov-ru category-hospital-cn
+    category-httpdns-cn category-httpdns-cn@ads category-insurance-ir category-ip-geo-detect
+    category-ip-geo-detect@!cn category-ip-geo-detect@cn category-ipfs category-ir category-
+    logistics-cn category-logistics-cn@ads category-media category-media-cn category-media-cn@ads
+    category-media-ir category-media-ru category-media-ru-blocked category-media@cn category-
+    medicine-ru category-mobile-repair category-mooc-cn category-netdisk-!cn category-
+    netdisk-!cn@ads category-netdisk-cn category-network-security-cn category-news-ir category-novel
+    category-ntp category-ntp-cn category-ntp-jp category-ntp@cn category-number-verification-cn
+    category-olympiad-in-informatics category-orgs category-outsource-cn category-password-
+    management category-payment-ir category-porn category-porn@ads category-proxy-tunnels category-
+    pt category-pt@!cn category-public-tracker category-remote-control category-remote-control@cn
+    category-retail-ru category-retail-ru@ads category-ru category-ru@ads category-ru@cn category-
+    scholar-!cn category-scholar-cn category-scholar-hk category-scholar-ir category-scholar-uk
+    category-securities-cn category-shopping-ir category-social-media-!cn category-social-
+    media-!cn@ads category-social-media-cn category-social-media-cn@ads category-social-media-ir
+    category-speedtest category-speedtest@!cn category-speedtest@ads category-speedtest@cn category-
+    stun category-tech-ir category-tech-media category-tech-media-ru category-tech-media@cn
+    category-tm category-travel-ir category-travel-ru category-urlshortner category-voip category-
+    vpnservices category-web-archive category-wiki-cn cavporn cbs ccb ccb@!cn cctv cctv@ads cdek
+    cdn77 ceno cerebras cern certinomis certum changyou chaoxing chatango chatwhores cheetahmobile
+    chegg chesscom chinabroadnet chinamobile chinamobile@!cn chinanews chinapost chinapower chinaso
+    chinatelecom chinatelecom@!cn chinatower chinaunicom chinaunicom@!cn chinaz cian cisco cisco@cn
+    citic citic@!cn citizenlab cityu-hk ciweimao ck101 clarivate clearasil clearasil@cn clearbit
+    clearbit@ads clips4sale cloudcone cloudconvert cloudflare cloudflare-cn cloudflare-ipfs
+    cloudflare@cn cloudinary cloudns clubhouse cmb cmb@!cn cn cn@ads cnb cnbc cnbeta cnblogs cnet
+    cnki cnn code codeberg codecademy codeforces coding coinone collabora colorfulclouds comfy
+    comfy-ui-launcher comodo comssone connectivity-check connectivity-check@cn contentful coolapk
+    coomer copymanga corel costco coupang coursera cowlevel cowtransfer craigslist creativecommons
+    csdn csis ctexcel ctexcel@!cn ctrip ctrip@!cn ctyun cuhk cuinc curseforge cursor cuttly
+    cybertrust cygames cylink dailymail dailymotion dandanplay dandanzan dangdang dart dazn dcard
+    ddmaicai debian decryptipastore dedao deepin deepin@!cn deepseek deezer dell dell@cn demonoid
+    deppon deribit dettol dettol@cn deviantart dewu dewu@!cn didi didi@!cn digicert digicert@cn
+    digitalocean digitalplayground dingdatech dingtalk discord discourse discoveryplus discuz disney
+    disney@ads disney@cn disqus divar dji dlercloud dlsite dmit dmm dmm-porn dmm@ads dnspod docker
+    doi dola dola@!cn dongchedi dongjiao douban doubao douyin douyu dowjones dribbble dropbox drweb
+    dslreports duckduckgo duitang duolingo duolingo@ads duolingo@cn duowan durex durex@cn duyaoss dw
+    dwion dyna dynu dzen dzen@ads ea eastmoney eastmoney@!cn easylist ebay ebay@cn ebuyer economist
+    eduhk edx egghead ehentai electron eleme eleme@ads elevenlabs elsevier embark embedly embl
+    emojipedia eneba enfa entermediadb entrust entrust@cn envato envybox epicbrowser epicgames
+    epicgames@cn epochmediagroup erolabs escapefromtarkov eset eset@cn espn espressif espressif@!cn
+    esri ethereum everbright evernote f-droid facebook facebook-dev facebook@ads faceit falungong
+    familymart familymart@cn fandom fans66 fansta farfetch farfetch@cn faronics fastlane fastly
+    faststone fcbox fedora feedly feishu fengxing fflogs fflogs@cn fibank ficbook figma filimo
+    finish finish@cn firebase firebase@cn firefox flatpak flibusta flickr flowus flowwow flutter
+    flyio focuschina fonbet fontawesome fontexplorer fonts fontshop fontsinuse forbes formula1 forza
+    fox fqnovel fqnovel@ads framer freebuff freecodecamp freenode ft ftv funpay futu fzdm gaijin
+    gamersky gamersky@ads gamesplanet gandi ganji gannett garena gateio geetest gemfury genotek-ru
+    geolocation-!cn geolocation-!cn@ads geolocation-!cn@telemetry geolocation-cn geolocation-cn@ads
+    gettyimages getui gfycat ggsel giffgaff gigabyte gigabyte@cn gimy gismeteo gitbook gitee github
+    github-copilot github-copilot@telemetry github1s github@telemetry gitlab gitv globalsign
+    globalsign@cn globalvoices globo glyphs gmo-internet gmo-internet@cn godaddy gofundme gog
+    gog@ads gog@cn golang goodreads google google-deepmind google-gemini google-play google-play@cn
+    google-registry google-registry-tld google-scholar google-trust-services google-trust-
+    services@cn google@!cn google@ads google@cn googlefcm googlefcm@!cn goproxy gracg grapheneos
+    gravatar greatfire gree groq group-ib growingio gucci gucci@cn guo guokr habr haier
+    hainanairlines haitang hamivideo hanyi harpercollins hashicorp haskell haveibeenpwned hbo
+    hcaptcha hdrezka headhunter hentaichen hentaivn herogame heroku hetzner hetzner@ads heyzo
+    hikvision hinet hinet-eca hisense hitun hkbn hkbu hkedcity hketgroup hketgroup@cn hkgolden hkt
+    hku hkust hm hm@cn homebrew homedepot hongkongpost honor hooligapps hotstar hoyoverse
+    hoyoverse@ads hp hp@cn hpe hsbc hsbc-cn huanghuagang huawei huawei-dev huawei@!cn huawei@ads
+    huaweicloud huaweicloud@!cn hubblephone huffpost hugecore huggingface hujiang hulu humblebundle
+    hunantv hunantv@ads huobi hupu hupun hurricaneelectric huya ibkr ibm icable icbc icbc@!cn icloud
+    icloud@cn icloudprivaterelay ideco-ru identrust idg ieee ifanr ifast ifast@cn iflytek ihuman
+    iina ikea ikea@cn illgames illusion illusion-nonofficial imagebam imagecurl imageshack
+    imagetwist imdb imgbb imgix imgur imperialcollege infowars infrapedia inoreader inshot insider
+    instagram instagram@ads intel intel-dev intel@cn intercom internet-archive intsig intuit ipip
+    ipip@!cn iqiyi iqiyi@!cn iqiyi@ads isgd ishumei itchio itiger itunes itunes@cn ixbt ixsystems
+    iyf jable japonx java javbus javcc javdb javwide jd jd@!cn jd@ads jetbrains jetbrains-ai
+    jetbrains@cn jfrog jianshu jibencaozuo jiemian jiguang jinshuju jiyukobo jkf jlc johren jquery
+    jsdelivr jtexpress juejin jushuitan justav justmysocks jutongbao jwplayer kaggle kakao
+    kanzhongguo kaspersky kaspersky@cn kechuang keep kemono kernel keybase khanacademy kick kindle
+    kindle4rss kindle@cn kingkonglive kingsoft kinopoisk kinopub kkbox kktv kodi kodik konachan
+    konami kontur kontur@ads koolearn kraken ku6 kuaidi100 kuaikan kuaishou kuaishou@ads kuaiyikeji
+    kubakuba kubernetes kucoin kugou kugou@ads kurogames kurogames@!cn kurogames@ads kuwo kyodonews
+    lagou landian lantern lanzou laracasts lark lark-global lastfm lastpass launchpad lavteam le
+    le@ads lenovo lethalhardcore letsencrypt lg lianjia liberapay libgen liepin lifewire ligastavok
+    lighter lihkg likee limelight linakesi line linguee linkedin linkedin@cn linotype linux linuxdo
+    lisiku litv livejournal liveperson lizhi lkcoffee localbitcoins localizejs logitech londonreal
+    longbridge louisvuitton louisvuitton@cn lowiro ltn lumion lysol lysol@cn madshi mafengwo magnit
+    mailcom mailru mailru-group mailru-group@ads mailru@ads mainichi manhuagui manhuaren manorama
+    manoto manus maocloud mapbox mapbox@cn marvel mastercard mastercard@cn masterclass matrix
+    matters mcdonalds mcdonalds@cn mdn meadjohnson meadjohnson@cn mediachinesegroup medium meduza
+    mega megafon meipian meitu meituan meizu messenger meta meta@ads metabrainz metacritic metart
+    miaomiaozhe microsoft microsoft-dev microsoft-dev@cn microsoft-pki microsoft@ads microsoft@cn
+    microsoft@telemetry midea mihoyo mihoyo-cn mihoyo-cn@ads mihoyo@ads mihoyo@cn mikrotik mindbox
+    mindbox@ads mindgeek mindgeek-porn mini miniso miniso@cn miraheze missav misskey misskey-
+    universe mit mixi mobile01 mocha modrinth mogujie mojang moji moji@ads momo mongodb monotype
+    moonvy morisawa mortein mortein@cn mosmetro motorola movefree movefree@cn moxing mozilla
+    mozilla@ads mozilla@telemetry msi msn msn@ads msn@cn mts-ru mts-ru@ads mubi mucinex mudvod muji
+    muji@cn musixmatch mvideo mxroute mydirtyhobby myfonts myoffice-ru myradio mytvsuper mzed n26
+    n3ro narwal nationalgeographic naver nbcuniversal neowin netcraze netcup netease netease@!cn
+    netease@ads netflav netflix netlify neuralink newegg newgrounds newscorp newsmax nexitally nexo
+    nexon nexusmods nga nginx ngrok nhk nic-ru nicegram nicegram@ads niconico nike nike@cn nikkan-
+    gendai nikke nikkei nintendo nintendo@cn nist nixos nodejs nodeseek noip nordstrom nordvpn
+    notion now nowcoder npmjs nudevista nurofen nurofen@cn nutaku nvidia nvidia@cn nyaa nypost
+    nytimes oan oculus ogury ogury@ads ok okaapps okaapps@cn okjike okko okx okx@cn olevod onedrive
+    onekey oneplus oneplus@!cn ookla-speedtest ookla-speedtest@ads op openai openai@ads
+    opencollective openjsfoundation openjsfoundation@cn openrec opensourceinsights openspeedtest
+    openstreetmap openweather openwrt openx openx@ads oppo oppo@!cn oracle oreilly oreilly@cn
+    organicmaps origin oschina oskelly osu otpbank oup overclockers-ru ozon ozon@ads pagecdn
+    panasonic panasonic@cn pandanet paofuyun paskoocheh pastebin patreon pawchive paypal paypal@cn
+    pbs pccw pchome pearson pearson@cn peppy perl perplexity petrochina pgyer phoenix picacg
+    picacg@ads picsee pikpak pikpak@ads pinduoduo pingan pingan@!cn pingcap pinggy pingpe pingsx
+    pinkcore pinterest piratebay pixhost pixiv pixiv@ads pixnet playboy playcover playstation plex
+    plutotv pocketcasts poe polocloud polymer polyu polyv pornhub pornpros positive-technologies
+    postimages pptv primevideo primevideo@cn private progress projectpoi projectsekai proquest
+    protonmail pstorage ptt pubg pubmatic pugpig purikonejp python qcc qcloud qcloud@!cn qianxin
+    qihoo360 qihoo360@ads qimao qingcloud qingtingfm qiniu qixin qnap qnap@cn qt qualcomm
+    qualcomm@cn quantil quip quora qwant qweather radiko raiffeisenbank rakuten rarbg razer razer@cn
+    rb rb@cn reabble reabble@cn readthedocs reagroup realclear realitykings realtype rebrandly
+    reddit redhat redis redotpay redtube regru remnawave renren reurl reuters rferl riot riot@cn
+    roblox rockstar roku rossiyasegodnya rostelecom rostelecom@ads rsshub rsshub-3rd rt rthk ruanmei
+    ruby rubychina ruleoflaw rumble rust ruten rutracker rutube safepal sakurafrp salesforce samsung
+    samsung@ads samsung@cn sankei sb sber sber@ads scala scaleflex scenesource schoopia schwab sci
+    sci-hub sciencedirect scmp scp seasun secom sectigo sectigo@cn segment segment@ads segmentfault
+    sehuatang selectel sentry servicepipe setapp setn sf-express shadowsockscom shanbay sharethis
+    shireyishunjian shopee shopee@cn shopify shorturl showtimeanytime shuqi signal sina sina@!cn
+    sina@ads singtaonewscorp sinopec sitepoint skillshare sky sky@cn skyeng skyperfect slack
+    slideshare sling smartone smena smtiaojiaoshi smzdm snap snap@ads snapcraft snapp snk snodehome
+    softbank softether sogou sogou@ads sohu sohu@ads sokolov sonemic sony sonypictures soundcloud
+    soundofhope sourceforge sourcehut soyjakparty spacemail spaceship spacex spankbang speedtest
+    speedtest@ads spiceworks spotify spotify@ads springer squareup squirrelvpn sslcom sslcom@cn
+    ssrcloud st st@cn stackexchange stackpath stage1st standardchartered starbucks starbucks@cn
+    starfieldtech starplus startpage starworld staticfile steam steam@cn steaminventoryhelper
+    steamunlocked steemit sto-express straitsx streamable strepsils strepsils@cn strikingly stripe
+    subscene suishouji sumkoo suning supercell supersonic supersonic@ads surflite suruga-ya svp swag
+    swift swift@cn swisssign sxl symantec symantec-pki synology synology@cn t2-ru taboola taihe
+    taikang tailscale take-two talkatone taomee taptap taptap@!cn target taylorfrancis tbank-ru tcl
+    tcl@ads teambition teamspeak teamviewer teamviewer@cn technogym techpowerup techtimes ted
+    telegram telekom temp-mail tencent tencent-dev tencent-dev@ads tencent-games tencent-tme
+    tencent-tme@ads tencent@!cn tencent@ads tendcloud tendcloud@ads terabox termux tesla tesla@cn
+    test test-ipv6 test-ipv6@cn tex tgbus theboringcompany theguardian theinitium thelinuxfoundation
+    thelinuxfoundation@cn theporndude thescoregroup thesun thetimes thetype thetype@cn
+    thomsonreuters threads tiancity tianyancha tidal tidelift tiktok tiktok@!cn tiktok@ads tilda
+    timeweb tinyurl tld-!cn tld-cn tld-opennic tld-ru tmdb tmtpost tokyo-sports tokyo-toshokan tonec
+    tongcheng tongfang tor torproject trackernetwork trae translatewiki trello trustasia trustwallet
+    trustwave truyen-hentai tsquare tube8 tubi tumblr tutanota tvb tvb@cn tvdb tver twca twilio
+    twitch twitter twitter@ads typekit typenetwork typography uber ubiquiti ubiquiti@cn ubisoft
+    ubuntu ubuntukylin uc uc@ads ucloud ucoz udacity udemy udn umeng umeng@ads unext unionpay unity
+    unity@ads unitychina unitychina@ads uoliv upai usersdrive uu-chat v2ray v8 vancl vanish
+    vanish@cn vaptcha veet veet@cn vercel verisign verisign-pki verizon vgtime viber vilavpn vimeo
+    visa visa@cn visualarts viu vivo vivo@!cn vixengroup vk vk@ads vmware vmware@cn voanews vodafone
+    vokino volcengine volmoe volvo volvo@cn voxmedia vpngate vrcdn vrchat vrzwk vultr w3schools
+    wallhaven walmart walmart@cn wanfang wangsu wanmei wantmedia wargaming wasu watchout wbgames
+    weathercn webex webex@cn webnovel webnovel@!cn webtype weiphone wenshushu westerndigital
+    westerndigital@cn whatsapp wholefoodsmarket whoosh wikidot wikihow wikimedia wildberries
+    wildberries@ads windsurf windy wink winline wise wisekey wish wistia wiwide wix wjx wolai
+    woolite woolite@cn wordpress wps wsj wwe wynd x x5 x5@ads x@ads xai xbox xbox@cn xd xd@!cn xda
+    xdty xedge xhamster xhamster@ads xiaoheihe xiaohongshu xiaohongshu@!cn xiaomi xiaomi-ai xiaomi-
+    iot xiaomi@!cn xiaomi@ads xiaoyuzhou ximalaya ximalaya@ads xingkongwuxianmedia xingrz xnxx xtom
+    xueersi xueqiu xunlei xvideos yahoo yahoo@ads yahoo@cn yandex yandex@ads ycombinator ymtc ynet
+    ynoproject yokaverse yomiuri yostar yostar@cn youjizz youku youku@!cn youku@ads youmind youporn
+    youquan youtube youtube@ads youtube@cn youzan yto-express yuanbei yuanfudao yuewen yuewen@!cn
+    yuketang yundaex yunfanjiasu yunlaopo yy z-library z3x-team zaobao zb zdns zee zeetv zendesk
+    zeplin zhangtao zhihu zhihu@ads zhimeishe zhubajie ziroom zoho zoom zotero zscaler zte zto-
+    express zuoyebang zuoyebang@ads zynga
+";
+
+/// The published names of one geo kind.
+fn published_geo_names(kind: &str) -> &'static str {
+    match kind {
+        "geoip" => PUBLISHED_GEOIP_NAMES,
+        "geosite" => PUBLISHED_GEOSITE_NAMES,
+        _ => "",
+    }
+}
+
+/// `true` when `name` is published by the official SagerNet repository for
+/// `kind` (`geoip`/`geosite`).
+pub fn is_published_geo_name(kind: &str, name: &str) -> bool {
+    if name.is_empty() || name.contains('/') {
+        return false;
+    }
+    published_geo_names(kind)
+        .split_ascii_whitespace()
+        .any(|published| published == name)
+}
+
+/// Clash geo values that name no published rule-set but have an exact
+/// sing-box equivalent, mapped EXPLICITLY.
+///
+/// `GEOIP,LAN` / `GEOIP,private` are pseudo-databases in clash (mihomo's
+/// GeoIP database resolves them to the private address ranges), not
+/// downloads. The SagerNet repositories publish no `geoip-lan` /
+/// `geoip-private` (verified 404), and mapping them onto `geosite-private`
+/// would swap IP ranges for private *domains* — a silent weakening. They
+/// are expressed as literal `ip_cidr` matches instead, which needs no
+/// download and keeps `GEOIP,LAN,DIRECT` meaning "private traffic goes
+/// direct".
+const PRIVATE_IP_GEO_VALUES: &[&str] = &["lan", "private", "local"];
+
+/// Clash pseudo-geosites with an explicitly named replacement set:
+/// `(clash value, published sing-box rule-set tag)`.
+const GEOSITE_PSEUDO_VALUES: &[(&str, &str)] = &[("private", "geosite-private"), ("lan", "geosite-private")];
+
+/// How a clash `GEOIP,<value>` / `GEOSITE,<value>` reference is expressed
+/// for sing-box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeoValueMatch {
+    /// A reference to an official rule-set with this tag.
+    RuleSet(String),
+    /// Literal private address ranges (clash's `GEOIP,LAN`), which have no
+    /// published rule-set.
+    PrivateNetworks,
+}
+
+/// Resolve one clash geo value into its sing-box form, or `None` when it
+/// cannot be expressed.
+///
+/// A value outside the published list is NEVER turned into a guessed tag:
+/// the caller keeps the rule verbatim for clash and drops it (with a note)
+/// for sing-box, which is strictly better than a 404 rule-set download.
+pub fn classify_geo_value(kind: &str, value: &str) -> Option<GeoValueMatch> {
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('!') {
+        return None;
+    }
+    let normalized = value.to_ascii_lowercase();
+    match kind {
+        "geoip" if PRIVATE_IP_GEO_VALUES.contains(&normalized.as_str()) => Some(GeoValueMatch::PrivateNetworks),
+        "geosite" => match GEOSITE_PSEUDO_VALUES.iter().find(|(value, _)| *value == normalized) {
+            Some((_, tag)) => Some(GeoValueMatch::RuleSet((*tag).to_string())),
+            None if is_published_geo_name("geosite", &normalized) => {
+                Some(GeoValueMatch::RuleSet(format!("geosite-{normalized}")))
+            }
+            None => None,
+        },
+        "geoip" if is_published_geo_name("geoip", &normalized) => {
+            Some(GeoValueMatch::RuleSet(format!("geoip-{normalized}")))
+        }
+        _ => None,
+    }
+}
+
 /// The remote `.srs` rule-set definition for a `geoip-*` / `geosite-*` tag
-/// produced by [`crate::routing::from_clash_rule_str`], or `None` for any
-/// other tag.
+/// that is actually published by the SagerNet repositories, or `None` for
+/// any other tag.
+///
+/// Gating matters as much as the URL: `geoip-lan` looks like a plausible
+/// tag, 404s on download and aborts `sing-box start` with
+/// `initialize rule-set: geoip-lan: 404`.
 pub fn geo_rule_set(tag: &str) -> Option<Value> {
     let (kind, name) = tag
         .strip_prefix("geoip-")
         .map(|name| ("geoip", name))
         .or_else(|| tag.strip_prefix("geosite-").map(|name| ("geosite", name)))?;
-    if name.is_empty() || name.contains('/') {
+    if !is_published_geo_name(kind, name) {
         return None;
     }
     let base = if kind == "geoip" {
@@ -738,7 +1139,7 @@ pub fn convert_rule_providers(config_yaml: &str) -> Result<RuleProviderConversio
         let Yaml::Mapping(entry) = provider else { continue };
         let url = entry.get(Yaml::String("url".into())).and_then(Yaml::as_str);
         match url {
-            Some(url) if url.ends_with(".srs") => result.rule_sets.push(json!({
+            Some(url) if publishable_rule_set_url(url) => result.rule_sets.push(json!({
                 "type": "remote",
                 "tag": name,
                 "format": "binary",
@@ -746,17 +1147,38 @@ pub fn convert_rule_providers(config_yaml: &str) -> Result<RuleProviderConversio
                 "download_detour": "direct",
                 "update_interval": "168h",
             })),
-            _ => result.skipped.push(format!(
-                "{name}: rule-provider is not a sing-box .srs payload ({}); \
+            Some(url) => result.skipped.push(format!(
+                "{name}: rule-provider payload {url:?} is not a sing-box .srs rule-set ({}); \
 RULE-SET rules referencing it are skipped",
                 entry
                     .get(Yaml::String("behavior".into()))
                     .and_then(Yaml::as_str)
                     .unwrap_or("unknown behavior")
             )),
+            None => result.skipped.push(format!(
+                "{name}: rule-provider has no url; RULE-SET rules referencing it are skipped"
+            )),
         }
     }
     Ok(result)
+}
+
+/// `true` when a provider URL points at a sing-box binary (`.srs`) rule-set.
+///
+/// - the suffix check ignores query strings and fragments, because
+///   subscription providers commonly append cache-busting parameters
+///   (`ads.srs?version=3`) which used to make an otherwise convertible
+///   provider unconvertible;
+/// - `.mrs` (the mihomo-flavored binary rule-set) is deliberately NOT
+///   accepted: verified against sing-box 1.14.2, an `.mrs` payload fails
+///   rule-set initialization with `invalid sing-box rule-set file` — its
+///   magic is a bare zstd frame, while 1.14.2 parses the `SRS` container
+///   (`SRS\x01` for the files SagerNet publishes, `SRS\x02` for the ones it
+///   compiles itself). Accepting it would turn a clean "provider skipped"
+///   note into a FATAL at core start.
+fn publishable_rule_set_url(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.to_ascii_lowercase().ends_with(".srs")
 }
 
 #[cfg(test)]
@@ -904,6 +1326,228 @@ proxy-groups:
         );
         assert!(geo_rule_set("some-local-set").is_none());
         assert!(geo_rule_set("geoip-").is_none());
+    }
+
+    #[test]
+    fn unpublished_geo_tags_are_never_synthesized() {
+        // #P0-2: every one of these used to produce a plausible-looking
+        // tag whose download 404s, and `sing-box run` then dies with
+        // `initialize rule-set: geoip-lan: 404` after `check` passed.
+        for tag in [
+            "geoip-lan",
+            "geoip-private",
+            "geoip-local",
+            "geoip-telegram",
+            "geoip-ZZ",
+            "geosite-category-scholar",
+            "geosite-not-published",
+            "geosite-private/../evil",
+        ] {
+            assert!(geo_rule_set(tag).is_none(), "{tag} must not be synthesized");
+        }
+        for tag in ["geoip-cn", "geoip-us", "geosite-category-ads-all", "geosite-private"] {
+            assert!(geo_rule_set(tag).is_some(), "{tag} is published");
+        }
+    }
+
+    #[test]
+    fn published_geo_name_gate_matches_the_official_repositories() {
+        // The gate is only as good as the embedded lists; spot-check both
+        // ends of them so a truncated regeneration fails loudly.
+        for name in ["cn", "us", "de", "hk", "tw", "mo"] {
+            assert!(is_published_geo_name("geoip", name), "geoip {name}");
+        }
+        for name in [
+            "private",
+            "category-ads-all",
+            "geolocation-!cn",
+            "geolocation-cn",
+            "google",
+        ] {
+            assert!(is_published_geo_name("geosite", name), "geosite {name}");
+        }
+        assert!(!is_published_geo_name("geoip", "lan"));
+        assert!(!is_published_geo_name("geosite", "lan"));
+        assert!(!is_published_geo_name("geosite", ""));
+        assert!(!is_published_geo_name("geosite", "a/b"));
+        assert!(PUBLISHED_GEOIP_NAMES.split_ascii_whitespace().count() > 200);
+        assert!(PUBLISHED_GEOSITE_NAMES.split_ascii_whitespace().count() > 1500);
+    }
+
+    #[test]
+    fn clash_geo_values_are_classified_against_the_published_names() {
+        assert_eq!(
+            classify_geo_value("geoip", "CN"),
+            Some(GeoValueMatch::RuleSet("geoip-cn".into()))
+        );
+        assert_eq!(
+            classify_geo_value("geosite", "geolocation-!cn"),
+            Some(GeoValueMatch::RuleSet("geosite-geolocation-!cn".into()))
+        );
+        assert_eq!(
+            classify_geo_value("geosite", "private"),
+            Some(GeoValueMatch::RuleSet("geosite-private".into()))
+        );
+        assert_eq!(classify_geo_value("geoip", "LAN"), Some(GeoValueMatch::PrivateNetworks));
+        // Negated sets have no positive rule-set reference; unknown names
+        // are never guessed.
+        assert_eq!(classify_geo_value("geoip", "!cn"), None);
+        assert_eq!(classify_geo_value("geosite", "!cn"), None);
+        assert_eq!(classify_geo_value("geoip", ""), None);
+        assert_eq!(classify_geo_value("geoip", "not-published"), None);
+        assert_eq!(classify_geo_value("geosite", "not-published"), None);
+    }
+
+    #[test]
+    fn members_referencing_groups_that_produce_no_outbound_are_pruned() {
+        // #P1-3: pruning used the DECLARED group names, so a member
+        // pointing at a skipped relay group (or a group emptied by
+        // pruning) survived into `GroupSpec.members` and made
+        // `config_gen::validate_references` abort generation.
+        let yaml = r#"
+proxies:
+  - {name: ok, type: http, server: a.example, port: 443}
+  - {name: gone, type: mieru, server: b.example, port: 443}
+proxy-groups:
+  - {name: Relay, type: relay, proxies: [ok]}
+  - {name: Emptied, type: select, proxies: [gone]}
+  - {name: PROXY, type: select, proxies: [ok, Relay, Emptied]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        let proxy = result.groups.iter().find(|group| group.name == "PROXY").expect("PROXY");
+        assert_eq!(proxy.members, vec!["ok".to_string()], "{:?}", proxy.members);
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("dropped member 'Relay'") && note.contains("produced no outbound")),
+            "{:?}",
+            result.notes
+        );
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("dropped member 'Emptied'")),
+            "{:?}",
+            result.notes
+        );
+        let tags = result.outbound_tags();
+        assert!(proxy.members.iter().all(|member| tags.contains(member)));
+    }
+
+    #[test]
+    fn members_referencing_a_group_converted_later_still_survive() {
+        // The fixed-point pruning must not depend on declaration order.
+        let yaml = r#"
+proxies:
+  - {name: ok, type: http, server: a.example, port: 443}
+proxy-groups:
+  - {name: PROXY, type: select, proxies: [ok, Later]}
+  - {name: Later, type: select, proxies: [ok]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        let proxy = result.groups.iter().find(|group| group.name == "PROXY").expect("PROXY");
+        assert_eq!(
+            proxy.members,
+            vec!["ok".to_string(), "Later".to_string()],
+            "{:?}",
+            proxy.members
+        );
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
+    }
+
+    #[test]
+    fn a_select_group_with_only_direct_survives() {
+        // #P1-4: `DIRECT` used to be stripped before the emptiness check,
+        // so `{select, proxies: [DIRECT]}` was dropped and every rule
+        // targeting it lost its outbound.
+        let yaml = r#"
+proxies:
+  - {name: ok, type: http, server: a.example, port: 443}
+proxy-groups:
+  - {name: Manual, type: select, proxies: [DIRECT]}
+  - {name: Mixed, type: select, proxies: [DIRECT, ok, ok]}
+  - {name: DirectOnly, type: url-test, proxies: [DIRECT]}
+"#;
+        let result = convert_profile(yaml).expect("convert");
+        let group = |name: &str| {
+            result
+                .groups
+                .iter()
+                .find(|group| group.name == name)
+                .unwrap_or_else(|| panic!("{name} must survive: {:?} / {:?}", result.groups, result.skipped))
+                .clone()
+        };
+        assert_eq!(group("Manual").members, vec!["DIRECT".to_string()]);
+        assert_eq!(group("DirectOnly").members, vec!["DIRECT".to_string()]);
+        // With another member present, `DIRECT` is still redundant: the
+        // generator appends it to every selector.
+        assert_eq!(group("Mixed").members, vec!["ok".to_string()]);
+        assert!(
+            result.notes.iter().any(|note| note.contains("redundant DIRECT")),
+            "{:?}",
+            result.notes
+        );
+        // A DIRECT-only selector is a valid outbound for sing-box.
+        let tags = result.outbound_tags();
+        for name in ["Manual", "Mixed", "DirectOnly"] {
+            assert!(group(name).members.iter().all(|member| tags.contains(member)));
+        }
+    }
+
+    #[test]
+    fn rule_providers_tolerate_query_strings_and_reject_unsupported_payloads() {
+        // #P2: `ads.srs?version=3` is the same binary rule-set, and the
+        // suffix check must ignore the query. `.mrs` is NOT accepted:
+        // verified against sing-box 1.14.2, an mihomo `.mrs` payload
+        // fails with `invalid sing-box rule-set file`.
+        let yaml = r#"
+rule-providers:
+  cached:
+    type: http
+    behavior: domain
+    url: https://example.com/ads.srs?version=3&token=abc
+  upper:
+    type: http
+    behavior: domain
+    url: https://example.com/ads.SRS
+  mihomo:
+    type: http
+    behavior: domain
+    url: https://example.com/cn.mrs
+  broken:
+    type: http
+    behavior: classical
+    url: https://example.com/cn.yaml
+  urlless:
+    type: file
+    behavior: classical
+"#;
+        let result = convert_rule_providers(yaml).expect("convert");
+        let tags: Vec<&str> = result.rule_sets.iter().filter_map(|set| set["tag"].as_str()).collect();
+        assert_eq!(tags, vec!["cached", "upper"], "{:?}", result.skipped);
+        assert_eq!(
+            result.rule_sets[0]["url"],
+            "https://example.com/ads.srs?version=3&token=abc"
+        );
+        assert_eq!(result.rule_sets[0]["format"], "binary");
+        assert_eq!(result.skipped.len(), 3, "{:?}", result.skipped);
+        assert!(
+            result.skipped.iter().any(|line| line.contains("cn.mrs")),
+            "{:?}",
+            result.skipped
+        );
+        assert!(
+            result.skipped.iter().any(|line| line.contains("cn.yaml")),
+            "{:?}",
+            result.skipped
+        );
+        assert!(
+            result.skipped.iter().any(|line| line.contains("has no url")),
+            "{:?}",
+            result.skipped
+        );
     }
 
     #[test]
