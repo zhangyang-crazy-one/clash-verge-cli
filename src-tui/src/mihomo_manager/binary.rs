@@ -241,6 +241,82 @@ pub async fn inspect(kind: CoreKind) -> CoreInspection {
     .await
 }
 
+/// Inspect the manager's exact selected executable offline. Settings setup
+/// must not silently substitute a pinned update for an already running core.
+pub async fn inspect_exact(kind: CoreKind, path: PathBuf) -> anyhow::Result<PreparedCore> {
+    let managed = managed_path(kind);
+    let needs_receipt = path.parent() == managed.parent();
+    inspect_exact_with(kind, path, needs_receipt, move |path| async move {
+        match kind {
+            CoreKind::Mihomo => read_mihomo_version(&path).await,
+            CoreKind::SingBox => super::singbox_binary::read_singbox_version(&path).await,
+        }
+    })
+    .await
+}
+
+async fn inspect_exact_with<F, Fut>(
+    kind: CoreKind,
+    path: PathBuf,
+    needs_receipt: bool,
+    probe: F,
+) -> anyhow::Result<PreparedCore>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Option<String>>>,
+{
+    let metadata = tokio::fs::metadata(&path).await?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!("candidate is not an executable regular file");
+    }
+    if needs_receipt && !verify_cached_digest(&path).await? {
+        anyhow::bail!("managed cache has no valid trusted-install receipt");
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(&path)?.read_exact(&mut magic)?;
+    ensure_elf(&magic)?;
+    let version = probe(path.clone())
+        .await?
+        .context("version probe omitted a valid version")?;
+    super::core_policy::Version::parse(&version)?;
+    Ok(PreparedCore {
+        kind,
+        path,
+        source: "selected".into(),
+        version,
+    })
+}
+
+/// Recheck the exact permission target immediately before the confirmed
+/// transaction; a replaced or unreceipted managed file cannot inherit consent.
+pub(crate) fn validate_permission_target(prepared: &PreparedCore) -> anyhow::Result<()> {
+    let path = &prepared.path;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        anyhow::bail!("permission target is not an executable regular file");
+    }
+    let bytes = std::fs::read(path)?;
+    ensure_elf(&bytes)?;
+    if matches!(prepared.source.as_str(), "cached" | "downloaded")
+        || path.parent() == managed_path(prepared.kind).parent()
+    {
+        let expected = sha256_hex(&bytes);
+        let qualified = digest_receipt_path(path, &expected);
+        let verified = match std::fs::read_to_string(&qualified) {
+            Ok(value) => value.trim() == format!("sha256:{expected}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read_to_string(path.with_extension("sha256"))
+                    .is_ok_and(|value| verify_sha256(&bytes, value.trim()).is_ok())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !verified {
+            anyhow::bail!("permission target has no valid trusted-install receipt; inspect it again");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn report_progress(
     sender: Option<&tokio::sync::mpsc::Sender<CoreProgress>>,
     authorization: DownloadAuthorization,
@@ -811,6 +887,44 @@ fn version_matches_target(version: &str, target: &str) -> bool {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn guided_tun_exact_inspection_requires_receipt_before_probe_and_keeps_selected_version() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(kind.as_str());
+            let bytes = b"\x7fELFfixture";
+            std::fs::write(&path, bytes).unwrap();
+            ensure_executable(&path).await.unwrap();
+            let error = inspect_exact_with(kind, path.clone(), true, |_| async {
+                panic!("untrusted cache never probed")
+            })
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("trusted-install receipt"));
+            write_digest_receipt(&path, bytes, ".fixture-receipt-").await.unwrap();
+            let exact = path.clone();
+            let prepared = inspect_exact_with(kind, path.clone(), true, move |probed| async move {
+                assert_eq!(probed, exact);
+                Ok(Some("1.0.0".into()))
+            })
+            .await
+            .unwrap();
+            assert_eq!(prepared.path, path);
+            assert_eq!(prepared.kind, kind);
+            assert_eq!(prepared.version, "1.0.0", "setup does not replace the selected core");
+            let mut downloaded = prepared.clone();
+            downloaded.source = "downloaded".into();
+            validate_permission_target(&downloaded).unwrap();
+            std::fs::write(&path, b"\x7fELFreplaced-fixture").unwrap();
+            assert!(
+                validate_permission_target(&downloaded)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("trusted-install receipt")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn guided_core_old_system_does_not_hide_verified_offline_cache() {

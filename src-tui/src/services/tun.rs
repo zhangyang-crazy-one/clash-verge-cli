@@ -35,9 +35,10 @@ pub async fn write_tun_runtime(enable_tun: bool) -> Result<std::path::PathBuf, S
 /// carry the TUN capability. Returns `Ok` when no binary is known yet (the
 /// spawn preflight will check the one that gets installed).
 pub fn preflight_enable(manager: &MihomoManager) -> anyhow::Result<()> {
-    let known = manager
-        .binary_path()
-        .or_else(crate::mihomo_manager::binary::candidate_without_install);
+    let known = manager.binary_path().or_else(|| match manager.core_kind() {
+        crate::mihomo_manager::CoreKind::Mihomo => crate::mihomo_manager::binary::candidate_without_install(),
+        crate::mihomo_manager::CoreKind::SingBox => crate::mihomo_manager::singbox_binary::candidate_without_install(),
+    });
     match known {
         Some(binary) => crate::commands::privilege::require_tun_capability(&binary),
         None => Ok(()),

@@ -55,6 +55,14 @@ pub enum Action {
         id: u64,
         result: Result<(), String>,
     },
+    CoreTunChecked {
+        context: super::GuidedTunContext,
+        result: Result<bool, String>,
+    },
+    CoreTunSetupFinished {
+        context: super::GuidedTunContext,
+        result: Result<(), String>,
+    },
     Quit,
 
     // Profile management
@@ -275,10 +283,6 @@ pub enum Action {
     PasswordBackspace,
     PasswordSubmit,
     PasswordCancel,
-    /// The user chose the explicit Settings → TUN setup action and the
-    /// resolved binary needs capabilities; open the popup.
-    TunSetupRequested(std::path::PathBuf),
-
     // System service + login autostart (Settings rows 5 and 6)
     /// Refresh the cached read-only service/autostart probes
     /// (`systemctl is-active/is-enabled`, `systemctl --user is-enabled`).

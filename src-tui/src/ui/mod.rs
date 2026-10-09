@@ -104,7 +104,15 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 let mut content = vec![Line::from(format!(
                     "{} · {}",
                     update.kind.as_str(),
-                    app.tr(update.phase.key())
+                    app.tr(if update.intent == crate::app::CoreIntent::TunSetup {
+                        match update.phase {
+                            crate::app::CoreUpdatePhase::Ready => "core_update.tun_ready",
+                            crate::app::CoreUpdatePhase::Success => "core_update.tun_success",
+                            _ => update.phase.key(),
+                        }
+                    } else {
+                        update.phase.key()
+                    })
                 ))];
                 if let Some(request) = &update.request {
                     content.push(Line::from(format!(
@@ -134,7 +142,11 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 }
                 content.push(Line::from(match update.phase {
                     crate::app::CoreUpdatePhase::Consent => app.tr("core_update.confirm_download"),
+                    crate::app::CoreUpdatePhase::Ready if update.intent == crate::app::CoreIntent::TunSetup => {
+                        app.tr("core_update.confirm_tun_check")
+                    }
                     crate::app::CoreUpdatePhase::Ready => app.tr("core_update.confirm_switch"),
+                    crate::app::CoreUpdatePhase::TunConsent => app.tun_setup_confirm_hint(),
                     crate::app::CoreUpdatePhase::Failed
                     | crate::app::CoreUpdatePhase::Success
                     | crate::app::CoreUpdatePhase::Cancelled => app.tr("core_update.dismiss"),
@@ -238,18 +250,28 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Danger, "Close All", content);
         }
         Overlay::TunSetupConfirmation => {
-            let content = vec![
+            let mut content = vec![
                 Line::from(Span::styled(
                     app.tr("dialog.tun_setup_title"),
                     theme::bold(theme::warn()),
                 )),
                 Line::from(app.tr("dialog.tun_setup_warning")),
+            ];
+            if let Some(crate::app::PendingSudoAction::GuidedTunSetup(context)) = &app.pending_sudo {
+                content.push(Line::from(format!(
+                    "{} · {}",
+                    context.prepared.kind.as_str(),
+                    context.prepared.version
+                )));
+                content.push(Line::from(context.prepared.path.display().to_string()));
+            }
+            content.extend([
                 Line::from(""),
                 Line::from(Span::styled(
                     app.tun_setup_confirm_hint(),
                     Style::new().fg(theme::dim()),
                 )),
-            ];
+            ]);
             dialog::draw_dialog(
                 frame,
                 frame.area(),
@@ -298,8 +320,16 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
         Overlay::PasswordInput => {
             let prompt = app.password_prompt.as_deref().unwrap_or("sudo");
             let masked = dialog::mask_password(app.password_buffer.len());
-            let content = vec![
-                Line::from(Span::styled(prompt, theme::bold(theme::warn()))),
+            let mut content = vec![Line::from(Span::styled(prompt, theme::bold(theme::warn())))];
+            if let Some(crate::app::PendingSudoAction::GuidedTunSetup(context)) = &app.pending_sudo {
+                content.push(Line::from(format!(
+                    "{} · {}",
+                    context.prepared.kind.as_str(),
+                    context.prepared.version
+                )));
+                content.push(Line::from(context.prepared.path.display().to_string()));
+            }
+            content.extend([
                 Line::from(vec![
                     Span::styled(app.tr("dialog.password.prompt"), theme::bold(theme::text())),
                     Span::styled(masked, Style::new().fg(theme::text())),
@@ -309,7 +339,7 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                     app.tr("dialog.password.hint"),
                     Style::new().fg(theme::dim()),
                 )),
-            ];
+            ]);
             dialog::draw_dialog(
                 frame,
                 frame.area(),
@@ -323,6 +353,144 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guided_tun_setup_only_overlay_never_claims_switch_or_selection_commit() {
+        for language in [crate::i18n::Language::English, crate::i18n::Language::SimplifiedChinese] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = App::new();
+            app.language = language;
+            app.overlay = Some(Overlay::CoreUpdate);
+            app.core_update = Some(crate::app::CoreUpdate {
+                id: 3,
+                generation: 0,
+                kind: crate::mihomo_manager::CoreKind::SingBox,
+                intent: crate::app::CoreIntent::TunSetup,
+                phase: crate::app::CoreUpdatePhase::Ready,
+                request: None,
+                prepared: Some(crate::mihomo_manager::binary::PreparedCore {
+                    kind: crate::mihomo_manager::CoreKind::SingBox,
+                    path: dir.path().join("selected-sing-box"),
+                    version: "1.0.0".into(),
+                    source: "selected".into(),
+                }),
+                message: String::new(),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            for phase in [crate::app::CoreUpdatePhase::Ready, crate::app::CoreUpdatePhase::Success] {
+                app.core_update.as_mut().unwrap().phase = phase;
+                let (text, _) = render(&app, 120, 32);
+                let clean: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                let phase_key = if phase == crate::app::CoreUpdatePhase::Ready {
+                    "core_update.tun_ready"
+                } else {
+                    "core_update.tun_success"
+                };
+                assert!(
+                    clean.contains(
+                        &app.tr(phase_key)
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                    )
+                );
+                assert!(
+                    !clean.contains(
+                        &app.tr("core_update.success")
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect::<String>()
+                    )
+                );
+                if phase == crate::app::CoreUpdatePhase::Ready {
+                    assert!(
+                        clean.contains(
+                            &app.tr("core_update.confirm_tun_check")
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>()
+                        )
+                    );
+                    assert!(
+                        !clean.contains(
+                            &app.tr("core_update.confirm_switch")
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>()
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn guided_tun_permission_dialog_renders_both_cores_exact_long_path_and_choices_in_both_languages() {
+        for kind in [
+            crate::mihomo_manager::CoreKind::Mihomo,
+            crate::mihomo_manager::CoreKind::SingBox,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir
+                .path()
+                .join("test-owned-long-directory-for-managed-core-candidates")
+                .join("nested-directory-for-exact-target-permission-consent")
+                .join(format!(
+                    "{}-{}",
+                    kind.as_str(),
+                    crate::mihomo_manager::binary::target_version(kind)
+                ));
+            for language in [crate::i18n::Language::English, crate::i18n::Language::SimplifiedChinese] {
+                let mut app = App::new();
+                app.language = language;
+                app.pending_sudo = Some(crate::app::PendingSudoAction::GuidedTunSetup(
+                    crate::app::GuidedTunContext {
+                        id: 9,
+                        generation: 3,
+                        prepared: crate::mihomo_manager::binary::PreparedCore {
+                            kind,
+                            path: path.clone(),
+                            version: crate::mihomo_manager::binary::target_version(kind).into(),
+                            source: "cached".into(),
+                        },
+                        intent: crate::app::CoreIntent::Switch,
+                        enable_tun: true,
+                    },
+                ));
+                app.overlay = Some(Overlay::TunSetupConfirmation);
+                let (text, _) = render(&app, 100, 32);
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && *c != '\0' && !(0x2500..=0x257f).contains(&(*c as u32)))
+                    .collect();
+                assert!(clean.contains(kind.as_str()));
+                assert!(clean.contains(crate::mihomo_manager::binary::target_version(kind)));
+                assert!(
+                    clean.contains(&path.display().to_string()),
+                    "exact long path must stay readable: {clean}"
+                );
+                assert!(clean.contains("n/Esc/q"));
+                assert!(clean.contains(if language == crate::i18n::Language::English {
+                    "y=setupnow"
+                } else {
+                    "y=立即设置"
+                }));
+                app.overlay = Some(Overlay::PasswordInput);
+                app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
+                let (text, _) = render(&app, 100, 32);
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_whitespace() && *c != '\0' && !(0x2500..=0x257f).contains(&(*c as u32)))
+                    .collect();
+                assert!(clean.contains(&path.display().to_string()));
+                assert!(clean.contains(if language == crate::i18n::Language::English {
+                    "Esc=cancel"
+                } else {
+                    "Esc=取消"
+                }));
+            }
+        }
+    }
+
     #[test]
     fn guided_core_overlay_renders_actual_verified_version_source_path_and_failure() {
         let mut app = App::new();

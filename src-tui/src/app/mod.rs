@@ -162,6 +162,8 @@ pub enum TunSetupReason {
 /// action — and the spawned transaction — differs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingSudoAction {
+    /// Exact verified guided operation, never re-resolved after setup.
+    GuidedTunSetup(GuidedTunContext),
     /// TUN capability + DNS polkit rule setup for `binary`.
     TunSetup {
         binary: std::path::PathBuf,
@@ -210,6 +212,16 @@ pub enum CoreIntent {
     Start,
     Restart,
     Switch,
+    TunSetup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuidedTunContext {
+    pub id: u64,
+    pub generation: u64,
+    pub prepared: crate::mihomo_manager::binary::PreparedCore,
+    pub intent: CoreIntent,
+    pub enable_tun: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +231,9 @@ pub enum CoreUpdatePhase {
     Downloading,
     Verifying,
     Ready,
+    TunChecking,
+    TunConsent,
+    TunSettingUp,
     Preparing,
     Switching,
     Success,
@@ -234,6 +249,9 @@ impl CoreUpdatePhase {
             Self::Downloading => "core_update.downloading",
             Self::Verifying => "core_update.verifying",
             Self::Ready => "core_update.ready",
+            Self::TunChecking => "core_update.tun_checking",
+            Self::TunConsent => "core_update.tun_consent",
+            Self::TunSettingUp => "core_update.tun_setting_up",
             Self::Preparing => "core_update.preparing",
             Self::Switching => "core_update.switching",
             Self::Success => "core_update.success",
@@ -534,10 +552,11 @@ impl App {
     pub fn tun_setup_confirm_hint(&self) -> &'static str {
         let hard_gate = matches!(
             self.pending_sudo.as_ref(),
-            Some(PendingSudoAction::TunSetup {
-                reason: TunSetupReason::MissingCapability,
-                ..
-            })
+            Some(PendingSudoAction::GuidedTunSetup(_))
+                | Some(PendingSudoAction::TunSetup {
+                    reason: TunSetupReason::MissingCapability,
+                    ..
+                })
         );
         if hard_gate {
             self.tr("dialog.tun_setup_confirm_hard")

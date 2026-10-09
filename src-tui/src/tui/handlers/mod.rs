@@ -332,6 +332,8 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         | Action::CorePrepared { .. }
         | Action::CoreUpdateProgress(_)
         | Action::CoreUpdateFinished { .. }
+        | Action::CoreTunChecked { .. }
+        | Action::CoreTunSetupFinished { .. }
         | Action::CoreUpdateSwitching { .. }) => core_update::event(app, ctx, action),
         Action::ResumeCoreStart { enable_tun } => lifecycle::resume_start(ctx, enable_tun),
 
@@ -483,13 +485,21 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::SkipTunSetupStart => tun::skip_tun_setup_start(app, &ctx.tx).await,
         Action::TunSetupSucceeded { resume_start } => tun::note_tun_setup_succeeded(app, resume_start, &ctx.tx).await,
         Action::TunCapabilityState(privileged) => app.tun_privileged = privileged,
-        Action::TunSetupRequested(binary) => tun::open_password_prompt(app, binary),
         Action::PasswordChar(c) => app.password_buffer.push(c),
         Action::PasswordBackspace => {
             app.password_buffer.pop();
         }
         Action::PasswordCancel => tun::handle_password_cancel(app),
-        Action::PasswordSubmit => tun::handle_password_submit(app, &ctx.tx),
+        Action::PasswordSubmit => {
+            if let Some(crate::app::PendingSudoAction::GuidedTunSetup(context)) = app.pending_sudo.as_ref() {
+                let context = context.clone();
+                app.pending_sudo = None;
+                let password = app.password_buffer.drain(..).collect();
+                core_update::submit_tun_setup(app, ctx, context, password);
+            } else {
+                tun::handle_password_submit(app, &ctx.tx);
+            }
+        }
 
         // Service install / uninstall share the password popup with TUN
         // setup: routing these actions here is what guarantees the password

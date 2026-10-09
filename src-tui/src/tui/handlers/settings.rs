@@ -274,31 +274,27 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
     });
 }
 
-/// Explicit TUN setup — the ONLY TUI authorization action. Start/toggle
-/// never open the password popup; this row does.
+/// Explicit setup targets the shared manager's selected kind and exact
+/// executable. Missing cores use the same confirmation-gated acquisition.
 fn begin_tun_setup(app: &mut App, ctx: &Ctx) {
-    let known = ctx
-        .manager
-        .binary_path()
-        .or_else(crate::mihomo_manager::binary::candidate_without_install);
-    if let Some(binary) = known
-        && crate::commands::privilege::has_tun_capability(&binary)
-    {
-        app.tun_privileged = true;
-        app.status_msg = Some(app.tr("settings.tun_setup_present").into());
-        return;
-    }
-    ctx.spawn(|tx| async move {
-        let _ = tx
-            .send(match crate::mihomo_manager::binary::resolve_or_install().await {
-                Ok(resolved) if crate::commands::privilege::has_tun_capability(&resolved.path) => {
-                    Action::TunCapabilityState(true)
-                }
-                Ok(resolved) => Action::TunSetupRequested(resolved.path),
-                Err(error) => Action::CoreError(error.to_string()),
-            })
-            .await;
+    begin_tun_setup_with(app, ctx, |kind, path| async move {
+        match path {
+            Some(path) => crate::mihomo_manager::binary::inspect_exact(kind, path)
+                .await
+                .map(crate::mihomo_manager::binary::CoreInspection::Ready),
+            None => Ok(crate::mihomo_manager::binary::inspect(kind).await),
+        }
     });
+}
+
+fn begin_tun_setup_with<F, Fut>(app: &mut App, ctx: &Ctx, inspect: F)
+where
+    F: FnOnce(crate::mihomo_manager::CoreKind, Option<std::path::PathBuf>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<crate::mihomo_manager::binary::CoreInspection>> + Send + 'static,
+{
+    let kind = ctx.manager.core_kind();
+    let work = inspect(kind, ctx.manager.binary_path());
+    super::core_update::begin_with(app, ctx, kind, crate::app::CoreIntent::TunSetup, work);
 }
 
 /// `e` on Settings / `O` on Rules: open the requested config file in
@@ -386,6 +382,59 @@ mod tests {
 
     fn detached_guard() -> Arc<Mutex<crate::tui::TerminalGuard>> {
         Arc::new(Mutex::new(crate::tui::TerminalGuard::detached()))
+    }
+
+    #[tokio::test]
+    async fn guided_tun_settings_inspects_shared_selected_kind_and_exact_path_without_download() {
+        for kind in [
+            crate::mihomo_manager::CoreKind::Mihomo,
+            crate::mihomo_manager::CoreKind::SingBox,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("selected-exact-core");
+            let manager = crate::mihomo_manager::MihomoManager::new(dir.path().to_path_buf()).with_core_kind(kind);
+            *manager.inner().resolved_binary.lock() = Some(path.clone());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let ctx = Ctx {
+                manager,
+                tx: tx.into(),
+                traffic_tx: tokio::sync::watch::channel(None).0,
+                log_tx: tokio::sync::mpsc::channel(8).0,
+                dropped_logs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                local_actions: Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
+                guard: detached_guard(),
+                keys: crate::tui::keymap::KeyMap::default(),
+            };
+            let mut app = App::new();
+            // The UI config is deliberately stale; manager selection wins.
+            app.gui_config.proxy_core = Some("mihomo".into());
+            let expected = path.clone();
+            begin_tun_setup_with(&mut app, &ctx, move |selected, exact| async move {
+                assert_eq!(selected, kind);
+                assert_eq!(exact, Some(expected.clone()));
+                Ok(crate::mihomo_manager::binary::CoreInspection::Ready(
+                    crate::mihomo_manager::binary::PreparedCore {
+                        kind,
+                        path: expected,
+                        version: "1.14.2".into(),
+                        source: "selected".into(),
+                    },
+                ))
+            });
+            app.core_operation_task.take().unwrap().await.unwrap();
+            let Action::CoreInspected { result, .. } = rx.recv().await.unwrap() else {
+                panic!("offline inspection only");
+            };
+            assert!(
+                matches!(result, crate::mihomo_manager::binary::CoreInspection::Ready(core) if core.kind == kind && core.path == path)
+            );
+            assert_eq!(
+                app.core_update.as_ref().unwrap().intent,
+                crate::app::CoreIntent::TunSetup
+            );
+            assert!(app.pending_sudo.is_none());
+            assert_eq!(ctx.manager.binary_path(), Some(path));
+        }
     }
 
     #[test]

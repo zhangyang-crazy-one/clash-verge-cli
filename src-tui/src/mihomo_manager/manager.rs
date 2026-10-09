@@ -960,6 +960,14 @@ impl MihomoManager {
         self.guided_record_check_with(target, || std::fs::read_to_string("/proc/net/unix"))
     }
 
+    pub fn guided_preflight(&self, generation: u64, target: CoreKind) -> anyhow::Result<()> {
+        self.guided_owner_check(super::ownership::gui_process_running())?;
+        if generation != self.current_generation() || self.inner.restarting.load(Ordering::SeqCst) {
+            anyhow::bail!("Core ownership/generation changed since checking; retry the operation");
+        }
+        self.guided_record_check(target)
+    }
+
     fn guided_record_check_with(
         &self,
         target: CoreKind,
@@ -993,15 +1001,15 @@ impl MihomoManager {
     pub async fn apply_prepared_core(
         &self,
         prepared: &binary::PreparedCore,
+        expected_generation: u64,
         start_if_stopped: bool,
         enable_tun: bool,
         cancelled: &AtomicBool,
         stages: Option<mpsc::Sender<()>>,
     ) -> anyhow::Result<()> {
         let _config_lock = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
-        self.guided_owner_check(super::ownership::gui_process_running())?;
-        self.guided_record_check(prepared.kind)?;
-        let generation = self.current_generation();
+        self.guided_preflight(expected_generation, prepared.kind)?;
+        let generation = expected_generation;
         let old_kind = self.core_kind();
         let was_running = self.state() == CoreState::Running;
         let old_binary = self.binary_path();

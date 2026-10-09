@@ -12,18 +12,6 @@ use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, Overlay, PendingSudoAction, TunSetupReason};
 
-/// Settings → TUN setup found an uncapped binary: ask for the sudo password.
-pub(super) fn open_password_prompt(app: &mut App, binary: std::path::PathBuf) {
-    app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
-    app.password_buffer.clear();
-    app.pending_sudo = Some(PendingSudoAction::TunSetup {
-        binary,
-        resume_start: None,
-        reason: TunSetupReason::MissingCapability,
-    });
-    app.overlay = Some(Overlay::PasswordInput);
-}
-
 /// Open the password popup with a `ServiceInstall` pending action. The
 /// transaction writes the systemd unit using the captured password
 /// (`sudo -S`, no askpass) and starts the service in the same boundary.
@@ -79,6 +67,7 @@ pub(super) fn handle_password_submit(app: &mut App, action_tx: &crate::tui::back
     app.overlay = None;
     let tx = action_tx.clone();
     match pending {
+        PendingSudoAction::GuidedTunSetup(_) => unreachable!("guided setup is dispatched with manager context"),
         PendingSudoAction::TunSetup {
             binary,
             resume_start,
@@ -136,6 +125,7 @@ pub(super) fn handle_password_cancel(app: &mut App) {
     app.overlay = None;
     app.password_buffer.clear();
     match pending {
+        Some(PendingSudoAction::GuidedTunSetup(_)) => super::core_update::cancel(app),
         Some(PendingSudoAction::TunSetup {
             resume_start: Some(_), ..
         }) => {
@@ -186,6 +176,9 @@ pub(super) fn begin_tun_setup_confirm(
 /// `pending_tun` (binary + resume context) is kept so the password submit
 /// can resume the pending start on success.
 pub(super) fn confirm_tun_setup(app: &mut App) {
+    if app.pending_sudo.is_none() {
+        return;
+    }
     app.password_prompt = Some(app.tr("settings.tun_setup_prompt").into());
     app.password_buffer.clear();
     app.overlay = Some(Overlay::PasswordInput);
@@ -200,8 +193,23 @@ pub(super) fn confirm_tun_setup(app: &mut App) {
 /// - missing DNS polkit rule only (soft gate, capability present): skip
 ///   starts anyway, preserving the passive DNS-rule warning.
 pub(super) async fn skip_tun_setup_start(app: &mut App, action_tx: &crate::tui::background::EventSender) {
+    skip_tun_setup_start_with(app, action_tx, || {
+        crate::commands::privilege::resolve1_rule_needed(true)
+    })
+    .await;
+}
+
+async fn skip_tun_setup_start_with(
+    app: &mut App,
+    action_tx: &crate::tui::background::EventSender,
+    rule_needed: impl FnOnce() -> bool,
+) {
     let pending = app.pending_sudo.take();
     app.overlay = None;
+    if matches!(pending, Some(PendingSudoAction::GuidedTunSetup(_))) {
+        super::core_update::cancel(app);
+        return;
+    }
     let Some(PendingSudoAction::TunSetup {
         resume_start, reason, ..
     }) = pending
@@ -223,7 +231,7 @@ pub(super) async fn skip_tun_setup_start(app: &mut App, action_tx: &crate::tui::
         return;
     }
     // Capability present; only the DNS rule may be missing → start anyway.
-    if crate::commands::privilege::resolve1_rule_needed(true) {
+    if rule_needed() {
         app.status_msg = Some(format!(
             "{} — {}",
             app.tr("settings.tun_dns_rule_missing"),
@@ -385,7 +393,7 @@ mod tests {
             TunSetupReason::MissingDnsRule,
         );
         let (tx, mut rx) = mpsc::channel::<Action>(32);
-        skip_tun_setup_start(&mut app, &tx.into()).await;
+        skip_tun_setup_start_with(&mut app, &tx.into(), || false).await;
 
         assert_eq!(app.overlay, None, "skip must dismiss the confirm dialog");
         assert!(app.pending_sudo.is_none(), "skip must drop the pending setup");

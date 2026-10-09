@@ -52,6 +52,12 @@ fn english(key: &'static str) -> &'static str {
         "core_update.downloading" => "Downloading pinned official archive…",
         "core_update.verifying" => "Verifying trusted SHA-256, executable and actual version…",
         "core_update.ready" => "Verified candidate ready; current core remains unchanged",
+        "core_update.tun_checking" => "Checking exact candidate TUN permissions…",
+        "core_update.tun_consent" => "TUN permission setup requires explicit consent",
+        "core_update.tun_setting_up" => "Applying confirmed TUN setup; current core stays unchanged…",
+        "core_update.tun_ready" => "Verified permission target ready; current runtime stays unchanged",
+        "core_update.tun_success" => "TUN permission check/setup complete",
+        "core_update.confirm_tun_check" => "y / Enter: check/setup TUN for this executable only · n / Esc: cancel",
         "core_update.preparing" => "Preparing subscription configuration and TUN preflight…",
         "core_update.switching" => "Switching owned core; waiting for readiness…",
         "core_update.success" => "Core selection committed",
@@ -273,9 +279,9 @@ fn english(key: &'static str) -> &'static str {
         "settings.tun_capable" => "capabilities present",
         "settings.tun_missing" => "not configured — Enter grants once",
         "settings.tun_setup_prompt" => {
-            "Enter password to install the TUN capability and the systemd-resolved DNS polkit rule for mihomo"
+            "Enter password to install the TUN capability and the systemd-resolved DNS polkit rule for this core"
         }
-        "settings.tun_setup_present" => "TUN setup already complete — capability and DNS rule present",
+        "settings.tun_setup_present" => "Selected core has TUN permission through file capability or root",
         "settings.tun_dns_rule_missing" => "TUN DNS polkit rule missing — run TUN setup once to avoid system dialogs",
         "home.mode" => "Mode",
         "dialog.confirm_close" => "Close active connection?",
@@ -298,7 +304,7 @@ fn english(key: &'static str) -> &'static str {
         "dialog.tun_setup" => "TUN Setup",
         "dialog.tun_setup_title" => "TUN needs one-time setup",
         "dialog.tun_setup_warning" => {
-            "Starting with TUN enabled needs the mihomo file capability and the systemd-resolved DNS polkit rule. Installing them now means core start requires no system dialogs."
+            "TUN needs this core's file capability. Confirming applies permissions to the exact executable shown and installs the systemd-resolved DNS polkit rule when needed."
         }
         "dialog.tun_setup_confirm" => "y = setup now | n/Esc/q = start without setup",
         "dialog.tun_setup_confirm_hard" => "y = setup now | n/Esc/q = cancel start (TUN setup required)",
@@ -348,6 +354,12 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "core_update.downloading" => "正在下载固定版本的官方归档…",
         "core_update.verifying" => "正在验证可信 SHA-256、可执行格式和实际版本…",
         "core_update.ready" => "候选核心已验证就绪；当前核心保持不变",
+        "core_update.tun_checking" => "正在检查候选核心的 TUN 权限…",
+        "core_update.tun_consent" => "TUN 权限设置需要明确授权",
+        "core_update.tun_setting_up" => "正在执行已确认的 TUN 设置；当前核心保持不变…",
+        "core_update.tun_ready" => "权限目标已验证；当前运行状态保持不变",
+        "core_update.tun_success" => "TUN 权限检查或设置已完成",
+        "core_update.confirm_tun_check" => "y / Enter: 仅检查或设置此文件的 TUN 权限 · n / Esc: 取消",
         "core_update.preparing" => "正在转换当前订阅配置并检查 TUN 权限…",
         "core_update.switching" => "正在切换自有核心，等待控制端就绪…",
         "core_update.success" => "核心选型已提交",
@@ -560,8 +572,8 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "settings.tun_setup" => "TUN 权限设置",
         "settings.tun_capable" => "已具备权限",
         "settings.tun_missing" => "未配置 — Enter 一次性授权",
-        "settings.tun_setup_prompt" => "输入密码为 mihomo 安装 TUN 权限与 systemd-resolved DNS polkit 规则",
-        "settings.tun_setup_present" => "TUN 设置已完成 — 权限与 DNS 规则均已安装",
+        "settings.tun_setup_prompt" => "输入密码为此核心安装 TUN 权限与 systemd-resolved DNS polkit 规则",
+        "settings.tun_setup_present" => "所选核心可通过文件能力或 root 身份运行 TUN",
         "settings.tun_dns_rule_missing" => "TUN DNS polkit 规则缺失 — 请先运行一次 TUN 权限设置以避免系统弹窗",
         "home.mode" => "模式",
         "dialog.confirm_close" => "关闭活动连接？",
@@ -582,7 +594,7 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "dialog.tun_setup" => "TUN 权限设置",
         "dialog.tun_setup_title" => "启动 TUN 需要一次性权限设置",
         "dialog.tun_setup_warning" => {
-            "启用 TUN 启动需要 mihomo 文件能力与 systemd-resolved DNS polkit 规则。现在安装它们可让核心启动不再弹出系统对话框。"
+            "TUN 需要此核心的文件能力。确认后将为下方显示的确切可执行文件设置权限，并按需安装 systemd-resolved DNS polkit 规则。"
         }
         "dialog.tun_setup_confirm" => "y = 立即设置 | n/Esc/q = 不设置直接启动",
         "dialog.tun_setup_confirm_hard" => "y = 立即设置 | n/Esc/q = 取消启动（需先完成 TUN 设置）",

@@ -1,7 +1,7 @@
 //! Confirmation-gated preparation and owned-core switching. This operation
 //! has its own cancellation token and join handle, independent of live traffic.
 use super::Ctx;
-use crate::app::{Action, App, CoreIntent, CoreUpdate, CoreUpdatePhase, Overlay};
+use crate::app::{Action, App, CoreIntent, CoreUpdate, CoreUpdatePhase, GuidedTunContext, Overlay, PendingSudoAction};
 use crate::mihomo_manager::{
     CoreKind,
     binary::{self, CoreInspection, CoreProgressPhase, DownloadAuthorization},
@@ -20,11 +20,18 @@ pub(super) fn begin(app: &mut App, ctx: &Ctx, kind: CoreKind, intent: CoreIntent
     });
 }
 
-fn begin_with<F>(app: &mut App, ctx: &Ctx, kind: CoreKind, intent: CoreIntent, work: F)
+pub(super) fn begin_with<F>(app: &mut App, ctx: &Ctx, kind: CoreKind, intent: CoreIntent, work: F)
 where
     F: std::future::Future<Output = anyhow::Result<CoreInspection>> + Send + 'static,
 {
-    if app.core_operation_task.as_ref().is_some_and(|task| !task.is_finished()) {
+    if app.core_operation_task.as_ref().is_some_and(|task| !task.is_finished())
+        || app.core_update.as_ref().is_some_and(|update| {
+            !matches!(
+                update.phase,
+                CoreUpdatePhase::Failed | CoreUpdatePhase::Success | CoreUpdatePhase::Cancelled
+            )
+        })
+    {
         app.overlay = Some(Overlay::CoreUpdate);
         return;
     }
@@ -112,35 +119,241 @@ pub(super) fn confirm(app: &mut App, ctx: &Ctx) {
             let Some(prepared) = update.prepared.clone() else {
                 return;
             };
-            let intent = update.intent;
-            let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
-            update.phase = CoreUpdatePhase::Preparing;
+            let context = GuidedTunContext {
+                id,
+                generation: update.generation,
+                prepared,
+                intent: update.intent,
+                enable_tun: app.gui_config.enable_tun_mode.unwrap_or(false),
+            };
+            update.phase = CoreUpdatePhase::TunChecking;
             let manager = ctx.manager.clone();
             app.core_operation_task = Some(tokio::spawn(async move {
-                let (stages, mut stage_rx) = tokio::sync::mpsc::channel(1);
-                // Do not abort this future on cancel/exit: it owns rollback.
-                let work = manager.apply_prepared_core(
-                    &prepared,
-                    intent != CoreIntent::Switch,
-                    enable_tun,
+                let result = check_tun_with(
+                    &context,
                     &cancelled,
-                    Some(stages),
+                    || manager.guided_preflight(context.generation, context.prepared.kind),
+                    crate::commands::privilege::running_as_root,
+                    crate::commands::privilege::has_tun_capability,
                 );
-                tokio::pin!(work);
-                let result = loop {
-                    tokio::select! {
-                        result = &mut work => break result.map_err(|error| format!("{error:#}")),
-                        Some(()) = stage_rx.recv() => {
-                            let _ = tx.send(Action::CoreUpdateSwitching { id }).await;
-                        }
-                    }
-                };
-                let _ = tx.send(Action::CoreUpdateFinished { id, result }).await;
+                let _ = tx.send(Action::CoreTunChecked { context, result }).await;
             }));
         }
+        CoreUpdatePhase::TunConsent => super::tun::confirm_tun_setup(app),
         CoreUpdatePhase::Failed | CoreUpdatePhase::Success | CoreUpdatePhase::Cancelled => app.overlay = None,
         _ => {}
     }
+}
+
+fn check_tun_with(
+    context: &GuidedTunContext,
+    cancelled: &AtomicBool,
+    owner: impl FnOnce() -> anyhow::Result<()>,
+    root: impl FnOnce() -> bool,
+    capable: impl FnOnce(&std::path::Path) -> bool,
+) -> Result<bool, String> {
+    owner().map_err(|error| format!("{error:#}"))?;
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("Core operation cancelled".into());
+    }
+    Ok((context.enable_tun || context.intent == CoreIntent::TunSetup) && !root() && !capable(&context.prepared.path))
+}
+
+fn start_apply(app: &mut App, ctx: &Ctx, context: GuidedTunContext) {
+    if context.intent == CoreIntent::TunSetup {
+        let message = app.tr("settings.tun_setup_present").to_string();
+        app.tun_privileged = true;
+        if let Some(update) = app.core_update.as_mut() {
+            update.phase = CoreUpdatePhase::Success;
+            update.message = message;
+        }
+        app.overlay = Some(Overlay::CoreUpdate);
+        return;
+    }
+    if !crate::mihomo_manager::core_policy::is_compatible(
+        context.prepared.kind.as_str(),
+        &context.prepared.version,
+        binary::target_version(context.prepared.kind),
+    )
+    .unwrap_or(false)
+    {
+        if let Some(update) = app.core_update.as_mut() {
+            update.phase = CoreUpdatePhase::Failed;
+            update.message = "Unreviewed core version cannot be started through permission setup".into();
+        }
+        app.overlay = Some(Overlay::CoreUpdate);
+        return;
+    }
+    let Some(update) = app.core_update.as_mut() else {
+        return;
+    };
+    update.phase = CoreUpdatePhase::Preparing;
+    let cancelled = update.cancelled.clone();
+    let manager = ctx.manager.clone();
+    let tx = ctx.tx.for_operation();
+    app.core_operation_task = Some(tokio::spawn(async move {
+        let (stages, mut stage_rx) = tokio::sync::mpsc::channel(1);
+        let work = manager.apply_prepared_core(
+            &context.prepared,
+            context.generation,
+            context.intent != CoreIntent::Switch,
+            context.enable_tun,
+            &cancelled,
+            Some(stages),
+        );
+        tokio::pin!(work);
+        let result = loop {
+            tokio::select! {
+                result = &mut work => break result.map_err(|error| format!("{error:#}")),
+                Some(()) = stage_rx.recv() => { let _ = tx.send(Action::CoreUpdateSwitching { id: context.id }).await; }
+            }
+        };
+        let _ = tx.send(Action::CoreUpdateFinished { id: context.id, result }).await;
+    }));
+}
+
+fn context_matches(app: &App, ctx: &Ctx, context: &GuidedTunContext, phase: CoreUpdatePhase) -> bool {
+    app.core_update.as_ref().is_some_and(|update| {
+        update.id == context.id
+            && update.phase == phase
+            && update.generation == context.generation
+            && update.generation == ctx.manager.current_generation()
+            && update.kind == context.prepared.kind
+            && update.prepared.as_ref() == Some(&context.prepared)
+            && update.intent == context.intent
+            && !update.cancelled.load(Ordering::SeqCst)
+            && context.enable_tun == app.gui_config.enable_tun_mode.unwrap_or(false)
+    })
+}
+
+fn tun_result(
+    app: &mut App,
+    ctx: &Ctx,
+    context: GuidedTunContext,
+    result: Result<bool, String>,
+    phase: CoreUpdatePhase,
+) {
+    let result = result.and_then(|needs_setup| {
+        ctx.manager
+            .guided_preflight(context.generation, context.prepared.kind)
+            .map(|()| needs_setup)
+            .map_err(|error| format!("{error:#}"))
+    });
+    tun_result_with(app, ctx, context, result, phase, start_apply);
+}
+
+fn tun_result_with(
+    app: &mut App,
+    ctx: &Ctx,
+    context: GuidedTunContext,
+    result: Result<bool, String>,
+    phase: CoreUpdatePhase,
+    apply: impl FnOnce(&mut App, &Ctx, GuidedTunContext),
+) {
+    if !context_matches(app, ctx, &context, phase) {
+        // A matching active operation whose generation/config changed is visibly failed.
+        if app.core_update.as_ref().is_some_and(|update| {
+            update.id == context.id && update.phase == phase && !update.cancelled.load(Ordering::SeqCst)
+        }) {
+            let update = app.core_update.as_mut().unwrap();
+            update.phase = CoreUpdatePhase::Failed;
+            update.message = "Core ownership/generation or TUN configuration changed during setup; retry".into();
+            app.pending_sudo = None;
+            app.overlay = Some(Overlay::CoreUpdate);
+        }
+        return;
+    }
+    match result {
+        Ok(true) => {
+            let update = app.core_update.as_mut().unwrap();
+            update.phase = CoreUpdatePhase::TunConsent;
+            update.message = crate::commands::privilege::missing_capability_error(&context.prepared.path);
+            app.pending_sudo = Some(PendingSudoAction::GuidedTunSetup(context));
+            app.overlay = Some(Overlay::TunSetupConfirmation);
+        }
+        Ok(false) => apply(app, ctx, context),
+        Err(error) => {
+            let update = app.core_update.as_mut().unwrap();
+            update.phase = CoreUpdatePhase::Failed;
+            update.message = error;
+            app.overlay = Some(Overlay::CoreUpdate);
+        }
+    }
+}
+
+pub(super) fn submit_tun_setup(app: &mut App, ctx: &Ctx, context: GuidedTunContext, password: String) {
+    let target = context.prepared.clone();
+    submit_tun_setup_with(
+        app,
+        ctx,
+        context,
+        password,
+        move |path, password| {
+            binary::validate_permission_target(&target)?;
+            crate::commands::privilege::apply_tun_capability_with_password(path, password)
+        },
+        crate::commands::privilege::require_tun_capability,
+        |manager, context| manager.guided_preflight(context.generation, context.prepared.kind),
+    );
+}
+
+fn submit_tun_setup_with<S, P, O>(
+    app: &mut App,
+    ctx: &Ctx,
+    context: GuidedTunContext,
+    password: String,
+    setup: S,
+    probe: P,
+    owner: O,
+) where
+    S: FnOnce(&std::path::Path, &str) -> anyhow::Result<()> + Send + 'static,
+    P: FnOnce(&std::path::Path) -> anyhow::Result<()> + Send + 'static,
+    O: Fn(&crate::mihomo_manager::MihomoManager, &GuidedTunContext) -> anyhow::Result<()> + Send + 'static,
+{
+    if app.overlay != Some(Overlay::PasswordInput) {
+        return;
+    }
+    if !context_matches(app, ctx, &context, CoreUpdatePhase::TunConsent) {
+        tun_result_with(
+            app,
+            ctx,
+            context,
+            Err("Core setup context changed".into()),
+            CoreUpdatePhase::TunConsent,
+            |_, _, _| {},
+        );
+        return;
+    }
+    let update = app.core_update.as_mut().unwrap();
+    update.phase = CoreUpdatePhase::TunSettingUp;
+    app.overlay = Some(Overlay::CoreUpdate);
+    let cancelled = update.cancelled.clone();
+    let manager = ctx.manager.clone();
+    let tx = ctx.tx.for_operation();
+    app.core_operation_task = Some(tokio::spawn(async move {
+        let completion = context.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let work = (|| {
+                owner(&manager, &context)?;
+                if cancelled.load(Ordering::SeqCst) {
+                    anyhow::bail!("Core operation cancelled");
+                }
+                setup(&context.prepared.path, &password)?;
+                owner(&manager, &context)?;
+                if cancelled.load(Ordering::SeqCst) {
+                    anyhow::bail!("Core operation cancelled");
+                }
+                probe(&context.prepared.path)?;
+                Ok(())
+            })()
+            .map_err(|error: anyhow::Error| format!("{error:#}"));
+            (context, work)
+        })
+        .await;
+        let (context, result) =
+            result.unwrap_or_else(|error| (completion, Err(format!("TUN setup task failed: {error}"))));
+        let _ = tx.send(Action::CoreTunSetupFinished { context, result }).await;
+    }));
 }
 
 pub(super) fn cancel(app: &mut App) {
@@ -156,12 +369,15 @@ pub(super) fn cancel(app: &mut App) {
         return;
     }
     update.cancelled.store(true, Ordering::SeqCst);
+    app.pending_sudo = None;
+    app.password_buffer.clear();
+    app.overlay = Some(Overlay::CoreUpdate);
     if matches!(update.phase, CoreUpdatePhase::Preparing | CoreUpdatePhase::Switching) {
         // Keep the visible operation until restoration has completed.
         update.message = "Cancellation requested; waiting for owned rollback".into();
     } else {
         update.phase = CoreUpdatePhase::Cancelled;
-        update.message.clear();
+        update.message = "TUN/core operation cancelled; current core and configuration unchanged".into();
     }
 }
 
@@ -175,6 +391,17 @@ pub(crate) async fn finish_owned_operation(app: &mut App) {
 }
 
 pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
+    match action {
+        Action::CoreTunChecked { context, result } => {
+            tun_result(app, ctx, context, result, CoreUpdatePhase::TunChecking);
+            return;
+        }
+        Action::CoreTunSetupFinished { context, result } => {
+            tun_result(app, ctx, context, result.map(|()| false), CoreUpdatePhase::TunSettingUp);
+            return;
+        }
+        _ => {}
+    }
     let id = match &action {
         Action::CoreInspected { id, .. }
         | Action::CorePrepared { id, .. }
@@ -191,7 +418,7 @@ pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
     }
     match action {
         Action::CoreInspected { result, .. } if update.phase == CoreUpdatePhase::Checking => match result {
-            CoreInspection::Ready(prepared) => {
+            CoreInspection::Ready(prepared) if prepared.kind == update.kind => {
                 update.prepared = Some(prepared);
                 update.phase = CoreUpdatePhase::Ready;
             }
@@ -204,9 +431,14 @@ pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
                 update.message = message;
                 update.phase = CoreUpdatePhase::Failed;
             }
+            _ => {
+                update.phase = CoreUpdatePhase::Failed;
+                update.message = "Candidate belongs to a different core".into();
+            }
         },
         Action::CorePrepared { prepared, .. }
-            if matches!(update.phase, CoreUpdatePhase::Downloading | CoreUpdatePhase::Verifying) =>
+            if prepared.kind == update.kind
+                && matches!(update.phase, CoreUpdatePhase::Downloading | CoreUpdatePhase::Verifying) =>
         {
             update.prepared = Some(prepared);
             update.phase = CoreUpdatePhase::Ready;
@@ -223,7 +455,12 @@ pub(super) fn event(app: &mut App, ctx: &Ctx, action: Action) {
         Action::CoreUpdateSwitching { .. } if update.phase == CoreUpdatePhase::Preparing => {
             update.phase = CoreUpdatePhase::Switching
         }
-        Action::CoreUpdateFinished { result, .. } => {
+        Action::CoreUpdateFinished { result, .. }
+            if !matches!(
+                update.phase,
+                CoreUpdatePhase::Success | CoreUpdatePhase::Failed | CoreUpdatePhase::Cancelled
+            ) =>
+        {
             update.phase = match &result {
                 Ok(()) => CoreUpdatePhase::Success,
                 Err(_) if update.cancelled.load(Ordering::SeqCst) => CoreUpdatePhase::Cancelled,
@@ -299,6 +536,474 @@ mod tests {
             version: "1.14.2".into(),
             source: "cached".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn guided_tun_decline_preserves_old_runtime_and_exact_operation() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            for intent in [CoreIntent::Start, CoreIntent::Restart, CoreIntent::Switch] {
+                let (ctx, mut rx) = ctx();
+                let fixture = tempfile::tempdir().unwrap();
+                let prepared = binary::PreparedCore {
+                    kind,
+                    path: fixture.path().join(kind.as_str()),
+                    version: binary::target_version(kind).into(),
+                    source: "cached".into(),
+                };
+                let target = prepared.clone();
+                let mut app = App::new();
+                app.core_state = crate::app::CoreState::Running;
+                app.core_pid = Some(42);
+                app.gui_config.enable_tun_mode = Some(true);
+                app.core_version = Some("old-fixture".into());
+                begin_with(&mut app, &ctx, kind, intent, async move {
+                    Ok(CoreInspection::Ready(target))
+                });
+                app.core_operation_task.take().unwrap().await.unwrap();
+                event(&mut app, &ctx, rx.recv().await.unwrap());
+                let id = app.core_update.as_ref().unwrap().id;
+                app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunChecking;
+                tun_result_with(
+                    &mut app,
+                    &ctx,
+                    GuidedTunContext {
+                        id,
+                        generation: 0,
+                        prepared: prepared.clone(),
+                        intent,
+                        enable_tun: true,
+                    },
+                    Ok(true),
+                    CoreUpdatePhase::TunChecking,
+                    |_, _, _| panic!("missing capability requires consent"),
+                );
+                super::super::tun::skip_tun_setup_start(&mut app, &ctx.tx).await;
+                assert_eq!(
+                    app.core_state,
+                    crate::app::CoreState::Running,
+                    "decline must preserve the old core"
+                );
+                assert_eq!(app.core_pid, Some(42));
+                assert_eq!(app.core_version.as_deref(), Some("old-fixture"));
+                assert_eq!(app.gui_config.enable_tun_mode, Some(true));
+                let update = app.core_update.as_ref().unwrap();
+                assert_eq!(update.id, id);
+                assert_eq!(update.prepared.as_ref(), Some(&prepared));
+                assert_eq!(update.phase, CoreUpdatePhase::Cancelled);
+                assert_eq!(app.overlay, Some(Overlay::CoreUpdate));
+                assert!(rx.try_recv().is_err(), "decline never starts a core");
+            }
+        }
+    }
+
+    fn tun_fixture(
+        kind: CoreKind,
+        intent: CoreIntent,
+    ) -> (
+        App,
+        Ctx,
+        tokio::sync::mpsc::Receiver<Action>,
+        GuidedTunContext,
+        tempfile::TempDir,
+    ) {
+        let (ctx, rx) = ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let prepared = binary::PreparedCore {
+            kind,
+            path: dir.path().join(kind.as_str()),
+            version: binary::target_version(kind).into(),
+            source: "cached".into(),
+        };
+        let context = GuidedTunContext {
+            id: 7,
+            generation: 0,
+            prepared: prepared.clone(),
+            intent,
+            enable_tun: true,
+        };
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.core_version = Some("old-fixture".into());
+        *ctx.manager.inner().resolved_binary.lock() = Some(dir.path().join("old-core"));
+        app.traffic_totals = Some((12, 34));
+        app.gui_config.enable_tun_mode = Some(true);
+        app.core_update = Some(CoreUpdate {
+            id: 7,
+            generation: 0,
+            kind,
+            intent,
+            phase: CoreUpdatePhase::TunChecking,
+            request: None,
+            prepared: Some(prepared),
+            message: String::new(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        (app, ctx, rx, context, dir)
+    }
+
+    #[test]
+    fn guided_tun_gate_probes_exact_candidate_and_rejects_foreign_owner_first() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let (_app, _ctx, _rx, context, _dir) = tun_fixture(kind, CoreIntent::Restart);
+            let cancelled = AtomicBool::new(false);
+            assert!(
+                check_tun_with(
+                    &context,
+                    &cancelled,
+                    || Ok(()),
+                    || false,
+                    |path| {
+                        assert_eq!(path, context.prepared.path);
+                        false
+                    }
+                )
+                .unwrap()
+            );
+            assert!(
+                !check_tun_with(
+                    &context,
+                    &cancelled,
+                    || Ok(()),
+                    || true,
+                    |_| panic!("root does not probe")
+                )
+                .unwrap()
+            );
+            assert!(!check_tun_with(&context, &cancelled, || Ok(()), || false, |_| true).unwrap());
+            let mut off = context.clone();
+            off.enable_tun = false;
+            assert!(!check_tun_with(&off, &cancelled, || Ok(()), || panic!("TUN off"), |_| panic!("TUN off")).unwrap());
+            assert!(
+                check_tun_with(
+                    &context,
+                    &cancelled,
+                    || anyhow::bail!("GUI owner"),
+                    || panic!("owner first"),
+                    |_| panic!("owner first")
+                )
+                .unwrap_err()
+                .contains("GUI")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_tun_setup_success_rechecks_exact_target_and_resumes_once_across_stream_cancel() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            for intent in [CoreIntent::Start, CoreIntent::Restart, CoreIntent::Switch] {
+                let (mut app, ctx, mut rx, context, _dir) = tun_fixture(kind, intent);
+                tun_result_with(
+                    &mut app,
+                    &ctx,
+                    context.clone(),
+                    Ok(true),
+                    CoreUpdatePhase::TunChecking,
+                    |_, _, _| panic!("consent before apply"),
+                );
+                assert_eq!(app.overlay, Some(Overlay::TunSetupConfirmation));
+                let path = context.prepared.path.clone();
+                let probed_path = path.clone();
+                // Submission before explicit y is ignored, even with a pending exact target.
+                submit_tun_setup_with(
+                    &mut app,
+                    &ctx,
+                    context.clone(),
+                    "fixture-password".into(),
+                    |_, _| panic!("no y"),
+                    |_| panic!("no y"),
+                    |_, _| Ok(()),
+                );
+                assert!(app.core_operation_task.is_none());
+                super::super::tun::confirm_tun_setup(&mut app);
+                app.pending_sudo = None;
+                let checks = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let counter = checks.clone();
+                submit_tun_setup_with(
+                    &mut app,
+                    &ctx,
+                    context.clone(),
+                    "fixture-password".into(),
+                    move |target, password| {
+                        assert_eq!(target, path);
+                        assert_eq!(password, "fixture-password");
+                        Ok(())
+                    },
+                    move |target| {
+                        assert_eq!(target, probed_path);
+                        Ok(())
+                    },
+                    move |_, _| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                );
+                ctx.cancel_background();
+                app.core_operation_task.take().unwrap().await.unwrap();
+                assert_eq!(checks.load(Ordering::SeqCst), 2);
+                let action = ctx.tx.accept(rx.recv().await.unwrap()).unwrap();
+                let Action::CoreTunSetupFinished {
+                    context: resumed,
+                    result,
+                } = action
+                else {
+                    panic!("guided completion required");
+                };
+                assert_eq!(resumed, context);
+                let mut applied = 0;
+                tun_result_with(
+                    &mut app,
+                    &ctx,
+                    resumed.clone(),
+                    result.map(|()| false),
+                    CoreUpdatePhase::TunSettingUp,
+                    |app, _, exact| {
+                        assert_eq!(exact, context);
+                        applied += 1;
+                        app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::Preparing;
+                    },
+                );
+                tun_result_with(
+                    &mut app,
+                    &ctx,
+                    resumed,
+                    Ok(false),
+                    CoreUpdatePhase::TunSettingUp,
+                    |_, _, _| applied += 1,
+                );
+                assert_eq!(applied, 1);
+                assert_eq!(app.core_pid, Some(42));
+                assert_eq!(app.gui_config.get_valid_proxy_core(), "mihomo");
+            }
+        }
+    }
+
+    #[test]
+    fn guided_tun_stale_wrong_target_and_password_cancel_cannot_resume() {
+        for changed in 0..7 {
+            let (mut app, ctx, _rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::Switch);
+            app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunSettingUp;
+            let mut wrong = context.clone();
+            match changed {
+                0 => wrong.id += 1,
+                1 => wrong.generation += 1,
+                2 => wrong.prepared.kind = CoreKind::Mihomo,
+                3 => wrong.prepared.path = wrong.prepared.path.with_file_name("other"),
+                4 => wrong.intent = CoreIntent::Start,
+                5 => {
+                    ctx.manager.inner().generation.store(1, Ordering::SeqCst);
+                }
+                _ => wrong.enable_tun = false,
+            }
+            tun_result_with(
+                &mut app,
+                &ctx,
+                wrong,
+                Ok(false),
+                CoreUpdatePhase::TunSettingUp,
+                |_, _, _| panic!("stale completion must never apply"),
+            );
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.gui_config.get_valid_proxy_core(), "mihomo");
+            assert_eq!(app.gui_config.enable_tun_mode, Some(true));
+        }
+        let (mut app, ctx, _rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::Switch);
+        tun_result_with(
+            &mut app,
+            &ctx,
+            context.clone(),
+            Ok(true),
+            CoreUpdatePhase::TunChecking,
+            |_, _, _| panic!("no consent"),
+        );
+        super::super::tun::confirm_tun_setup(&mut app);
+        app.password_buffer = vec!['x'];
+        super::super::tun::handle_password_cancel(&mut app);
+        assert_eq!(app.core_state, crate::app::CoreState::Running);
+        assert!(app.password_buffer.is_empty());
+        assert_eq!(app.overlay, Some(Overlay::CoreUpdate));
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Cancelled);
+        tun_result_with(
+            &mut app,
+            &ctx,
+            context,
+            Ok(false),
+            CoreUpdatePhase::TunSettingUp,
+            |_, _, _| panic!("cancelled"),
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_tun_setup_failure_and_failed_recheck_leave_old_runtime_visible() {
+        for fail_probe in [false, true] {
+            let (mut app, ctx, mut rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::Restart);
+            app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunConsent;
+            app.overlay = Some(Overlay::PasswordInput);
+            submit_tun_setup_with(
+                &mut app,
+                &ctx,
+                context,
+                "fixture".into(),
+                move |_, _| {
+                    if fail_probe {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("fixture setup failed")
+                    }
+                },
+                |_| anyhow::bail!("fixture capability still missing"),
+                |_, _| Ok(()),
+            );
+            app.core_operation_task.take().unwrap().await.unwrap();
+            let Action::CoreTunSetupFinished { context, result } = rx.recv().await.unwrap() else {
+                panic!("guided result");
+            };
+            tun_result_with(
+                &mut app,
+                &ctx,
+                context,
+                result.map(|()| false),
+                CoreUpdatePhase::TunSettingUp,
+                |_, _, _| panic!("failure never applies"),
+            );
+            assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Failed);
+            assert!(app.core_update.as_ref().unwrap().message.contains("fixture"));
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.traffic_totals, Some((12, 34)));
+            assert_eq!(app.overlay, Some(Overlay::CoreUpdate));
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_tun_generation_change_or_cancel_during_setup_cannot_resume() {
+        for cancellation in [false, true] {
+            let (mut app, ctx, mut rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::Restart);
+            app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunConsent;
+            app.overlay = Some(Overlay::PasswordInput);
+            let token = app.core_update.as_ref().unwrap().cancelled.clone();
+            let manager = ctx.manager.clone();
+            submit_tun_setup_with(
+                &mut app,
+                &ctx,
+                context,
+                "fixture".into(),
+                move |_, _| {
+                    if cancellation {
+                        token.store(true, Ordering::SeqCst);
+                    } else {
+                        manager.inner().generation.store(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                },
+                |_| panic!("changed operation must not pass to capability recheck"),
+                |manager, context| {
+                    if manager.current_generation() != context.generation {
+                        anyhow::bail!("fixture generation changed");
+                    }
+                    Ok(())
+                },
+            );
+            app.core_operation_task.take().unwrap().await.unwrap();
+            let Action::CoreTunSetupFinished { context, result } = rx.recv().await.unwrap() else {
+                panic!("guided result");
+            };
+            assert!(result.is_err());
+            if cancellation {
+                cancel(&mut app);
+            }
+            tun_result_with(
+                &mut app,
+                &ctx,
+                context,
+                result.map(|()| false),
+                CoreUpdatePhase::TunSettingUp,
+                |_, _, _| panic!("changed operation never resumes"),
+            );
+            assert_eq!(
+                app.core_update.as_ref().unwrap().phase,
+                if cancellation {
+                    CoreUpdatePhase::Cancelled
+                } else {
+                    CoreUpdatePhase::Failed
+                }
+            );
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.gui_config.enable_tun_mode, Some(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn guided_tun_setup_worker_panic_reports_persistent_failure_without_password() {
+        let (mut app, ctx, mut rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::Restart);
+        app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunConsent;
+        app.overlay = Some(Overlay::PasswordInput);
+        submit_tun_setup_with(
+            &mut app,
+            &ctx,
+            context,
+            "fixture-private-password".into(),
+            |_, _| panic!("fixture worker panic"),
+            |_| panic!("setup failed"),
+            |_, _| Ok(()),
+        );
+        app.core_operation_task.take().unwrap().await.unwrap();
+        let Action::CoreTunSetupFinished { context, result } = rx.recv().await.unwrap() else {
+            panic!("failure result required");
+        };
+        assert!(result.as_ref().unwrap_err().contains("TUN setup task failed"));
+        assert!(!result.as_ref().unwrap_err().contains("fixture-private-password"));
+        tun_result_with(
+            &mut app,
+            &ctx,
+            context,
+            result.map(|()| false),
+            CoreUpdatePhase::TunSettingUp,
+            |_, _, _| panic!("failure never starts"),
+        );
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Failed);
+        assert_eq!(app.overlay, Some(Overlay::CoreUpdate));
+        assert_eq!(app.core_pid, Some(42));
+    }
+
+    #[test]
+    fn guided_tun_settings_setup_only_does_not_modify_runtime_or_selection() {
+        let (mut app, ctx, _rx, context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::TunSetup);
+        app.core_update.as_mut().unwrap().phase = CoreUpdatePhase::TunSettingUp;
+        let old_path = ctx.manager.binary_path();
+        tun_result_with(
+            &mut app,
+            &ctx,
+            context,
+            Ok(false),
+            CoreUpdatePhase::TunSettingUp,
+            start_apply,
+        );
+        assert_eq!(app.core_state, crate::app::CoreState::Running);
+        assert_eq!(app.core_pid, Some(42));
+        assert_eq!(app.core_version.as_deref(), Some("old-fixture"));
+        assert_eq!(ctx.manager.binary_path(), old_path);
+        assert_eq!(app.traffic_totals, Some((12, 34)));
+        assert_eq!(ctx.manager.core_kind(), CoreKind::Mihomo);
+        assert_eq!(app.gui_config.get_valid_proxy_core(), "mihomo");
+        assert!(app.core_operation_task.is_none());
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Success);
+    }
+
+    #[test]
+    fn guided_tun_setup_only_existing_version_cannot_be_used_for_lifecycle() {
+        let (mut app, ctx, _rx, mut context, _dir) = tun_fixture(CoreKind::SingBox, CoreIntent::TunSetup);
+        context.prepared.version = "1.0.0".into();
+        start_apply(&mut app, &ctx, context.clone());
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Success);
+        context.intent = CoreIntent::Start;
+        start_apply(&mut app, &ctx, context);
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Failed);
+        assert!(app.core_update.as_ref().unwrap().message.contains("Unreviewed"));
+        assert!(app.core_operation_task.is_none());
+        assert_eq!(app.core_pid, Some(42));
     }
 
     #[tokio::test]
