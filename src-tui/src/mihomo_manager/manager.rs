@@ -70,6 +70,14 @@ pub struct ManagerInner {
     pub core_kind: AtomicU8,
     /// TCP port of the sing-box clash_api controller (fixed loopback host).
     pub singbox_port: AtomicU16,
+    /// Controller secret resolved (and, on a fresh install or a weak value,
+    /// rotated + persisted) by `enhance::resolve_controller_secret` at spawn
+    /// time. It overrides the `MihomoManager`'s construction-time snapshot of
+    /// `config.yaml`: the manager is built *before* the rotation, so its
+    /// snapshot still holds the template's `set-your-secret` and every
+    /// controller call would answer 401 — fatal for sing-box, whose clash_api
+    /// is a TCP transport that really enforces the bearer secret.
+    secret_override: Mutex<Option<String>>,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -238,7 +246,23 @@ impl ManagerInner {
             expected_exit_gen: AtomicU64::new(u64::MAX),
             core_kind: AtomicU8::new(0),
             singbox_port: AtomicU16::new(9090),
+            secret_override: Mutex::new(None),
         }
+    }
+
+    /// Publish the secret that was just resolved/persisted for this spawn.
+    pub fn set_secret_override(&self, secret: String) {
+        *self.secret_override.lock() = Some(secret);
+    }
+
+    /// Drop the published secret (an explicit `set_secret` supersedes it).
+    pub fn clear_secret_override(&self) {
+        *self.secret_override.lock() = None;
+    }
+
+    /// The secret last resolved by the spawn path, if any.
+    pub fn secret_override(&self) -> Option<String> {
+        self.secret_override.lock().clone()
     }
 
     /// D-09: 3-in-60s policy. Returns `true` if another auto-restart is
@@ -363,9 +387,13 @@ impl ManagerInner {
         // config.yaml does not exist yet; composing it here is what makes
         // `start` work out of the box instead of failing with a bare
         // ENOENT from `controller_secret_from_config`.
-        crate::enhance::resolve_controller_secret()
+        let secret = crate::enhance::resolve_controller_secret()
             .await
             .context("failed to prepare the controller secret in the clash config; no core was started")?;
+        // Publish it to the live manager: it was built from the pre-rotation
+        // config.yaml, so its snapshot still carries the template secret and
+        // every controller call would be rejected (401) on sing-box.
+        inner.set_secret_override(secret);
         // Validate control-plane auth before a child exists; errors here
         // cannot leak an unsupervised process or invalidate rollback.
         let probe_api = api_for_core(
@@ -969,6 +997,8 @@ impl MihomoManager {
 
     pub fn set_secret(&mut self, secret: String) {
         self.secret = secret;
+        // An explicit assignment supersedes anything the spawn path published.
+        self.inner.clear_secret_override();
     }
 
     pub fn set_socket_path(&mut self, path: PathBuf) {
@@ -981,13 +1011,32 @@ impl MihomoManager {
         self.inner.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// The secret the controller client must present.
+    ///
+    /// Resolution order: the value the spawn path published (it also
+    /// persisted it into `config.yaml`), else the manager's own snapshot when
+    /// that snapshot is a real secret, else the last secret resolved anywhere
+    /// in this process, else the snapshot verbatim. Every one of the secret's
+    /// producers (spawn, sing-box config generation) runs before the first
+    /// controller call, so a template `set-your-secret` snapshot never reaches
+    /// the wire.
+    pub fn effective_secret(&self) -> String {
+        if let Some(resolved) = self.inner.secret_override() {
+            return resolved;
+        }
+        if !self.secret.trim().is_empty() && !crate::enhance::is_placeholder_secret(&self.secret) {
+            return self.secret.clone();
+        }
+        crate::enhance::last_resolved_secret().unwrap_or_else(|| self.secret.clone())
+    }
+
     pub fn api(&self) -> MihomoApi {
+        let secret = self.effective_secret();
         let result = match self.core_kind() {
-            CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), self.secret.clone()),
-            CoreKind::SingBox => MihomoApi::with_transport(
-                crate::mihomo_api::Transport::Tcp(self.singbox_controller),
-                self.secret.clone(),
-            ),
+            CoreKind::Mihomo => MihomoApi::new(self.socket_path.clone(), secret),
+            CoreKind::SingBox => {
+                MihomoApi::with_transport(crate::mihomo_api::Transport::Tcp(self.singbox_controller), secret)
+            }
         };
         result
             .expect("MihomoApi construction failed — secret may contain invalid header characters")
@@ -4257,6 +4306,16 @@ fn convert_one_rule(
     }
     let converted = crate::routing::to_singbox_json(&model)
         .ok_or_else(|| format!("kind {} cannot be represented by sing-box 1.14.2; skipped", fields[0]))?;
+    // A rule whose target the conversion could not produce would be a
+    // dangling outbound reference, which aborts the whole config. Check
+    // before materializing any rule-set so a dropped rule never leaves an
+    // orphan download.
+    let tag = normalize_policy_tag(&target);
+    if !known_outbounds.contains(&tag) {
+        return Err(format!(
+            "target {target:?} is not an available outbound in the converted config; skipped"
+        ));
+    }
     // GEOIP/GEOSITE map to rule-set references; materialize the sets.
     if let Some(tags) = converted.get("rule_set").and_then(serde_json::Value::as_array) {
         for tag in tags.iter().filter_map(serde_json::Value::as_str) {
@@ -4267,14 +4326,6 @@ fn convert_one_rule(
                 .ok_or_else(|| format!("rule-set {tag:?} is unknown; skipped"))?;
             out.rule_sets.push(set);
         }
-    }
-    // A rule whose target the conversion could not produce would be a
-    // dangling outbound reference, which aborts the whole config.
-    let tag = normalize_policy_tag(&target);
-    if !known_outbounds.contains(&tag) {
-        return Err(format!(
-            "target {target:?} is not an available outbound in the converted config; skipped"
-        ));
     }
     let mut rule = converted;
     rule["outbound"] = serde_json::json!(tag);
@@ -4660,5 +4711,71 @@ mod alignment_regressions {
                 .unwrap()
                 .contains("user-picked")
         );
+    }
+    /// P1-A: the secret resolved at spawn time must reach the live manager.
+    /// A manager is built from `config.yaml` *before* the rotation, so it
+    /// keeps the template's `set-your-secret`; sing-box enforces the bearer
+    /// secret on its TCP clash_api, so every controller call answered 401 and
+    /// a fresh-install start failed readiness.
+    #[tokio::test]
+    async fn a_rotated_secret_is_propagated_into_the_live_manager() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: set-your-secret\n",
+        )
+        .unwrap();
+
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_core_kind(CoreKind::SingBox)
+            .with_socket(home.path().join("external-controller.sock"))
+            .with_singbox_controller("127.0.0.1:49715".parse().unwrap())
+            .with_secret("set-your-secret".into());
+        // The manager's own snapshot is still the template secret; only the
+        // spawn-path publication below fixes that (the process-wide fallback
+        // may already hold another test's secret, so it is not asserted here).
+
+        // What `spawn_core_as` does after resolving.
+        let secret = crate::enhance::resolve_controller_secret().await.unwrap();
+        manager.inner().set_secret_override(secret.clone());
+
+        assert_eq!(
+            manager.effective_secret(),
+            secret,
+            "api() must present the rotated secret"
+        );
+        assert_ne!(manager.effective_secret(), "set-your-secret");
+    }
+
+    /// P1-A, other producer: the sing-box config generation path resolves the
+    /// same secret, and a manager built before it must pick it up too.
+    #[tokio::test]
+    async fn a_singbox_generation_secret_reaches_a_previously_built_manager() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: set-your-secret\n",
+        )
+        .unwrap();
+
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_core_kind(CoreKind::SingBox)
+            .with_socket(home.path().join("external-controller.sock"))
+            .with_singbox_controller("127.0.0.1:49715".parse().unwrap())
+            .with_secret("set-your-secret".into());
+
+        let generated = home.path().join("candidate.json");
+        let (_path, _parts) = ManagerInner::write_singbox_assembled_to(home.path(), None, false, &generated)
+            .await
+            .unwrap();
+        let generated_secret = crate::enhance::last_resolved_secret().expect("resolved secret published");
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&generated).unwrap()).unwrap();
+        assert_eq!(
+            written["experimental"]["clash_api"]["secret"],
+            serde_json::Value::from(generated_secret.as_str())
+        );
+        assert_eq!(manager.effective_secret(), generated_secret);
     }
 }

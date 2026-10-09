@@ -17,6 +17,20 @@ const DEFAULT_TPROXY_PORT: u16 = 7896;
 const DEFAULT_TUN_STACK: &str = "gvisor";
 const DEFAULT_TUN_DNS_HIJACK: &[&str] = &["any:53"];
 
+/// Origins allowed to reach the mihomo external controller over CORS.
+///
+/// The CLI ships no web UI: it talks to the controller from a loopback client
+/// that never sends an `Origin` header. The upstream GUI template allowed
+/// third-party dashboards (yacd / metacubex / zash) and private-network
+/// access, which lets any page a user visits read and rewrite the controller —
+/// including the proxy configuration. Keep it loopback-only.
+pub const CONTROLLER_ALLOW_ORIGINS: &[&str] = &[
+    "http://localhost",
+    "https://localhost",
+    "http://127.0.0.1",
+    "http://[::1]",
+];
+
 #[derive(Default, Debug, Clone)]
 pub struct IClashTemp(pub Mapping);
 
@@ -81,18 +95,8 @@ impl IClashTemp {
                 .into(),
         );
         map.insert("tun".into(), tun_config.into());
-        cors_map.insert("allow-private-network".into(), true.into());
-        cors_map.insert(
-            "allow-origins".into(),
-            vec![
-                "tauri://localhost",
-                "http://tauri.localhost",
-                "https://yacd.metacubex.one",
-                "https://metacubex.github.io",
-                "https://board.zash.run.place",
-            ]
-            .into(),
-        );
+        cors_map.insert("allow-private-network".into(), false.into());
+        cors_map.insert("allow-origins".into(), CONTROLLER_ALLOW_ORIGINS.into());
         map.insert("secret".into(), "set-your-secret".into());
         map.insert("external-controller-cors".into(), cors_map.into());
         map.insert("unified-delay".into(), true.into());
@@ -346,6 +350,46 @@ mod tests {
             get_case(8888, "192.168.1.1:80800"),
             get_result(8888, DEFAULT_EXTERNAL_CONTROLLER)
         );
+    }
+
+    /// The CLI has no web dashboard, so the controller it binds must not be
+    /// reachable from a third-party page (yacd/metacubex/zash) nor over the
+    /// private network. Loopback origins only.
+    #[test]
+    fn the_template_controller_cors_is_loopback_only() {
+        let cors = IClashTemp::template()
+            .0
+            .get("external-controller-cors")
+            .and_then(|value| value.as_mapping())
+            .expect("external-controller-cors")
+            .clone();
+
+        assert_eq!(
+            cors.get("allow-private-network").and_then(Value::as_bool),
+            Some(false),
+            "the CLI must not let a page reach the controller over the local network"
+        );
+        let origins = cors
+            .get("allow-origins")
+            .and_then(Value::as_sequence)
+            .expect("allow-origins")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            !origins.is_empty(),
+            "the CLI's own loopback client needs no Origin, but deny-all is not the policy"
+        );
+        assert!(
+            !origins.contains(&"*"),
+            "wildcard origin must never be allowed: {origins:?}"
+        );
+        for origin in &origins {
+            assert!(
+                origin.contains("localhost") || origin.contains("127.0.0.1") || origin.contains("[::1]"),
+                "non-loopback controller origin in the template: {origin}"
+            );
+        }
     }
 }
 

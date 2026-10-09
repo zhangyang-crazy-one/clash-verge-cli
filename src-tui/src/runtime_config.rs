@@ -86,7 +86,11 @@ pub async fn apply_singbox_restart_for_profile(
     profile_uid: Option<&str>,
 ) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let core_running = manager.state() == crate::app::CoreState::Running;
+    // Captured at entry and used for the whole transaction: a failed restart
+    // clears the manager's pid, so conditioning the rollback restart on the
+    // post-failure state skipped the retry and left the previous config
+    // restored on disk with no core running at all.
+    let was_running = manager.state() == crate::app::CoreState::Running;
     // #55: sing-box has no hot reload, so applying a profile means
     // restarting the core. Requiring this process to be the parent made
     // `profile use` / `profile update --reload` impossible under sing-box:
@@ -100,7 +104,7 @@ pub async fn apply_singbox_restart_for_profile(
         // a detached supervisor so the replacement outlives this process.
         manager.restart_through_supervisor().await
     };
-    if core_running
+    if was_running
         && let Err(error) = crate::mihomo_manager::manager::supervisor_restart_policy(
             manager.owns_child(),
             manager.pid(),
@@ -166,7 +170,7 @@ pub async fn apply_singbox_restart_for_profile(
 
     // Keep the validated durable config current while stopped, but never turn
     // a refresh/settings write into an implicit core start.
-    if !core_running {
+    if !was_running {
         transaction.commit();
         persist_dns_override_state(dns_state.as_ref()).await;
         return Ok(if parts.profile_used {
@@ -186,11 +190,10 @@ pub async fn apply_singbox_restart_for_profile(
         transaction
             .rollback()
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
-        // Retry with the previous configuration only when a core is still
-        // tracked by this manager; after a supervisor-launched replacement
-        // the next invocation adopts the new pid from the record.
-        if transaction.previous.is_some()
-            && (manager.owns_child() || manager.pid().is_some())
+        // Retry with the previous configuration whenever a core was running
+        // when we entered: the failed restart already cleared the pid, so the
+        // manager state can no longer answer this question.
+        if should_retry_rollback_restart(transaction.previous.is_some(), was_running)
             && let Err(rollback_error) = restart().await
         {
             return Err(format!(
@@ -296,6 +299,19 @@ impl Drop for RuntimeCandidate {
         }
         let _ = std::fs::remove_file(&self.candidate);
     }
+}
+
+/// Whether a failed restart should be retried against the restored previous
+/// config.
+///
+/// Driven by the state captured at entry (`was_running`), never by the state
+/// left behind by the failure: a failed restart clears the manager's pid, so
+/// `owns_child || pid.is_some()` is false exactly when a core was running and
+/// needs to come back — which left the previous config on disk with nothing
+/// serving it. There is nothing to bring up when no core was running, and
+/// nothing to restore when there was no previous config.
+fn should_retry_rollback_restart(has_previous: bool, was_running: bool) -> bool {
+    has_previous && was_running
 }
 
 /// Task 8.1/7.5 helper: regenerate from the ACTIVE profile (not a caller
@@ -1216,5 +1232,24 @@ mod tests {
             .expect_err("/bin/false always fails");
         assert!(err.contains(&config.display().to_string()), "{err}");
         let _ = std::fs::remove_file(&config);
+    }
+    /// The rollback restart is driven by the state captured at entry, not by
+    /// the manager state a failed restart leaves behind (which has no pid at
+    /// all — the case that used to skip the retry and strand the previous
+    /// config on disk with nothing running).
+    #[test]
+    fn the_rollback_restart_follows_the_entry_state() {
+        assert!(
+            should_retry_rollback_restart(true, true),
+            "a failed restart of a running core must retry the previous config"
+        );
+        assert!(
+            !should_retry_rollback_restart(true, false),
+            "nothing to bring back when no core was running"
+        );
+        assert!(
+            !should_retry_rollback_restart(false, true),
+            "nothing to restore when there was no previous config"
+        );
     }
 }

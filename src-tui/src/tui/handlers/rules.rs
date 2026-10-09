@@ -65,20 +65,30 @@ fn compose_edit_buffer(
 /// Persist the split rule buffer: clash rules back into the profile YAML,
 /// logical rules into the sing-box sidecar.
 ///
-/// The sidecar is always written, and removed when no logical rule is left
-/// (#59): writing only on a non-empty list left deleted rules in place, and
-/// never writing it lost every rule that was already saved.
+/// The sidecar is written — and removed when no logical rule is left (#59) —
+/// only under the sing-box core, which is the only core that consumes it.
+/// Under mihomo the buffer holds no logical rule (the save path rejects them),
+/// so writing it would take the partition's empty list and delete every rule
+/// the user had saved for their next sing-box run.
+///
+/// Under sing-box the sidecar is always written: writing only on a non-empty
+/// list left deleted rules in place, and never writing it lost every rule that
+/// was already saved.
 fn persist_rules(
     path: &std::path::Path,
     home: &std::path::Path,
     yaml: &str,
     buffer: Vec<crate::routing::IRouteRule>,
+    kind: crate::mihomo_manager::CoreKind,
 ) -> Result<(), String> {
     let (clash_rules, logical): (Vec<_>, Vec<_>) = buffer
         .into_iter()
         .partition(|r| !matches!(r, crate::routing::IRouteRule::Logical { .. }));
     let saved = crate::routing::save_profile_rules(yaml, &clash_rules)?;
     write_atomic(path, &saved)?;
+    if kind != crate::mihomo_manager::CoreKind::SingBox {
+        return Ok(());
+    }
     persist_logical_rules(home, &logical)
 }
 
@@ -98,12 +108,47 @@ fn persist_logical_rules(home: &std::path::Path, logical: &[crate::routing::IRou
     crate::singbox::save_logical_rules(home, logical)
 }
 
-/// Write through a temporary file in the same directory and rename over the
-/// target, so an interrupted save cannot leave a truncated profile.
+/// Write through a uniquely-named temporary file in the same directory and
+/// rename it over the target, so an interrupted save cannot leave a truncated
+/// profile and concurrent writers cannot share a staging name.
+///
+/// Follows the same convention as `singbox::storage::atomic_write`: the
+/// staging file is created `create_new` with owner-only permissions, its
+/// content is fsynced before the rename, and an existing target's mode is
+/// mirrored (otherwise the profile would silently become 0600 or 0644).
 fn write_atomic(path: &std::path::Path, body: &str) -> Result<(), String> {
-    let temporary = path.with_extension("yaml.tmp");
-    std::fs::write(&temporary, body).map_err(|error| format!("write {}: {error}", temporary.display()))?;
-    if let Err(error) = std::fs::rename(&temporary, path) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("profile.yaml");
+    let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(".{name}.{}.{sequence}.tmp", std::process::id()));
+
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mode = std::fs::metadata(path)
+                .map(|meta| meta.permissions().mode())
+                .unwrap_or(0o600);
+            options.mode(mode);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if let Err(error) = result {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("replace {}: {error}", path.display()));
     }
@@ -403,7 +448,7 @@ fn spawn_rules_save(
             {
                 return Err("logical rules require the sing-box core".into());
             }
-            persist_rules(&path, &home, &yaml, buffer)?;
+            persist_rules(&path, &home, &yaml, buffer, manager.core_kind())?;
             Ok(item)
         }
         .await;
@@ -575,6 +620,7 @@ pub(super) fn note_dns_failed(app: &mut App, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mihomo_manager::CoreKind;
     use crate::routing::{IRouteRule, LogicOp, MatchField, RuleTarget};
 
     const PROFILE: &str = "proxies: []\nrules:\n  - DOMAIN,a.com,DIRECT\n  - MATCH,PROXY\n";
@@ -640,6 +686,7 @@ mod tests {
                     clash_raw: "MATCH,DIRECT".into(),
                 },
             ],
+            CoreKind::SingBox,
         )
         .expect("persist");
 
@@ -666,7 +713,7 @@ mod tests {
         crate::singbox::save_logical_rules(&home, &[logical("c.com")]).expect("seed sidecar");
         assert!(home.join(crate::singbox::LOGICAL_RULES_FILE).is_file());
 
-        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")]).expect("persist");
+        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::SingBox).expect("persist");
 
         assert!(!home.join(crate::singbox::LOGICAL_RULES_FILE).exists());
         assert!(crate::singbox::load_logical_rules(&home).unwrap().is_empty());
@@ -682,13 +729,27 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        persist_rules(&profile, &home, PROFILE, vec![simple("a.com"), logical("c.com")]).expect("first");
+        persist_rules(
+            &profile,
+            &home,
+            PROFILE,
+            vec![simple("a.com"), logical("c.com")],
+            CoreKind::SingBox,
+        )
+        .expect("first");
         assert_eq!(
             crate::singbox::load_logical_rules(&home).unwrap(),
             vec![logical("c.com")]
         );
 
-        persist_rules(&profile, &home, PROFILE, vec![simple("a.com"), logical("d.com")]).expect("second");
+        persist_rules(
+            &profile,
+            &home,
+            PROFILE,
+            vec![simple("a.com"), logical("d.com")],
+            CoreKind::SingBox,
+        )
+        .expect("second");
         assert_eq!(
             crate::singbox::load_logical_rules(&home).unwrap(),
             vec![logical("d.com")]
@@ -705,9 +766,74 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        let error = persist_rules(&profile, &home, "rules: [oops\n", vec![logical("c.com")]).expect_err("invalid yaml");
+        let error = persist_rules(
+            &profile,
+            &home,
+            "rules: [oops\n",
+            vec![logical("c.com")],
+            CoreKind::SingBox,
+        )
+        .expect_err("invalid yaml");
         assert!(!error.is_empty());
         assert_eq!(std::fs::read_to_string(&profile).unwrap(), PROFILE);
         assert!(!home.join(crate::singbox::LOGICAL_RULES_FILE).exists());
+    }
+
+    /// Saving rules while running mihomo must not touch the sing-box logical
+    /// sidecar: the mihomo buffer holds no logical rule, so writing the empty
+    /// partition deleted every logical rule the user had saved — data loss
+    /// that only surfaced on the next core switch.
+    #[test]
+    fn a_mihomo_save_leaves_the_singbox_sidecar_untouched() {
+        let dir = temp_dir("mihomo-sidecar");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+        crate::singbox::save_logical_rules(&home, &[logical("c.com")]).expect("seed sidecar");
+
+        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::Mihomo).expect("persist");
+
+        assert_eq!(
+            crate::singbox::load_logical_rules(&home).unwrap(),
+            vec![logical("c.com")],
+            "a mihomo rule save must not delete the sing-box logical rules"
+        );
+        // The clash side of the save still happened.
+        let after = std::fs::read_to_string(&profile).expect("reread");
+        assert!(after.contains("DOMAIN,a.com,DIRECT"), "{after}");
+    }
+
+    /// The atomic write follows the `singbox` convention: unique staging
+    /// name, owner-only permissions (mirroring an existing target's mode),
+    /// and no staging file left behind.
+    #[test]
+    fn the_profile_write_is_atomic_and_private() {
+        let dir = temp_dir("atomic");
+        let profile = dir.join("profile.yaml");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        write_atomic(&profile, "proxies: []\nrules: []\n").expect("write");
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), "proxies: []\nrules: []\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let before = std::fs::metadata(&profile).expect("stat").permissions().mode() & 0o777;
+            std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o600)).expect("tighten");
+            write_atomic(&profile, "proxies: []\nrules: []\n").expect("rewrite");
+            let after = std::fs::metadata(&profile).expect("stat").permissions().mode() & 0o777;
+            assert_eq!(after, 0o600, "an existing target's mode is mirrored");
+            assert_ne!(before, 0, "precondition: the seeded file had some mode");
+        }
+
+        // No staging file survives the write, under either naming convention.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "profile.yaml")
+            .collect();
+        assert!(leftovers.is_empty(), "staging files left behind: {leftovers:?}");
     }
 }
