@@ -14,6 +14,7 @@
 //! [`Ctx`] and receive its result as another action.
 
 mod connections;
+mod core_update;
 mod lifecycle;
 mod navigation;
 mod profile;
@@ -37,6 +38,7 @@ use crate::tui::{TerminalGuard, input};
 use navigation::key_context;
 pub(crate) use navigation::view_filters;
 
+pub(super) use core_update::finish_owned_operation;
 pub(super) use profile::spawn_auto_update;
 
 /// What the event loop does after a handler returns.
@@ -323,6 +325,14 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             ctx.cancel_background();
             lifecycle::note_error(app, msg);
         }
+        Action::ConfirmCoreUpdate => core_update::confirm(app, ctx),
+        Action::RequestCoreUpdate { kind, intent } => core_update::begin(app, ctx, kind, intent),
+        Action::CancelCoreUpdate => core_update::cancel(app),
+        action @ (Action::CoreInspected { .. }
+        | Action::CorePrepared { .. }
+        | Action::CoreUpdateProgress(_)
+        | Action::CoreUpdateFinished { .. }
+        | Action::CoreUpdateSwitching { .. }) => core_update::event(app, ctx, action),
         Action::ResumeCoreStart { enable_tun } => lifecycle::resume_start(ctx, enable_tun),
 
         // Profiles and subscriptions.

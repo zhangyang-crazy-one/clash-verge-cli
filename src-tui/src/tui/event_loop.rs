@@ -287,6 +287,7 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
     action_rx.close();
     ctx.tx.cancel_and_wait().await;
     finish_loop(loop_error, async {
+        handlers::finish_owned_operation(&mut app).await;
         if ctx.manager.owns_child() {
             ctx.manager.stop().await?;
         }

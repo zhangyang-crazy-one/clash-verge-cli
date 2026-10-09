@@ -98,6 +98,7 @@ impl Focus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
+    CoreUpdate,
     Help,
     Filter,
     CloseConfirmation,
@@ -151,6 +152,7 @@ pub enum TunSetupReason {
     /// Capability is fine; only the systemd-resolved DNS polkit rule is
     /// missing: soft gate — the core can still start, it will just show
     /// system auth dialogs until the rule is installed.
+    #[allow(dead_code)]
     MissingDnsRule,
 }
 
@@ -203,8 +205,61 @@ pub struct RuntimeErrors {
     pub logs: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreIntent {
+    Start,
+    Restart,
+    Switch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreUpdatePhase {
+    Checking,
+    Consent,
+    Downloading,
+    Verifying,
+    Ready,
+    Preparing,
+    Switching,
+    Success,
+    Failed,
+    Cancelled,
+}
+
+impl CoreUpdatePhase {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Checking => "core_update.checking",
+            Self::Consent => "core_update.consent",
+            Self::Downloading => "core_update.downloading",
+            Self::Verifying => "core_update.verifying",
+            Self::Ready => "core_update.ready",
+            Self::Preparing => "core_update.preparing",
+            Self::Switching => "core_update.switching",
+            Self::Success => "core_update.success",
+            Self::Failed => "core_update.failed",
+            Self::Cancelled => "core_update.cancelled",
+        }
+    }
+}
+
+pub struct CoreUpdate {
+    pub id: u64,
+    pub generation: u64,
+    pub kind: crate::mihomo_manager::CoreKind,
+    pub intent: CoreIntent,
+    pub phase: CoreUpdatePhase,
+    pub request: Option<crate::mihomo_manager::binary::CoreUpdateRequest>,
+    pub prepared: Option<crate::mihomo_manager::binary::PreparedCore>,
+    pub message: String,
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
 /// Application state shared between TUI components.
 pub struct App {
+    pub core_update: Option<CoreUpdate>,
+    pub core_operation_task: Option<tokio::task::JoinHandle<()>>,
+    pub core_operation_sequence: u64,
     pub core_state: CoreState,
     pub core_version: Option<String>,
     pub core_pid: Option<u32>,
@@ -354,6 +409,9 @@ impl App {
             view: View::Home,
             focus: Focus::Menu,
             overlay: None,
+            core_update: None,
+            core_operation_task: None,
+            core_operation_sequence: 0,
             pending_trust: None,
             filter: None,
             traffic: None,

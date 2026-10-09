@@ -48,6 +48,8 @@ pub fn context_hint(view: View, focus: Focus, language: Language) -> &'static st
 pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
     if let Some(overlay) = context.overlay {
         return match (overlay, event.code) {
+            (Overlay::CoreUpdate, KeyCode::Char('y' | 'Y') | KeyCode::Enter) => Some(Action::ConfirmCoreUpdate),
+            (Overlay::CoreUpdate, KeyCode::Char('n' | 'N' | 'q') | KeyCode::Esc) => Some(Action::CancelCoreUpdate),
             (Overlay::Filter, KeyCode::Enter) => Some(Action::SubmitFilter),
             (Overlay::CloseConfirmation, KeyCode::Enter) => context
                 .pending_connection_close
@@ -212,6 +214,26 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guided_core_overlay_requires_explicit_confirmation_and_cancel_keys() {
+        let context = KeyContext {
+            overlay: Some(Overlay::CoreUpdate),
+            ..KeyContext::base(View::Settings, Focus::Content)
+        };
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            assert!(matches!(
+                map_key(KeyEvent::new(code, KeyModifiers::NONE), context),
+                Some(Action::ConfirmCoreUpdate)
+            ));
+        }
+        for code in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            assert!(matches!(
+                map_key(KeyEvent::new(code, KeyModifiers::NONE), context),
+                Some(Action::CancelCoreUpdate)
+            ));
+        }
+        assert!(map_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), context).is_none());
+    }
     use super::*;
 
     fn event(code: KeyCode) -> KeyEvent {

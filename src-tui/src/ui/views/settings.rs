@@ -44,6 +44,11 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             app.core_config.get_port()
         )),
         Line::from(format!("{}: {}", app.tr("settings.core_pid"), core_owner_label(app))),
+        Line::from(format!(
+            "{}: {}",
+            app.tr("core_update.verified"),
+            app.core_version.as_deref().unwrap_or("—")
+        )),
     ])
     .block(theme::panel_block(app.tr("settings.runtime"), false).padding(Padding::horizontal(1)));
     frame.render_widget(core, rows[0]);

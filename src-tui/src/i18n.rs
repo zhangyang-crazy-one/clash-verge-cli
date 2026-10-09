@@ -46,6 +46,28 @@ pub fn tr(language: Language, key: &'static str) -> &'static str {
 
 fn english(key: &'static str) -> &'static str {
     match key {
+        "core_update.title" => "Core check and update",
+        "core_update.checking" => "Checking compatible local cores…",
+        "core_update.consent" => "Compatible core update required",
+        "core_update.downloading" => "Downloading pinned official archive…",
+        "core_update.verifying" => "Verifying trusted SHA-256, executable and actual version…",
+        "core_update.ready" => "Verified candidate ready; current core remains unchanged",
+        "core_update.preparing" => "Preparing subscription configuration and TUN preflight…",
+        "core_update.switching" => "Switching owned core; waiting for readiness…",
+        "core_update.success" => "Core selection committed",
+        "core_update.failed" => "Core operation failed",
+        "core_update.cancelled" => "Core operation cancelled",
+        "core_update.observed" => "Observed version/source",
+        "core_update.target" => "Reviewed target",
+        "core_update.verified" => "Verified version",
+        "core_update.confirm_download" => {
+            "y / Enter: authorize managed download and integrity validation · n / Esc: cancel"
+        }
+        "core_update.confirm_switch" => {
+            "y / Enter: prepare config and apply this verified core · n / Esc: keep current core"
+        }
+        "core_update.cancel_hint" => "Esc / n: cancel this operation; current core stays running during preparation",
+        "core_update.dismiss" => "Enter / Esc: close · retry from Start / Restart / Settings",
         "view.home" => "Home",
         "view.proxies" => "Proxies",
         "view.profiles" => "Profiles",
@@ -320,6 +342,24 @@ fn english(key: &'static str) -> &'static str {
 
 fn chinese(key: &'static str) -> Option<&'static str> {
     Some(match key {
+        "core_update.title" => "核心检查与更新",
+        "core_update.checking" => "正在检查本地兼容核心…",
+        "core_update.consent" => "需要更新到已审查的兼容核心",
+        "core_update.downloading" => "正在下载固定版本的官方归档…",
+        "core_update.verifying" => "正在验证可信 SHA-256、可执行格式和实际版本…",
+        "core_update.ready" => "候选核心已验证就绪；当前核心保持不变",
+        "core_update.preparing" => "正在转换当前订阅配置并检查 TUN 权限…",
+        "core_update.switching" => "正在切换自有核心，等待控制端就绪…",
+        "core_update.success" => "核心选型已提交",
+        "core_update.failed" => "核心操作失败",
+        "core_update.cancelled" => "核心操作已取消",
+        "core_update.observed" => "检测版本与来源",
+        "core_update.target" => "已审查目标版本",
+        "core_update.verified" => "已验证版本",
+        "core_update.confirm_download" => "y / Enter：授权下载并校验 · n / Esc：取消",
+        "core_update.confirm_switch" => "y / Enter：准备配置并应用已验证核心 · n / Esc：保留当前核心",
+        "core_update.cancel_hint" => "Esc / n：取消本次操作；准备阶段旧核心继续运行",
+        "core_update.dismiss" => "Enter / Esc：关闭；可从启动、重启或设置重试",
         "view.home" => "首页",
         "view.proxies" => "代理",
         "view.profiles" => "订阅",

@@ -76,11 +76,25 @@ impl EventSender {
             scope: self.scope.clone(),
             generation: self.current_generation(),
             local: None,
-            core_generation: self
-                .scope
-                .manager
-                .as_ref()
-                .map(|manager| manager.generation.load(Ordering::SeqCst)),
+            core_generation: self.scope.manager.as_ref().map(|manager| {
+                if manager.restarting.load(Ordering::SeqCst) {
+                    u64::MAX
+                } else {
+                    manager.generation.load(Ordering::SeqCst)
+                }
+            }),
+        }
+    }
+
+    /// Guided core results survive ordinary stream cancellation. Their own
+    /// operation identity and cancellation token are checked by the reducer.
+    pub(super) fn for_operation(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            scope: self.scope.clone(),
+            generation: 0,
+            local: None,
+            core_generation: None,
         }
     }
 

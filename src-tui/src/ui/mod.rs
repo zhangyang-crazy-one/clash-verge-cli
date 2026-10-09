@@ -99,6 +99,56 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
     }
 
     match overlay {
+        Overlay::CoreUpdate => {
+            if let Some(update) = &app.core_update {
+                let mut content = vec![Line::from(format!(
+                    "{} · {}",
+                    update.kind.as_str(),
+                    app.tr(update.phase.key())
+                ))];
+                if let Some(request) = &update.request {
+                    content.push(Line::from(format!(
+                        "{}: {} ({})",
+                        app.tr("core_update.observed"),
+                        request.observed.as_deref().unwrap_or("—"),
+                        request.source
+                    )));
+                    content.push(Line::from(format!(
+                        "{}: {}",
+                        app.tr("core_update.target"),
+                        request.required
+                    )));
+                    content.push(Line::from(request.destination.display().to_string()));
+                }
+                if let Some(prepared) = &update.prepared {
+                    content.push(Line::from(format!(
+                        "{}: {} ({})",
+                        app.tr("core_update.verified"),
+                        prepared.version,
+                        prepared.source
+                    )));
+                    content.push(Line::from(prepared.path.display().to_string()));
+                }
+                if !update.message.is_empty() {
+                    content.push(Line::from(update.message.clone()));
+                }
+                content.push(Line::from(match update.phase {
+                    crate::app::CoreUpdatePhase::Consent => app.tr("core_update.confirm_download"),
+                    crate::app::CoreUpdatePhase::Ready => app.tr("core_update.confirm_switch"),
+                    crate::app::CoreUpdatePhase::Failed
+                    | crate::app::CoreUpdatePhase::Success
+                    | crate::app::CoreUpdatePhase::Cancelled => app.tr("core_update.dismiss"),
+                    _ => app.tr("core_update.cancel_hint"),
+                }));
+                dialog::draw_dialog(
+                    frame,
+                    frame.area(),
+                    dialog::DialogKind::Warn,
+                    app.tr("core_update.title"),
+                    content,
+                );
+            }
+        }
         Overlay::Help => {
             let content = vec![
                 Line::from(Span::styled(app.tr("help.global"), theme::bold(theme::accent()))),
@@ -273,6 +323,41 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guided_core_overlay_renders_actual_verified_version_source_path_and_failure() {
+        let mut app = App::new();
+        app.overlay = Some(Overlay::CoreUpdate);
+        app.core_update = Some(crate::app::CoreUpdate {
+            id: 1,
+            generation: 0,
+            kind: crate::mihomo_manager::CoreKind::SingBox,
+            intent: crate::app::CoreIntent::Switch,
+            phase: crate::app::CoreUpdatePhase::Ready,
+            request: None,
+            prepared: Some(crate::mihomo_manager::binary::PreparedCore {
+                kind: crate::mihomo_manager::CoreKind::SingBox,
+                path: "/fixture/sing-box-v1.14.2".into(),
+                source: "cached".into(),
+                version: "1.14.2".into(),
+            }),
+            message: String::new(),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let (ready, _) = render(&app, 120, 32);
+        assert!(ready.contains("Verified version: 1.14.2 (cached)"));
+        assert!(ready.contains("/fixture/sing-box-v1.14.2"));
+        assert!(ready.contains("y / Enter"));
+        let update = app.core_update.as_mut().unwrap();
+        update.phase = crate::app::CoreUpdatePhase::Failed;
+        update.message = "Unsupported DNS field; old core remains running".into();
+        let (failed, _) = render(&app, 120, 32);
+        assert!(failed.contains("Unsupported DNS field; old core remains running"));
+        app.language = crate::i18n::Language::SimplifiedChinese;
+        let (chinese, _) = render(&app, 120, 32);
+        let chinese: String = chinese.chars().filter(|character| !character.is_whitespace()).collect();
+        assert!(chinese.contains("核心操作失败"));
+        assert!(chinese.contains("已验证版本"));
+    }
     use clash_verge_core::config::PrfItem;
     use ratatui::{Terminal, backend::TestBackend};
 

@@ -33,6 +33,28 @@ pub enum Action {
     },
     CoreExited(i32),
     CoreError(String),
+    ConfirmCoreUpdate,
+    RequestCoreUpdate {
+        kind: crate::mihomo_manager::CoreKind,
+        intent: super::CoreIntent,
+    },
+    CancelCoreUpdate,
+    CoreInspected {
+        id: u64,
+        result: crate::mihomo_manager::binary::CoreInspection,
+    },
+    CoreUpdateProgress(crate::mihomo_manager::binary::CoreProgress),
+    CorePrepared {
+        id: u64,
+        prepared: crate::mihomo_manager::binary::PreparedCore,
+    },
+    CoreUpdateSwitching {
+        id: u64,
+    },
+    CoreUpdateFinished {
+        id: u64,
+        result: Result<(), String>,
+    },
     Quit,
 
     // Profile management
@@ -230,6 +252,7 @@ pub enum Action {
     /// records which gate fired so the skip key knows whether starting
     /// anyway is safe (missing DNS rule only) or must cancel (missing
     /// capability).
+    #[cfg_attr(not(test), allow(dead_code))]
     TunSetupPrompt {
         binary: std::path::PathBuf,
         enable_tun: bool,

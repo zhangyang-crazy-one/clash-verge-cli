@@ -155,6 +155,7 @@ pub(super) fn handle_password_cancel(app: &mut App) {
 /// confirm is offered when the binary lacks the TUN file capability (and the
 /// process is not root) OR the systemd-resolved DNS polkit rule is missing.
 /// Injectable so all four combinations are testable without getcap/polkit.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn tun_start_offers_setup(capable: bool, root: bool, rule_needed: bool) -> bool {
     let cap_ok = root || capable;
     !cap_ok || rule_needed

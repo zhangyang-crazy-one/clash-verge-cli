@@ -27,17 +27,17 @@ pub(super) async fn activate_row(app: &mut App, ctx: &Ctx) {
 /// confirm and open the password popup directly so the same password flow
 /// runs the install transaction under one `sudo -S` boundary.
 fn activate_service_row(app: &mut App, ctx: &Ctx) {
+    activate_service_row_with(app, ctx, crate::mihomo_manager::binary::candidate_without_install);
+}
+
+fn activate_service_row_with(app: &mut App, ctx: &Ctx, fallback: impl FnOnce() -> Option<std::path::PathBuf>) {
     if app.service_installed {
         app.overlay = Some(crate::app::Overlay::ServiceUninstallConfirmation);
         return;
     }
     // Resolve the binary and config dir without triggering a download —
     // installing the service before any core is downloaded is a footgun.
-    let Some(binary_path) = ctx
-        .manager
-        .binary_path()
-        .or_else(crate::mihomo_manager::binary::candidate_without_install)
-    else {
+    let Some(binary_path) = ctx.manager.binary_path().or_else(fallback) else {
         app.status_msg = Some("Core binary not found — start the core once first".into());
         return;
     };
@@ -142,58 +142,17 @@ fn apply_autostart_unit(enabled: bool, binary_path: &str, config_dir: &str) -> R
     }
 }
 
-/// Settings row 7 ("Proxy core"). Toggle `proxy_core` between `"mihomo"`
-/// (default) and `"singbox"`. The persisted flag follows immediately; the
-/// running core is NOT hot-swapped (that would risk two cores bound to the
-/// same port). When a core is running, this fn orders a clean stop FIRST,
-/// flushes the cached runtime data, then writes the new config — the user
-/// starts the new core by pressing `s` on Home. Switching to sing-box is
-/// refused up-front if a GUI is running (GUI only understands mihomo) or
-/// if no sing-box binary is available.
+/// Settings row 7 prepares and confirms the actual shared manager selection.
 async fn toggle_proxy_core(app: &mut App, ctx: &Ctx) {
-    let current = app.gui_config.get_valid_proxy_core();
-    let next = if current == "singbox" { "mihomo" } else { "singbox" };
-    if next == "singbox" {
-        if crate::mihomo_manager::ownership::gui_process_running() {
-            app.status_msg = Some("a GUI instance is running — exit it before switching to sing-box".into());
-            return;
-        }
-        if crate::mihomo_manager::singbox_binary::candidate_without_install().is_none() {
-            app.status_msg = Some("sing-box binary not found — install it or set PATH first".into());
-            return;
-        }
-    }
-    // Ordered stop: never leave the old kind alive alongside a fresh kind
-    // on the next start (they both bind the same port).
-    if ctx.manager.pid().is_some() {
-        if let Err(error) = ctx.manager.stop().await {
-            app.status_msg = Some(format!("Could not stop running core: {error}"));
-            return;
-        }
-        app.core_state = CoreState::Stopped;
-        app.core_pid = None;
-        // Drop cached proxies / connections / traffic so the post-restart UI
-        // does not show stale data from the previous core kind.
-        app.clear_runtime_caches();
-    }
-    // Ownership marker (task 3.5): the GUI uses it to know it must NOT
-    // manage the core while sing-box mode is active.
-    if next == "singbox" {
-        let _ = crate::mihomo_manager::ownership::write_ownership_marker("singbox");
-    } else {
-        crate::mihomo_manager::ownership::remove_ownership_marker();
-    }
-    let mut updated = app.gui_config.clone();
-    updated.proxy_core = Some(next.into());
-    match updated.save_file().await {
-        Ok(()) => {
-            app.gui_config = updated;
-            app.status_msg = Some(format!("Proxy core: {next} (applies at next core start)"));
-        }
-        Err(error) => {
-            app.status_msg = Some(format!("save failed: {error}"));
-        }
-    }
+    let kind = match ctx.manager.core_kind() {
+        crate::mihomo_manager::CoreKind::Mihomo => crate::mihomo_manager::CoreKind::SingBox,
+        crate::mihomo_manager::CoreKind::SingBox => crate::mihomo_manager::CoreKind::Mihomo,
+    };
+    app.status_msg = Some(app.tr("core_update.checking").into());
+    ctx.send(Action::RequestCoreUpdate {
+        kind,
+        intent: crate::app::CoreIntent::Switch,
+    });
 }
 
 fn save_failed(app: &mut App, error: impl std::fmt::Display) {
@@ -464,7 +423,8 @@ mod tests {
         std::fs::write(&path, b"{\"log\":{}}").expect("write");
 
         crate::editor::validate_json(&path).expect("json must validate");
-        crate::editor::validate_singbox(&path).expect("singbox must accept valid json");
+        // Runtime sing-box check is explicitly unverified here: developer
+        // tests parse this fixture and never discover/execute a real core.
     }
 
     #[test]
@@ -530,7 +490,7 @@ mod tests {
         // ServiceInstall pending action. The key invariant is that the
         // overlay is one of {PasswordInput, ServiceUninstallConfirmation,
         // None}, never an unrelated state.
-        activate_service_row(&mut app, &ctx);
+        activate_service_row_with(&mut app, &ctx, || None);
 
         match app.overlay {
             None => {
@@ -713,29 +673,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // --- Settings row 7 — Proxy core -----------------------------------
-
     #[tokio::test]
-    async fn proxy_core_toggle_refuses_singbox_when_gui_is_running() {
-        // The refusal path runs only when next == "singbox" AND the GUI
-        // process scan returns true. We can't reliably spawn a GUI in a
-        // unit test, so we point at the state we DO control — the toggle
-        // either succeeds (writing proxy_core + ownership marker) or
-        // refuses. Either way the persisted file MUST NOT exist when the
-        // refusal fires (no half-written state). We assert that on the
-        // refusal branch the persisted proxy_core is unchanged.
-        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
-        let root = test_app_home_root();
-        let _guard = claim_test_app_home(root.clone()).await;
-        // No marker at start.
-        crate::mihomo_manager::ownership::remove_ownership_marker_at(&root);
-
-        let mut app = App::new();
-        // Seed proxy_core = "mihomo" so the toggle would switch to "singbox".
-        app.gui_config.proxy_core = Some("mihomo".into());
+    async fn guided_core_settings_row_queues_actual_manager_switch_without_persistence() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(8);
         let ctx = Ctx {
-            manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::channel(256).0.into(),
+            manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir())
+                .with_core_kind(crate::mihomo_manager::CoreKind::SingBox),
+            tx: sender.into(),
             traffic_tx: tokio::sync::watch::channel(None).0,
             log_tx: tokio::sync::mpsc::channel(8).0,
             dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -743,206 +687,20 @@ mod tests {
             guard: detached_guard(),
             keys: crate::tui::keymap::KeyMap::default(),
         };
-
-        let before = clash_verge_core::config::IVerge::new().await;
-        toggle_proxy_core(&mut app, &ctx).await;
-        let after = clash_verge_core::config::IVerge::new().await;
-
-        let message = app.status_msg.as_deref().expect("status message set");
-        if message.contains("GUI instance") {
-            // Refusal branch: config must not have changed, no marker written.
-            assert_eq!(
-                before.proxy_core, after.proxy_core,
-                "refusal must not persist a partial change"
-            );
-            assert!(
-                crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_none(),
-                "refusal must not write the ownership marker"
-            );
-        } else {
-            // Either the binary-missing refusal or success path. We only
-            // verify that if refusal was "binary not found" we did NOT
-            // change the config — other branches (success) intentionally
-            // do change it.
-            if message.contains("sing-box binary not found") {
-                assert_eq!(
-                    before.proxy_core, after.proxy_core,
-                    "refusal must not persist a partial change"
-                );
-                assert!(
-                    crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_none(),
-                    "refusal must not write the ownership marker"
-                );
-            }
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn proxy_core_toggle_off_path_persists_and_clears_ownership_marker() {
-        // Switching FROM singbox → mihomo: persist the new value, remove
-        // the ownership marker. We start the app seeded to singbox so the
-        // next toggle is mihomo (the "off" path that clears the marker).
-        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
-        let root = test_app_home_root();
-        let _guard = claim_test_app_home(root.clone()).await;
-        // Pre-write a marker so the toggle has something to remove.
-        crate::mihomo_manager::ownership::write_ownership_marker_at(&root, "singbox").expect("seed ownership marker");
-        assert!(
-            crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_some(),
-            "marker must be present before the toggle"
-        );
-
-        let mut app = App::new();
-        app.gui_config.proxy_core = Some("singbox".into());
-        let ctx = Ctx {
-            manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::channel(256).0.into(),
-            traffic_tx: tokio::sync::watch::channel(None).0,
-            log_tx: tokio::sync::mpsc::channel(8).0,
-            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
-            guard: detached_guard(),
-            keys: crate::tui::keymap::KeyMap::default(),
-        };
-
-        toggle_proxy_core(&mut app, &ctx).await;
-
-        assert_eq!(
-            app.gui_config.proxy_core.as_deref(),
-            Some("mihomo"),
-            "toggle to mihomo must update gui_config"
-        );
-        assert!(
-            crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_none(),
-            "marker must be removed when switching back to mihomo"
-        );
-        let message = app.status_msg.as_deref().expect("status message set");
-        assert!(
-            message.contains("mihomo"),
-            "status must announce the new core kind: {message}"
-        );
-        assert!(
-            message.contains("next core start"),
-            "status must explain when the change takes effect: {message}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn proxy_core_toggle_on_path_persists_and_writes_ownership_marker() {
-        // Switching FROM mihomo → singbox (the "on" path) writes the marker
-        // AND persists proxy_core.
-        //
-        // The guards are environmental (GUI running, sing-box binary on PATH):
-        // on this runner we accept either the success-path status or the
-        // refusal-path status, but require the marker only gets written on
-        // success.
-        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
-        let root = test_app_home_root();
-        let _guard = claim_test_app_home(root.clone()).await;
-        // Make sure no pre-existing marker muddies the assertion.
-        crate::mihomo_manager::ownership::remove_ownership_marker_at(&root);
-
-        let mut app = App::new();
-        app.gui_config.proxy_core = Some("mihomo".into());
-        let ctx = Ctx {
-            manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::channel(256).0.into(),
-            traffic_tx: tokio::sync::watch::channel(None).0,
-            log_tx: tokio::sync::mpsc::channel(8).0,
-            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
-            guard: detached_guard(),
-            keys: crate::tui::keymap::KeyMap::default(),
-        };
-
-        toggle_proxy_core(&mut app, &ctx).await;
-
-        // On a runner without a sing-box binary, the toggle refuses with
-        // the "sing-box binary not found" status and never writes the
-        // marker. On a runner with one, the toggle succeeds and writes
-        // the marker + updates proxy_core. Either branch is correct as
-        // long as the two stay consistent.
-        let message = app.status_msg.as_deref().expect("status message set");
-        if message.contains("sing-box binary not found") {
-            assert!(
-                crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_none(),
-                "refusal must NOT write the ownership marker"
-            );
-            assert_eq!(
-                app.gui_config.proxy_core.as_deref(),
-                Some("mihomo"),
-                "refusal must NOT change the persisted config"
-            );
-        } else {
-            assert_eq!(
-                app.gui_config.proxy_core.as_deref(),
-                Some("singbox"),
-                "success must update the persisted config"
-            );
-            assert!(
-                crate::mihomo_manager::ownership::read_ownership_marker_at(&root).is_some(),
-                "success must write the ownership marker"
-            );
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn activate_row_index_six_and_seven_route_to_toggles() {
-        // Compile-time + dispatch check: rows 6 and 7 must NOT fall into
-        // `_ => {}`. We exercise the dispatch by setting the row and
-        // inspecting `status_msg` AFTER triggering — both rows seed a
-        // status message ("Enabling login autostart…" / "Proxy core: …")
-        // even before the background task completes, so we can detect a
-        // missing arm via "no status_msg change" ⇒ still `_ => {}`.
-        //
-        // Initialize the app home once for the row 7 save_file to succeed
-        // in environments where no other test has set it yet (the OnceLock
-        // is global).
-        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
-        let root = test_app_home_root();
-        let _guard = claim_test_app_home(root.clone()).await;
-
-        let ctx = Ctx {
-            manager: crate::mihomo_manager::MihomoManager::new(std::env::temp_dir()),
-            tx: tokio::sync::mpsc::channel(256).0.into(),
-            traffic_tx: tokio::sync::watch::channel(None).0,
-            log_tx: tokio::sync::mpsc::channel(8).0,
-            dropped_logs: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            local_actions: std::sync::Arc::new(parking_lot::Mutex::new(crate::tui::handlers::LocalActionQueue::new())),
-            guard: detached_guard(),
-            keys: crate::tui::keymap::KeyMap::default(),
-        };
-
-        // Row 6: auto-launch. The toggle seeds an "Enabling/Disabling…"
-        // status before the background task runs, so we can detect
-        // dispatch without awaiting the spawn.
-        let mut app = App::new();
-        app.settings_selected_index = 6;
-        activate_row(&mut app, &ctx).await;
-        let message = app.status_msg.as_deref().unwrap_or_default();
-        assert!(
-            message.contains("autostart") || message.contains("Disabling") || message.contains("Enabling"),
-            "row 6 must dispatch to toggle_auto_launch, status was {message:?}"
-        );
-
-        // Row 7: proxy_core toggle. Without a running core and without
-        // PATH-side singbox, it should EITHER succeed (writes
-        // proxy_core + marker) OR refuse (binary missing message). The
-        // discriminator is the message contents — both are valid outcomes.
         let mut app = App::new();
         app.settings_selected_index = 7;
+        // A stale persisted value must never override the actual manager kind.
+        app.gui_config.proxy_core = Some("mihomo".into());
         activate_row(&mut app, &ctx).await;
-        let message = app.status_msg.as_deref().unwrap_or_default();
-        assert!(
-            message.contains("Proxy core")
-                || message.contains("sing-box binary not found")
-                || message.contains("GUI instance"),
-            "row 7 must dispatch to toggle_proxy_core, status was {message:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(
+            ctx.take_local_action(),
+            Some(Action::RequestCoreUpdate {
+                kind: crate::mihomo_manager::CoreKind::Mihomo,
+                intent: crate::app::CoreIntent::Switch,
+            })
+        ));
+        assert_eq!(app.gui_config.proxy_core.as_deref(), Some("mihomo"));
+        assert_eq!(ctx.manager.core_kind(), crate::mihomo_manager::CoreKind::SingBox);
+        assert!(app.core_operation_task.is_none());
     }
 }

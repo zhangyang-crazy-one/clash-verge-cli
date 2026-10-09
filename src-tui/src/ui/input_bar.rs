@@ -12,6 +12,10 @@ use crate::ui::theme;
 pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let Some(overlay) = app.overlay {
         match overlay {
+            Overlay::CoreUpdate => {
+                frame.render_widget(Paragraph::new(app.tr("core_update.cancel_hint")), area);
+                return;
+            }
             Overlay::Filter => {
                 let query = app.filter.as_deref().unwrap_or_default();
                 let line = Line::from(vec![

@@ -2,11 +2,10 @@
 
 use std::time::Duration;
 
-use crate::app::{Action, App, CoreState, TunSetupReason};
+use crate::app::{Action, App, CoreState};
 use crate::runtime_config::write_runtime_config;
 
 use super::Ctx;
-use super::tun::tun_start_offers_setup;
 
 /// `s` on Home.
 ///
@@ -16,66 +15,23 @@ use super::tun::tun_start_offers_setup;
 /// the TUI-native setup confirm is offered inline instead of hard-blocking or
 /// relying on system dialogs.
 pub(super) fn start(app: &mut App, ctx: &Ctx) {
-    ctx.cancel_background();
-    let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
-    app.core_state = CoreState::Starting;
-    app.status_msg = Some(app.tr("home.starting_core").into());
-    let manager = ctx.manager.clone();
-    ctx.spawn(|tx| async move {
-        if enable_tun {
-            let resolved_path = match manager.core_kind() {
-                crate::mihomo_manager::CoreKind::Mihomo => crate::mihomo_manager::binary::resolve_or_install()
-                    .await
-                    .map(|resolved| resolved.path),
-                crate::mihomo_manager::CoreKind::SingBox => crate::mihomo_manager::singbox_binary::resolve_or_install()
-                    .await
-                    .map(|resolved| resolved.path),
-            };
-            match resolved_path {
-                Ok(path) => {
-                    let capable = crate::commands::privilege::has_tun_capability(&path);
-                    let root = crate::commands::privilege::running_as_root();
-                    let needs_setup =
-                        tun_start_offers_setup(capable, root, crate::commands::privilege::resolve1_rule_needed(true));
-                    if needs_setup {
-                        // Record which gate fired: dismissing a capability-missing
-                        // prompt must cancel the start, while a missing-DNS-rule
-                        // prompt may start anyway.
-                        let reason = if root || capable {
-                            TunSetupReason::MissingDnsRule
-                        } else {
-                            TunSetupReason::MissingCapability
-                        };
-                        let _ = tx
-                            .send(Action::TunSetupPrompt {
-                                binary: path,
-                                enable_tun,
-                                reason,
-                            })
-                            .await;
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Action::CoreError(error.to_string())).await;
-                    return;
-                }
-            }
-        }
-        if let Err(error) = start_core_with_tun(&manager, enable_tun).await {
-            let _ = tx.send(Action::CoreError(error)).await;
-        }
-        // On success, the manager emits CoreStarted.
-    });
+    super::core_update::begin(app, ctx, ctx.manager.core_kind(), crate::app::CoreIntent::Start);
 }
 
-/// `S` on Home.
+/// Stop the owned core.
 pub(super) fn stop(app: &mut App, ctx: &Ctx) {
+    if let Some(update) = &app.core_update {
+        update.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let pending = app.core_operation_task.take();
     app.clear_runtime_caches();
     app.core_state = CoreState::Stopped;
     ctx.cancel_background();
     let manager = ctx.manager.clone();
     ctx.spawn(|tx| async move {
+        if let Some(pending) = pending {
+            let _ = pending.await;
+        }
         if let Err(error) = manager.stop().await {
             let _ = tx.send(Action::CoreError(error.to_string())).await;
         }
@@ -84,21 +40,7 @@ pub(super) fn stop(app: &mut App, ctx: &Ctx) {
 
 /// `r` on Home.
 pub(super) fn restart(app: &mut App, ctx: &Ctx) {
-    ctx.cancel_background();
-    app.core_state = CoreState::Starting;
-    app.status_msg = Some(app.tr("home.starting_core").into());
-    let manager = ctx.manager.clone();
-    let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
-    ctx.spawn(|tx| async move {
-        let config = clash_verge_core::config::IClashTemp::new().await.0;
-        if let Err(error) = write_runtime_config(config, enable_tun).await {
-            let _ = tx.send(Action::CoreError(error)).await;
-            return;
-        }
-        if let Err(error) = manager.restart().await {
-            let _ = tx.send(Action::CoreError(error.to_string())).await;
-        }
-    });
+    super::core_update::begin(app, ctx, ctx.manager.core_kind(), crate::app::CoreIntent::Restart);
 }
 
 /// Start the core after a TUN setup prompt resolved.
