@@ -13,7 +13,8 @@ use serde_yaml_ng::Value as Yaml;
 #[derive(Debug, Clone)]
 pub struct ConvertedNode {
     pub outbound: Value,
-    /// clash field paths that had no sing-box equivalent and were dropped.
+    /// clash field paths that had no sing-box equivalent and were dropped,
+    /// each with a human-readable reason.
     pub dropped: Vec<String>,
 }
 
@@ -76,7 +77,7 @@ pub fn convert_node(proxy: &Yaml) -> Result<ConvertedNode, String> {
             outbound[*skey] = value;
         }
     }
-    apply_udp(&ptype, &mut outbound, map)?;
+    apply_udp(&ptype, &name, &mut outbound, map, &mut dropped)?;
     apply_tls(&ptype, &mut outbound, map)?;
     if let Some(fingerprint) = as_str("client-fingerprint") {
         if !crate::singbox::capabilities::SING_BOX_1_14_2.client_fingerprint {
@@ -229,35 +230,83 @@ fn apply_tls(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) ->
     Ok(())
 }
 
-/// Transport layer for ws/grpc networks; other networks are noted by the
-/// caller through the dropped-fields report (they never reach `outbound`).
-fn apply_udp(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) -> Result<(), String> {
+/// Clash's `udp` flag versus sing-box's per-outbound UDP relay.
+///
+/// A supplementary flag never costs the user a node: `udp: true` is either
+/// already the outbound's default (flag dropped with a note) or a capability
+/// the outbound does not have (flag dropped, capability loss reported, node
+/// kept). `udp: false` is the unsafe direction — silently relaying UDP the
+/// user switched off would leak traffic onto a transport they rejected — so it
+/// is expressed as `network: "tcp"` where sing-box supports that and refused
+/// outright where it does not. See
+/// [`crate::singbox::capabilities::udp_relay`] for the verified matrix.
+fn apply_udp(
+    ptype: &str,
+    name: &str,
+    outbound: &mut Value,
+    map: &serde_yaml_ng::Mapping,
+    dropped: &mut Vec<String>,
+) -> Result<(), String> {
+    use crate::singbox::capabilities::{UdpRelay, udp_relay};
+
     let Some(value) = map.get(Yaml::String("udp".into())) else {
         return Ok(());
     };
     let enabled = value
         .as_bool()
         .ok_or_else(|| "udp must be a boolean; refusing to guess transport behavior".to_string())?;
-    if !matches!(ptype, "ss" | "hysteria2") {
-        return Err(format!(
-            "node type {ptype:?} has no verified sing-box mapping for explicit udp: {enabled}; refusing to lose transport semantics"
-        ));
-    }
-    // Both supported sing-box outbounds use their native default for UDP;
-    // the only explicit override needed to preserve Clash semantics is
-    // disabling UDP, which maps to the TCP-only network.
-    if !enabled {
-        outbound["network"] = json!("tcp");
+
+    match udp_relay(ptype) {
+        UdpRelay::NetworkToggle => {
+            if enabled {
+                dropped.push(format!(
+                    "{name}.udp: {ptype} relays UDP natively in sing-box 1.14.2; explicit udp: true dropped"
+                ));
+            } else {
+                outbound["network"] = json!("tcp");
+            }
+        }
+        UdpRelay::UdpOverTcp => {
+            if enabled {
+                dropped.push(format!(
+                    "{name}.udp: {ptype} relays UDP over its TCP stream (UDP-over-TCP) in sing-box 1.14.2; explicit udp: true dropped"
+                ));
+            } else {
+                return Err(format!(
+                    "node {name:?} sets udp: false but the sing-box {ptype} outbound has no tcp-only mode; refusing to silently relay UDP"
+                ));
+            }
+        }
+        UdpRelay::NoRelay | UdpRelay::Unverified => {
+            if enabled {
+                let reason = if udp_relay(ptype) == UdpRelay::NoRelay {
+                    format!("sing-box 1.14.2 {ptype} outbound has no UDP relay")
+                } else {
+                    format!("sing-box 1.14.2 {ptype} UDP relay is unverified on the pinned build")
+                };
+                dropped.push(format!(
+                    "{name}.udp: {reason}; udp: true dropped, UDP traffic through this node will fail"
+                ));
+            } else {
+                return Err(format!(
+                    "node {name:?} sets udp: false but sing-box {ptype} cannot be restricted to TCP; refusing to silently relay UDP"
+                ));
+            }
+        }
     }
     Ok(())
 }
 
 fn apply_transport(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mapping) -> Result<(), String> {
+    use crate::singbox::capabilities::{UdpRelay, udp_relay};
     let get = |key: &str| map.get(Yaml::String(key.into()));
     let Some(network) = get("network").and_then(Yaml::as_str) else {
         return Ok(());
     };
-    if matches!(ptype, "ss" | "hysteria2") && matches!(network, "udp" | "tcp") {
+    // Only outbounds that accept `network: ["tcp","udp"]` can carry Clash's
+    // own network selector; the rest fall through to ws/grpc handling.
+    let network_toggle = udp_relay(ptype) == UdpRelay::NetworkToggle;
+    if network_toggle && matches!(network, "udp" | "tcp") {
         if let Some(udp) = get("udp").and_then(Yaml::as_bool)
             && (network == "udp") != udp
         {
@@ -268,7 +317,7 @@ fn apply_transport(ptype: &str, outbound: &mut Value, map: &serde_yaml_ng::Mappi
         outbound["network"] = json!(network);
         return Ok(());
     }
-    if matches!(ptype, "ss" | "hysteria2") && matches!(network, "ws" | "grpc") && get("udp").is_some() {
+    if network_toggle && matches!(network, "ws" | "grpc") && get("udp").is_some() {
         return Err(format!(
             "node type {ptype:?} cannot combine explicit udp selection with {network} transport"
         ));
@@ -347,6 +396,101 @@ udp: true
 
         let h2 = parse("name: h2\ntype: hysteria2\nserver: h.example\nport: 443\npassword: pw\nudp: true\n");
         assert!(convert_node(&h2).unwrap().outbound.get("network").is_none());
+    }
+
+    #[test]
+    fn anytls_with_udp_true_is_kept_and_the_flag_is_dropped_with_a_note() {
+        // The shape of the user's real subscription nodes.
+        let node = parse(
+            r#"
+name: "🇭🇰 01"
+type: anytls
+server: anytls.example.com
+port: 443
+password: hunter2
+sni: anytls.example.com
+skip-cert-verify: true
+client-fingerprint: random
+udp: true
+tfo: false
+"#,
+        );
+        let converted = convert_node(&node).expect("anytls must not be dropped for udp: true");
+        assert_eq!(converted.outbound["type"], "anytls");
+        assert_eq!(converted.outbound["tls"]["server_name"], "anytls.example.com");
+        assert_eq!(converted.outbound["tls"]["insecure"], true);
+        assert_eq!(converted.outbound["tls"]["utls"]["fingerprint"], "random");
+        assert!(
+            converted.outbound.get("network").is_none(),
+            "anytls has no network field in sing-box 1.14.2"
+        );
+        let note = converted
+            .dropped
+            .iter()
+            .find(|line| line.contains(".udp:"))
+            .expect("udp degradation is reported");
+        assert!(note.contains("UDP-over-TCP"), "{note}");
+    }
+
+    #[test]
+    fn udp_true_keeps_nodes_whose_sing_box_outbound_has_no_udp_relay() {
+        let http = parse("name: h\ntype: http\nserver: p.example\nport: 8080\nudp: true\n");
+        let converted = convert_node(&http).expect("http is kept");
+        assert_eq!(converted.outbound["type"], "http");
+        let note = converted
+            .dropped
+            .iter()
+            .find(|line| line.contains(".udp:"))
+            .expect("capability loss is reported");
+        assert!(note.contains("no UDP relay"), "{note}");
+        assert!(note.contains("will fail"), "{note}");
+
+        // Unverified types degrade the same way instead of vanishing.
+        let naive = parse("name: nv\ntype: naive\nserver: n.example\nport: 443\nudp: true\n");
+        let naive = convert_node(&naive).expect("naive is kept");
+        assert!(
+            naive.dropped.iter().any(|line| line.contains("unverified")),
+            "{:?}",
+            naive.dropped
+        );
+    }
+
+    #[test]
+    fn udp_false_maps_to_tcp_only_where_sing_box_offers_the_network_field() {
+        for (yaml, sb_type) in [
+            (
+                "name: v\ntype: vless\nserver: h\nport: 443\nuuid: u\ntls: true\nudp: false\n",
+                "vless",
+            ),
+            (
+                "name: t\ntype: trojan\nserver: h\nport: 443\npassword: p\nudp: false\n",
+                "trojan",
+            ),
+            (
+                "name: s\ntype: socks5\nserver: 1.2.3.4\nport: 1080\nudp: false\n",
+                "socks",
+            ),
+            (
+                "name: q\ntype: tuic\nserver: h\nport: 443\nuuid: u\npassword: p\nudp: false\n",
+                "tuic",
+            ),
+        ] {
+            let converted = convert_node(&parse(yaml)).unwrap_or_else(|e| panic!("{yaml}: {e}"));
+            assert_eq!(converted.outbound["type"], sb_type);
+            assert_eq!(converted.outbound["network"], "tcp", "{yaml}");
+        }
+    }
+
+    #[test]
+    fn udp_false_stays_fail_closed_where_sing_box_cannot_disable_udp() {
+        for yaml in [
+            "name: at\ntype: anytls\nserver: h\nport: 443\npassword: p\nudp: false\n",
+            "name: hp\ntype: http\nserver: h\nport: 8080\nudp: false\n",
+            "name: nv\ntype: naive\nserver: h\nport: 443\nudp: false\n",
+        ] {
+            let err = convert_node(&parse(yaml)).expect_err("must not silently relay UDP");
+            assert!(err.contains("refusing to silently relay UDP"), "{err}");
+        }
     }
 
     #[test]
@@ -457,8 +601,12 @@ port: 1
 
     #[test]
     fn critical_fields_and_unknown_transports_are_rejected_not_dropped() {
-        let udp = parse("name: n\ntype: vmess\nserver: host\nport: 443\nuuid: id\nudp: false\n");
-        assert!(convert_node(&udp).unwrap_err().contains("no verified sing-box mapping"));
+        let udp = parse("name: n\ntype: anytls\nserver: host\nport: 443\npassword: p\nudp: false\n");
+        assert!(
+            convert_node(&udp)
+                .unwrap_err()
+                .contains("refusing to silently relay UDP")
+        );
         let ws = parse("name: n\ntype: vless\nserver: host\nport: 443\nuuid: id\ntls: true\nnetwork: h2\n");
         assert!(convert_node(&ws).unwrap_err().contains("unsupported transport \"h2\""));
         let reality = parse(

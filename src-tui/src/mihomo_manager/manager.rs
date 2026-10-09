@@ -645,9 +645,14 @@ impl ManagerInner {
     pub(crate) async fn write_singbox_full(config_dir: &Path) -> anyhow::Result<PathBuf> {
         let yaml = Self::active_profile_yaml().await?;
         let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
-        Ok(Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun)
-            .await?
-            .0)
+        let (path, parts) = Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun).await?;
+        // Start, restart and crash auto-restart all funnel through here, so
+        // this is where the losses of the config the core is about to run
+        // become known: the TUI notice and `status --json` read the record.
+        // A native sing-box subscription passes through untouched and
+        // records nothing.
+        crate::runtime_config::record_singbox_degradation(&parts).await;
+        Ok(path)
     }
 
     /// Persist a sing-box runtime config assembled from the given profile
@@ -815,22 +820,29 @@ impl SingboxParts {
             Some(home) => crate::singbox::load_dns_spec(home).map_err(anyhow::Error::msg)?,
             None => crate::singbox::DnsConfigSpec::default(),
         };
-        let profile_dns = yaml
-            .map(crate::singbox::dns::dns_spec_from_clash_yaml)
+        // Profile DNS degrades gracefully like the rules layer: what the
+        // typed model cannot express is reported in `conversion.notes`
+        // instead of aborting the whole configuration.
+        let dns_report = yaml
+            .map(crate::singbox::dns::dns_conversion_from_clash_yaml)
             .transpose()
             .map_err(anyhow::Error::msg)?
-            .flatten();
-        let dns_spec = if home
+            .unwrap_or_default();
+        let profile_dns = dns_report.spec.clone();
+        let (dns_spec, dns_notes) = if home
             .as_ref()
             .is_some_and(|home| home.join(crate::singbox::DNS_CONFIG_FILE).exists())
         {
-            stored_dns
+            // A stored DNS override wins; the profile's DNS was not consulted,
+            // so its degradations are not this run's report.
+            (stored_dns, Vec::new())
         } else {
-            profile_dns.unwrap_or(stored_dns)
+            (profile_dns.unwrap_or(stored_dns), dns_report.notes)
         };
         let default_domain_resolver = crate::singbox::dns::default_domain_resolver(&dns_spec);
         let dns_section = crate::singbox::dns::build_dns_section(&dns_spec).map_err(anyhow::Error::msg)?;
         conversion.notes.extend(route_report);
+        conversion.notes.extend(dns_notes);
         Ok(Self {
             conversion,
             profile_used,
@@ -1245,6 +1257,9 @@ impl MihomoManager {
             Vec::new()
         };
         preflight_tun_capability(&prepared.path, enable_tun)?;
+        // Kept out of the arm so a committed core switch can report what the
+        // conversion lost, like the apply path does.
+        let mut converted_parts: Option<SingboxParts> = None;
         match prepared.kind {
             CoreKind::SingBox => {
                 let yaml = ManagerInner::active_profile_yaml().await?;
@@ -1252,6 +1267,7 @@ impl MihomoManager {
                     ManagerInner::write_singbox_assembled_to(&self.config_dir, yaml.as_deref(), enable_tun, &candidate)
                         .await?;
                 validate_guided_conversion(&parts.conversion)?;
+                converted_parts = Some(parts);
                 crate::runtime_config::prevalidate_singbox_config(&prepared.path, &candidate)
                     .await
                     .map_err(anyhow::Error::msg)?;
@@ -1425,6 +1441,13 @@ impl MihomoManager {
             && stopped.load(Ordering::SeqCst)
         {
             *self.inner.state.lock() = CoreState::Error(error.to_string());
+        }
+        // Only a committed switch may claim losses; a rolled-back one must
+        // leave the previous report standing.
+        if outcome.is_ok()
+            && let Some(parts) = converted_parts
+        {
+            crate::runtime_config::record_singbox_degradation(&parts).await;
         }
         outcome
     }
@@ -3116,7 +3139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guided_core_critical_subscription_fields_fail_without_formal_file_mutation() {
+    async fn guided_core_unsupported_critical_dns_degrades_without_touching_the_formal_file() {
         use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
         let root = test_app_home_root();
         let _home = claim_test_app_home(root.clone()).await;
@@ -3125,10 +3148,73 @@ mod tests {
         std::fs::write(&formal, "prior config").unwrap();
         let candidate = dir.path().join("prepared.json");
         let yaml = "dns:\n  enable: true\n  nameserver: [8.8.8.8]\n  fallback-filter: {geoip: true}\n";
-        let result = ManagerInner::write_singbox_assembled_to(&root, Some(yaml), false, &candidate).await;
-        assert!(result.is_err(), "unsupported critical DNS must reject preparation");
-        assert_eq!(std::fs::read_to_string(formal).unwrap(), "prior config");
-        assert!(!candidate.exists());
+        // `fallback-filter` has no typed equivalent, but a real subscription
+        // ships it: the core must still start and the loss must be reported.
+        let (path, parts) = ManagerInner::write_singbox_assembled_to(&root, Some(yaml), false, &candidate)
+            .await
+            .expect("unrepresentable DNS policy degrades with a report, never a refusal");
+        assert_eq!(path, candidate);
+        assert!(
+            parts
+                .conversion
+                .notes
+                .iter()
+                .any(|note| note.starts_with("dns.fallback-filter:")),
+            "{:?}",
+            parts.conversion.notes
+        );
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&candidate).unwrap()).unwrap();
+        assert!(
+            config["dns"]["servers"]
+                .as_array()
+                .is_some_and(|servers| servers.iter().any(|server| server["server"] == "8.8.8.8")),
+            "the supported nameserver still reaches the core: {config}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(formal).unwrap(),
+            "prior config",
+            "preparing a candidate never mutates the formal config"
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_core_profile_dns_degradations_reach_the_status_notes() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+        let root = test_app_home_root();
+        let _home = claim_test_app_home(root.clone()).await;
+        let yaml = "dns:\n  enable: true\n  listen: 127.0.0.1:5335\n  enhanced-mode: fake-ip\n  fake-ip-filter: ['*.lan']\n  nameserver: [8.8.8.8]\n";
+        let parts = SingboxParts::assemble(Some(yaml)).await.expect("assemble");
+        for expected in ["dns.listen:", "dns.fake-ip-filter:"] {
+            assert!(
+                parts.conversion.notes.iter().any(|note| note.starts_with(expected)),
+                "status surface must report {expected}: {:?}",
+                parts.conversion.notes
+            );
+        }
+        let dns = parts.dns_section.as_ref().expect("dns section");
+        assert!(
+            dns["servers"]
+                .as_array()
+                .is_some_and(|servers| servers.iter().any(|server| server["type"] == "fakeip")),
+            "{dns}"
+        );
+
+        // A stored DNS override replaces the profile DNS: its degradations are
+        // not part of this run's report. The shared test app home is restored
+        // afterwards so the override cannot leak into another test.
+        std::fs::create_dir_all(&root).unwrap();
+        let override_file = root.join(crate::singbox::DNS_CONFIG_FILE);
+        let preexisting = override_file.exists();
+        crate::singbox::save_dns_spec(&root, &crate::singbox::DnsConfigSpec::default()).unwrap();
+        let overridden = SingboxParts::assemble(Some(yaml)).await.expect("assemble");
+        if !preexisting {
+            std::fs::remove_file(&override_file).unwrap();
+        }
+        assert!(
+            !overridden.conversion.notes.iter().any(|note| note.starts_with("dns.")),
+            "{:?}",
+            overridden.conversion.notes
+        );
     }
 
     #[test]

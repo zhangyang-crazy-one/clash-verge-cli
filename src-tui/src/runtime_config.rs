@@ -173,6 +173,7 @@ pub async fn apply_singbox_restart_for_profile(
     if !was_running {
         transaction.commit();
         persist_dns_override_state(dns_state.as_ref()).await;
+        record_singbox_degradation(&parts).await;
         return Ok(if parts.profile_used {
             format!(
                 "sing-box: {} nodes, {} skipped, {} fields degraded, {} notes (saved; core stopped)",
@@ -205,6 +206,9 @@ pub async fn apply_singbox_restart_for_profile(
 
     transaction.commit();
     persist_dns_override_state(dns_state.as_ref()).await;
+    // What this apply lost, in a shape the TUI and `status --json` can show
+    // grouped (the report string below only carries counts).
+    record_singbox_degradation(&parts).await;
 
     // Human-readable degradation report for the status bar.
     let report = if parts.profile_used {
@@ -224,6 +228,120 @@ pub async fn apply_singbox_restart_for_profile(
         tracing::info!(target: "config", "sing-box conversion: {note}");
     }
     Ok(report)
+}
+
+/// One bucket of what a Clash → sing-box conversion lost. The TUI notice
+/// and `status --json` speak in buckets because the raw notes are one line
+/// per lost item and nobody reads forty of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradationCategory {
+    /// Nodes/groups the conversion could not express at all.
+    Nodes,
+    /// Route rules dropped or approximated.
+    Rules,
+    /// Profile DNS fields the typed model cannot carry.
+    Dns,
+    /// Everything else (approximated group semantics, pruned members).
+    Groups,
+}
+
+/// Grouped digest of one conversion run's losses.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SingboxDegradationDigest {
+    /// Total note lines behind the buckets (the raw conversion report size).
+    pub notes: usize,
+    /// Node/group count the conversion dropped entirely.
+    pub nodes_skipped: usize,
+    /// Per-node field-level degradations (`node.field` lines).
+    pub fields_degraded: usize,
+    /// Counts per category, ascending by category so the notice is stable.
+    pub categories: std::collections::BTreeMap<DegradationCategory, usize>,
+}
+
+/// A digest plus the apply generation it belongs to, so a consumer shows it
+/// once instead of on every later event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SingboxDegradationRecord {
+    /// Monotonic id: a newer apply supersedes an older record even when the
+    /// new apply produced fewer notes.
+    pub seq: u64,
+    pub digest: SingboxDegradationDigest,
+}
+
+impl SingboxDegradationDigest {
+    /// Number of non-empty categories — the "N 类降级" headline count.
+    pub fn category_count(&self) -> usize {
+        self.categories.values().filter(|count| **count > 0).count()
+    }
+}
+
+/// Which note line belongs to which bucket. `dns.` prefixed notes come from
+/// the DNS conversion report, rule mentions from the route rule pass, and
+/// the remainder is group/member pruning.
+pub fn classify_degradation_note(note: &str) -> DegradationCategory {
+    let lower = note.to_ascii_lowercase();
+    if lower.starts_with("dns.") {
+        DegradationCategory::Dns
+    } else if lower.contains("rule") {
+        DegradationCategory::Rules
+    } else {
+        DegradationCategory::Groups
+    }
+}
+
+/// Build the digest from a finished conversion. Pure: unit-tested without a
+/// core, a config dir or a network.
+pub fn singbox_degradation_digest(parts: &crate::mihomo_manager::manager::SingboxParts) -> SingboxDegradationDigest {
+    let mut categories = std::collections::BTreeMap::new();
+    if !parts.conversion.skipped.is_empty() {
+        categories.insert(DegradationCategory::Nodes, parts.conversion.skipped.len());
+    }
+    for note in &parts.conversion.notes {
+        *categories.entry(classify_degradation_note(note)).or_insert(0) += 1;
+    }
+    categories.retain(|_, count| *count > 0);
+    SingboxDegradationDigest {
+        notes: parts.conversion.notes.len(),
+        nodes_skipped: parts.conversion.skipped.len(),
+        fields_degraded: parts.conversion.degraded.len(),
+        categories,
+    }
+}
+
+/// The notice is only true for a *converted* profile running on sing-box:
+/// a native sing-box subscription passes through untouched (no losses to
+/// report) and a mihomo core never converts anything.
+pub fn should_surface_singbox_degradation(
+    profile_used: bool,
+    core: crate::mihomo_manager::CoreKind,
+    digest: &SingboxDegradationDigest,
+) -> bool {
+    let total: usize = digest.notes + digest.nodes_skipped + digest.fields_degraded;
+    profile_used && core == crate::mihomo_manager::CoreKind::SingBox && total > 0 && digest.category_count() > 0
+}
+
+static LAST_SINGBOX_DEGRADATION: LazyLock<Mutex<Option<SingboxDegradationRecord>>> = LazyLock::new(|| Mutex::new(None));
+static SINGBOX_DEGRADATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Remember what the last successful sing-box apply lost. Records the
+/// *absence* of losses too (as `None`) so a clean apply clears a stale
+/// warning instead of leaving it on screen forever.
+pub async fn record_singbox_degradation(parts: &crate::mihomo_manager::manager::SingboxParts) {
+    let digest = singbox_degradation_digest(parts);
+    let record =
+        should_surface_singbox_degradation(parts.profile_used, crate::mihomo_manager::CoreKind::SingBox, &digest).then(
+            || {
+                let seq = SINGBOX_DEGRADATION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                SingboxDegradationRecord { seq, digest }
+            },
+        );
+    *LAST_SINGBOX_DEGRADATION.lock().await = record;
+}
+
+/// The last apply's degradation record, for `status --json` and the TUI.
+pub async fn last_singbox_degradation() -> Option<SingboxDegradationRecord> {
+    LAST_SINGBOX_DEGRADATION.lock().await.clone()
 }
 
 async fn persist_dns_override_state(state: Option<&clash_verge_core::config::DnsOverrideState>) {
@@ -695,6 +813,117 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn parts_with(
+        profile_used: bool,
+        skipped: &[&str],
+        degraded: &[&str],
+        notes: &[&str],
+    ) -> crate::mihomo_manager::manager::SingboxParts {
+        let owned = |items: &[&str]| items.iter().map(|item| (*item).to_string()).collect::<Vec<_>>();
+        crate::mihomo_manager::manager::SingboxParts {
+            conversion: crate::singbox::convert::ProfileConversion {
+                outbounds: vec![],
+                groups: vec![],
+                skipped: owned(skipped),
+                degraded: owned(degraded),
+                notes: owned(notes),
+            },
+            profile_used,
+            route_rules: vec![],
+            rule_sets: vec![],
+            dns_section: None,
+            default_domain_resolver: None,
+        }
+    }
+
+    #[test]
+    fn degradation_notes_group_into_nodes_rules_dns_and_groups() {
+        // The user-visible shape of a real converted Clash profile:
+        // unsupported nodes, dropped rules and DNS fields the typed model
+        // cannot carry, plus group pruning.
+        let parts = parts_with(
+            true,
+            &[
+                "edge: unsupported protocol mieru",
+                "pool: group type 'relay' unsupported",
+            ],
+            &["tls-node.skip-cert-verify: dropped"],
+            &[
+                "profile rules[3]: GEOSITE matcher unsupported",
+                "dns.fallback-filter: ignored; no typed equivalent",
+                "dns.fake-ip-filter: unsupported DNS field; dropped",
+                "select: dropped redundant DIRECT member (selectors always expose direct)",
+            ],
+        );
+        let digest = singbox_degradation_digest(&parts);
+        assert_eq!(digest.nodes_skipped, 2);
+        assert_eq!(digest.fields_degraded, 1);
+        assert_eq!(digest.notes, 4);
+        assert_eq!(digest.category_count(), 4);
+        assert_eq!(digest.categories.get(&DegradationCategory::Nodes), Some(&2));
+        assert_eq!(digest.categories.get(&DegradationCategory::Rules), Some(&1));
+        assert_eq!(digest.categories.get(&DegradationCategory::Dns), Some(&2));
+        assert_eq!(digest.categories.get(&DegradationCategory::Groups), Some(&1));
+    }
+
+    #[test]
+    fn the_notice_is_gated_on_a_converted_profile_running_sing_box() {
+        use crate::mihomo_manager::CoreKind;
+
+        let converted = singbox_degradation_digest(&parts_with(
+            true,
+            &["edge: unsupported protocol mieru"],
+            &[],
+            &["dns.listen: unsupported DNS field; dropped"],
+        ));
+        assert!(
+            should_surface_singbox_degradation(true, CoreKind::SingBox, &converted),
+            "a converted profile with losses is exactly what must be surfaced"
+        );
+        assert!(
+            !should_surface_singbox_degradation(false, CoreKind::SingBox, &converted),
+            "a skeleton apply lost nothing; do not warn"
+        );
+        assert!(
+            !should_surface_singbox_degradation(true, CoreKind::Mihomo, &converted),
+            "mihomo never converts a profile; the hint would be a lie"
+        );
+        // A native sing-box subscription passes through `write_singbox_assembled_to`
+        // untouched: no skipped entries and no notes.
+        let native = singbox_degradation_digest(&parts_with(true, &[], &[], &[]));
+        assert!(
+            !should_surface_singbox_degradation(true, CoreKind::SingBox, &native),
+            "a native passthrough profile has no degradations to report"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recorded_apply_replaces_the_previous_record_and_clears_on_a_clean_one() {
+        let lossy = parts_with(
+            true,
+            &["edge: unsupported protocol mieru"],
+            &[],
+            &["dns.listen: ignored"],
+        );
+        record_singbox_degradation(&lossy).await;
+        let first = last_singbox_degradation().await.expect("a lossy apply is recorded");
+        assert_eq!(first.digest.nodes_skipped, 1);
+
+        // A later, cleaner apply supersedes it (newer seq, fewer buckets) so
+        // the TUI shows the current truth instead of an old warning.
+        let milder = parts_with(true, &[], &[], &["dns.fallback-filter: ignored"]);
+        record_singbox_degradation(&milder).await;
+        let second = last_singbox_degradation().await.expect("still recorded");
+        assert!(second.seq > first.seq);
+        assert_eq!(second.digest.nodes_skipped, 0);
+
+        record_singbox_degradation(&parts_with(true, &[], &[], &[])).await;
+        assert!(
+            last_singbox_degradation().await.is_none(),
+            "a lossless apply must clear a stale degradation notice"
+        );
+    }
 
     #[tokio::test]
     async fn a_recorded_sing_box_core_is_reconfigurable_but_a_foreign_one_is_not() {

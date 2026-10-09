@@ -3,6 +3,7 @@ pub mod event_loop;
 mod handlers;
 pub mod input;
 pub mod keymap;
+mod singbox_degradation;
 pub mod terminal_guard;
 
 pub use terminal_guard::TerminalGuard;

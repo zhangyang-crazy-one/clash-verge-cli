@@ -206,6 +206,12 @@ fn english(key: &'static str) -> &'static str {
         "profiles.import" => "Press i to import a subscription URL",
         "profiles.hint" => "Enter switch | u update | i add",
         "profiles.none" => "No profiles - press i to import a subscription",
+        "singbox.degradation.notice" => "sing-box conversion degraded ({count} categories)",
+        "singbox.degradation.nodes" => "{count} nodes skipped",
+        "singbox.degradation.rules" => "{count} rules ignored",
+        "singbox.degradation.dns" => "{count} DNS fields degraded",
+        "singbox.degradation.groups" => "{count} group losses",
+        "singbox.degradation.hint" => "a native sing-box subscription avoids all of these losses",
         "connections.title" => "Connections",
         "connections.detail" => "Connection Detail",
         "connections.unknown_host" => "unknown host",
@@ -502,6 +508,12 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "profiles.import" => "按 i 导入订阅地址",
         "profiles.hint" => "Enter 切换 | u 更新 | i 添加",
         "profiles.none" => "暂无订阅，按 i 导入订阅地址",
+        "singbox.degradation.notice" => "sing-box 转换降级（{count} 类）",
+        "singbox.degradation.nodes" => "跳过 {count} 个节点",
+        "singbox.degradation.rules" => "忽略 {count} 条规则",
+        "singbox.degradation.dns" => "{count} 项 DNS 字段降级",
+        "singbox.degradation.groups" => "{count} 项分组降级",
+        "singbox.degradation.hint" => "建议改用 sing-box 原生订阅，可避免以上全部损失",
         "connections.title" => "连接",
         "connections.detail" => "连接详情",
         "connections.unknown_host" => "未知主机",
@@ -644,6 +656,30 @@ mod tests {
         assert_eq!(tr(Language::SimplifiedChinese, "view.settings"), "设置");
         assert_eq!(tr(Language::English, "view.settings"), "Settings");
         assert_eq!(tr(Language::SimplifiedChinese, "missing.key"), "missing.key");
+    }
+
+    #[test]
+    fn singbox_degradation_notice_keys_exist_in_both_locales() {
+        // The degradation notice is the only place a user learns what a
+        // Clash -> sing-box conversion lost; it must never fall back to the
+        // raw key in either locale.
+        for key in [
+            "singbox.degradation.notice",
+            "singbox.degradation.nodes",
+            "singbox.degradation.rules",
+            "singbox.degradation.dns",
+            "singbox.degradation.groups",
+            "singbox.degradation.hint",
+        ] {
+            let en = tr(Language::English, key);
+            let zh = tr(Language::SimplifiedChinese, key);
+            assert_ne!(en, key, "english `{key}` must be translated");
+            assert_ne!(zh, key, "zh-CN `{key}` must be translated");
+            assert_ne!(zh, en, "zh-CN `{key}` must differ from English");
+            let counted = key != "singbox.degradation.hint";
+            assert_eq!(en.contains("{count}"), counted, "english `{key}` placeholder");
+            assert_eq!(zh.contains("{count}"), counted, "zh-CN `{key}` placeholder");
+        }
     }
 
     #[test]
