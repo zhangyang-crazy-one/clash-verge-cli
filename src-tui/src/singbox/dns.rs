@@ -412,22 +412,18 @@ fn add_clash_dns_endpoint(
         }
     };
     if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
-        return Err(format!(
-            "dns.nameserver endpoint contains unsupported credentials, query, or fragment"
-        ));
+        return Err("dns.nameserver endpoint contains unsupported credentials, query, or fragment".to_string());
     }
     let path = if kind == DnsServerKind::Https && url.path() == "/dns-query" {
         Some(url.path().to_string())
     } else if url.path().is_empty() || url.path() == "/" {
         None
     } else {
-        return Err(format!(
-            "dns.nameserver endpoint has an unsupported path (only HTTPS /dns-query is supported)"
-        ));
+        return Err("dns.nameserver endpoint has an unsupported path (only HTTPS /dns-query is supported)".to_string());
     };
     let server = url
         .host_str()
-        .ok_or_else(|| format!("dns.nameserver endpoint has no host"))?
+        .ok_or_else(|| "dns.nameserver endpoint has no host".to_string())?
         .to_string();
     let server_port = url.port();
     let key = format!(

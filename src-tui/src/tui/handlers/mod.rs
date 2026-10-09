@@ -76,7 +76,7 @@ impl LocalActionQueue {
         }
     }
 
-    pub(super) fn push(&mut self, action: Action) -> Result<(), Action> {
+    pub(super) fn push(&mut self, action: Action) -> Result<(), Box<Action>> {
         if is_refresh_intent(&action)
             && self
                 .queue
@@ -98,7 +98,7 @@ impl LocalActionQueue {
                     self.queue.remove(at);
                 } else {
                     self.overflowed = true;
-                    return Err(action);
+                    return Err(Box::new(action));
                 }
             } else {
                 return Ok(());

@@ -59,10 +59,12 @@ fn native_display_keys(
         .iter()
         .filter_map(|(group_name, group)| group.all.as_ref().map(|members| (group_name, members)))
         .flat_map(|(group_name, members)| {
-            members.iter().filter_map(|name| {
-                (!crate::services::proxy::POLICY_PSEUDO_NODES.contains(&name.as_str()) && !is_group(groups, name))
-                    .then(|| ((group_name.clone(), name.clone()), vec![native_target(name)]))
-            })
+            members
+                .iter()
+                .filter(|&name| {
+                    !crate::services::proxy::POLICY_PSEUDO_NODES.contains(&name.as_str()) && !is_group(groups, name)
+                })
+                .map(|name| ((group_name.clone(), name.clone()), vec![native_target(name)]))
         })
         .collect()
 }

@@ -37,7 +37,7 @@ pub(crate) fn validate_apply_target(kind: CoreKind, running: bool, owns_core: bo
 }
 
 pub(crate) fn should_rollback_selected_exit(selected_node: &str, refreshed_nodes: &[&str]) -> bool {
-    !refreshed_nodes.iter().any(|node| *node == selected_node)
+    !refreshed_nodes.contains(&selected_node)
 }
 
 /// Shared guard and dispatch seam for refresh callers. A stopped core is

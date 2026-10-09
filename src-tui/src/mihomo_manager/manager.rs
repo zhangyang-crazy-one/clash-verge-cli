@@ -1306,10 +1306,11 @@ impl MihomoManager {
             },
         )
         .await;
-        if let Err(error) = &outcome {
-            if self.pid().is_none() && stopped.load(Ordering::SeqCst) {
-                *self.inner.state.lock() = CoreState::Error(error.to_string());
-            }
+        if let Err(error) = &outcome
+            && self.pid().is_none()
+            && stopped.load(Ordering::SeqCst)
+        {
+            *self.inner.state.lock() = CoreState::Error(error.to_string());
         }
         outcome
     }

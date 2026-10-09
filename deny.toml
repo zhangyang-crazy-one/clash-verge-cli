@@ -35,3 +35,9 @@ allow-wildcard-paths = true
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+# paste is a frozen, widely-used proc-macro pulled in by boa_engine (the
+# profile script engine). "Unmaintained" is not a vulnerability; there is no
+# maintained drop-in that boa uses. Revisit if boa switches to pastey.
+ignore = ["RUSTSEC-2024-0436"]
