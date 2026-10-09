@@ -21,28 +21,112 @@ const CLASH_VERGE_REPO: &str = "clash-verge-rev/clash-verge-rev";
 
 static COMPAT_VERSION: OnceCell<String> = OnceCell::const_new();
 
+/// Proxy environment in effect for GitHub release metadata requests.
+///
+/// Issue #50: metadata requests used `.no_proxy()` while the core download
+/// client honoured `HTTPS_PROXY`. In proxy-only networks the metadata call to
+/// `api.github.com` failed (403 anonymous rate limit from a shared egress IP,
+/// or unreachable) even though release assets downloaded fine. Both paths now
+/// use the same reqwest default policy: honour `HTTPS_PROXY`/`ALL_PROXY` and
+/// `NO_PROXY` from the environment, exactly like the download client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataNetwork {
+    /// Proxy URL taken from the environment, if any. `None` means direct.
+    proxy: Option<String>,
+}
+
+impl MetadataNetwork {
+    fn describe(&self) -> String {
+        match &self.proxy {
+            Some(proxy) => format!("via proxy {proxy} from the environment"),
+            None => "directly, no proxy environment is set".to_string(),
+        }
+    }
+}
+
+/// Pure environment projection so the policy is testable without touching the
+/// process environment or the network.
+fn proxy_from_env_vars(https: Option<&str>, all: Option<&str>) -> Option<String> {
+    let pick = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    pick(https).or_else(|| pick(all))
+}
+
+fn metadata_network() -> MetadataNetwork {
+    let read = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty())
+    };
+    MetadataNetwork {
+        proxy: proxy_from_env_vars(
+            read(["HTTPS_PROXY", "https_proxy"]).as_deref(),
+            read(["ALL_PROXY", "all_proxy"]).as_deref(),
+        ),
+    }
+}
+
+/// Extra operator guidance appended to a failed metadata request.
+fn metadata_status_hint(status: u16) -> &'static str {
+    match status {
+        401 | 403 | 429 => {
+            "GitHub API rate limit or auth required (set GITHUB_TOKEN, or retry later; a shared proxy exit IP is rate limited)"
+        }
+        404 => "release or tag not found in the official repository",
+        _ => "see the HTTP status above",
+    }
+}
+
+/// Build a metadata client with the same proxy policy as the binary download
+/// client in `mihomo_manager::binary` / `singbox_binary`: reqwest's default
+/// environment-proxy behaviour (honouring `NO_PROXY`), never `.no_proxy()`.
+fn metadata_client_builder(timeout: Duration, connect_timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(connect_timeout)
+        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
+}
+
 /// Shared: query the GitHub releases API for `owner/repo` and return the
 /// `tag_name` stripped of a leading `v`/`V`.
 ///
 /// Times out after 5 s (3 s connect).  Returns `None` on any failure.
 pub(crate) async fn fetch_latest_release_tag(owner_repo: &str) -> Option<String> {
     let url = format!("https://api.github.com/repos/{owner_repo}/releases/latest");
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .connect_timeout(Duration::from_secs(3))
-        .no_proxy()
-        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
+    let network = metadata_network();
+    let client = metadata_client_builder(Duration::from_secs(5), Duration::from_secs(3))
         .build()
         .ok()?;
 
-    let response = client
+    let response = match client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
-        .ok()?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                target: "subscribe",
+                "release metadata request failed ({url}) {}: {error}",
+                network.describe()
+            );
+            return None;
+        }
+    };
     if !response.status().is_success() {
+        tracing::warn!(
+            target: "subscribe",
+            "release metadata request failed ({url}) {}: {}",
+            network.describe(),
+            metadata_status_hint(response.status().as_u16())
+        );
         return None;
     }
 
@@ -174,34 +258,43 @@ fn manifest_sha256(text: &str, asset_name: &str) -> anyhow::Result<String> {
 }
 
 pub(crate) async fn fetch_trusted_release_digest(repo: &str, tag: &str, asset_name: &str) -> anyhow::Result<String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .connect_timeout(Duration::from_secs(3))
-        .no_proxy()
-        .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
+    let network = metadata_network();
+    let client = metadata_client_builder(Duration::from_secs(10), Duration::from_secs(3))
         .build()
         .context("failed to build release metadata client")?;
     let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
     let response = client
-        .get(url)
+        .get(&url)
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
-        .context("release metadata HTTP request failed; existing binary preserved")?
-        .error_for_status()
-        .context("release metadata HTTP returned error; existing binary preserved")?;
+        .with_context(|| format!("release metadata request to {url} failed ({})", network.describe()))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "release metadata request to {url} failed ({}): status {} — {}; existing binary preserved",
+            network.describe(),
+            status.as_u16(),
+            metadata_status_hint(status.as_u16())
+        );
+    }
     let release = response.json().await.context("invalid release JSON metadata")?;
     match trusted_digest_metadata(&release, repo, tag, asset_name)? {
         TrustedDigestMetadata::Digest(digest) => Ok(digest),
         TrustedDigestMetadata::Manifest(url) => {
             let response = client
-                .get(url)
+                .get(&url)
                 .send()
                 .await
-                .context("official checksum manifest HTTP request failed")?
+                .with_context(|| {
+                    format!(
+                        "official checksum manifest request to {url} failed ({})",
+                        network.describe()
+                    )
+                })?
                 .error_for_status()
-                .context("official checksum manifest HTTP returned error")?;
+                .with_context(|| format!("official checksum manifest request to {url} returned an HTTP error"))?;
             use tokio_stream::StreamExt as _;
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
@@ -295,6 +388,57 @@ pub(crate) fn normalize_version(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_requests_use_the_environment_proxy_instead_of_bypassing_it() {
+        // Issue #50: the download client honours HTTPS_PROXY; metadata must not
+        // call .no_proxy() or a proxy-only network cannot install a core.
+        assert_eq!(
+            proxy_from_env_vars(Some("http://127.0.0.1:7890"), None).as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            proxy_from_env_vars(None, Some("socks5://127.0.0.1:1080")).as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        // HTTPS_PROXY wins over ALL_PROXY; blank values are treated as unset.
+        assert_eq!(
+            proxy_from_env_vars(Some("http://p:1"), Some("http://p:2")).as_deref(),
+            Some("http://p:1")
+        );
+        assert_eq!(
+            proxy_from_env_vars(Some("  "), Some("http://p:2")).as_deref(),
+            Some("http://p:2")
+        );
+        assert_eq!(proxy_from_env_vars(None, None), None);
+        assert_eq!(
+            MetadataNetwork { proxy: None }.describe(),
+            "directly, no proxy environment is set"
+        );
+        assert!(
+            MetadataNetwork {
+                proxy: Some("http://p:1".into())
+            }
+            .describe()
+            .contains("via proxy http://p:1")
+        );
+    }
+
+    #[test]
+    fn metadata_failures_name_the_request_and_proxy_rate_limit_context() {
+        for status in [401_u16, 403, 429] {
+            let hint = metadata_status_hint(status);
+            assert!(hint.contains("rate limit"), "status {status} hint: {hint}");
+        }
+        assert!(metadata_status_hint(404).contains("not found"));
+        // The metadata client builder must stay proxy-env driven: building it
+        // offline must not panic and must not require an explicit proxy.
+        let client = metadata_client_builder(Duration::from_secs(5), Duration::from_secs(3)).build();
+        assert!(
+            client.is_ok(),
+            "metadata client must build from environment proxy policy"
+        );
+    }
 
     #[test]
     fn normalize_rpm_deb_and_tag_versions() {

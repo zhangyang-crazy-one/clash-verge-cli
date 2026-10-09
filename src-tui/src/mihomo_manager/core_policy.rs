@@ -102,15 +102,66 @@ impl Version {
     }
 }
 
-/// Compatibility is explicitly pinned. Future versions require reviewed
-/// capability data; a higher version alone cannot establish compatibility.
-pub fn is_compatible(_core: &str, observed: &str, required: &str) -> anyhow::Result<bool> {
-    let got = Version::parse(observed)?;
-    let min = Version::parse(required)?;
-    if got.major != min.major || got.minor != min.minor || !got.prerelease.is_empty() {
-        return Ok(false);
+/// Decision for an observed core version against the pinned download target.
+///
+/// The pinned version is the *download target* for fresh installs and
+/// updates, not an equality gate: an already installed binary that is newer
+/// than the pin stays usable so a GUI-side update cannot brick the CLI.
+/// Anything outside the pinned major line, or any prerelease, stays
+/// fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionPolicy {
+    /// Observed equals the pinned target.
+    Exact,
+    /// Same major, no prerelease, and newer than the pin — accepted.
+    NewerWithinMajor,
+    /// Same major but older than the pin — guided update/download.
+    OlderThanPinned,
+    /// Different major than the pin — rejected, never auto-replaced.
+    UnsupportedMajor,
+    /// Any prerelease identifier — rejected.
+    Prerelease,
+}
+
+impl VersionPolicy {
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Exact | Self::NewerWithinMajor)
     }
-    Ok(got.cmp(&min) == Ordering::Equal)
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Exact => "matches the pinned download target",
+            Self::NewerWithinMajor => "newer than the pinned target within the same major version",
+            Self::OlderThanPinned => "older than the pinned target",
+            Self::UnsupportedMajor => "different major version than the pinned target",
+            Self::Prerelease => "prerelease version is not accepted",
+        }
+    }
+}
+
+/// Classify `observed` against the pinned `required` version.
+///
+/// Applies uniformly to both cores: the pinned version comes from
+/// [`MIHOMO_POLICY_VERSION`] or [`SINGBOX_POLICY_VERSION`].
+pub fn classify(observed: &str, required: &str) -> anyhow::Result<VersionPolicy> {
+    let got = Version::parse(observed)?;
+    let pin = Version::parse(required)?;
+    if !got.prerelease.is_empty() {
+        return Ok(VersionPolicy::Prerelease);
+    }
+    if got.major != pin.major {
+        return Ok(VersionPolicy::UnsupportedMajor);
+    }
+    Ok(match got.cmp(&pin) {
+        Ordering::Equal => VersionPolicy::Exact,
+        Ordering::Greater => VersionPolicy::NewerWithinMajor,
+        Ordering::Less => VersionPolicy::OlderThanPinned,
+    })
+}
+
+/// Accept the pinned version and any newer release in the same major line.
+pub fn is_compatible(_core: &str, observed: &str, required: &str) -> anyhow::Result<bool> {
+    Ok(classify(observed, required)?.is_usable())
 }
 
 pub fn is_newer_than(observed: &str, target: &str) -> anyhow::Result<bool> {
@@ -118,9 +169,24 @@ pub fn is_newer_than(observed: &str, target: &str) -> anyhow::Result<bool> {
 }
 
 pub fn incompatibility(core: &str, observed: &str, required: &str) -> String {
+    let reason = classify(observed, required)
+        .map(|policy| policy.reason())
+        .unwrap_or("version is malformed");
     format!(
-        "{core} version {observed} is outside the supported policy; requires the reviewed version {required} (new versions need a policy update)"
+        "{core} version {observed} is outside the supported policy ({reason}); pinned download target is {required}"
     )
+}
+
+/// Log the acceptance decision for a newer-than-pinned binary so the
+/// substitution stays visible in logs.
+pub fn log_acceptance(core: &str, observed: &str, policy: VersionPolicy) {
+    if policy == VersionPolicy::NewerWithinMajor {
+        tracing::info!(
+            target: "core_policy",
+            "accepting {core} {observed}: {} (pinned download target unchanged)",
+            policy.reason()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -128,14 +194,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pinned_policy_accepts_only_explicitly_reviewed_versions() {
+    fn pinned_policy_accepts_newer_within_the_same_major_for_both_cores() {
+        // Pinned target itself.
         assert!(is_compatible("mihomo", "v1.19.32", MIHOMO_POLICY_VERSION).unwrap());
-        assert!(!is_compatible("mihomo", "1.19.99", MIHOMO_POLICY_VERSION).unwrap());
-        assert!(!is_compatible("mihomo", "1.19.31", MIHOMO_POLICY_VERSION).unwrap());
-        assert!(!is_compatible("mihomo", "1.20.0", MIHOMO_POLICY_VERSION).unwrap());
         assert!(is_compatible("sing-box", "1.14.2", SINGBOX_POLICY_VERSION).unwrap());
+        // Same major, newer than the pin → accepted (GUI-updated binary).
+        assert!(is_compatible("mihomo", "1.19.33", MIHOMO_POLICY_VERSION).unwrap());
+        assert!(is_compatible("mihomo", "1.19.99", MIHOMO_POLICY_VERSION).unwrap());
+        assert!(is_compatible("mihomo", "1.20.0", MIHOMO_POLICY_VERSION).unwrap());
+        assert!(is_compatible("sing-box", "1.15.0", SINGBOX_POLICY_VERSION).unwrap());
+        assert!(is_compatible("sing-box", "v1.14.3", SINGBOX_POLICY_VERSION).unwrap());
+    }
+
+    #[test]
+    fn pinned_policy_rejects_older_than_pinned_with_guidance() {
+        assert!(!is_compatible("mihomo", "1.19.31", MIHOMO_POLICY_VERSION).unwrap());
+        assert!(!is_compatible("sing-box", "1.14.1", SINGBOX_POLICY_VERSION).unwrap());
+        assert_eq!(
+            classify("1.19.31", MIHOMO_POLICY_VERSION).unwrap(),
+            VersionPolicy::OlderThanPinned
+        );
+        assert!(incompatibility("mihomo", "1.19.31", MIHOMO_POLICY_VERSION).contains("older than the pinned target"));
+    }
+
+    #[test]
+    fn pinned_policy_rejects_different_major() {
+        assert!(!is_compatible("mihomo", "2.19.32", MIHOMO_POLICY_VERSION).unwrap());
+        assert!(!is_compatible("sing-box", "0.14.2", SINGBOX_POLICY_VERSION).unwrap());
+        assert_eq!(
+            classify("2.0.0", MIHOMO_POLICY_VERSION).unwrap(),
+            VersionPolicy::UnsupportedMajor
+        );
+        assert!(incompatibility("mihomo", "2.19.32", MIHOMO_POLICY_VERSION).contains("different major"));
+    }
+
+    #[test]
+    fn pinned_policy_rejects_any_prerelease() {
         assert!(!is_compatible("sing-box", "1.14.2-rc.1", SINGBOX_POLICY_VERSION).unwrap());
         assert!(!is_compatible("sing-box", "1.14.3-alpha.1", SINGBOX_POLICY_VERSION).unwrap());
+        assert!(!is_compatible("mihomo", "1.19.33-beta.1", MIHOMO_POLICY_VERSION).unwrap());
+        assert_eq!(
+            classify("1.19.33-beta.1", MIHOMO_POLICY_VERSION).unwrap(),
+            VersionPolicy::Prerelease
+        );
+    }
+
+    #[test]
+    fn malformed_versions_never_classify() {
+        assert!(classify("not-a-version", MIHOMO_POLICY_VERSION).is_err());
+        assert!(is_compatible("mihomo", "", MIHOMO_POLICY_VERSION).is_err());
+        assert!(incompatibility("mihomo", "not-a-version", MIHOMO_POLICY_VERSION).contains("malformed"));
     }
 
     #[test]
@@ -170,5 +278,6 @@ mod tests {
     fn errors_identify_core_observed_and_required_versions() {
         let message = incompatibility("sing-box", "1.13.21", SINGBOX_POLICY_VERSION);
         assert!(message.contains("sing-box") && message.contains("1.13.21") && message.contains("1.14.2"));
+        assert!(is_newer_than("1.19.33", MIHOMO_POLICY_VERSION).unwrap());
     }
 }

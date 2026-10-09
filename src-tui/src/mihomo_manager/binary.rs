@@ -171,14 +171,11 @@ where
         }
         .await;
         match result {
-            Ok(version) => {
-                if super::core_policy::is_newer_than(&version, target).unwrap_or(false) {
-                    reviews.push(format!(
-                        "{} at {} reports {version}; reviewed target is {target}; refusing automatic downgrade",
-                        kind.as_str(),
-                        path.display()
-                    ));
-                } else if super::core_policy::is_compatible(kind.as_str(), &version, target).unwrap_or(false) {
+            Ok(version) => match super::core_policy::classify(&version, target) {
+                Ok(policy) if policy.is_usable() => {
+                    // The pin is the download target, not an equality gate: a
+                    // newer same-major system binary is accepted and logged.
+                    super::core_policy::log_acceptance(kind.as_str(), &version, policy);
                     if ready.is_none() {
                         ready = Some(PreparedCore {
                             kind,
@@ -187,18 +184,31 @@ where
                             version,
                         });
                     }
-                } else {
+                }
+                Ok(policy) if policy == super::core_policy::VersionPolicy::OlderThanPinned => {
                     diagnostics.push(format!(
-                        "{} at {} reports unsupported {version}",
+                        "{} at {} reports {version}; {}",
                         candidate_source,
-                        path.display()
+                        path.display(),
+                        policy.reason()
                     ));
                     if observed.is_none() {
                         observed = Some(version);
                         source = candidate_source.into();
                     }
                 }
-            }
+                Ok(policy) => reviews.push(format!(
+                    "{} at {} reports {version}; {}; refusing automatic replacement",
+                    kind.as_str(),
+                    path.display(),
+                    policy.reason()
+                )),
+                Err(error) => diagnostics.push(format!(
+                    "{} at {} reports unusable version {version}: {error:#}",
+                    candidate_source,
+                    path.display()
+                )),
+            },
             Err(error) => diagnostics.push(format!("{} at {}: {error:#}", candidate_source, path.display())),
         }
     }
@@ -973,7 +983,37 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn guided_core_unknown_newer_requires_review_without_downgrade() {
+    async fn guided_core_newer_within_major_is_accepted_instead_of_blocking_startup() {
+        // Issue #51: a GUI-side update to /usr/bin/verge-mihomo must not brick
+        // the CLI. Same major, newer than the pinned download target → Ready.
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("system");
+        tokio::fs::write(&system, b"\x7fELFfixture").await.unwrap();
+        ensure_executable(&system).await.unwrap();
+        let result = inspect_candidates(
+            super::super::CoreKind::Mihomo,
+            vec![system.clone()],
+            root.path().join("mihomo"),
+            |_| async { Ok(Some("v1.19.33".into())) },
+        )
+        .await;
+        assert!(
+            matches!(result, CoreInspection::Ready(ref candidate) if candidate.path == system && candidate.version == "v1.19.33")
+        );
+        assert!(!matches!(
+            inspect_candidates(
+                super::super::CoreKind::SingBox,
+                vec![system.clone()],
+                root.path().join("sing-box"),
+                |_| async { Ok(Some("1.14.3".into())) },
+            )
+            .await,
+            CoreInspection::Review(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn guided_core_older_than_pinned_still_requires_download() {
         let root = tempfile::tempdir().unwrap();
         let system = root.path().join("system");
         tokio::fs::write(&system, b"\x7fELFfixture").await.unwrap();
@@ -982,10 +1022,38 @@ pub(crate) mod tests {
             super::super::CoreKind::Mihomo,
             vec![system],
             root.path().join("mihomo"),
-            |_| async { Ok(Some("v1.20.0".into())) },
+            |_| async { Ok(Some("v1.19.31".into())) },
         )
         .await;
-        assert!(matches!(result, CoreInspection::Review(ref diagnostic) if diagnostic.contains("1.20.0")));
+        assert!(
+            matches!(result, CoreInspection::NeedsUpdate(ref request) if request.observed.as_deref() == Some("v1.19.31") && request.required == "v1.19.32")
+        );
+    }
+
+    #[tokio::test]
+    async fn guided_core_different_major_requires_review_without_downgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("system");
+        tokio::fs::write(&system, b"\x7fELFfixture").await.unwrap();
+        ensure_executable(&system).await.unwrap();
+        let result = inspect_candidates(
+            super::super::CoreKind::Mihomo,
+            vec![system.clone()],
+            root.path().join("mihomo"),
+            |_| async { Ok(Some("v2.19.32".into())) },
+        )
+        .await;
+        assert!(
+            matches!(result, CoreInspection::Review(ref diagnostic) if diagnostic.contains("2.19.32") && diagnostic.contains("different major"))
+        );
+        let prerelease = inspect_candidates(
+            super::super::CoreKind::SingBox,
+            vec![system],
+            root.path().join("sing-box"),
+            |_| async { Ok(Some("1.14.3-beta.1".into())) },
+        )
+        .await;
+        assert!(matches!(prerelease, CoreInspection::Review(ref diagnostic) if diagnostic.contains("prerelease")));
     }
 
     #[tokio::test]
