@@ -12,9 +12,10 @@ use std::sync::{
 };
 
 pub(super) fn begin(app: &mut App, ctx: &Ctx, kind: CoreKind, intent: CoreIntent) {
-    let manager = ctx.manager.clone();
     begin_with(app, ctx, kind, intent, async move {
-        manager.guided_owner_check(crate::mihomo_manager::ownership::gui_process_running())?;
+        // Inspection and confirmed acquisition only touch CLI-owned candidates.
+        // GUI/foreign ownership is checked at the lifecycle boundary, allowing
+        // users to prepare an update while their current network still works.
         Ok(binary::inspect(kind).await)
     });
 }
@@ -395,14 +396,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guided_core_gui_failure_opens_persistent_dismissible_overlay() {
+    async fn guided_core_gui_allows_preparation_but_refuses_lifecycle_visibly() {
         let (ctx, mut rx) = ctx();
         let mut app = App::new();
         begin_with(&mut app, &ctx, CoreKind::SingBox, CoreIntent::Switch, async {
-            anyhow::bail!("GUI instance is running")
+            Ok(CoreInspection::Ready(ready()))
         });
         app.core_operation_task.take().unwrap().await.unwrap();
         event(&mut app, &ctx, rx.recv().await.unwrap());
+        assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Ready);
+        assert_eq!(ctx.manager.core_kind(), CoreKind::Mihomo);
+        let error = ctx.manager.guided_owner_check(true).unwrap_err();
+        let id = app.core_update.as_ref().unwrap().id;
+        event(
+            &mut app,
+            &ctx,
+            Action::CoreUpdateFinished {
+                id,
+                result: Err(error.to_string()),
+            },
+        );
         assert_eq!(app.overlay, Some(Overlay::CoreUpdate));
         assert_eq!(app.core_update.as_ref().unwrap().phase, CoreUpdatePhase::Failed);
         app.status_msg = Some("unrelated refresh".into());
