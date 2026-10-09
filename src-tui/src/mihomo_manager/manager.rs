@@ -1476,6 +1476,16 @@ pub struct CoreStatus {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn guided_core_shared_selection_updates_every_clone_and_transport() {
+        let manager = super::MihomoManager::new(std::env::temp_dir());
+        let clone = manager.clone();
+        manager.inner().set_core_kind(super::CoreKind::SingBox);
+        assert_eq!(manager.core_kind(), super::CoreKind::SingBox);
+        assert_eq!(clone.core_kind(), super::CoreKind::SingBox);
+        assert_eq!(clone.api().core_kind(), super::CoreKind::SingBox);
+        assert!(matches!(clone.api().transport(), crate::mihomo_api::Transport::Tcp(_)));
+    }
     use super::*;
 
     #[tokio::test]
