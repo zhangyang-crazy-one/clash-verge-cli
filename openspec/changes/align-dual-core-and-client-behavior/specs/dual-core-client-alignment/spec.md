@@ -94,3 +94,36 @@ Daemon refresh, forced probe recovery, rollback, and provider operations MUST di
 #### Scenario: external sing-box attachment
 - **WHEN** applying configuration would require restarting a sing-box core not owned by the manager
 - **THEN** the client rejects that lifecycle action with an ownership explanation rather than stopping the attached core
+
+### Requirement: Shared bounded profile script enhancement
+The client MUST execute configured synchronous GUI-compatible `main(config, profileName)` hooks before mihomo generation or sing-box conversion, with the profile display name, bounded execution and no host filesystem/network APIs. Local and remote profiles MUST share enhancement ordering and preserve unknown supported fields and authoritative application controls.
+
+#### Scenario: default or transforming script
+- **WHEN** a Clash profile contains a no-op script or a valid script modifying configuration
+- **THEN** both target cores receive the enhanced configuration through the same pipeline rather than rejecting the presence of a script
+
+#### Scenario: invalid or unbounded script
+- **WHEN** a script throws, returns an invalid configuration, or exceeds its execution limits
+- **THEN** preparation reports the failing hook and retains the previous runtime and selection without silently omitting the script
+
+#### Scenario: imported native JSON carries default enhancement references
+- **WHEN** a native sing-box JSON import carries the generated empty fragments and canonical no-op script
+- **THEN** loading preserves native JSON without adding Clash fields; genuinely nonempty Clash enhancements produce an explicit diagnostic
+
+### Requirement: Stopped core selection independent of profile validity
+Selecting a verified core while stopped MUST atomically update only its selection and marker, without profile execution, runtime generation, TUN authorization or implicit startup. The client MUST retain passive foreign-resource protections and full preparation/rollback for running switches.
+
+#### Scenario: stopped selection with an unlaunchable profile
+- **WHEN** the manager is stopped and the user selects another core while the active profile cannot be prepared for that core
+- **THEN** selection succeeds without attempting preparation, and a later explicit start reports any remaining profile problem
+
+### Requirement: Isolated non-TUN CLI instance while GUI is running
+The client MAY operate its own core while the GUI is running only when it verifies separate configuration, private owned controller resources, loopback listeners, and TUN/system proxy disabled. It MUST reject shared or foreign resources and retain owned-process-only lifecycle control. Sing-box controller generation, API selection and readiness MUST use the same configured loopback endpoint.
+
+#### Scenario: verified private instance
+- **WHEN** an explicitly configured standalone instance has private independent resources and nonconflicting listeners with TUN/system proxy disabled
+- **THEN** its owned lifecycle can proceed without adopting, contacting, signalling or reconfiguring the GUI
+
+#### Scenario: isolation cannot be established
+- **WHEN** the configuration/controller resources overlap, a listener is foreign, TUN/system proxy is enabled, or inspection cannot establish isolation
+- **THEN** lifecycle apply is refused and the GUI remains untouched

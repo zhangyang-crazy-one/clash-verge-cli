@@ -36,7 +36,7 @@ The design must preserve existing graceful SIGTERM cleanup (5-second termination
 **Non-Goals:**
 
 - Implementing the pending `add-singbox-dual-core` work or claiming live-core interoperability.
-- Supporting every future sing-box protocol, guessed TUN field, legacy DNS provider shape, or full JavaScript hook runtime; unsupported critical fields must be rejected or explained.
+- Supporting every future sing-box protocol, guessed TUN field, legacy DNS provider shape, or JavaScript browser/Node/host-I/O APIs; synchronous GUI profile `main(config, profileName)` hooks are supported by the follow-up below. Unsupported critical fields must be rejected or explained.
 - Changing GUI, WebView, Windows, or macOS behavior, or starting/stopping the user's running `clash-tui`.
 
 ## Decisions
@@ -83,3 +83,17 @@ Alternatives considered: a latest-version-only policy was rejected because it ca
 - Traffic/log delivery is bounded and tagged with both work and core generations. Completed control events use bounded reservation/backpressure; local refresh intents coalesce and overflow is visible. Final cleanup waits for owned background futures to be destroyed before stopping an owned core. No CPU or memory benchmark is claimed.
 
 See [evidence.md](evidence.md) for implementation/test traceability and verification limits.
+
+## Profile scripts and stopped selection (2026-10-09)
+
+The client currently rejects configured script overrides before either core can use the subscription. A stopped Settings switch also prepares the active profile, so a rejected script or native sing-box profile prevents even selecting mihomo. These are separate client defects: profile enhancement must execute the script, while stopped selection must not require a launchable profile.
+
+Use an embedded Boa Rust engine for synchronous `main(config, profileName)`, with the profile display name and JSON-compatible object input/output. Enforce finite execution/loop/recursion limits, bounded input/output, and no module loader or filesystem/network/Node host bindings. Errors, invalid results and exceeded limits abort preparation with a diagnostic; do not silently discard configured transformations. The shared local/remote pipeline follows the pinned GUI sequence/global/profile override order and reapplies authoritative application controls after enhancement. The upstream contract and order are documented in the [GUI v2.5.7 enhancement implementation](https://github.com/clash-verge-rev/clash-verge-rev/blob/v2.5.7/src-tauri/src/enhance/mod.rs) and [script implementation](https://github.com/clash-verge-rev/clash-verge-rev/blob/v2.5.7/src-tauri/src/enhance/script.rs). Unlike the GUI's fallback on script error, the CLI deliberately fails preparation rather than applying an unenhanced subscription.
+
+Keep the existing CLI DNS confirmation contract: capture source identity from the effective enhanced profile before applying the DNS-page overlay, then persist that decision after successful commit. Apply that overlay once after hooks rather than recomputing source identity from already-overlaid settings. This is an intentional difference from the GUI's pre-hook DNS-page arrangement; it preserves the source-bound confirmation behavior established by this change.
+
+For an actually stopped manager, selecting a verified candidate commits only the standalone core selection and ownership marker. It does not read/execute the active profile, generate runtime configuration, request TUN permissions, probe controllers or start a process. Foreign/live ownership checks still apply. Running switches and explicit start/restart retain full prevalidation and rollback.
+
+The user subsequently authorized operating the TUI while the GUI remains running. Parent-owned live verification uses separate temporary config/runtime directories and private available ports, with TUN/system proxy disabled. It may start and stop only its own test instances; the GUI, GUI controllers and actual user settings remain untouched. Earlier offline-only records remain historical and are not retroactively promoted to live evidence.
+
+GUI process presence alone does not prove resource ownership for a separately configured standalone instance. Permit only a verifiably private, independently configured non-TUN instance with system proxy disabled, loopback listeners and no foreign listener conflict. Inspect the actual prepared candidate again at the apply boundary; running switches may retain only listeners proved to belong to the current owned child. Shared GUI configuration, unsafe/private-directory failures, foreign sockets/listeners or uncertain inspection retain visible refusal. Bind sing-box JSON generation, manager API and readiness to the configured loopback controller port rather than a hardcoded shared `9090` endpoint. Native JSON imports retain their generated empty/default fragments as no-ops; nonempty Clash-specific enhancement is diagnosed instead of being silently applied across formats.

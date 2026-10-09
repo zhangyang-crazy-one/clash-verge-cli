@@ -62,3 +62,11 @@ Socket regression: 3/3 complete; 30/30 tracked implementation tasks. Source: `da
 - [x] 8.3 Run isolated safe suite and locked dev/release builds, format/diff/OpenSpec checks; record fresh evidence without invoking sudo/setcap/pkcheck, modifying actual capabilities/configuration or operating user instances.
 
 TUN follow-up: 3/3 complete in the authorized implementation/isolated verification scope; 33/33 tracked implementation tasks. Source `19902dd1`; final suite644 passed and locked debug/release builds passed. Actual permission grant and live core acceptance remain unexecuted; see [evidence.md](evidence.md).
+
+## 9. Profile script and stopped core selection follow-up
+
+- [x] 9.1 Execute GUI-style synchronous `main(config, profileName)` scripts in a bounded embedded Rust engine before either core's configuration generation; unify local/remote profile enhancement, preserve sequence/global/profile ordering and app-owned control fields, and cover no-op, transforms, invalid results and execution limits.
+- [x] 9.2 Make stopped Settings core selection independent of profile generation and TUN authorization; atomically persist only the selected core and marker while retaining foreign-resource protections. Running switches continue to prepare, verify and roll back.
+- [x] 9.3 Run isolated regression tests and locked debug/release builds, then exercise the TUI and both real cores with private configuration/controllers/ports and TUN/system proxy off under the user's new authorization. Preserve the running GUI and record the distinction between fixtures, isolated live results and unverified user-network behavior.
+
+Follow-up complete: 9.1–9.3 verified (672 isolated tests, locked builds, private live bidirectional core switches with script transform; debug `profile-script-core-switch` resolved). The prior 33 completed tasks are historical. Isolated live results do not certify user-network behavior, real TUN authorization, or performance.
