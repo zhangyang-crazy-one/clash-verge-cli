@@ -236,6 +236,65 @@ pub async fn effective_mixed_port() -> u16 {
     clash_verge_core::config::IClashTemp::new().await.get_mixed_port()
 }
 
+/// The publicly-known secret shipped by the shared `config.yaml` template.
+/// Anyone can read it, so it must never guard a live controller.
+pub const PLACEHOLDER_CONTROLLER_SECRET: &str = "set-your-secret";
+
+/// A fresh, unguessable controller secret (RFC 4122 v4 UUID).
+pub fn generate_controller_secret() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Whether `secret` would leave the controller effectively unauthenticated.
+pub fn is_placeholder_secret(secret: &str) -> bool {
+    secret.trim().is_empty() || secret.trim() == PLACEHOLDER_CONTROLLER_SECRET
+}
+
+/// Resolve the effective controller secret, rotating a weak one and
+/// persisting it back into `config.yaml` (mode 600) before returning.
+///
+/// Fail-closed contract:
+/// - A missing `config.yaml` (fresh install) is composed from the template and
+///   saved, so the CLI's own defaults exist before anything binds a port.
+/// - An empty or `set-your-secret` secret is replaced with a random one and
+///   persisted, so mihomo and the generated sing-box `clash_api` — which share
+///   this secret — both stop accepting a publicly-known value.
+/// - Persisting happens here (before any core starts), so a later CLI
+///   invocation authenticates against the same value.
+/// - A save failure is an error; we never silently fall back to the weak
+///   secret.
+pub async fn resolve_controller_secret() -> anyhow::Result<String> {
+    let mut clash = clash_verge_core::config::IClashTemp::new().await;
+    let current = clash.get_client_info().secret.unwrap_or_default();
+    if !is_placeholder_secret(&current) {
+        return Ok(current);
+    }
+
+    let secret = generate_controller_secret();
+    clash.0.insert(Value::from("secret"), Value::from(secret.clone()));
+    let path = clash_verge_core::utils::dirs::clash_path()
+        .map_err(|error| anyhow::anyhow!("cannot locate the clash config to store the controller secret: {error}"))?;
+    clash.save_config().await.map_err(|error| {
+        anyhow::anyhow!(
+            "failed to persist the generated controller secret to {}: {error}",
+            path.display()
+        )
+    })?;
+    // `save_yaml` mirrors an existing file's mode, so a pre-existing 0644
+    // config.yaml would keep a controller secret world-readable. Force 600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
+            anyhow::anyhow!(
+                "generated a controller secret but could not restrict {} to mode 600: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(secret)
+}
+
 /// Fail fast when the mixed port is already bound by another process.
 ///
 /// The CLI and the Clash Verge GUI share the same template defaults, and the

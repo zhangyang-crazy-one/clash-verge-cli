@@ -358,6 +358,14 @@ impl ManagerInner {
             CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path().ok(),
             CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path().ok(),
         });
+        // #48/#49: resolve (and, when needed, rotate + persist) the shared
+        // controller secret BEFORE anything is spawned. On a fresh install
+        // config.yaml does not exist yet; composing it here is what makes
+        // `start` work out of the box instead of failing with a bare
+        // ENOENT from `controller_secret_from_config`.
+        crate::enhance::resolve_controller_secret()
+            .await
+            .context("failed to prepare the controller secret in the clash config; no core was started")?;
         // Validate control-plane auth before a child exists; errors here
         // cannot leak an unsupervised process or invalidate rollback.
         let probe_api = api_for_core(
@@ -366,6 +374,16 @@ impl ManagerInner {
             inner.singbox_controller(),
             controller_secret_from_config(config_path.as_deref())?,
         )?;
+        // #49: name the missing path up front. A bare `os error 2` from
+        // `Command::spawn` is indistinguishable between "binary missing" and
+        // "runtime config missing", which is what made the original report
+        // blame the core binary for a missing config.yaml.
+        if !resolved_path.exists() {
+            anyhow::bail!(
+                "core binary '{}' does not exist; install it or point `verge_mihomo_version`/`proxy_core` at a valid binary. No core was started.",
+                resolved_path.display()
+            );
+        }
         // TUN disabled → no capability needed. If the config cannot be read
         // we assume TUN is off and let mihomo fail on its own if it is not.
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
@@ -404,6 +422,12 @@ impl ManagerInner {
                     .clone()
                     .map(Ok)
                     .unwrap_or_else(clash_verge_core::utils::dirs::singbox_config_path)?;
+                if !path.exists() {
+                    anyhow::bail!(
+                        "generated sing-box config '{}' does not exist; run `clash-verge-cli profile use <id>` or `apply runtime` to generate it. No core was started.",
+                        path.display()
+                    );
+                }
                 command.arg("run").arg("-c").arg(path);
             }
         }
@@ -619,7 +643,12 @@ impl ManagerInner {
         let tun = profile_tun_settings(yaml, &core_config.0).map_err(anyhow::Error::msg)?;
         let clash_api = crate::singbox::ClashApiSettings {
             listen: configured_singbox_controller(&core_config.0)?,
-            secret: core_config.get_client_info().secret.unwrap_or_default(),
+            // #48: never write the template's public `set-your-secret` (or an
+            // empty secret) into singbox.json. Rotate + persist into the shared
+            // config.yaml first, so the CLI and the generated clash_api agree.
+            secret: crate::enhance::resolve_controller_secret()
+                .await
+                .context("cannot generate the sing-box clash_api controller secret")?,
         };
 
         // Native sing-box JSON profile passthrough: preserve the provider's own
@@ -635,6 +664,7 @@ impl ManagerInner {
             let home = clash_verge_core::utils::dirs::app_home_dir()?;
             apply_native_sidecars(&mut config, &home)?;
             crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
+            crate::singbox::config_gen::validate_control_plane_security(&config).map_err(anyhow::Error::msg)?;
             let path = destination.to_path_buf();
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.ok();
@@ -685,6 +715,7 @@ impl ManagerInner {
             tokio::fs::create_dir_all(parent).await.ok();
         }
         crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
+        crate::singbox::config_gen::validate_control_plane_security(&config).map_err(anyhow::Error::msg)?;
         write_generated_json(&path, &config)?;
         Ok((path, parts))
     }
@@ -1825,7 +1856,14 @@ fn controller_secret_from_config(path: Option<&Path>) -> anyhow::Result<String> 
     let Some(path) = path else {
         return Ok(String::new());
     };
-    let text = std::fs::read_to_string(path)?;
+    // #49: a missing config file is a fresh install, not an error. The caller
+    // has already composed/persisted config.yaml via `resolve_controller_secret`,
+    // and an absent per-core runtime config simply means "no secret here".
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read the runtime config at {}", path.display()))?;
     let value: serde_json::Value = if text.trim_start().starts_with('{') {
         serde_json::from_str(&text)?
     } else {
@@ -4090,6 +4128,128 @@ mod alignment_regressions {
         inner.send_action(Action::CoreExited(0)).await;
         assert!(
             matches!(rx.recv().await, Some(Action::CoreGeneration { generation: 4, action }) if matches!(*action, Action::CoreExited(0)))
+        );
+    }
+
+    /// Regression #48: a template/placeholder secret in config.yaml is
+    /// rotated into the generated singbox.json, persisted, and reused on a
+    /// second generation pass (no per-write rotation, no drift).
+    #[tokio::test]
+    async fn generated_singbox_carries_a_rotated_secret_and_never_the_template_one() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: set-your-secret\n",
+        )
+        .unwrap();
+
+        let first = home.path().join("candidate-1.json");
+        ManagerInner::write_singbox_assembled_to(home.path(), None, false, &first)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&first).unwrap();
+        assert!(!text.contains("set-your-secret"), "template secret leaked: {text}");
+        assert!(!text.contains("\"*\""), "wildcard CORS origin emitted: {text}");
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let clash_api = &parsed["experimental"]["clash_api"];
+        let secret = clash_api["secret"].as_str().expect("secret").to_string();
+        assert!(!secret.is_empty() && secret != "set-your-secret");
+        assert_eq!(
+            clash_api["access_control_allow_private_network"],
+            serde_json::Value::from(false)
+        );
+        assert!(
+            clash_api["access_control_allow_origin"]
+                .as_array()
+                .expect("allow origins")
+                .iter()
+                .all(|origin| origin != "*")
+        );
+
+        // Persisted into config.yaml, mode 600, and shared with the mihomo side.
+        let saved = std::fs::read_to_string(home.path().join("config.yaml")).unwrap();
+        assert!(saved.contains(&secret), "config.yaml did not keep the rotated secret");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(home.path().join("config.yaml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "controller config must stay private");
+        }
+
+        // The same secret survives a second generation pass.
+        let second = home.path().join("candidate-2.json");
+        ManagerInner::write_singbox_assembled_to(home.path(), None, false, &second)
+            .await
+            .unwrap();
+        let again: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&second).unwrap()).unwrap();
+        assert_eq!(
+            again["experimental"]["clash_api"]["secret"],
+            serde_json::Value::from(secret.as_str())
+        );
+    }
+
+    /// Regression #49: `start` preparation against a completely empty config
+    /// dir composes config.yaml (rather than failing with a bare os error 2)
+    /// and resolves a usable controller secret, with no core spawned.
+    #[tokio::test]
+    async fn fresh_install_config_dir_gets_a_composed_config_and_secret() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        assert!(
+            !home.path().join("config.yaml").exists(),
+            "precondition: empty config dir"
+        );
+
+        // The read used by the spawn path must tolerate the missing file.
+        assert_eq!(
+            controller_secret_from_config(Some(&home.path().join("config.yaml"))).unwrap(),
+            String::new()
+        );
+
+        // What `spawn_core_as` runs before touching the child process.
+        let secret = crate::enhance::resolve_controller_secret().await.unwrap();
+        assert!(!secret.is_empty());
+        assert_ne!(secret, "set-your-secret");
+
+        let path = home.path().join("config.yaml");
+        assert!(path.exists(), "config.yaml must be composed on a fresh install");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&secret));
+        assert!(saved.contains("external-controller-unix"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // The spawn path now reads a real secret instead of erroring.
+        assert_eq!(controller_secret_from_config(Some(&path)).unwrap(), secret);
+        // Idempotent: a second preparation does not rotate the secret again.
+        assert_eq!(crate::enhance::resolve_controller_secret().await.unwrap(), secret);
+    }
+
+    /// Regression #49: an existing, user-set secret is preserved verbatim
+    /// (we never silently re-key a configured controller).
+    #[tokio::test]
+    async fn a_configured_controller_secret_is_left_alone() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(home.path().join("config.yaml"), "secret: user-picked\n").unwrap();
+        assert_eq!(
+            crate::enhance::resolve_controller_secret().await.unwrap(),
+            "user-picked"
+        );
+        assert!(
+            std::fs::read_to_string(home.path().join("config.yaml"))
+                .unwrap()
+                .contains("user-picked")
         );
     }
 }
