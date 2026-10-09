@@ -78,3 +78,40 @@
 命令明确跳过 `real_sing_box_spawns_and_answers_controller`，不使用 `--ignored`、`--include-ignored`、`cargo run` 或应用生命周期/服务命令。测试自己的 mock listeners、tempfiles 和非核心 child 不与现有实例共用资源。
 
 未验证：真实核心启动/切换/重启、网络资产下载、TLS 握手与协议互通、TUN/权限、联网订阅、真实性能指标。没有替换已安装二进制或部署构建产物，也没有停止用户当前运行的 clash-tui。对于没有经过映射审查的 DNS/transport/routing 字段，当前行为是保留原文件并报告拒绝；不声明完整 Clash→sing-box 无损转换。
+
+## Quick 261009-eth：引导更新与实际选型切换（2026-10-09）
+
+用户本次报告为切换 sing-box 没有任何显示、设置切换没有效果，并确认当前运行的是 GUI。上面的 `6aff4da7`、22 项任务和 588 项测试均为历史记录。本轮审计发现历史 editor 测试可能进入生产 `sing-box check`，service 测试可能枚举系统候选；本轮分别改为静态 JSON fixture 与显式候选注入，并删除旧 settings 的环境依赖测试。历史日志未记录这些分支是否命中，因此不能以历史 588 次通过证明它们绝未执行。
+
+代码提交：`7b9a5136`（检查/可信准备）、`bdf06fe6`（共享类型/事务）、`dcf03232`（TUI 消费）、`71ba7ccb`（GUI 运行时允许候选准备、实际应用保留所有权门禁）。最终测试对应 `71ba7ccb` 的源码内容。保留历史 22 项完成记录，并新增完成 6.1–6.5 五项 follow-up（共 27 项），没有同步或归档主规格，没有修改 ROADMAP。
+
+新增 `guided_core` 回归共 **39 项**，覆盖两个核心的旧系统+离线兼容缓存、cache-before-network、未知新版拒绝降级、同版本独立候选、授权/manifest/错误 digest/ELF/版本/取消清理；事务顺序、各晚期失败、文件/kind/API/选择器恢复、GUI 运行时允许候选准备、GUI/foreign/live-record 拒绝生命周期应用；常见 Clash nodes+selector+MATCH+DNS 准备、关键 DNS/TLS 拒绝；TUI 取消、重复/陈旧 Ready、stream cancellation 独立交付、代际变化、持久诊断及中英 TestBackend 渲染。网络元数据和版本来自夹具/注入，未发生真实核心或真实 GitHub 资产下载。
+
+最终验证环境使用 `/tmp/clash-guided-core-validation.ETH/{data,runtime,config,bin}` 分别提供 `XDG_DATA_HOME`、`XDG_RUNTIME_DIR`、`XDG_CONFIG_HOME`、`XDG_BIN_HOME`，`CARGO_BUILD_JOBS=2`。不更改 HOME/CARGO_HOME，也不另设 CARGO_TARGET_DIR，沿用项目编译缓存。测试中的磁盘配置与控制器使用自己的临时路径和 mock listener。精确命令：
+
+```bash
+XDG_DATA_HOME=/tmp/clash-guided-core-validation.ETH/data \
+XDG_RUNTIME_DIR=/tmp/clash-guided-core-validation.ETH/runtime \
+XDG_CONFIG_HOME=/tmp/clash-guided-core-validation.ETH/config \
+XDG_BIN_HOME=/tmp/clash-guided-core-validation.ETH/bin \
+CARGO_BUILD_JOBS=2 \
+cargo test --workspace --all-targets --locked -- --test-threads=1 --skip real_sing_box_spawns_and_answers_controller
+
+# With the same four temporary XDG values and CARGO_BUILD_JOBS=2:
+cargo build --workspace --locked
+cargo fmt --all --check
+git diff --check
+openspec validate align-dual-core-and-client-behavior --strict
+```
+
+| 检查 | 实际结果 | 日志（根目录 `/tmp/clash-guided-core-validation.ETH/`） | SHA-256 |
+|---|---|---|---|
+| 最终 safe suite | exit 0；605 CLI +4 integration +13 core = **622 passed**；0 failed；1 filtered；无 warnings | `suite-parent-final.log` | `f76b8402b1d52b70dc6924f550c6861a0397f1601df6b3315c87f56b7aab3ae4` |
+| locked workspace build | exit 0；复用测试阶段编译后的最终源码产物 | `build-parent-final.log` | `22e0df986057b9ba5be07526ac5fb348862a3dedef42108383cc3e088acbb889` |
+| fmt | exit 0 | `fmt-parent-final.log` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| diff | exit 0 | `diff-parent-final.log` | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+| OpenSpec strict | exit 0；valid | `openspec-parent-final.log` | `e34801d7350adbe5d185a626ad0d6452e3b914065571d94bffe1cbd63e24a253` |
+
+构建产物仅为 `target/debug/clash-verge-cli`，SHA-256 `1f39a9db1e612fd92bdebbc10b4e3e98ee3299408019de938905d5c0da61fb62`。没有安装到 `/usr/local/bin`，没有覆盖 GUI 实际核心/已安装 CLI；用户实际运行入口仍未确认。没有运行 app、`cargo run`、真实核心 version/check、服务/提权安装、真实控制端请求或 process signal。
+
+TUI 使用启动 `s`、重启 `r` 或 Settings 的 Proxy Core 行启动检查；`y`/Enter 授权下载，验证后显示实际版本/来源/路径，再以 `y`/Enter 确认配置准备和应用；`n`/Esc 取消，结果以 Enter/Esc 关闭。GUI 运行时允许检查与经授权下载、验证 CLI 自有候选；实际应用时会显示持久可关闭的所有权解释并拒绝启动/切换，不通过停止 GUI 实现切换。准备失败保留旧核心；commit/boot 失败执行自有回滚。联网下载、真实核心启动/切换、协议/TLS/TUN与权限仍未验证，mock 通过不能替代真实认证。

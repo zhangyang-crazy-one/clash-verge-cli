@@ -9,7 +9,15 @@ The client MUST use an explicit compatibility policy with candidate managed targ
 
 #### Scenario: unsupported or downgrade candidate rejected
 - **WHEN** a candidate is below the pinned policy or cannot be compared unambiguously
-- **THEN** selection fails with the core name, observed version, and required policy version
+- **THEN** it is recorded as ineligible with the observed and required versions; an older system candidate does not prevent inspection of compatible managed caches, and an unknown newer candidate requires review without automatic downgrade
+
+#### Scenario: older system core with compatible managed cache
+- **WHEN** a system mihomo `1.19.29` or sing-box `1.13` candidate is unsupported and a compatible integrity-verified managed cache exists
+- **THEN** the client selects the cache offline before any release API lookup and leaves every system binary untouched
+
+#### Scenario: no compatible local candidate
+- **WHEN** inspection finds no compatible validated local candidate
+- **THEN** the TUI remains usable and shows the observed source/version, fixed reviewed target and managed destination, requiring download consent before acquiring an archive
 
 #### Scenario: release API unavailable with newer valid cache
 - **WHEN** the release API is unavailable and the existing validated cache is newer than a compile-time fallback but still allowed by policy
@@ -44,6 +52,14 @@ Managed downloads MUST be staged under a cross-process lock, verified for integr
 #### Scenario: verification metadata unavailable
 - **WHEN** the installer cannot obtain trusted integrity metadata for a candidate
 - **THEN** it preserves the existing executable and returns an actionable acquisition error instead of accepting an unchecked replacement
+
+#### Scenario: official release digest is absent
+- **WHEN** the exact official repo/tag release asset has no SHA-256 digest
+- **THEN** acquisition may use only a valid unambiguous 64-hex checksum entry for that exact archive filename from an HTTPS official repo/tag-bound checksums asset; missing, malformed, ambiguous or mismatched data fails visibly
+
+#### Scenario: verified candidate requires apply confirmation
+- **WHEN** staged integrity, executable and runtime version checks succeed
+- **THEN** the TUI displays the actual verified version/path/source and requires an explicit apply confirmation before any core stop or durable selection change
 
 ### Requirement: No live-core mutation during compatibility checks
 Version comparison, executable validation, and fixture tests MUST NOT start, stop, signal, switch, or contact the user's running core. Developer verification MUST isolate temporary paths and mock endpoints, exclude real-core spawn tests, and avoid modifying installed managed binaries. Pure version subcommands used by normal product discovery are distinct from launching a core; developer tests use captured output fixtures.

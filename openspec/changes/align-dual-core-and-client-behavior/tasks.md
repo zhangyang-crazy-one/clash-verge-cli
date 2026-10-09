@@ -36,3 +36,13 @@
 - [x] 5.4 Review capability traceability from all six delta specs to implementation and unit/fixture tests, record mock/schema coverage versus unverified live/network/TUN behavior, and defer separately authorized real-core validation.
 
 All 22 tasks are complete for the authorized offline implementation and verification scope. Real-core/network/TUN validation remains explicitly deferred; this change has not been archived or synced into the main specs. Implementation: `6aff4da7`. See [evidence.md](evidence.md).
+
+## 6. Guided core update follow-up (quick 261009-eth)
+
+- [x] 6.1 Inspect all read-only system candidates and integrity-verified managed caches before network access; recover from older unsupported versions with typed consent, while unknown newer versions require review.
+- [x] 6.2 Require operation-bound download consent, official repo/tag/asset SHA-256 metadata or an exact official checksum manifest, bounded staging, actual version validation, and cancellation cleanup; retain prior executables at independent candidate paths.
+- [x] 6.3 Make manager kind/API transport shared; prepare the current Clash subscription and nonprivileged preflight before stopping an owned core, commit after readiness, and await full config/selection/owner/kind/executable rollback on failure.
+- [x] 6.4 Render check/consent/download/verify/verified-ready/prepare/switch/result in a responsive bilingual TUI; ready requires explicit apply confirmation, failures remain dismissible and retain a surviving old core, stale/cancelled operations cannot commit.
+- [x] 6.5 Validate exclusively with isolated fixtures/mock endpoints and temporary XDG paths; explicitly skip the real-core E2E, run locked suite/build and format/diff/OpenSpec checks, and record fresh counts/log digests independently from historical 588-test evidence.
+
+Follow-up: 5/5 complete under the isolated implementation scope; 27/27 total tracked implementation tasks. Code: `7b9a5136`, `bdf06fe6`, `dcf03232`, `71ba7ccb`. Fresh evidence follows the historical record in [evidence.md](evidence.md).
