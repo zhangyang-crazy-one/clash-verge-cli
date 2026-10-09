@@ -102,9 +102,10 @@ mod tests {
         (home, manager)
     }
 
-    #[test]
-    fn a_stopped_manager_reports_its_selection_and_rejects_a_switch_while_running() {
-        let (_home, manager) = manager(CoreKind::Mihomo);
+    #[tokio::test]
+    async fn a_stopped_manager_reports_its_selection_and_rejects_a_switch_while_running() {
+        let (home, manager) = manager(CoreKind::Mihomo);
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
         assert_eq!(manager.core_kind(), CoreKind::Mihomo);
         // Nothing is running, so the selection transaction is allowed.
         manager
@@ -113,9 +114,10 @@ mod tests {
         assert_eq!(manager.core_kind(), CoreKind::SingBox);
     }
 
-    #[test]
-    fn a_tracked_core_blocks_the_stopped_selection_transaction() {
-        let (_home, manager) = manager(CoreKind::SingBox);
+    #[tokio::test]
+    async fn a_tracked_core_blocks_the_stopped_selection_transaction() {
+        let (home, manager) = manager(CoreKind::SingBox);
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
         // Pretend a core is running without touching any real process.
         *manager.inner().pid.lock() = Some(u32::MAX);
         let error = manager
