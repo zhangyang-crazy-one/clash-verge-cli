@@ -189,6 +189,10 @@ async fn run() -> anyhow::Result<i32> {
             let manager = commands::build_manager(config_dir).await?;
             commands::mode::run(&manager, mode, json).await?;
         }
+        Some(cli::Command::Core { action }) => match action.unwrap_or(cli::CoreCommand::Show) {
+            cli::CoreCommand::Show => commands::core::show(config_dir, json).await?,
+            cli::CoreCommand::Use { core } => commands::core::use_core(config_dir, core).await?,
+        },
         Some(cli::Command::Connections { action }) => {
             let manager = commands::build_manager(config_dir).await?;
             match action.unwrap_or(cli::ConnectionsCommand::List) {

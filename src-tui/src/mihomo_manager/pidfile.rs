@@ -42,7 +42,21 @@ impl CoreKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl clap::ValueEnum for CoreKind {
+    /// `clash-verge-cli core use mihomo|singbox` (#56). The accepted
+    /// spellings are exactly the `proxy_core` values `IVerge` validates,
+    /// so a value that parses here is always a valid selection.
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Mihomo, Self::SingBox]
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
+
+/// `Copy` is intentionally absent: `exe` is an owned `String` (#54).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoreRecord {
     pub pid: u32,
     /// Unix seconds.
@@ -51,6 +65,17 @@ pub struct CoreRecord {
     /// backward compat with pre-schema records.
     #[serde(default)]
     pub kind: CoreKind,
+    /// Executable that was spawned, as recorded by the spawning process.
+    ///
+    /// Issue #54: the cmdline check below used to decide "is this a
+    /// sing-box" from the *file name* alone, so `verge-sing-box` (the
+    /// binary `singbox_binary::system_singbox_candidates` prefers) could
+    /// never be adopted. Recording the exact path makes adoption robust
+    /// for any binary name: the record is only honoured while
+    /// `/proc/<pid>/exe` still points at the same executable. Older
+    /// records have no `exe` and keep working through the cmdline check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
 }
 
 impl CoreRecord {
@@ -59,6 +84,7 @@ impl CoreRecord {
             pid,
             started_at: started_at.timestamp(),
             kind: CoreKind::Mihomo,
+            exe: None,
         }
     }
 
@@ -69,6 +95,17 @@ impl CoreRecord {
             pid,
             started_at: started_at.timestamp(),
             kind,
+            exe: None,
+        }
+    }
+
+    /// Record with the spawned executable path (see [`CoreRecord::exe`]).
+    pub const fn with_kind_and_exe(pid: u32, started_at: DateTime<Utc>, kind: CoreKind, exe: Option<String>) -> Self {
+        Self {
+            pid,
+            started_at: started_at.timestamp(),
+            kind,
+            exe,
         }
     }
 
@@ -161,6 +198,13 @@ pub fn read_live_for_kind(
     if record.kind != kind {
         return None;
     }
+    // A record that names the executable it spawned is only honoured while
+    // that executable is still the one running under this pid (#54).
+    if let Some(exe) = record.exe.as_deref()
+        && !running_exe_is(record.pid, exe)
+    {
+        return None;
+    }
     let cmdline = std::fs::read(format!("/proc/{}/cmdline", record.pid)).ok()?;
     let serves = match kind {
         CoreKind::Mihomo => cmdline_serves_mihomo(&cmdline, socket_path),
@@ -229,7 +273,7 @@ fn cmdline_serves_singbox(cmdline: &[u8], expected_endpoint: SocketAddr) -> bool
         .next_back()
         .and_then(|name| std::str::from_utf8(name).ok())
         .unwrap_or("");
-    if !binary_name.starts_with("sing-box") {
+    if !is_singbox_binary_name(binary_name) {
         return false;
     }
     let config_path = match args.windows(2).find(|pair| pair[0] == b"-c") {
@@ -252,6 +296,40 @@ fn cmdline_serves_singbox(cmdline: &[u8], expected_endpoint: SocketAddr) -> bool
         .and_then(|value| value.as_str())
         .and_then(|listen| listen.parse::<SocketAddr>().ok())
         == Some(expected_endpoint)
+}
+
+/// Executable names accepted as a sing-box core.
+///
+/// Issue #54: `singbox_binary::system_singbox_candidates` prefers
+/// `verge-sing-box` from `~/.local/bin`, `/usr/bin` and `/usr/local/bin`,
+/// but the check used to require the name to *start with* `sing-box`, so
+/// a core this CLI started itself could not be adopted: `status` showed no
+/// pid and `stop`/`restart`/`profile use` refused. Both the upstream name
+/// and the Verge-packaged variant are sing-box builds.
+fn is_singbox_binary_name(name: &str) -> bool {
+    name.starts_with("sing-box") || name.starts_with("verge-sing-box")
+}
+
+/// Whether `/proc/<pid>/exe` still resolves to `expected` (either the whole
+/// path or, when the procfs link cannot be read, the same file name).
+fn running_exe_is(pid: u32, expected: &str) -> bool {
+    let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        // Non-dumpable/capability-bearing processes hide the link; the
+        // cmdline check below still applies, so this is not fatal.
+        return true;
+    };
+    // A replaced binary's link reads as `…/sing-box (deleted)`.
+    let linked: String = link.to_string_lossy().into_owned();
+    let linked = linked.split(" (deleted)").next().unwrap_or_default();
+    if linked == expected {
+        return true;
+    }
+    // The record may name a symlink while procfs names its target (or the
+    // other way round); canonicalize both when the file is still present.
+    match (std::fs::canonicalize(linked), std::fs::canonicalize(expected)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +394,71 @@ mod tests {
     }
 
     #[test]
+    fn verge_sing_box_cmdline_is_adoptable() {
+        // #54: `start` may spawn /usr/bin/verge-sing-box (the system
+        // candidate this CLI prefers). Such a core must still be adopted by
+        // a later CLI invocation.
+        let dir = std::env::temp_dir().join(format!("cv-sb-verge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("sb.json");
+        std::fs::write(
+            &config_path,
+            br#"{"experimental":{"clash_api":{"external_controller":"127.0.0.1:9090"}}}"#,
+        )
+        .unwrap();
+        for binary in [
+            "/usr/bin/verge-sing-box",
+            "/usr/local/bin/verge-sing-box-1.14.2",
+            "sing-box",
+        ] {
+            let mut cmdline = Vec::new();
+            cmdline.extend_from_slice(binary.as_bytes());
+            cmdline.push(0);
+            cmdline.extend_from_slice(b"run\0");
+            cmdline.extend_from_slice(b"-c\0");
+            cmdline.extend_from_slice(config_path.as_os_str().as_encoded_bytes());
+            cmdline.push(0);
+            let endpoint: SocketAddr = "127.0.0.1:9090".parse().unwrap();
+            assert!(cmdline_serves_singbox(&cmdline, endpoint), "{binary}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binary_name_recognition_covers_both_packagings_only() {
+        assert!(is_singbox_binary_name("sing-box"));
+        assert!(is_singbox_binary_name("verge-sing-box"));
+        assert!(!is_singbox_binary_name("mihomo"));
+        assert!(!is_singbox_binary_name("singbox"));
+        assert!(!is_singbox_binary_name(""));
+    }
+
+    #[test]
+    fn recorded_exe_must_still_be_the_running_executable() {
+        // A record naming this test binary is honoured (it IS running);
+        // naming any other binary is refused, so a recycled pid whose
+        // executable was swapped can never be adopted.
+        let this_exe = std::fs::read_link("/proc/self/exe")
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        assert!(running_exe_is(std::process::id(), &this_exe));
+        assert!(
+            !running_exe_is(std::process::id(), "/opt/somewhere/else/sing-box"),
+            "a record for another executable must not be adopted"
+        );
+    }
+
+    #[test]
+    fn record_without_exe_still_adopts_through_the_cmdline_check() {
+        // Backward compatibility: a record written before the `exe` field
+        // existed parses as None and keeps working.
+        let legacy = r#"{"pid":42,"started_at":1700000000,"kind":"singbox"}"#;
+        let parsed: CoreRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.exe, None);
+        assert_eq!(parsed.kind, CoreKind::SingBox);
+    }
+
+    #[test]
     fn singbox_cmdline_rejects_non_singbox_binary() {
         // A reused pid whose binary has been swapped to something else
         // must not be adopted, even if the rest of the cmdline looks
@@ -363,7 +506,7 @@ mod tests {
         assert!(path.ends_with("mihomo.pid"));
         assert!(CoreRecord::new(1, Utc::now()).started_at().is_some());
         let record = CoreRecord::new(std::process::id(), Utc::now());
-        write(&path, record).unwrap();
+        write(&path, record.clone()).unwrap();
 
         // This test process does not serve the socket, so it is not adopted.
         assert!(read_live(&path, &dir.join("external-controller.sock")).is_none());
@@ -473,6 +616,22 @@ mod tests {
         assert!(take_stop_intent(&path, 42));
         assert!(!path.exists(), "the intent is consumed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn core_kind_is_a_clap_value_enum_for_the_core_command() {
+        // #56: `clash-verge-cli core use <kind>` must accept exactly the
+        // `proxy_core` spellings.
+        use clap::ValueEnum as _;
+        assert_eq!(
+            CoreKind::from_str("singbox", false).expect("singbox"),
+            CoreKind::SingBox
+        );
+        // Only the exact `proxy_core` spellings are accepted; a typo is a
+        // usage error rather than a silent default.
+        assert!(CoreKind::from_str("MIHOMO", false).is_err());
+        assert!(CoreKind::from_str("clash", false).is_err());
+        assert_eq!(CoreKind::value_variants().len(), 2);
     }
 
     #[test]

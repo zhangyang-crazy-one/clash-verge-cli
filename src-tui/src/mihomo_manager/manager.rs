@@ -466,7 +466,17 @@ impl ManagerInner {
         inner.owns_child.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Err(error) = pidfile::write(
             &pidfile::path_for(socket_path),
-            pidfile::CoreRecord::with_kind(pid, started_at, core_kind),
+            // #54: record the resolved executable so a later CLI process
+            // can adopt this core by identity, whatever the binary is
+            // called (`verge-sing-box` included).
+            pidfile::CoreRecord::with_kind_and_exe(
+                pid,
+                started_at,
+                core_kind,
+                std::fs::canonicalize(resolved_path)
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            ),
         ) {
             tracing::warn!(target: "mihomo", "failed to record the core pid: {error}");
         }
@@ -682,6 +692,7 @@ impl ManagerInner {
                     groups: vec![],
                     skipped: vec![],
                     degraded: vec![],
+                    notes: vec![],
                 },
                 profile_used: true,
                 route_rules: vec![],
@@ -742,21 +753,36 @@ impl SingboxParts {
             ),
             None => (crate::singbox::convert::ProfileConversion::default(), false),
         };
-        // Reject rules that have no supported sing-box representation rather
-        // than silently removing routing policy from the applied profile.
-        let mut route_rules: Vec<serde_json::Value> = match yaml {
-            Some(y) => profile_route_rules(y).map_err(anyhow::Error::msg)?,
+        let home = clash_verge_core::utils::dirs::app_home_dir().ok();
+        let stored_rule_sets: Vec<serde_json::Value> = match &home {
+            Some(home) => crate::singbox::load_rule_sets(home).map_err(anyhow::Error::msg)?,
             None => Vec::new(),
         };
-        let home = clash_verge_core::utils::dirs::app_home_dir().ok();
+        // Profile rules degrade gracefully (#52): unrepresentable rules are
+        // reported instead of aborting the whole configuration, and the geo
+        // rule-sets they reference are materialized alongside them.
+        let stored_tags: std::collections::HashSet<String> = stored_rule_sets
+            .iter()
+            .filter_map(|set| set.get("tag").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        let profile_routes = match yaml {
+            Some(y) => profile_route_rules(y, &conversion.outbound_tags(), &stored_tags).map_err(anyhow::Error::msg)?,
+            None => ProfileRouteRules {
+                rules: Vec::new(),
+                rule_sets: Vec::new(),
+                skipped: Vec::new(),
+            },
+        };
+        let mut route_rules: Vec<serde_json::Value> = profile_routes.rules;
+        let rule_sets = merge_rule_sets(stored_rule_sets, profile_routes.rule_sets);
         if let Some(home) = &home {
             let logical = crate::singbox::load_logical_rules(home).map_err(anyhow::Error::msg)?;
             route_rules.extend(logical.iter().filter_map(crate::routing::to_singbox_json));
         }
-        let rule_sets = match &home {
-            Some(home) => crate::singbox::load_rule_sets(home).map_err(anyhow::Error::msg)?,
-            None => Vec::new(),
-        };
+        // Rules the conversion could not express are reported, never fatal.
+        let route_report = profile_routes.skipped;
+        let mut conversion = conversion;
         let stored_dns = match &home {
             Some(home) => crate::singbox::load_dns_spec(home).map_err(anyhow::Error::msg)?,
             None => crate::singbox::DnsConfigSpec::default(),
@@ -776,6 +802,7 @@ impl SingboxParts {
         };
         let default_domain_resolver = crate::singbox::dns::default_domain_resolver(&dns_spec);
         let dns_section = crate::singbox::dns::build_dns_section(&dns_spec).map_err(anyhow::Error::msg)?;
+        conversion.notes.extend(route_report);
         Ok(Self {
             conversion,
             profile_used,
@@ -832,6 +859,13 @@ impl MihomoManager {
 
     pub fn core_kind(&self) -> CoreKind {
         self.inner.core_kind()
+    }
+
+    /// The sing-box clash_api TCP endpoint this manager talks to (#54:
+    /// sing-box's controller is TCP-only, so user-facing messages must
+    /// name this address, not the unix socket).
+    pub fn singbox_controller_addr(&self) -> std::net::SocketAddr {
+        self.singbox_controller
     }
 
     pub fn with_socket(mut self, socket_path: PathBuf) -> Self {
@@ -1697,6 +1731,51 @@ stop it where it was started",
         })
     }
 
+    /// Replace the running core with a fresh one that picks up a
+    /// regenerated configuration, when this process did **not** spawn the
+    /// running core (#55).
+    ///
+    /// sing-box has no hot reload, so applying a profile means restarting
+    /// it. `start` runs the core under a detached `start --foreground`
+    /// supervisor, so in every *later* CLI invocation (and in a TUI
+    /// attached to a service-started core) `owns_child()` is false and the
+    /// old check refused with "externally managed core" — making
+    /// `profile use` / `profile update --reload` impossible.
+    ///
+    /// A core with a verified pid record (see
+    /// [`pidfile::read_live_for_kind`], which also validates the executable
+    /// and the controller endpoint) *is* ours to replace: the old
+    /// supervisor stands down through the stop-intent marker written by
+    /// [`MihomoManager::stop`] and the replacement is handed to a new
+    /// detached supervisor. Only a core with no pid record at all — one
+    /// somebody else started — is refused.
+    pub async fn restart_through_supervisor(&self) -> anyhow::Result<()> {
+        let configured = configured_core_kind().await;
+        supervisor_restart_policy(self.owns_child(), self.pid(), self.core_kind(), configured)?;
+        if self.owns_child() {
+            self.restart().await.map(|_| ())
+        } else {
+            self.stop().await.context("failed to stop the recorded core")?;
+            let log = crate::commands::start::supervisor_log_path(&self.config_dir);
+            let mut supervisor = crate::commands::start::launch_supervisor(&self.config_dir, &log)?;
+            crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await?;
+            // The replacement belongs to the new supervisor; adopt its pid
+            // record so the rest of this process sees the running core.
+            self.adopt_running_core();
+            Ok(())
+        }
+    }
+
+    /// CLI `core use` while nothing is running: persist the selection
+    /// (verge.yaml `proxy_core` plus the sing-box ownership marker) after
+    /// the same read-only stopped-state preflight the TUI guided switch
+    /// uses, so both surfaces share one transaction (#56).
+    pub fn select_core_while_stopped(&self, target: CoreKind) -> anyhow::Result<()> {
+        let generation = self.current_generation();
+        let old_kind = self.core_kind();
+        self.commit_stopped_selection(generation, old_kind, target, &AtomicBool::new(false))
+    }
+
     /// Return CoreStatus with live version info if mihomo is running.
     /// Status from this process's own view, without probing the controller
     /// (`version` is `None`).
@@ -1795,6 +1874,55 @@ pub(crate) fn rollback_failed_spawn(inner: &ManagerInner, socket_path: &Path, pi
 /// Pure helper: only reads the on-disk record + checks `/proc/<pid>/stat`
 /// liveness; no manager state, no awaits. Unit-testable in isolation by
 /// staging a temporary record and a known-dead pid.
+/// Whether a configuration restart may replace the running core (#55).
+///
+/// - an owned child is always restartable in place;
+/// - a core with a verified pid record is restartable through a detached
+///   supervisor, but only while the configured `proxy_core` still names
+///   the running kind — otherwise the supervisor would bring up a
+///   *different* core than the one being reconfigured (#56: switch first);
+/// - a core with no pid record belongs to somebody else and is refused.
+pub(crate) fn supervisor_restart_policy(
+    owns_child: bool,
+    pid: Option<u32>,
+    running: CoreKind,
+    configured: CoreKind,
+) -> anyhow::Result<()> {
+    if owns_child {
+        return Ok(());
+    }
+    if pid.is_none() {
+        anyhow::bail!(
+            "cannot apply settings to a {} core with no clash-verge-cli pid record; \
+it was started outside this CLI — stop it where it was started",
+            running.as_str()
+        );
+    }
+    if running != configured {
+        anyhow::bail!(
+            "a {} core is running but verge.yaml selects {}; switch the core first \
+(`clash-verge-cli core use {}`) so the replacement matches the running one",
+            running.as_str(),
+            configured.as_str(),
+            configured.as_str()
+        );
+    }
+    Ok(())
+}
+
+/// The core `verge.yaml` selects (`proxy_core`), with the same
+/// fail-safe-to-mihomo validation `IVerge` applies. Read on every
+/// lifecycle decision so a core switch written by the TUI, a restore or a
+/// hand edit is always honoured (#56).
+pub async fn configured_core_kind() -> CoreKind {
+    let verge = clash_verge_core::config::IVerge::new().await;
+    if verge.get_valid_proxy_core() == "singbox" {
+        CoreKind::SingBox
+    } else {
+        CoreKind::Mihomo
+    }
+}
+
 pub(crate) fn check_cross_kind_record(socket_path: &Path, self_kind: CoreKind) -> anyhow::Result<()> {
     let record_path = pidfile::path_for(socket_path);
     let Some(record) = pidfile::read_record(&record_path) else {
@@ -2552,7 +2680,7 @@ mod tests {
             let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
             let record = pidfile::CoreRecord::with_kind(u32::MAX, Utc::now(), CoreKind::Mihomo);
-            pidfile::write(&pidfile::path_for(&socket), record).unwrap();
+            pidfile::write(&pidfile::path_for(&socket), record.clone()).unwrap();
             let manager = MihomoManager::new(home.path().to_path_buf())
                 .with_socket(socket.clone())
                 .with_singbox_controller("127.0.0.1:0".parse().unwrap());
@@ -2648,7 +2776,7 @@ mod tests {
             .with_socket(socket.clone())
             .with_singbox_controller(address);
         let record = pidfile::CoreRecord::with_kind(std::process::id(), Utc::now(), CoreKind::Mihomo);
-        pidfile::write(&pidfile::path_for(&socket), record).unwrap();
+        pidfile::write(&pidfile::path_for(&socket), record.clone()).unwrap();
         *manager.inner.pid.lock() = Some(std::process::id());
         *manager.inner.state.lock() = CoreState::Running;
         manager.inner.owns_child.store(true, Ordering::SeqCst);
@@ -3203,6 +3331,31 @@ mod tests {
     // resurrecting the old core to fight the new one for ports.
     // The generation-based classifier below must make that impossible:
     // a watcher whose generation no longer matches NEVER restarts.
+    #[test]
+    fn adopted_core_is_restartable_but_a_foreign_one_is_not() {
+        // #55: the supervisor owns the child, so `owns_child` is false in
+        // every later CLI invocation — that must not block a profile apply
+        // when a verified pid record exists.
+        supervisor_restart_policy(false, Some(4242), CoreKind::SingBox, CoreKind::SingBox)
+            .expect("a recorded core may be replaced through its supervisor");
+        // Our own child always restarts in place.
+        supervisor_restart_policy(true, Some(1), CoreKind::Mihomo, CoreKind::SingBox)
+            .expect("an owned child needs no record check");
+        // No pid record at all: somebody else's core.
+        let foreign = supervisor_restart_policy(false, None, CoreKind::SingBox, CoreKind::SingBox)
+            .expect_err("an unrecorded core must be refused");
+        assert!(
+            foreign.to_string().contains("no clash-verge-cli pid record"),
+            "{foreign}"
+        );
+        // A running core the configuration no longer selects (#56): the
+        // supervisor would start a different core than the one being
+        // reconfigured, so refuse and point at `core use`.
+        let mismatch = supervisor_restart_policy(false, Some(4242), CoreKind::Mihomo, CoreKind::SingBox)
+            .expect_err("a core switch must be reconciled first");
+        assert!(mismatch.to_string().contains("core use singbox"), "{mismatch}");
+    }
+
     #[test]
     fn stale_watcher_never_restarts_even_after_flag_clear() {
         // Old core spawned at gen 1; a new core already bumped gen to 2.
@@ -3975,23 +4128,188 @@ fn profile_tun_settings(
     })
 }
 
-fn profile_route_rules(yaml: &str) -> Result<Vec<serde_json::Value>, String> {
+/// Converted profile routing plus the report lines describing what had to
+/// be approximated or dropped (#52).
+#[derive(Debug)]
+struct ProfileRouteRules {
+    rules: Vec<serde_json::Value>,
+    /// `route.rule_set` entries the converted rules reference (geo sets
+    /// synthesized from `GEOIP`/`GEOSITE`, providers from `rule-providers`).
+    rule_sets: Vec<serde_json::Value>,
+    /// Human-readable degradation lines, surfaced by `status` and the
+    /// profile commands instead of failing the whole configuration.
+    skipped: Vec<String>,
+}
+
+/// Convert a clash profile's `rules:` list into sing-box route rules.
+///
+/// Issue #52: the previous pass required every rule to be exactly three
+/// comma-separated fields and refused anything it could not map, so a
+/// single `no-resolve` modifier or one `GEOIP,CN,DIRECT` line made the
+/// whole subscription unusable. The mapping now degrades gracefully:
+///
+/// - tolerated modifiers (`no-resolve`) are dropped and reported —
+///   sing-box never resolves a domain for an `ip_cidr` rule anyway;
+/// - `GEOIP`/`GEOSITE` become references to the official SagerNet `.srs`
+///   rule-sets, which are emitted alongside the rules;
+/// - `RULE-SET,<name>` resolves against the rule-sets converted from
+///   `rule-providers` (`.srs` payloads only) plus the user's stored sets;
+/// - a rule that still cannot be represented — an extra match field, a
+///   negated geo set, an unconvertible provider, or a target outbound the
+///   conversion could not produce — is skipped and reported instead of
+///   aborting the configuration with a dangling reference.
+fn profile_route_rules(
+    yaml: &str,
+    known_outbounds: &std::collections::HashSet<String>,
+    known_rule_sets: &std::collections::HashSet<String>,
+) -> Result<ProfileRouteRules, String> {
     let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).map_err(|error| error.to_string())?;
-    let Some(rules) = document.get("rules") else {
-        return Ok(Vec::new());
+    let mut result = ProfileRouteRules {
+        rules: Vec::new(),
+        rule_sets: Vec::new(),
+        skipped: Vec::new(),
     };
-    let rules = rules.as_sequence().ok_or("profile rules must be a list")?;
-    rules.iter().enumerate().map(|(index, rule)| {
-        let rule = rule.as_str().ok_or_else(|| format!("profile rules[{index}] must be a string"))?;
-        let parts: Vec<_> = rule.split(',').map(str::trim).collect();
-        if parts.first() == Some(&"MATCH") && parts.len() == 2 {
-            let target = match parts[1] { "DIRECT" => "direct", "REJECT" => "block", value => value };
-            return Ok(serde_json::json!({"outbound": target}));
+    // Providers that already publish a sing-box payload become rule-sets,
+    // so `RULE-SET` rules can point at them.
+    let providers = crate::singbox::convert::convert_rule_providers(yaml).map_err(|error| error.to_string())?;
+    result.rule_sets.extend(providers.rule_sets.clone());
+    result
+        .skipped
+        .extend(providers.skipped.iter().map(|line| format!("rules: {line}")));
+    let mut available_sets: std::collections::HashSet<String> = known_rule_sets.clone();
+    available_sets.extend(
+        providers
+            .rule_sets
+            .iter()
+            .filter_map(|set| set.get("tag").and_then(serde_json::Value::as_str))
+            .map(str::to_owned),
+    );
+
+    let Some(rules) = document.get("rules") else {
+        return Ok(result);
+    };
+    let rules = rules.as_sequence().ok_or("profile rules must be a list")?.clone();
+    for (index, rule) in rules.iter().enumerate() {
+        let rule = rule
+            .as_str()
+            .ok_or_else(|| format!("profile rules[{index}] must be a string"))?;
+        match convert_one_rule(rule, known_outbounds, &available_sets, &mut result) {
+            Ok(()) => {}
+            // Only a structurally broken rule list is fatal; a single
+            // unrepresentable rule degrades into the report.
+            Err(reason) => result.skipped.push(format!("profile rules[{index}]: {reason}")),
         }
-        if parts.len() != 3 { return Err(format!("profile rules[{index}] has unsupported sing-box rule syntax or modifiers; migrate it to a native route rule/rule-set")); }
-        crate::routing::to_singbox_json(&crate::routing::from_clash_rule_str(rule))
-            .ok_or_else(|| format!("profile rules[{index}] kind {} cannot be represented by sing-box 1.14.2; migrate it to a native route rule/rule-set", parts[0]))
-    }).collect()
+    }
+    Ok(result)
+}
+
+/// Convert one clash rule, appending to `out` what it needs (the rule
+/// itself and any geo rule-set it references).
+fn convert_one_rule(
+    rule: &str,
+    known_outbounds: &std::collections::HashSet<String>,
+    known_rule_sets: &std::collections::HashSet<String>,
+    out: &mut ProfileRouteRules,
+) -> Result<(), String> {
+    let (fields, modifiers) = crate::routing::split_clash_rule(rule);
+    if modifiers.is_empty() {
+        // Nothing to report for a rule that used no modifier.
+    } else {
+        out.skipped.push(format!(
+            "profile rule {rule:?}: dropped modifier(s) {}",
+            modifiers.join(", ")
+        ));
+    }
+    if fields.first().map(String::as_str) == Some("MATCH") {
+        let target = fields.get(1).ok_or("MATCH rule has no target")?.clone();
+        let tag = normalize_policy_tag(&target);
+        if !known_outbounds.contains(&tag) {
+            return Err(format!(
+                "final MATCH target {target:?} is not an available outbound in the converted config; skipped"
+            ));
+        }
+        // clash's catch-all `MATCH` is sing-box's `route.final`, which the
+        // generator already emits; the rule is kept as a catch-all so rule
+        // ORDER is preserved when other rules follow it.
+        out.rules.push(serde_json::json!({ "outbound": tag }));
+        return Ok(());
+    }
+    // kind, value, target — and nothing else is representable.
+    if fields.len() != 3 {
+        return Err(format!("unsupported syntax or match fields ({fields:?}); skipped"));
+    }
+    let target = fields[2].clone();
+    let model = crate::routing::from_clash_rule_str(rule);
+    // A `RULE-SET` rule only survives when the referenced set exists;
+    // otherwise it would abort the config with a missing rule-set error.
+    if let crate::routing::IRouteRule::Simple { matches, .. } = &model
+        && matches.iter().any(|field| {
+            // GEOIP/GEOSITE tags are synthesized right below; only a tag
+            // that is neither stored nor derivable is unresolvable.
+            matches!(field, crate::routing::MatchField::RuleSet(tag)
+                if !known_rule_sets.contains(tag)
+                    && crate::singbox::convert::geo_rule_set(tag).is_none())
+        })
+    {
+        return Err(format!(
+            "RULE-SET {rule:?} has no sing-box rule-set (clash rule-providers are only converted from .srs payloads); skipped"
+        ));
+    }
+    let converted = crate::routing::to_singbox_json(&model)
+        .ok_or_else(|| format!("kind {} cannot be represented by sing-box 1.14.2; skipped", fields[0]))?;
+    // GEOIP/GEOSITE map to rule-set references; materialize the sets.
+    if let Some(tags) = converted.get("rule_set").and_then(serde_json::Value::as_array) {
+        for tag in tags.iter().filter_map(serde_json::Value::as_str) {
+            if known_rule_sets.contains(tag) {
+                continue;
+            }
+            let set = crate::singbox::convert::geo_rule_set(tag)
+                .ok_or_else(|| format!("rule-set {tag:?} is unknown; skipped"))?;
+            out.rule_sets.push(set);
+        }
+    }
+    // A rule whose target the conversion could not produce would be a
+    // dangling outbound reference, which aborts the whole config.
+    let tag = normalize_policy_tag(&target);
+    if !known_outbounds.contains(&tag) {
+        return Err(format!(
+            "target {target:?} is not an available outbound in the converted config; skipped"
+        ));
+    }
+    let mut rule = converted;
+    rule["outbound"] = serde_json::json!(tag);
+    out.rules.push(rule);
+    Ok(())
+}
+
+/// sing-box's built-in policy outbound tags.
+fn normalize_policy_tag(target: &str) -> String {
+    match target {
+        "DIRECT" => "direct".into(),
+        "REJECT" => "block".into(),
+        other => other.into(),
+    }
+}
+
+/// Merge generated geo/provider rule-sets with the user's stored ones.
+/// Stored sets win on a tag clash; duplicates are dropped so
+/// `config_gen::validate_references` sees unique tags.
+fn merge_rule_sets(stored: Vec<serde_json::Value>, generated: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut merged = stored;
+    let mut tags: std::collections::HashSet<String> = merged
+        .iter()
+        .filter_map(|set| set.get("tag").and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
+        .collect();
+    for set in generated {
+        let Some(tag) = set.get("tag").and_then(serde_json::Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if tags.insert(tag) {
+            merged.push(set);
+        }
+    }
+    merged
 }
 
 fn write_generated_json(path: &Path, config: &serde_json::Value) -> anyhow::Result<()> {
@@ -4069,18 +4387,109 @@ mod alignment_regressions {
         assert_eq!(profile_tun_settings(Some(native), &base).unwrap().mtu, 1400);
     }
 
+    fn tags(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
     #[test]
-    fn profile_routing_preserves_final_policy_and_rejects_unsupported_rules() {
-        let rules = profile_route_rules("rules: ['DOMAIN,example.com,DIRECT', 'MATCH,Proxy']").unwrap();
-        assert_eq!(rules[0]["outbound"], "direct");
-        assert_eq!(rules[1], serde_json::json!({"outbound":"Proxy"}));
-        for yaml in [
-            "rules: ['GEOIP,CN,DIRECT']",
-            "rules: ['IP-CIDR,10.0.0.0/8,DIRECT,no-resolve']",
-            "rules: [7]",
-        ] {
-            assert!(profile_route_rules(yaml).is_err());
-        }
+    fn profile_routing_preserves_final_policy_and_order() {
+        let outbounds = tags(&["Proxy", "direct", "block"]);
+        let converted = profile_route_rules(
+            "rules: ['DOMAIN,example.com,DIRECT', 'MATCH,Proxy']",
+            &outbounds,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(converted.rules[0]["outbound"], "direct");
+        assert_eq!(converted.rules[0]["domain"], serde_json::json!(["example.com"]));
+        assert_eq!(converted.rules[1], serde_json::json!({"outbound":"Proxy"}));
+        assert!(converted.skipped.is_empty(), "{:?}", converted.skipped);
+    }
+
+    #[test]
+    fn no_resolve_geo_rules_and_srs_providers_now_convert_with_a_report() {
+        // #52: every one of these used to abort the whole configuration.
+        let outbounds = tags(&["PROXY", "direct", "block"]);
+        let yaml = "rules: [\n  'GEOIP,CN,DIRECT',\n  'GEOSITE,geolocation-!cn,REJECT',\n  'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',\n  'RULE-SET,ads,REJECT',\n  'RULE-SET,cn,PROXY',\n  'MATCH,PROXY',\n]\nrule-providers:\n  ads:\n    behavior: domain\n    url: https://example.com/ads.srs\n  cn:\n    behavior: classical\n    url: https://example.com/cn.list\n";
+        let converted = profile_route_rules(yaml, &outbounds, &Default::default()).unwrap();
+        assert_eq!(
+            converted.rules.len(),
+            5,
+            "the classical-provider rule is skipped: {:?}",
+            converted.rules
+        );
+        assert_eq!(converted.rules[0]["rule_set"], serde_json::json!(["geoip-cn"]));
+        assert_eq!(
+            converted.rules[1]["rule_set"],
+            serde_json::json!(["geosite-geolocation-!cn"])
+        );
+        assert_eq!(converted.rules[2]["ip_cidr"], serde_json::json!(["10.0.0.0/8"]));
+        assert_eq!(converted.rules[2]["outbound"], "direct");
+        assert_eq!(converted.rules[3]["rule_set"], serde_json::json!(["ads"]));
+        assert_eq!(converted.rules[3]["outbound"], "block");
+        // A classical provider has no .srs payload: that ONE rule degrades.
+        assert!(
+            converted
+                .skipped
+                .iter()
+                .any(|line| line.contains("RULE-SET") && line.contains("cn")),
+            "{:?}",
+            converted.skipped
+        );
+        assert_eq!(converted.rules[4], serde_json::json!({"outbound": "PROXY"}));
+        // geo sets + the .srs provider are materialized for the references.
+        let tags: Vec<&str> = converted
+            .rule_sets
+            .iter()
+            .filter_map(|set| set.get("tag").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(tags, vec!["ads", "geoip-cn", "geosite-geolocation-!cn"]);
+        // The dropped no-resolve modifier is reported, not silently lost.
+        assert!(
+            converted.skipped.iter().any(|line| line.contains("no-resolve")),
+            "{:?}",
+            converted.skipped
+        );
+    }
+
+    #[test]
+    fn unrepresentable_and_dangling_rules_degrade_instead_of_failing() {
+        let outbounds = tags(&["PROXY", "direct", "block"]);
+        let yaml = "rules: [\n  'IP-CIDR,10.0.0.0/8,udp,DIRECT',\n  'GEOIP,!cn,REJECT',\n  'SRC-IP-CIDR,10.0.0.0/8,DIRECT',\n  'DOMAIN,a.com,MissingGroup',\n  'MATCH,PROXY',\n]\n";
+        let converted = profile_route_rules(yaml, &outbounds, &Default::default()).unwrap();
+        assert_eq!(
+            converted.rules,
+            vec![serde_json::json!({"outbound":"PROXY"})],
+            "only the final policy survives"
+        );
+        assert_eq!(converted.skipped.len(), 4, "{:?}", converted.skipped);
+        assert!(converted.skipped.iter().any(|line| line.contains("MissingGroup")));
+        assert!(converted.skipped.iter().any(|line| line.contains("SRC-IP-CIDR")));
+    }
+
+    #[test]
+    fn structurally_broken_rule_lists_are_still_refused() {
+        // Degradation covers semantics, never a malformed document.
+        assert!(profile_route_rules("rules: 7", &tags(&["direct"]), &Default::default()).is_err());
+        assert!(
+            profile_route_rules("rules: [7]", &tags(&["direct"]), &Default::default())
+                .unwrap_err()
+                .contains("must be a string")
+        );
+    }
+
+    #[test]
+    fn merged_rule_sets_keep_stored_sets_and_drop_duplicates() {
+        let merged = merge_rule_sets(
+            vec![serde_json::json!({"tag":"ads","type":"local","path":"a.srs"})],
+            vec![
+                serde_json::json!({"tag":"ads","type":"remote","url":"https://x/ads.srs"}),
+                serde_json::json!({"tag":"geoip-cn","type":"remote","url":"https://x/geoip-cn.srs"}),
+            ],
+        );
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0]["type"], "local", "a stored set wins the tag");
+        assert_eq!(merged[1]["tag"], "geoip-cn");
     }
 
     #[test]

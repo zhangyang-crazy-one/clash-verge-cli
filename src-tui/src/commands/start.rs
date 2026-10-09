@@ -57,7 +57,10 @@ pub fn supervisor_log_path(config_dir: &Path) -> PathBuf {
 /// from this process: its own process group (a terminal Ctrl-C aimed at the
 /// CLI does not reach it), stdin closed, output appended to `log` (the
 /// previous run is kept as `daemon.log.old`).
-fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+///
+/// Also used by [`crate::mihomo_manager::MihomoManager::restart_through_supervisor`]
+/// to hand a replacement core to a supervisor after stopping an adopted one.
+pub fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
 
     if let Some(dir) = log.parent() {
@@ -83,7 +86,7 @@ fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::proce
 
 /// Wait until the supervised core answers. If the supervisor exits first
 /// (bad config, missing TUN capability, crash loop), report its log tail.
-async fn wait_until_ready(
+pub async fn wait_until_ready(
     manager: &MihomoManager,
     supervisor: &mut std::process::Child,
     log: &Path,

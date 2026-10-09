@@ -1,6 +1,7 @@
 pub mod askpass;
 pub mod backup;
 pub mod connections;
+pub mod core;
 pub mod daemon;
 pub mod docs;
 pub mod log_cleanup;
@@ -27,20 +28,31 @@ use clash_verge_core::config::IClashTemp;
 
 /// Build a MihomoManager wired with config from the standalone config dir.
 ///
-/// Honors `verge.yaml`'s `proxy_core` selection (`mihomo` or `singbox`) so
-/// the CLI matches the GUI's core switch: a stored `singbox` value makes the
-/// manager resolve and spawn the sing-box core instead of verge-mihomo.
+/// The core kind comes from the **running** pid record when there is one
+/// and from `verge.yaml`'s `proxy_core` otherwise (issue #56). The record
+/// is the source of truth for what is actually serving this controller:
+/// editing `proxy_core` while a core runs used to make `status`/`stop`/
+/// `restart` look for a core that was never started and refuse with "not
+/// started by clash-verge-cli". `adopt_running_core` then validates the
+/// record (kind, executable, controller endpoint) before any pid is used.
 pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager> {
     let clash = IClashTemp::new().await;
+    let socket = controller_socket_path(&clash.0).await;
+    let singbox = crate::mihomo_manager::manager::configured_singbox_controller(&clash.0)?;
+    let kind = running_core_kind(&socket, singbox).await;
+    build_manager_for_kind(config_dir, kind).await
+}
+
+/// Build a manager pinned to `kind`, ignoring the running record. Used for
+/// the *replacement* side of `restart`/`core use`, which must follow the
+/// configured `proxy_core` rather than the core being replaced.
+pub async fn build_manager_for_kind(
+    config_dir: PathBuf,
+    kind: crate::mihomo_manager::CoreKind,
+) -> anyhow::Result<MihomoManager> {
+    let clash = IClashTemp::new().await;
     let info = clash.get_client_info();
-    // Read Unix socket path from the CLI's own clash config; fall back to the
-    // standalone socket (never a GUI path).
-    let socket_path = clash
-        .0
-        .get("external-controller-unix")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .unwrap_or_else(clash_verge_core::utils::dirs::standalone_socket_path);
+    let socket_path = controller_socket_path(&clash.0).await;
     let secret = info.secret.unwrap_or_default();
 
     let mut manager = MihomoManager::new(config_dir)
@@ -48,16 +60,57 @@ pub async fn build_manager(config_dir: PathBuf) -> anyhow::Result<MihomoManager>
         .with_singbox_controller(crate::mihomo_manager::manager::configured_singbox_controller(&clash.0)?)
         .with_secret(secret);
 
-    // proxy_core: "singbox" switches the managed core from verge-mihomo to
-    // sing-box. IVerge validates the value (unknown degrades to mihomo).
-    let verge = clash_verge_core::config::IVerge::new().await;
-    if verge.get_valid_proxy_core() == "singbox" {
+    if kind == crate::mihomo_manager::CoreKind::SingBox {
         manager = manager.with_core_kind(crate::mihomo_manager::CoreKind::SingBox);
     }
 
     // A core started by an earlier `start` (or the TUI) is managed here too.
     manager.adopt_running_core();
     Ok(manager)
+}
+
+/// The core kind a lifecycle command must talk to (#56): the kind recorded
+/// for the running core, else `verge.yaml`'s `proxy_core`.
+pub async fn running_core_kind(
+    socket_path: &std::path::Path,
+    singbox_controller: std::net::SocketAddr,
+) -> crate::mihomo_manager::CoreKind {
+    use crate::mihomo_manager::CoreKind;
+    use crate::mihomo_manager::pidfile;
+    // Only a record that would actually be ADOPTED counts: kind, recorded
+    // executable, live pid and controller endpoint must all check out.
+    // Reading the field alone would let a stale record — or a recycled pid
+    // — steer the lifecycle commands at the wrong core.
+    let path = pidfile::path_for(socket_path);
+    for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+        let endpoint = (kind == CoreKind::SingBox).then_some(singbox_controller);
+        if pidfile::read_live_for_kind(&path, socket_path, kind, endpoint).is_some() {
+            return kind;
+        }
+    }
+    configured_core_kind().await
+}
+
+/// Read the Unix socket path from the CLI's own clash config; fall back to
+/// the standalone socket (never a GUI path).
+pub async fn controller_socket_path(config: &serde_yaml_ng::Mapping) -> PathBuf {
+    config
+        .get("external-controller-unix")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(clash_verge_core::utils::dirs::standalone_socket_path)
+}
+
+/// The controller socket this CLI manages, as [`build_manager`] sees it.
+pub async fn active_socket_path() -> PathBuf {
+    let clash = IClashTemp::new().await;
+    controller_socket_path(&clash.0).await
+}
+
+/// The core `verge.yaml` selects, re-read on every lifecycle command so a
+/// switch written by the TUI, a restore or a hand edit is always honoured.
+pub async fn configured_core_kind() -> crate::mihomo_manager::CoreKind {
+    crate::mihomo_manager::manager::configured_core_kind().await
 }
 
 /// The last `lines` lines of `path`, for error messages.
@@ -153,8 +206,46 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_an_adoptable_pid_record_decides_the_kind_not_the_file_alone() {
+        use crate::mihomo_manager::CoreKind;
+        use crate::mihomo_manager::pidfile::{self, CoreRecord};
+
+        let dir = std::env::temp_dir().join(format!("cv-corekind-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("external-controller.sock");
+        let path = pidfile::path_for(&socket);
+
+        // No record: the configured selection decides (this test's home has
+        // no verge.yaml, so it falls back to mihomo).
+        let endpoint: std::net::SocketAddr = "127.0.0.1:9090".parse().unwrap();
+        assert_eq!(running_core_kind(&socket, endpoint).await, CoreKind::Mihomo);
+
+        // A dead record is stale and must not steer lifecycle commands.
+        pidfile::write(
+            &path,
+            CoreRecord::with_kind(u32::MAX, chrono::Utc::now(), CoreKind::SingBox),
+        )
+        .unwrap();
+        assert_eq!(running_core_kind(&socket, endpoint).await, CoreKind::Mihomo);
+
+        // A live pid whose cmdline does not serve this controller is not
+        // adoptable either (here: the test binary itself), so the
+        // configuration still decides. #56 only redirects lifecycle
+        // commands for a core this CLI could really have started.
+        pidfile::write(
+            &path,
+            CoreRecord::with_kind(std::process::id(), chrono::Utc::now(), CoreKind::SingBox),
+        )
+        .unwrap();
+        assert_eq!(running_core_kind(&socket, endpoint).await, CoreKind::Mihomo);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn log_tail_keeps_the_last_lines_in_order() {

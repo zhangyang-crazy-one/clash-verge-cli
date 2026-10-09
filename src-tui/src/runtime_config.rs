@@ -87,8 +87,28 @@ pub async fn apply_singbox_restart_for_profile(
 ) -> Result<String, String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let core_running = manager.state() == crate::app::CoreState::Running;
-    if core_running && !manager.owns_child() {
-        return Err("cannot apply sing-box settings: controller is attached to an externally managed core; reconfigure it through its owner".into());
+    // #55: sing-box has no hot reload, so applying a profile means
+    // restarting the core. Requiring this process to be the parent made
+    // `profile use` / `profile update --reload` impossible under sing-box:
+    // `start` runs the core under a detached supervisor, so every later CLI
+    // invocation (and a TUI attached to a service-started core) was
+    // refused as "externally managed". A core with a verified pid record
+    // is ours to replace — through its supervisor. Only a core with no
+    // record at all is somebody else's.
+    let restart = || async {
+        // An owned child restarts in place; an adopted one is replaced by
+        // a detached supervisor so the replacement outlives this process.
+        manager.restart_through_supervisor().await
+    };
+    if core_running
+        && let Err(error) = crate::mihomo_manager::manager::supervisor_restart_policy(
+            manager.owns_child(),
+            manager.pid(),
+            manager.core_kind(),
+            crate::mihomo_manager::manager::configured_core_kind().await,
+        )
+    {
+        return Err(format!("cannot apply sing-box settings: {error}"));
     }
     let mut prepared_yaml = None;
     let mut dns_state = None;
@@ -151,22 +171,27 @@ pub async fn apply_singbox_restart_for_profile(
         persist_dns_override_state(dns_state.as_ref()).await;
         return Ok(if parts.profile_used {
             format!(
-                "sing-box: {} nodes, {} skipped, {} fields degraded (saved; core stopped)",
+                "sing-box: {} nodes, {} skipped, {} fields degraded, {} notes (saved; core stopped)",
                 parts.conversion.outbounds.len(),
                 parts.conversion.skipped.len(),
-                parts.conversion.degraded.len()
+                parts.conversion.degraded.len(),
+                parts.conversion.notes.len()
             )
         } else {
             "sing-box: skeleton config saved (core stopped)".into()
         });
     }
 
-    if let Err(restart_error) = manager.restart().await {
+    if let Err(restart_error) = restart().await {
         transaction
             .rollback()
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
+        // Retry with the previous configuration only when a core is still
+        // tracked by this manager; after a supervisor-launched replacement
+        // the next invocation adopts the new pid from the record.
         if transaction.previous.is_some()
-            && let Err(rollback_error) = manager.restart().await
+            && (manager.owns_child() || manager.pid().is_some())
+            && let Err(rollback_error) = restart().await
         {
             return Err(format!(
                 "{restart_error}; previous configuration restored but fallback restart failed: {rollback_error}"
@@ -181,14 +206,20 @@ pub async fn apply_singbox_restart_for_profile(
     // Human-readable degradation report for the status bar.
     let report = if parts.profile_used {
         format!(
-            "sing-box: {} nodes, {} skipped, {} fields degraded",
+            "sing-box: {} nodes, {} skipped, {} fields degraded, {} notes",
             parts.conversion.outbounds.len(),
             parts.conversion.skipped.len(),
-            parts.conversion.degraded.len()
+            parts.conversion.degraded.len(),
+            parts.conversion.notes.len()
         )
     } else {
         "sing-box: skeleton config applied".into()
     };
+    // Detail lines: what was approximated or dropped while converting
+    // (#52), so a degraded run is never silent.
+    for note in parts.conversion.notes.iter().chain(parts.conversion.skipped.iter()) {
+        tracing::info!(target: "config", "sing-box conversion: {note}");
+    }
     Ok(report)
 }
 
@@ -648,6 +679,24 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn a_recorded_sing_box_core_is_reconfigurable_but_a_foreign_one_is_not() {
+        // #55: the manager here never spawned the core (the supervisor
+        // does), so `owns_child` is false in every later CLI invocation.
+        // The pid record is what makes the core ours to replace.
+        use crate::mihomo_manager::CoreKind;
+        use crate::mihomo_manager::manager::supervisor_restart_policy;
+
+        supervisor_restart_policy(false, Some(1234), CoreKind::SingBox, CoreKind::SingBox)
+            .expect("an adopted sing-box core may be restarted");
+        let foreign = supervisor_restart_policy(false, None, CoreKind::SingBox, CoreKind::SingBox)
+            .expect_err("a core with no record stays off limits");
+        assert!(
+            foreign.to_string().contains("no clash-verge-cli pid record"),
+            "{foreign}"
+        );
+    }
 
     #[tokio::test]
     async fn accepted_hot_reload_requires_controller_readiness_before_success() {
