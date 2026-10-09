@@ -10,6 +10,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod binary;
+mod controller_socket;
 pub mod core_policy;
 // `core_policy` and binary parser tests are offline fixture checks. The live
 // sing-box spawn/controller test remains explicitly ignored and must stay out

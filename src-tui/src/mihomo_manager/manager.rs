@@ -129,36 +129,28 @@ pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
 /// Called between stopping an old core and spawning the next one. Two jobs:
 /// 1. Remove a stale external-controller unix socket — dead processes do
 ///    not clean it up on SIGKILL, and a leftover file blocks the rebind.
-///    Safe to remove unconditionally here: we only run after our own stop.
+///    Recheck kernel state and private directory ownership before unlink.
 /// 2. Poll until TUN devices from either core are gone. Both cores hijack
 ///    the default route; overlapping TUN lifetimes can blackhole traffic.
 ///
-/// Best-effort: logs a warning on timeout instead of failing — the spawn
-/// itself will surface a bind error if a resource really is still held.
-pub(super) async fn resource_barrier(socket_path: &Path, timeout: std::time::Duration) {
-    if socket_path.exists() {
-        match tokio::fs::remove_file(socket_path).await {
-            Ok(()) => tracing::info!(target: "mihomo", "removed stale controller socket {}", socket_path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(target: "mihomo", "could not remove stale socket {}: {error}", socket_path.display())
-            }
-        }
-    }
+/// Socket uncertainty fails closed; TUN timeout remains best-effort.
+pub(super) async fn resource_barrier(socket_path: &Path, timeout: std::time::Duration) -> anyhow::Result<()> {
+    super::controller_socket::remove_stale(socket_path)
+        .map_err(|error| anyhow::anyhow!("Controller socket {}: {error:#}", socket_path.display()))?;
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let tun0 = net_iface_exists("tun0");
         let sb_tun0 = net_iface_exists("sb-tun0");
         if !tun0 && !sb_tun0 {
-            return;
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             tracing::warn!(
                 target: "mihomo",
                 "resource barrier timeout: tun device still present (tun0={tun0}, sb-tun0={sb_tun0})"
             );
-            return;
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -388,7 +380,7 @@ impl ManagerInner {
 
         // Task 3.2: wait out TUN teardown and clear any stale controller
         // socket left by a SIGKILLed predecessor before binding anew.
-        resource_barrier(socket_path, std::time::Duration::from_secs(5)).await;
+        resource_barrier(socket_path, std::time::Duration::from_secs(5)).await?;
 
         *inner.resolved_binary.lock() = Some(resolved_path.to_path_buf());
         let mut command = Command::new(resolved_path);
@@ -965,6 +957,16 @@ impl MihomoManager {
     }
 
     fn guided_record_check(&self, target: CoreKind) -> anyhow::Result<()> {
+        self.guided_record_check_with(target, || std::fs::read_to_string("/proc/net/unix"))
+    }
+
+    fn guided_record_check_with(
+        &self,
+        target: CoreKind,
+        read_status: impl FnOnce() -> std::io::Result<String>,
+    ) -> anyhow::Result<()> {
+        let socket = super::controller_socket::inspect_with(&self.socket_path, read_status)
+            .map_err(|error| anyhow::anyhow!("Controller socket {}: {error:#}", self.socket_path.display()))?;
         let record = pidfile::read_record(&pidfile::path_for(&self.socket_path));
         let live = record.as_ref().is_some_and(|record| pidfile::is_running(record.pid));
         check_guided_record(
@@ -972,8 +974,9 @@ impl MihomoManager {
             live,
             self.pid(),
             self.owns_child(),
-            self.socket_path.exists(),
-        )?;
+            socket == super::controller_socket::SocketState::Bound,
+        )
+        .map_err(|error| anyhow::anyhow!("Controller socket {}: {error:#}", self.socket_path.display()))?;
         if target == CoreKind::SingBox
             && !(self.core_kind() == CoreKind::SingBox && self.owns_child() && self.pid().is_some())
         {
@@ -1684,7 +1687,7 @@ fn check_guided_record(
     record_live: bool,
     tracked_pid: Option<u32>,
     owns_child: bool,
-    socket_exists: bool,
+    socket_bound: bool,
 ) -> anyhow::Result<()> {
     if tracked_pid.is_some() && (!owns_child || record_pid != tracked_pid || !record_live) {
         anyhow::bail!(
@@ -1696,7 +1699,7 @@ fn check_guided_record(
             "A core belongs to another CLI supervisor; manage it through its owner. No process or controller was contacted."
         );
     }
-    if tracked_pid.is_none() && socket_exists && record_pid.is_none() {
+    if tracked_pid.is_none() && socket_bound {
         anyhow::bail!(
             "An external controller socket has no CLI ownership record; manage it through its owner. The socket was left untouched."
         );
@@ -1948,13 +1951,122 @@ pub struct CoreStatus {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    fn private_socket_fixture() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        home
+    }
+
+    #[test]
+    fn guided_socket_stale_without_record_allows_both_target_kinds() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let home = private_socket_fixture();
+            let socket = home.path().join("controller.sock");
+            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            let manager = MihomoManager::new(home.path().to_path_buf())
+                .with_socket(socket.clone())
+                .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+            assert!(socket.exists());
+            let result = manager.guided_record_check(kind);
+            assert!(result.is_ok(), "{kind:?}: {result:?}");
+            assert!(socket.exists(), "read-only preflight must not unlink");
+        }
+    }
+
+    #[test]
+    fn guided_socket_live_even_with_dead_record_refuses_both_target_kinds() {
+        use std::os::unix::fs::MetadataExt;
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let home = private_socket_fixture();
+            let socket = home.path().join("controller.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+            let record = pidfile::CoreRecord::with_kind(u32::MAX, Utc::now(), CoreKind::Mihomo);
+            pidfile::write(&pidfile::path_for(&socket), record).unwrap();
+            let manager = MihomoManager::new(home.path().to_path_buf())
+                .with_socket(socket.clone())
+                .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+            let error = manager.guided_record_check(kind).unwrap_err().to_string();
+            assert!(error.contains(socket.to_str().unwrap()), "{kind:?}: {error}");
+            assert!(error.contains("ownership record"), "{error}");
+            assert!(socket.exists());
+            assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+            assert_eq!(pidfile::read_record(&pidfile::path_for(&socket)), Some(record));
+        }
+    }
+
+    #[test]
+    fn guided_socket_unknown_kernel_status_fails_closed_for_both_target_kinds() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let home = private_socket_fixture();
+            let socket = home.path().join("controller.sock");
+            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            let manager = MihomoManager::new(home.path().to_path_buf())
+                .with_socket(socket.clone())
+                .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+            for malformed in [false, true] {
+                let result = manager.guided_record_check_with(kind, || {
+                    if malformed {
+                        Ok(String::from("unrecognized kernel table"))
+                    } else {
+                        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    }
+                });
+                assert!(result.is_err(), "{kind:?}: {result:?}");
+                assert!(socket.exists());
+                assert!(pidfile::read_record(&pidfile::path_for(&socket)).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn guided_socket_unlinked_live_endpoint_refuses_both_target_kinds() {
+        let home = private_socket_fixture();
+        let socket = home.path().join("controller.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::remove_file(&socket).unwrap(); // unlink only our listener's fixture pathname
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(socket.clone())
+            .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            assert!(manager.guided_record_check(kind).is_err(), "{kind:?}");
+            assert!(
+                manager
+                    .guided_record_check_with(kind, || Err(std::io::ErrorKind::PermissionDenied.into()))
+                    .is_err()
+            );
+        }
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn guided_socket_apply_boundary_rechecks_new_live_endpoint() {
+        use std::os::unix::fs::MetadataExt;
+        let home = private_socket_fixture();
+        let socket = home.path().join("controller.sock");
+        drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(socket.clone())
+            .with_singbox_controller("127.0.0.1:0".parse().unwrap());
+        manager.guided_record_check(CoreKind::Mihomo).unwrap();
+        std::fs::remove_file(&socket).unwrap(); // replace only our own fixture
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let inode = std::fs::symlink_metadata(&socket).unwrap().ino();
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            assert!(manager.guided_record_check(kind).is_err());
+        }
+        assert!(resource_barrier(&socket, Duration::ZERO).await.is_err());
+        assert_eq!(std::fs::symlink_metadata(&socket).unwrap().ino(), inode);
+    }
+
     #[test]
     fn guided_core_unadopted_live_record_and_external_socket_refuse_without_mutation() {
         assert!(check_guided_record(Some(10), true, None, false, true).is_err());
         assert!(check_guided_record(None, false, None, false, true).is_err());
         assert!(check_guided_record(Some(11), true, Some(10), true, true).is_err());
         assert!(check_guided_record(Some(10), true, Some(10), true, true).is_ok());
-        assert!(check_guided_record(Some(10), false, None, false, true).is_ok());
+        assert!(check_guided_record(Some(10), false, None, false, true).is_err());
     }
 
     #[test]
@@ -2283,11 +2395,14 @@ mod tests {
 
     #[tokio::test]
     async fn barrier_removes_stale_socket_file() {
-        let path = std::env::temp_dir().join(format!("barrier-test-{}.sock", uuid::Uuid::new_v4()));
-        std::fs::write(&path, b"").expect("create stale socket placeholder");
+        let home = private_socket_fixture();
+        let path = home.path().join("controller.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
 
-        resource_barrier(&path, std::time::Duration::from_millis(50)).await;
+        resource_barrier(&path, std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
 
         assert!(!path.exists(), "stale socket must be removed by the barrier");
     }
@@ -2296,7 +2411,9 @@ mod tests {
     async fn barrier_returns_quickly_when_no_tun_present() {
         let started = std::time::Instant::now();
         let missing = std::env::temp_dir().join(format!("barrier-none-{}.sock", uuid::Uuid::new_v4()));
-        resource_barrier(&missing, std::time::Duration::from_secs(5)).await;
+        resource_barrier(&missing, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "no tun devices named tun0/sb-tun0: barrier must not wait out the timeout"
