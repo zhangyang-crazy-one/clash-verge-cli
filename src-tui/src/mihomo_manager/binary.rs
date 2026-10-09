@@ -515,6 +515,54 @@ fn version_matches_target(version: &str, target: &str) -> bool {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn guided_core_old_system_does_not_hide_verified_offline_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("system");
+        let managed = root.path().join("mihomo");
+        for path in [&old, &managed] {
+            tokio::fs::write(path, b"\x7fELFfixture").await.unwrap();
+            ensure_executable(path).await.unwrap();
+        }
+        write_digest_receipt(&managed, b"\x7fELFfixture", ".receipt-").await.unwrap();
+        let old_probe = old.clone();
+        let result = inspect_candidates(super::super::CoreKind::Mihomo, vec![old], managed.clone(), move |path| {
+            let old = old_probe.clone();
+            async move { Ok(Some(if path == old { "v1.19.29" } else { "v1.19.32" }.to_string())) }
+        }).await;
+        assert!(matches!(result, CoreInspection::Ready(ref candidate) if candidate.path == managed && candidate.source == "cached"));
+    }
+
+    #[tokio::test]
+    async fn guided_core_old_system_without_cache_requires_confirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("system");
+        tokio::fs::write(&old, b"\x7fELFfixture").await.unwrap();
+        ensure_executable(&old).await.unwrap();
+        let result = inspect_candidates(super::super::CoreKind::SingBox, vec![old], root.path().join("sing-box"), |_| async { Ok(Some("1.13.21".into())) }).await;
+        assert!(matches!(result, CoreInspection::NeedsUpdate(ref request) if request.observed.as_deref() == Some("1.13.21") && request.required == "v1.14.2"));
+    }
+
+    #[tokio::test]
+    async fn guided_core_unknown_newer_requires_review_without_downgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("system");
+        tokio::fs::write(&system, b"\x7fELFfixture").await.unwrap();
+        ensure_executable(&system).await.unwrap();
+        let result = inspect_candidates(super::super::CoreKind::Mihomo, vec![system], root.path().join("mihomo"), |_| async { Ok(Some("v1.20.0".into())) }).await;
+        assert!(matches!(result, CoreInspection::Review(ref diagnostic) if diagnostic.contains("1.20.0")));
+    }
+
+    #[tokio::test]
+    async fn guided_core_corrupt_cache_is_never_executed() {
+        let root = tempfile::tempdir().unwrap();
+        let managed = root.path().join("mihomo");
+        tokio::fs::write(&managed, b"\x7fELFfixture").await.unwrap();
+        ensure_executable(&managed).await.unwrap();
+        let result = inspect_candidates(super::super::CoreKind::Mihomo, vec![], managed, |_| async { panic!("untrusted cache must not be executed"); #[allow(unreachable_code)] Ok(None) }).await;
+        assert!(matches!(result, CoreInspection::NeedsUpdate(_)));
+    }
     use std::sync::Mutex;
 
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
