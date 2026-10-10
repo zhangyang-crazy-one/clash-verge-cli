@@ -211,9 +211,16 @@ the edited list; saving the rules editor is not supported for this profile",
 ///
 /// `chain_rules` is the configured Rules/Merge/Script chain's own contribution
 /// (see [`crate::runtime_config::compose_profile_rules`]): it is stripped off
-/// the composed list before the profile is written, and put back in front of
-/// it for the fingerprint — the identity that must describe the list the
-/// `Profile(i)` indices address.
+/// the composed list before the profile is written.
+///
+/// `reproduced` is the composition that write produces — the composed list
+/// WITH the chain's contribution back in ITS OWN position, already computed by
+/// the caller as the proof that this save is safe. It is the fingerprint
+/// source, because it is exactly the list the `Profile(i)` indices address.
+/// Guessing that position here (chain first) was wrong for an appending
+/// chain: the next generation fingerprinted the real composition, saw a
+/// mismatch, demoted the saved order to append-after, and the logical rule the
+/// user had moved before `MATCH` landed after the catch-all again.
 fn persist_rules(
     path: &std::path::Path,
     home: &std::path::Path,
@@ -221,6 +228,7 @@ fn persist_rules(
     buffer: Vec<crate::routing::IRouteRule>,
     kind: crate::mihomo_manager::CoreKind,
     chain_rules: &[crate::routing::IRouteRule],
+    reproduced: &[crate::routing::IRouteRule],
 ) -> Result<(), String> {
     let (composed_rules, mut order) = partition_edit_buffer(buffer);
     let file_rules = strip_chain_rules(&composed_rules, chain_rules)?;
@@ -232,12 +240,14 @@ fn persist_rules(
     // Fingerprint the composed list AS IT WILL READ BACK, not the in-memory
     // partition: generation matches the sidecar against the composed profile,
     // and only the round-tripped form is guaranteed to describe the same
-    // rules. A profile that cannot be re-parsed keeps no fingerprint, which
-    // the generator treats as "unverifiable" rather than "changed".
-    if let Ok(rules) = crate::routing::load_profile_rules(&saved) {
-        let mut canonical: Vec<crate::routing::IRouteRule> = chain_rules.to_vec();
-        canonical.extend(rules);
-        order.profile = Some(crate::singbox::profile_rule_fingerprint(&canonical));
+    // rules. `reproduced` was composed from `file_rules`, so it only describes
+    // the written file while that file re-reads to the same list; a profile
+    // that cannot be re-parsed (or did not round-trip) keeps no fingerprint,
+    // which the generator treats as "unverifiable" rather than "changed".
+    if let Ok(rules) = crate::routing::load_profile_rules(&saved)
+        && rules_equivalent(&rules, &file_rules)
+    {
+        order.profile = Some(crate::singbox::profile_rule_fingerprint(reproduced));
     }
     persist_logical_rules(home, &order)
 }
@@ -264,7 +274,10 @@ rules cannot be saved from the editor; nothing was written"
                 .into(),
         );
     }
-    persist_rules(path, home, yaml, buffer, kind, &chain_rules)
+    // `reproduced` keeps the chain's real position, so passing it as the
+    // fingerprint source cannot describe a list other than the one the next
+    // composition will produce.
+    persist_rules(path, home, yaml, buffer, kind, &chain_rules, &reproduced)
 }
 
 /// Write the logical sidecar, or delete it when the list is empty so that a
@@ -825,6 +838,20 @@ mod tests {
         }
     }
 
+    /// [`persist_rules`] for a chain-free profile: the composition the save
+    /// reproduces is the clash partition itself, so the fingerprint describes
+    /// the list the `Profile(i)` indices address.
+    fn persist(
+        path: &std::path::Path,
+        home: &std::path::Path,
+        yaml: &str,
+        buffer: Vec<IRouteRule>,
+        kind: CoreKind,
+    ) -> Result<(), String> {
+        let reproduced = partition_edit_buffer(buffer.clone()).0;
+        persist_rules(path, home, yaml, buffer, kind, &[], &reproduced)
+    }
+
     /// #59: already-saved logical rules must show up in the editor buffer,
     /// after the profile rules — the order the sing-box generator uses for a
     /// sidecar that carries no cross-type order.
@@ -932,7 +959,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        persist_rules(
+        persist(
             &profile,
             &home,
             PROFILE,
@@ -943,7 +970,6 @@ mod tests {
                 },
             ],
             CoreKind::SingBox,
-            &[],
         )
         .expect("save");
 
@@ -976,7 +1002,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        persist_rules(
+        persist(
             &profile,
             &home,
             PROFILE,
@@ -988,7 +1014,6 @@ mod tests {
                 },
             ],
             CoreKind::SingBox,
-            &[],
         )
         .expect("save");
 
@@ -1031,7 +1056,7 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        persist_rules(
+        persist(
             &profile,
             &home,
             PROFILE,
@@ -1042,7 +1067,6 @@ mod tests {
                 },
             ],
             CoreKind::SingBox,
-            &[],
         )
         .expect("persist");
 
@@ -1069,7 +1093,7 @@ mod tests {
         crate::singbox::save_logical_rules(&home, &[logical("c.com")]).expect("seed sidecar");
         assert!(home.join(crate::singbox::LOGICAL_RULES_FILE).is_file());
 
-        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::SingBox, &[]).expect("persist");
+        persist(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::SingBox).expect("persist");
 
         assert!(!home.join(crate::singbox::LOGICAL_RULES_FILE).exists());
         assert!(crate::singbox::load_logical_rules(&home).unwrap().is_empty());
@@ -1085,13 +1109,12 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        persist_rules(
+        persist(
             &profile,
             &home,
             PROFILE,
             vec![simple("a.com"), logical("c.com")],
             CoreKind::SingBox,
-            &[],
         )
         .expect("first");
         assert_eq!(
@@ -1099,13 +1122,12 @@ mod tests {
             vec![logical("c.com")]
         );
 
-        persist_rules(
+        persist(
             &profile,
             &home,
             PROFILE,
             vec![simple("a.com"), logical("d.com")],
             CoreKind::SingBox,
-            &[],
         )
         .expect("second");
         assert_eq!(
@@ -1124,13 +1146,12 @@ mod tests {
         std::fs::create_dir_all(&home).expect("mkdir home");
         std::fs::write(&profile, PROFILE).expect("seed");
 
-        let error = persist_rules(
+        let error = persist(
             &profile,
             &home,
             "rules: [oops\n",
             vec![logical("c.com")],
             CoreKind::SingBox,
-            &[],
         )
         .expect_err("invalid yaml");
         assert!(!error.is_empty());
@@ -1151,7 +1172,7 @@ mod tests {
         std::fs::write(&profile, PROFILE).expect("seed");
         crate::singbox::save_logical_rules(&home, &[logical("c.com")]).expect("seed sidecar");
 
-        persist_rules(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::Mihomo, &[]).expect("persist");
+        persist(&profile, &home, PROFILE, vec![simple("a.com")], CoreKind::Mihomo).expect("persist");
 
         assert_eq!(
             crate::singbox::load_logical_rules(&home).unwrap(),
@@ -1259,6 +1280,141 @@ mod tests {
             },
             "the logical block must still precede the catch-all"
         );
+    }
+
+    /// C7 (reviewer): the SAME save with an APPENDING chain. The editor
+    /// accepts a suffix (append) contribution, but the fingerprint used to be
+    /// built as `chain_rules + file_rules` — chain first, regardless of where
+    /// the chain actually lands. For an append chain the real composition is
+    /// `file_rules + chain_rules`, so every save recorded a fingerprint that
+    /// the very next generation contradicted: the order was demoted to
+    /// append-after, the interleaved entries were cleared, and the logical
+    /// rule the user had moved above `MATCH` landed after the catch-all.
+    ///
+    /// Full path: save -> `load_rule_order` -> `composed_profile_rules` ->
+    /// `resolve_profile_drift` must report no drift, the reopened editor must
+    /// still show the logical block before `MATCH`, and a second save of the
+    /// same edit must neither duplicate the fragment nor lose the order.
+    #[tokio::test]
+    async fn a_saved_logical_rule_before_match_survives_an_append_fragment() {
+        use crate::profile_store::store::ProfileStore;
+        use clash_verge_core::config::PrfItem;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mode: rule\nmixed-port: 39192\nsecret: append-fixture-secret\nexternal-controller: 127.0.0.1:19992\n",
+        )
+        .expect("config");
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rbase\nitems:\n  - {uid: Rbase, type: remote, file: base.yaml, option: {rules: Rfrag}}\n  - {uid: Rfrag, type: rules, file: rules.yaml}\n",
+        )
+        .expect("profiles");
+        std::fs::write(
+            home.path().join("profiles/base.yaml"),
+            "proxies: []\nrules:\n  - DOMAIN,base.example,DIRECT\n  - MATCH,DIRECT\n",
+        )
+        .expect("base profile");
+        std::fs::write(
+            home.path().join("profiles/rules.yaml"),
+            "prepend: []\nappend:\n  - MATCH,DIRECT\ndelete: []\n",
+        )
+        .expect("rules fragment");
+
+        let item: PrfItem = ProfileStore::snapshot()
+            .await
+            .expect("store")
+            .items()
+            .into_iter()
+            .find(|item| item.uid.as_deref() == Some("Rbase"))
+            .expect("base profile item");
+        let path = clash_verge_core::utils::dirs::app_profiles_dir()
+            .expect("profiles dir")
+            .join("base.yaml");
+
+        // The editor buffer is the COMPOSED list: base rule, MATCH, and the
+        // fragment's appended MATCH at the END.
+        let composed = crate::runtime_config::composed_profile_rules(&item)
+            .await
+            .expect("compose");
+        assert_eq!(composed.len(), 3, "{composed:?}");
+        let buffer = compose_edit_buffer(composed, &crate::singbox::RuleOrder::default());
+        assert_eq!(buffer.len(), 3, "{buffer:?}");
+        // The user drags the logical block above the first MATCH.
+        let edited = vec![
+            buffer[0].clone(),
+            logical("blocked.example"),
+            buffer[1].clone(),
+            buffer[2].clone(),
+        ];
+
+        for round in 1..=2 {
+            let yaml = std::fs::read_to_string(&path).expect("read base profile");
+            persist_rules_for_profile(&item, &path, home.path(), &yaml, edited.clone(), CoreKind::SingBox)
+                .await
+                .unwrap_or_else(|error| panic!("round {round} save: {error}"));
+
+            // The fragment's own MATCH is NOT written into the profile file —
+            // and a second save must not duplicate it either.
+            let saved_yaml = std::fs::read_to_string(&path).expect("reread profile");
+            let file_rules = crate::routing::load_profile_rules(&saved_yaml).expect("load file rules");
+            assert_eq!(file_rules.len(), 2, "round {round}: {saved_yaml}");
+            assert!(saved_yaml.contains("DOMAIN,base.example,DIRECT"), "{saved_yaml}");
+            assert_eq!(
+                saved_yaml.matches("MATCH,DIRECT").count(),
+                1,
+                "round {round}: the appended fragment must not be duplicated into the file: {saved_yaml}"
+            );
+
+            // Generation's view: the composed list plus the stored order.
+            let after = crate::runtime_config::composed_profile_rules(&item)
+                .await
+                .expect("compose after save");
+            let stored = crate::singbox::load_rule_order(home.path()).expect("load order");
+            let (effective, note) = stored.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&after));
+            assert!(
+                note.is_none(),
+                "round {round}: a fresh save must not look like drift: {note:?}"
+            );
+            assert_eq!(
+                effective.entries,
+                vec![
+                    crate::singbox::RuleOrderEntry::Profile(0),
+                    crate::singbox::RuleOrderEntry::Logical(0),
+                    crate::singbox::RuleOrderEntry::Profile(1),
+                    crate::singbox::RuleOrderEntry::Profile(2),
+                ],
+                "round {round}: the logical rule must stay recorded before the first MATCH"
+            );
+
+            // The reopened editor keeps the logical block above the catch-all.
+            let rebuilt = compose_edit_buffer(after, &effective);
+            assert!(
+                matches!(rebuilt[1], IRouteRule::Logical { .. }),
+                "round {round}: {rebuilt:?}"
+            );
+            assert_eq!(
+                rebuilt[2],
+                IRouteRule::Raw {
+                    clash_raw: "MATCH,DIRECT".into()
+                },
+                "round {round}: the logical block must still precede the catch-all"
+            );
+        }
+
+        // A real subscription refresh (same rule COUNT, different content) is
+        // still drift: the fingerprint is not weakened by the fix above.
+        let replaced: Vec<IRouteRule> = vec![simple("base.example"), simple("other.example"), simple("third.example")];
+        let stored = crate::singbox::load_rule_order(home.path()).expect("load order");
+        let (effective, note) = stored.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&replaced));
+        assert!(
+            note.expect("a same-length replacement is drift")
+                .contains("rule order reset")
+        );
+        assert!(effective.entries.is_empty(), "stale indices must be dropped");
+        assert_eq!(effective.logical.len(), 1, "the logical rule itself is kept");
     }
 
     /// A chain that contributes rules the edited list no longer contains at

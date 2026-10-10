@@ -61,7 +61,11 @@ pub enum RuleOrderEntry {
 /// Both the editor's save and generation must fingerprint THIS list (see
 /// [`crate::runtime_config::composed_profile_rules`]); fingerprinting the raw
 /// profile file instead makes every save look like drift as soon as the
-/// profile has a prepend fragment.
+/// profile has a Rules/Merge/Script chain. The editor must likewise fingerprint
+/// the composition it actually REPRODUCES, with the chain's contribution back
+/// in its own position — a chain that appends is not a chain that prepends, and
+/// assuming the wrong position makes each save look like drift to the next
+/// generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileFingerprint {
     pub count: usize,
@@ -787,6 +791,70 @@ mod storage_tests {
         assert!(legacy.matches_profile(profile_rule_fingerprint(&refreshed)));
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// C7 (reviewer): drift detection must survive the fix that stopped the
+    /// editor from guessing the chain's position. A subscription refresh that
+    /// replaces the rule list with a DIFFERENT list of the SAME length is a
+    /// real drift: every stored index stays in range while repointing, so the
+    /// fingerprint — not the count — has to catch it.
+    #[test]
+    fn a_same_length_replacement_is_still_profile_drift() {
+        let profile = vec![
+            IRouteRule::Simple {
+                matches: vec![MatchField::Domain("base.example".into())],
+                target: RuleTarget::Direct,
+            },
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+        ];
+        let replaced: Vec<IRouteRule> = profile
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| match (index, rule) {
+                // Same arity, different rule: only the identity changes.
+                (0, IRouteRule::Simple { .. }) => IRouteRule::Simple {
+                    matches: vec![MatchField::Domain("substituted.example".into())],
+                    target: RuleTarget::Direct,
+                },
+                (_, other) => other.clone(),
+            })
+            .collect();
+        assert_eq!(
+            profile.len(),
+            replaced.len(),
+            "precondition: the replacement keeps every index in range"
+        );
+        assert_ne!(
+            profile_rule_fingerprint(&profile),
+            profile_rule_fingerprint(&replaced),
+            "a same-length replacement must change the identity"
+        );
+
+        let order = RuleOrder {
+            logical: vec![IRouteRule::Logical {
+                op: LogicOp::Or,
+                rules: vec![IRouteRule::Simple {
+                    matches: vec![MatchField::Domain("blocked.example".into())],
+                    target: RuleTarget::Direct,
+                }],
+                target: RuleTarget::Block,
+            }],
+            entries: vec![RuleOrderEntry::Profile(0), RuleOrderEntry::Logical(0)],
+            profile: Some(profile_rule_fingerprint(&profile)),
+        };
+        assert!(order.matches_profile(profile_rule_fingerprint(&profile)));
+        let (effective, note) = order.resolve_profile_drift(profile_rule_fingerprint(&replaced));
+        assert!(note.expect("reported").contains("rule order reset"));
+        assert!(effective.entries.is_empty(), "the stale indices must be dropped");
+        assert_eq!(effective.logical, order.logical, "the logical rules are kept");
+        // The identity stays usable afterwards: the fallback is recorded
+        // against the list that is actually there now.
+        assert!(effective.matches_profile(profile_rule_fingerprint(&replaced)));
     }
 
     /// Interleaving against ORIGINAL slots: a dropped rule keeps its index
