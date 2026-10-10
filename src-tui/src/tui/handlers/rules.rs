@@ -31,13 +31,23 @@ async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> R
         .join(file);
     let yaml = std::fs::read_to_string(&path).map_err(|e| format!("read profile: {e}"))?;
     let rules = crate::routing::load_profile_rules(&yaml).map_err(|e| e.to_string())?;
-    app.rules_edit_buffer = compose_edit_buffer(rules, &load_rule_order(singbox)?);
+    let (order, drift) = match load_rule_order(singbox)? {
+        Some(order) => order.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&rules)),
+        None => (crate::singbox::RuleOrder::default(), None),
+    };
+    app.rules_edit_buffer = compose_edit_buffer(rules, &order);
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
         app.rule_sets_edit = crate::singbox::load_rule_sets(&home)?;
     }
     app.rules_selected_index = 0;
     app.rules_edit_mode = true;
     app.rules_edit_dirty = false;
+    if let Some(note) = drift {
+        // Generation applies the same demotion (see
+        // `SingboxParts::assemble`), so the editor must show it too instead of
+        // an order the core will not honour.
+        app.status_msg = Some(note);
+    }
     Ok(())
 }
 
@@ -45,12 +55,13 @@ async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> R
 /// active core cannot express them. A broken sidecar is reported rather
 /// than silently dropped: the user must fix it before saving, or the next
 /// save would overwrite it.
-fn load_rule_order(singbox: bool) -> Result<crate::singbox::RuleOrder, String> {
+fn load_rule_order(singbox: bool) -> Result<Option<crate::singbox::RuleOrder>, String> {
     if !singbox {
-        return Ok(crate::singbox::RuleOrder::default());
+        return Ok(None);
     }
     let home = clash_verge_core::utils::dirs::app_home_dir().map_err(|e| e.to_string())?;
-    crate::singbox::load_rule_order(&home)
+    let order = crate::singbox::load_rule_order(&home)?;
+    Ok((!order.logical.is_empty() || !order.entries.is_empty()).then_some(order))
 }
 
 /// Rebuild the interleaved edit buffer: profile rules and logical rules in
@@ -125,6 +136,10 @@ fn partition_edit_buffer(
             clash.push(rule);
         }
     }
+    // The saved order records WHICH profile rule list these indices belong
+    // to (a subscription refresh that replaces the list keeps every index in
+    // range while repointing it); `persist_rules` fills that fingerprint in
+    // from the file it just wrote, which is the list the indices address.
     (clash, order)
 }
 
@@ -148,11 +163,20 @@ fn persist_rules(
     buffer: Vec<crate::routing::IRouteRule>,
     kind: crate::mihomo_manager::CoreKind,
 ) -> Result<(), String> {
-    let (clash_rules, order) = partition_edit_buffer(buffer);
+    let (clash_rules, mut order) = partition_edit_buffer(buffer);
     let saved = crate::routing::save_profile_rules(yaml, &clash_rules)?;
     write_atomic(path, &saved)?;
     if kind != crate::mihomo_manager::CoreKind::SingBox {
         return Ok(());
+    }
+    // Fingerprint the rule list AS THE FILE NOW READS IT BACK, not the
+    // in-memory partition: generation matches the sidecar against
+    // `load_profile_rules` of the composed profile, and only the round-tripped
+    // form is guaranteed to describe the same rules. A profile that cannot be
+    // re-parsed keeps no fingerprint, which the generator treats as
+    // "unverifiable" rather than "changed".
+    if let Ok(rules) = crate::routing::load_profile_rules(&saved) {
+        order.profile = Some(crate::singbox::profile_rule_fingerprint(&rules));
     }
     persist_logical_rules(home, &order)
 }
@@ -723,6 +747,7 @@ mod tests {
         let order = crate::singbox::RuleOrder {
             logical: vec![logical("c.com")],
             entries: Vec::new(),
+            profile: None,
         };
         let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &order);
         assert_eq!(buffer.len(), 3);
@@ -748,6 +773,7 @@ mod tests {
                 crate::singbox::RuleOrderEntry::Profile(0),
                 crate::singbox::RuleOrderEntry::Profile(1),
             ],
+            profile: None,
         };
         let buffer = compose_edit_buffer(
             vec![
@@ -803,6 +829,7 @@ mod tests {
                 crate::singbox::RuleOrderEntry::Profile(0),
                 crate::singbox::RuleOrderEntry::Logical(0),
             ],
+            profile: None,
         };
         let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &order);
         assert_eq!(buffer, vec![simple("a.com"), simple("b.com"), logical("c.com")]);
@@ -847,6 +874,63 @@ mod tests {
                 clash_raw: "MATCH,DIRECT".into()
             }
         );
+    }
+
+    /// P1 (reviewer): a subscription refresh can replace the profile rule
+    /// list under a saved order. Every stored index stays in range while
+    /// repointing at a different rule, so the save records the identity of
+    /// the list it ordered, and a later refresh is detected instead of being
+    /// trusted.
+    #[test]
+    fn the_saved_order_records_which_profile_rule_list_it_belongs_to() {
+        let dir = temp_dir("fingerprint");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        persist_rules(
+            &profile,
+            &home,
+            PROFILE,
+            vec![
+                simple("a.com"),
+                logical("blocked.example"),
+                IRouteRule::Raw {
+                    clash_raw: "MATCH,DIRECT".into(),
+                },
+            ],
+            CoreKind::SingBox,
+        )
+        .expect("save");
+
+        let stored = crate::singbox::load_rule_order(&home).expect("load order");
+        let fingerprint = stored.profile.expect("the save records the profile rule list");
+        // The fingerprint must describe the rules the indices address — i.e.
+        // the ones the restart re-reads from the rewritten profile file, not
+        // the ones the buffer happened to hold.
+        let saved_yaml = std::fs::read_to_string(&profile).expect("reread profile");
+        let reloaded = crate::routing::load_profile_rules(&saved_yaml).unwrap();
+        assert_eq!(reloaded.len(), 2, "{saved_yaml}");
+        assert_eq!(
+            fingerprint,
+            crate::singbox::profile_rule_fingerprint(&reloaded),
+            "the fingerprint must describe the rules the indices address"
+        );
+
+        // The rules themselves round-trip through the profile file.
+        let buffer = compose_edit_buffer(reloaded, &stored);
+        assert!(matches!(buffer[1], IRouteRule::Logical { .. }), "{buffer:?}");
+
+        // A refreshed subscription changes the identity.
+        let refreshed: Vec<IRouteRule> = vec![simple("new1.com"), simple("new2.com"), simple("new3.com")];
+        let (effective, note) = stored.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&refreshed));
+        assert!(effective.entries.is_empty(), "the stale order must be dropped");
+        assert!(note.expect("reported").contains("rule order reset"));
+        // The fallback the generator uses: profile rules, then logical ones.
+        let fallback = compose_edit_buffer(refreshed, &effective);
+        assert_eq!(fallback.len(), 4);
+        assert!(matches!(fallback[3], IRouteRule::Logical { .. }), "{fallback:?}");
     }
 
     /// The save writes the edited rules into the profile YAML the restart

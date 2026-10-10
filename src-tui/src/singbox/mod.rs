@@ -46,6 +46,44 @@ pub enum RuleOrderEntry {
     Logical(usize),
 }
 
+/// Cheap identity of the profile rule list an order was saved against.
+///
+/// The order's `Profile(i)` entries are indices into the profile YAML's
+/// `rules:` list, so they only mean anything while that list is the one the
+/// user actually arranged. A subscription refresh replaces the list under
+/// the sidecar: the indices stay perfectly in range and every one of them
+/// now points at a different rule, which silently reorders the generated
+/// config. Storing the rule count plus a hash of the rule descriptors turns
+/// that into a detectable identity change instead of a silent one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileFingerprint {
+    pub count: usize,
+    pub hash: u64,
+}
+
+/// Fingerprint of the profile rules a saved order refers to.
+///
+/// FNV-1a over [`crate::routing::describe`] rather than
+/// `DefaultHasher`, whose keys are an implementation detail: this value is
+/// persisted and must be identical across processes and releases.
+pub fn profile_rule_fingerprint(rules: &[crate::routing::IRouteRule]) -> ProfileFingerprint {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut absorb = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for rule in rules {
+        absorb(crate::routing::describe(rule).as_bytes());
+        absorb(b"\x1f");
+    }
+    ProfileFingerprint {
+        count: rules.len(),
+        hash,
+    }
+}
+
 /// The durable ordering of profile rules and logical (AND/OR) rules.
 ///
 /// The editor buffer is one interleaved list, but the two halves are stored
@@ -60,6 +98,49 @@ pub enum RuleOrderEntry {
 pub struct RuleOrder {
     pub logical: Vec<crate::routing::IRouteRule>,
     pub entries: Vec<RuleOrderEntry>,
+    /// Identity of the profile rule list `entries` was recorded against.
+    /// `None` on a sidecar written before drift detection existed.
+    pub profile: Option<ProfileFingerprint>,
+}
+
+impl RuleOrder {
+    /// Whether this order still describes `actual`.
+    ///
+    /// An order without a recorded fingerprint (legacy sidecar) is trusted:
+    /// it was written by a build that had no way to detect the drift, and
+    /// refusing it would discard user ordering that is still valid.
+    pub fn matches_profile(&self, actual: ProfileFingerprint) -> bool {
+        self.profile.is_none_or(|stored| stored == actual)
+    }
+
+    /// The order to use for `actual`, plus a note when the stored one was
+    /// dropped.
+    ///
+    /// A subscription refresh that replaced the profile rule list makes every
+    /// stored `Profile(i)` point somewhere else. Rather than trust indices
+    /// that merely happen to be in range, fall back to append-after — the
+    /// same layout a sidecar without order information uses — and report the
+    /// mismatch so it is visible instead of silent. The logical rules
+    /// themselves are kept: only the cross-type placement is dropped.
+    pub fn resolve_profile_drift(&self, actual: ProfileFingerprint) -> (RuleOrder, Option<String>) {
+        if self.entries.is_empty() || self.matches_profile(actual) {
+            return (self.clone(), None);
+        }
+        let stored = self.profile.expect("a mismatch implies a recorded fingerprint");
+        (
+            RuleOrder {
+                logical: self.logical.clone(),
+                entries: Vec::new(),
+                profile: Some(actual),
+            },
+            Some(format!(
+                "rule order reset: the profile rule list changed since it was saved \
+(stored {} rules, now {}); logical rules are appended after the profile rules instead \
+of interleaved",
+                stored.count, actual.count
+            )),
+        )
+    }
 }
 
 /// Task 8.1: structured DNS settings (1.12+ new format), TUI-owned.
@@ -151,6 +232,7 @@ fn parse_rule_order(value: &Value) -> Result<RuleOrder, String> {
         return Ok(RuleOrder {
             logical: parse_logical_values(value.as_array().expect("array"))?,
             entries: Vec::new(),
+            profile: None,
         });
     }
     if !value.is_object() {
@@ -191,9 +273,17 @@ fn parse_rule_order(value: &Value) -> Result<RuleOrder, String> {
         .get("rules")
         .and_then(Value::as_array)
         .ok_or("rule order requires a `rules` array of logical rules")?;
+    let profile = match value.get("profile") {
+        None | Some(Value::Null) => None,
+        Some(fingerprint) => Some(
+            serde_json::from_value::<ProfileFingerprint>(fingerprint.clone())
+                .map_err(|error| format!("rule order `profile` fingerprint: {error}"))?,
+        ),
+    };
     Ok(RuleOrder {
         logical: parse_logical_values(rules)?,
         entries: parsed,
+        profile,
     })
 }
 
@@ -255,6 +345,7 @@ pub fn save_rule_order(home: &std::path::Path, order: &RuleOrder) -> Result<(), 
     let value = serde_json::json!({
         "version": RULE_ORDER_VERSION,
         "rules": rules,
+        "profile": order.profile,
         "entries": order
             .entries
             .iter()
@@ -271,32 +362,56 @@ pub fn save_rule_order(home: &std::path::Path, order: &RuleOrder) -> Result<(), 
 /// Merge profile-derived route rules with the stored logical rules in the
 /// order the editor persisted.
 ///
-/// A stale entry (an index past the end of what the profile actually yielded
-/// — a profile edited outside the editor, or a rule the converter dropped)
-/// is skipped instead of failing the whole generation. Profile rules the
-/// order does not mention keep their relative order directly after the last
-/// referenced one, so a subscription update cannot silently shadow the rules
-/// the user ordered on purpose: directly after the last referenced profile
-/// rule (in front of the profile block when nothing is referenced).
+/// The convenience form for callers that hold the CONVERTED profile rules
+/// only, i.e. without their original-slot identity. Generation uses
+/// [`interleave_route_slots`] so a rule the conversion dropped cannot shift
+/// every index after it; this shim exists for the tests that exercise the
+/// interleaving itself.
+#[cfg(test)]
 pub fn interleave_route_rules(profile_rules: &[Value], order: &RuleOrder) -> Vec<Value> {
+    interleave_route_slots(&profile_rules.iter().cloned().map(Some).collect::<Vec<_>>(), order)
+}
+
+/// Merge the converted profile rules — carried in their ORIGINAL profile-rule
+/// slots, `None` where the conversion dropped the rule — with the stored
+/// logical rules, in the order the editor persisted.
+///
+/// The sidecar's `Profile(i)` entries index the ORIGINAL YAML rule list, so
+/// interleaving has to walk the original slots, not the compressed output.
+/// Indexing the compressed list instead made every entry after a dropped
+/// rule point one slot too early: with `P0=DOMAIN-REGEX,ads.*,REJECT`
+/// (dropped), `L0=logical block`, `P1=MATCH,DIRECT` and a saved order of
+/// `P0,L0,P1`, `P0` resolved to the converted `MATCH` and the block rule was
+/// emitted *after* the catch-all, where the core never evaluates it.
+///
+/// A dropped slot keeps its identity (it is simply skipped), so one
+/// unrepresentable rule cannot reorder everything below it.
+pub fn interleave_route_slots(profile_slots: &[Option<Value>], order: &RuleOrder) -> Vec<Value> {
     let logical_json: Vec<Option<Value>> = order.logical.iter().map(crate::routing::to_singbox_json).collect();
     if order.entries.is_empty() {
-        // Legacy sidecar: no cross-type order was ever recorded.
-        let mut merged = profile_rules.to_vec();
+        // Legacy sidecar (or a drifted one, which was deliberately demoted to
+        // this layout): no cross-type order was ever recorded.
+        let mut merged: Vec<Value> = profile_slots.iter().flatten().cloned().collect();
         merged.extend(logical_json.into_iter().flatten());
         return merged;
     }
-    let mut merged: Vec<Value> = Vec::with_capacity(profile_rules.len() + order.logical.len());
-    let mut referenced = vec![false; profile_rules.len()];
+    let mut merged: Vec<Value> = Vec::with_capacity(profile_slots.len() + order.logical.len());
+    let mut referenced = vec![false; profile_slots.len()];
     let mut last_profile_slot = None;
     for entry in &order.entries {
         match entry {
-            RuleOrderEntry::Profile(index) => match profile_rules.get(*index) {
-                Some(rule) => {
+            RuleOrderEntry::Profile(index) => match profile_slots.get(*index) {
+                Some(Some(rule)) => {
                     referenced[*index] = true;
                     merged.push(rule.clone());
                     last_profile_slot = Some(merged.len() - 1);
                 }
+                // Referenced but dropped by the conversion: its slot is
+                // consumed, nothing is emitted. Marking it keeps the
+                // unplaced fallback from trying to re-insert it later.
+                Some(None) => referenced[*index] = true,
+                // Past the end of the profile rule list (edited outside the
+                // editor): skipped, like before.
                 None => continue,
             },
             RuleOrderEntry::Logical(index) => match logical_json.get(*index).and_then(Option::as_ref) {
@@ -305,11 +420,11 @@ pub fn interleave_route_rules(profile_rules: &[Value], order: &RuleOrder) -> Vec
             },
         }
     }
-    let unplaced: Vec<Value> = profile_rules
+    let unplaced: Vec<Value> = profile_slots
         .iter()
         .enumerate()
         .filter(|(index, _)| !referenced[*index])
-        .map(|(_, rule)| rule.clone())
+        .filter_map(|(_, slot)| slot.clone())
         .collect();
     if !unplaced.is_empty() {
         let at = last_profile_slot.map_or(0, |slot| slot + 1);
@@ -552,6 +667,7 @@ mod storage_tests {
                 RuleOrderEntry::Profile(0),
                 RuleOrderEntry::Profile(1),
             ],
+            profile: None,
         };
         save_rule_order(&home, &order).expect("save");
         assert_eq!(load_rule_order(&home).unwrap(), order);
@@ -587,6 +703,7 @@ mod storage_tests {
         let stale = RuleOrder {
             logical: vec![logical("c.com")],
             entries: vec![RuleOrderEntry::Profile(9), RuleOrderEntry::Logical(0)],
+            profile: None,
         };
         let merged = interleave_route_rules(&profile, &stale);
         assert_eq!(merged[0], profile[0]);
@@ -594,6 +711,111 @@ mod storage_tests {
         assert_eq!(merged.len(), 2);
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The fingerprint is part of the sidecar, so a stored order can be
+    /// matched against the profile rule list it was recorded against.
+    #[test]
+    fn the_saved_order_carries_the_profile_rule_list_it_was_recorded_against() {
+        let home = temp_home("rule-order-fingerprint");
+        let logical = |domain: &str| IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![IRouteRule::Simple {
+                matches: vec![MatchField::Domain(domain.into())],
+                target: RuleTarget::Direct,
+            }],
+            target: RuleTarget::Block,
+        };
+        let profile: Vec<IRouteRule> = vec![
+            IRouteRule::Simple {
+                matches: vec![MatchField::Domain("a.example".into())],
+                target: RuleTarget::Direct,
+            },
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+        ];
+        let fingerprint = profile_rule_fingerprint(&profile);
+        let order = RuleOrder {
+            logical: vec![logical("blocked.example")],
+            entries: vec![RuleOrderEntry::Logical(0), RuleOrderEntry::Profile(0)],
+            profile: Some(fingerprint),
+        };
+        save_rule_order(&home, &order).expect("save");
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(LOGICAL_RULES_FILE)).unwrap()).unwrap();
+        assert_eq!(body["profile"]["count"], Value::from(2));
+        assert_eq!(
+            load_rule_order(&home).unwrap(),
+            order,
+            "the fingerprint must survive the round-trip"
+        );
+
+        // A subscription refresh that replaced the list is an identity
+        // change even though every stored index stays in range.
+        let refreshed: Vec<IRouteRule> = vec![
+            IRouteRule::Simple {
+                matches: vec![MatchField::Domain("new.example".into())],
+                target: RuleTarget::Direct,
+            },
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+        ];
+        let (effective, note) = order.resolve_profile_drift(profile_rule_fingerprint(&refreshed));
+        assert!(effective.entries.is_empty(), "stale indices must be dropped");
+        assert_eq!(effective.logical.len(), 1, "the logical rule is kept");
+        assert!(note.expect("reported").contains("rule order reset"));
+        // An unchanged list is trusted.
+        assert_eq!(order.resolve_profile_drift(fingerprint).1, None);
+        // A legacy sidecar without a fingerprint is trusted too.
+        let legacy = RuleOrder {
+            logical: order.logical.clone(),
+            entries: order.entries.clone(),
+            profile: None,
+        };
+        assert!(legacy.matches_profile(profile_rule_fingerprint(&refreshed)));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Interleaving against ORIGINAL slots: a dropped rule keeps its index
+    /// identity, so nothing below it shifts.
+    #[test]
+    fn a_dropped_slot_keeps_its_identity_when_interleaving() {
+        let logical = IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![IRouteRule::Simple {
+                matches: vec![MatchField::Domain("blocked.example".into())],
+                target: RuleTarget::Direct,
+            }],
+            target: RuleTarget::Block,
+        };
+        let order = RuleOrder {
+            logical: vec![logical],
+            entries: vec![
+                RuleOrderEntry::Profile(0),
+                RuleOrderEntry::Logical(0),
+                RuleOrderEntry::Profile(1),
+            ],
+            profile: None,
+        };
+        // P0 dropped by the conversion, P1 = the catch-all.
+        let slots: Vec<Option<Value>> = vec![None, Some(serde_json::json!({ "outbound": "direct" }))];
+        let merged = interleave_route_slots(&slots, &order);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0]["type"], Value::from("logical"));
+        assert_eq!(merged[1]["outbound"], Value::from("direct"));
+
+        // Interleaving the COMPRESSED list instead — the old behaviour — is
+        // what put the block rule after the catch-all.
+        let compressed: Vec<Option<Value>> = slots.iter().flatten().cloned().map(Some).collect();
+        let broken = interleave_route_slots(&compressed, &order);
+        assert_eq!(broken[0]["outbound"], Value::from("direct"));
+        assert_eq!(broken[1]["type"], Value::from("logical"));
     }
 
     #[test]
