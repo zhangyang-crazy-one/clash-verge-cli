@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "clash-verge-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
