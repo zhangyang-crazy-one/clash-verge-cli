@@ -42,7 +42,7 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
     }
 
     let log = supervisor_log_path(manager.config_dir());
-    let mut supervisor = launch_supervisor_via(manager.config_dir(), &log)?;
+    let mut supervisor = launch_supervisor_via(manager.config_dir(), &log, SupervisorLaunch::Regenerate)?;
     wait_until_ready(&manager, &mut supervisor, &log).await?;
 
     let version = manager
@@ -60,6 +60,37 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
     println!("  supervisor: pid {}", supervisor.id());
     println!("  log:        {}", log.display());
     Ok(())
+}
+
+/// What a supervisor-launched core must do about the runtime config on disk.
+///
+/// P1 (reviewer): the rollback recovery of a failed apply has to bring the
+/// OLD service back, not re-apply the newer profile. The restored config
+/// (A) is already on disk, but the supervisor's normal start regenerates it
+/// from whatever the active profile now holds (B) — so the recovered core
+/// served the config the user was trying to get away from, and the restored
+/// file was overwritten a moment later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupervisorLaunch {
+    /// Normal cold start: generate the runtime config from the active profile.
+    Regenerate,
+    /// Recovery: bring the core up on the config already on disk, verbatim.
+    UseExistingConfig,
+}
+
+/// Environment variable carrying [`SupervisorLaunch`] to the detached child.
+///
+/// The supervisor is launched as `start --foreground`, whose argument parser
+/// lives outside this module; an environment variable is what lets the
+/// recovery request travel to the child without a new CLI flag.
+pub const START_CONFIG_MODE_ENV: &str = "CLASH_VERGE_CLI_START_CONFIG";
+
+/// The launch mode this process was started with (default [`SupervisorLaunch::Regenerate`]).
+pub fn requested_launch() -> SupervisorLaunch {
+    match std::env::var(START_CONFIG_MODE_ENV).as_deref() {
+        Ok("existing") => SupervisorLaunch::UseExistingConfig,
+        _ => SupervisorLaunch::Regenerate,
+    }
 }
 
 /// Where the detached supervisor writes its own and the core's output.
@@ -89,7 +120,7 @@ pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::
 ///
 /// Also used by [`crate::mihomo_manager::MihomoManager::restart_through_supervisor`]
 /// to hand a replacement core to a supervisor after stopping an adopted one.
-pub fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+pub fn launch_supervisor(config_dir: &Path, log: &Path, mode: SupervisorLaunch) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
 
     if let Some(dir) = log.parent() {
@@ -101,16 +132,19 @@ pub fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::p
     let out = std::fs::File::create(log).with_context(|| format!("failed to create {}", log.display()))?;
     let err = out.try_clone().context("failed to duplicate the log handle")?;
     let exe = std::env::current_exe().context("cannot locate the clash-verge-cli executable")?;
-    std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .arg("--config-dir")
         .arg(config_dir)
         .args(["start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err)
-        .process_group(0)
-        .spawn()
-        .context("failed to launch the core supervisor")
+        .process_group(0);
+    if mode == SupervisorLaunch::UseExistingConfig {
+        command.env(START_CONFIG_MODE_ENV, "existing");
+    }
+    command.spawn().context("failed to launch the core supervisor")
 }
 
 /// Launch the detached supervisor, or the test-installed stand-in.
@@ -118,21 +152,26 @@ pub fn launch_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::p
 /// Every detached start goes through here (the plain `start`, the adopted
 /// core replacement and the apply transaction's rollback recovery), so a
 /// test can inject a *failing* supervisor launch at the real process
-/// boundary without spawning a core.
-pub(crate) fn launch_supervisor_via(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+/// boundary without spawning a core — and can observe the launch mode the
+/// production path would have put on the child's command line.
+pub(crate) fn launch_supervisor_via(
+    config_dir: &Path,
+    log: &Path,
+    mode: SupervisorLaunch,
+) -> anyhow::Result<std::process::Child> {
     #[cfg(test)]
     if let Some(launcher) = *SUPERVISOR_LAUNCHER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
-        return launcher(config_dir, log);
+        return launcher(config_dir, log, mode);
     }
-    launch_supervisor(config_dir, log)
+    launch_supervisor(config_dir, log, mode)
 }
 
 /// Test seam: the launcher [`launch_supervisor_via`] prefers while armed.
 #[cfg(test)]
-pub(crate) type SupervisorLauncher = fn(&Path, &Path) -> anyhow::Result<std::process::Child>;
+pub(crate) type SupervisorLauncher = fn(&Path, &Path, SupervisorLaunch) -> anyhow::Result<std::process::Child>;
 
 #[cfg(test)]
 static SUPERVISOR_LAUNCHER: std::sync::Mutex<Option<SupervisorLauncher>> = std::sync::Mutex::new(None);
@@ -156,6 +195,23 @@ pub(crate) fn install_supervisor_launcher(launcher: SupervisorLauncher) -> anyho
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(launcher);
     Ok(SupervisorLauncherGuard)
+}
+
+/// Terminate a supervisor that never became ready and reap it.
+///
+/// P1 (reviewer): a readiness timeout can happen AFTER the supervisor has
+/// spawned its core (a core that answers too slowly, a wedged one). Leaving
+/// that supervisor alive would leave it watching a core that competes with
+/// the recovery attempt's replacement for the same controller socket, so the
+/// timeout path has to kill the supervisor and collect it instead of dropping
+/// the [`std::process::Child`] (which never reaps anything) on the floor.
+pub fn reap_supervisor(supervisor: &mut std::process::Child) {
+    if matches!(supervisor.try_wait(), Ok(None)) {
+        let _ = supervisor.kill();
+    }
+    // `wait` after `kill` collects the zombie; a supervisor that already
+    // exited is reaped by it too.
+    let _ = supervisor.wait();
 }
 
 /// Wait until the supervised core answers. If the supervisor exits first
@@ -266,7 +322,11 @@ mod tests {
     /// child process that first performs the credential preparation the
     /// supervisor does at spawn time — in its own process, so the parent's
     /// process-global caches stay untouched, exactly as in production.
-    fn standin_supervisor(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+    fn standin_supervisor(
+        config_dir: &Path,
+        log: &Path,
+        mode: SupervisorLaunch,
+    ) -> anyhow::Result<std::process::Child> {
         let (config, child_secret) = CHILD_VIEW.get_or_init(|| {
             let config = clash_verge_core::utils::dirs::clash_path().expect("clash path");
             let config = config.clone();
@@ -300,6 +360,7 @@ mod tests {
             .spawn()?;
         STANDIN_PIDS.lock().unwrap().push(child.id());
         let _ = config_dir;
+        let _ = mode;
         Ok(child)
     }
 

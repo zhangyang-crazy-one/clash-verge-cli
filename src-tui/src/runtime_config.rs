@@ -114,12 +114,16 @@ pub async fn apply_singbox_restart_for_profile(
         // Stopped: the apply only persists; no restart is ever attempted.
         None
     };
-    let restart = || async {
-        // An owned child restarts in place; an adopted one is replaced by
-        // a detached supervisor so the replacement outlives this process.
-        match &authorization {
-            Some(authorization) => manager.apply_restart_authorization(authorization).await,
-            None => manager.restart_through_supervisor().await,
+    use crate::commands::start::SupervisorLaunch;
+    let restart = |mode: SupervisorLaunch| {
+        let authorization = authorization.clone();
+        async move {
+            // An owned child restarts in place; an adopted one is replaced by
+            // a detached supervisor so the replacement outlives this process.
+            match &authorization {
+                Some(authorization) => manager.apply_restart_authorization_with(authorization, mode).await,
+                None => manager.restart_through_supervisor_with(mode).await,
+            }
         }
     };
     let mut prepared_yaml = None;
@@ -195,7 +199,7 @@ pub async fn apply_singbox_restart_for_profile(
         });
     }
 
-    if let Err(restart_error) = restart().await {
+    if let Err(restart_error) = restart(SupervisorLaunch::Regenerate).await {
         transaction
             .rollback()
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
@@ -204,8 +208,15 @@ pub async fn apply_singbox_restart_for_profile(
         // manager state can no longer answer this question — and the
         // authorization captured at entry is what makes the retry possible at
         // all.
+        //
+        // P1 (reviewer): the retry runs in RECOVERY mode. The previous
+        // config (A) is back on disk, but the rules editor has already
+        // persisted the newer profile (B); a supervisor launched the normal
+        // way regenerates the runtime config from the active profile, so the
+        // "recovered" service ran B and overwrote A again. The recovery must
+        // start the core on the restored file, verbatim.
         if should_retry_rollback_restart(transaction.previous.is_some(), was_running)
-            && let Err(rollback_error) = restart().await
+            && let Err(rollback_error) = restart(SupervisorLaunch::UseExistingConfig).await
         {
             return Err(format!(
                 "{restart_error}; previous configuration restored but fallback restart failed: {rollback_error}"
@@ -1522,6 +1533,8 @@ mod tests {
             live: &'static Mutex<Vec<u32>>,
             formal: PathBuf,
             supervisor: &'static Mutex<Vec<u32>>,
+            /// Launch mode each attempt asked for.
+            modes: &'static Mutex<Vec<crate::commands::start::SupervisorLaunch>>,
         }
         static SEAM: OnceLock<&'static Seam> = OnceLock::new();
         static AUTHED: AtomicUsize = AtomicUsize::new(0);
@@ -1581,13 +1594,18 @@ mod tests {
             child.id()
         }
 
-        fn launch(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+        fn launch(
+            config_dir: &Path,
+            log: &Path,
+            mode: crate::commands::start::SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
             let seam = *SEAM.get().expect("seam");
             if let Some(dir) = log.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             std::fs::write(log, b"stand-in supervisor\n")?;
             let attempt = seam.attempts.fetch_add(1, Ordering::SeqCst);
+            seam.modes.lock().expect("modes").push(mode);
             if attempt == 0 {
                 // Injected failure: the core is stopped and nothing starts.
                 anyhow::bail!("injected supervisor launch failure");
@@ -1627,11 +1645,14 @@ mod tests {
 
         let live: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
         let supervisor: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let modes: &'static Mutex<Vec<crate::commands::start::SupervisorLaunch>> =
+            Box::leak(Box::new(Mutex::new(Vec::new())));
         let seam: &'static Seam = Box::leak(Box::new(Seam {
             attempts: AtomicUsize::new(0),
             live,
             supervisor,
             formal: formal.clone(),
+            modes,
         }));
         SEAM.set(seam).ok().expect("seam once");
 
@@ -1678,6 +1699,16 @@ mod tests {
         }
 
         assert_eq!(seam.attempts.load(Ordering::SeqCst), 2, "the rollback must retry once");
+        // P1 (reviewer): the retry is a RECOVERY — it must be launched to
+        // serve the restored config, not to regenerate it from the (newer)
+        // active profile.
+        assert_eq!(
+            *seam.modes.lock().expect("modes"),
+            vec![
+                crate::commands::start::SupervisorLaunch::Regenerate,
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
+            ]
+        );
         assert_eq!(
             std::fs::read_to_string(&formal).expect("formal"),
             PREVIOUS,
@@ -1727,5 +1758,314 @@ mod tests {
                 .contains("no clash-verge-cli pid record"),
             "the global foreign-core refusal must not be loosened by the recovery path"
         );
+    }
+
+    /// P1 (reviewer), REAL chain: the rollback recovery must bring the
+    /// SERVICE back on the restored config, going through the real
+    /// foreground start (`commands::daemon::run` → `manager.start` →
+    /// `start_singbox`) and a REAL sing-box process — no stand-in launcher
+    /// and no independent HTTP listener.
+    ///
+    /// Scene: profile B is persisted, the running core serves A, the first
+    /// supervisor launch fails. Both the final disk config and the live
+    /// service must be A. Before the fix the recovery supervisor
+    /// regenerated from the active profile, so the "recovered" service ran B
+    /// and A was overwritten again.
+    ///
+    /// Tagged `#[ignore]` like the repository's other real-core e2e tests
+    /// (it spawns a real binary and binds ports); runs with:
+    /// `cargo test -p clash-verge-cli -- --ignored`.
+    #[tokio::test]
+    #[ignore = "spawns a real sing-box core; run: cargo test -p clash-verge-cli -- --ignored"]
+    async fn the_recovery_brings_the_service_back_on_the_restored_config_through_the_real_supervisor() {
+        use crate::mihomo_manager::pidfile::{self, CoreKind, CoreRecord};
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Mutex, OnceLock};
+
+        const PROFILE_A: &str = "proxies: []\nrules:\n  - DOMAIN,a-recovery-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+        const PROFILE_B: &str = "proxies: []\nrules:\n  - DOMAIN,b-apply-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+
+        let Some(core_binary) = crate::mihomo_manager::singbox_binary::candidate_without_install() else {
+            eprintln!("skipping: no sing-box binary found");
+            return;
+        };
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+
+        // Two free ports: the clash_api controller and the mixed port.
+        let controller = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr")
+        };
+        let mixed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let socket = home.path().join("controller.sock");
+        std::fs::write(
+            home.path().join("config.yaml"),
+            format!(
+                "mixed-port: {mixed_port}\nexternal-controller: {controller}\nexternal-controller-unix: {}\n\
+secret: fixture-secret\ntun: {{enable: false}}\n",
+                socket.display()
+            ),
+        )
+        .expect("config");
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            format!("proxy_core: singbox\nverge_mixed_port: {mixed_port}\n"),
+        )
+        .expect("verge");
+        // The editor has already persisted profile B — the config the failed
+        // apply was installing, and the one a regenerating recovery would
+        // wrongly serve.
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: base\nitems:\n  - {uid: base, type: remote, name: fixture, file: base.yaml}\n",
+        )
+        .expect("profiles");
+        std::fs::write(home.path().join("profiles/base.yaml"), PROFILE_B).expect("profile B");
+
+        // Config A: what the core is running right now and what the
+        // transaction will restore.
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("formal path");
+        crate::mihomo_manager::ManagerInner::write_singbox_assembled_to(home.path(), Some(PROFILE_A), false, &formal)
+            .await
+            .expect("assemble A");
+        let config_a = std::fs::read(&formal).expect("read A");
+        assert!(String::from_utf8_lossy(&config_a).contains("a-recovery-marker.example"));
+
+        // The old core: a REAL sing-box serving A, recorded the way
+        // `spawn_core` records it.
+        #[allow(clippy::zombie_processes)]
+        let core_log = home.path().join("core-a.log");
+        let core_err = std::fs::File::create(&core_log).expect("core log");
+        let old_core = std::process::Command::new(&core_binary)
+            .arg("run")
+            .arg("-c")
+            .arg(&formal)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(core_err)
+            .spawn()
+            .expect("spawn the running core");
+        // The old core is killed and reaped even if an assertion fails.
+        struct OldCore(std::process::Child);
+        impl Drop for OldCore {
+            fn drop(&mut self) {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(self.0.id() as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = self.0.wait();
+            }
+        }
+        let old_core = OldCore(old_core);
+        pidfile::write(
+            &pidfile::path_for(&socket),
+            CoreRecord::with_kind_and_exe(
+                old_core.0.id(),
+                chrono::Utc::now(),
+                CoreKind::SingBox,
+                std::fs::canonicalize(&core_binary)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            ),
+        )
+        .expect("record");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let manager = crate::mihomo_manager::MihomoManager::new(config_dir.clone())
+            .with_socket(socket.clone())
+            .with_singbox_controller(controller)
+            .with_core_kind(CoreKind::SingBox)
+            .with_secret("fixture-secret".to_string());
+        *manager.inner().resolved_binary.lock() = Some(core_binary.clone());
+        // Wait for the old core to answer, then adopt it (a real process
+        // shape, so adoption validates: cmdline `-c <formal>` and the
+        // clash_api endpoint inside it).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while manager.api().version().await.is_err() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        manager.adopt_running_core();
+        assert!(
+            manager.pid().is_some(),
+            "the running core A must be adopted for the case under test; core log:\n{}",
+            std::fs::read_to_string(&core_log).unwrap_or_default()
+        );
+
+        struct Seam {
+            attempts: AtomicUsize,
+            modes: &'static Mutex<Vec<crate::commands::start::SupervisorLaunch>>,
+            daemons: &'static Mutex<Vec<tokio::task::JoinHandle<anyhow::Result<()>>>>,
+            placeholders: &'static Mutex<Vec<u32>>,
+            config_dir: PathBuf,
+        }
+        static SEAM: OnceLock<&'static Seam> = OnceLock::new();
+
+        /// Panic-safe cleanup: a failed assertion must not leave a real core
+        /// (or a placeholder) running after the test.
+        struct Cleanup {
+            seam: &'static Seam,
+            pids: Mutex<Vec<u32>>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for handle in self
+                    .seam
+                    .daemons
+                    .lock()
+                    .map(|mut d| d.drain(..).collect::<Vec<_>>())
+                    .unwrap_or_default()
+                {
+                    handle.abort();
+                }
+                let mut pids = self
+                    .seam
+                    .placeholders
+                    .lock()
+                    .map(|mut p| p.drain(..).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                pids.extend(
+                    self.pids
+                        .lock()
+                        .map(|mut p| p.drain(..).collect::<Vec<u32>>())
+                        .unwrap_or_default(),
+                );
+                for pid in pids {
+                    let _ = nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
+        }
+
+        /// The supervisor seam: attempt 0 fails (the injected fault);
+        /// attempt 1 runs the REAL foreground supervisor in-process, which
+        /// is the code `start --foreground` executes.
+        fn launch(
+            config_dir: &Path,
+            log: &Path,
+            mode: crate::commands::start::SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
+            let seam = *SEAM.get().expect("seam");
+            seam.modes.lock().expect("modes").push(mode);
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"in-process supervisor\n")?;
+            let attempt = seam.attempts.fetch_add(1, Ordering::SeqCst);
+            // A placeholder `Child` stands for the detached supervisor process
+            // boundary; the supervisor's work itself runs as a task.
+            #[allow(clippy::zombie_processes)]
+            let placeholder = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            seam.placeholders.lock().expect("placeholders").push(placeholder.id());
+            if attempt == 0 {
+                anyhow::bail!("injected supervisor launch failure");
+            }
+            let dir = seam.config_dir.clone();
+            seam.daemons.lock().expect("daemons").push(tokio::spawn(async move {
+                // The detached child learns its mode from the
+                // environment; reproduce that here.
+                let guard = if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+                    "existing"
+                } else {
+                    ""
+                };
+                let previous = std::env::var_os(crate::commands::start::START_CONFIG_MODE_ENV);
+                // SAFETY: single-threaded access to the environment is
+                // guarded by the app-home lock held for this test.
+                unsafe { std::env::set_var(crate::commands::start::START_CONFIG_MODE_ENV, guard) };
+                let outcome = crate::commands::daemon::run(dir).await;
+                match previous {
+                    Some(value) => unsafe { std::env::set_var(crate::commands::start::START_CONFIG_MODE_ENV, value) },
+                    None => unsafe { std::env::remove_var(crate::commands::start::START_CONFIG_MODE_ENV) },
+                }
+                outcome
+            }));
+            let _ = config_dir;
+            Ok(placeholder)
+        }
+
+        let modes: &'static Mutex<Vec<crate::commands::start::SupervisorLaunch>> =
+            Box::leak(Box::new(Mutex::new(Vec::new())));
+        let daemons: &'static Mutex<Vec<tokio::task::JoinHandle<anyhow::Result<()>>>> =
+            Box::leak(Box::new(Mutex::new(Vec::new())));
+        let placeholders: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let seam: &'static Seam = Box::leak(Box::new(Seam {
+            attempts: AtomicUsize::new(0),
+            modes,
+            daemons,
+            placeholders,
+            config_dir,
+        }));
+        SEAM.set(seam).ok().expect("seam once");
+
+        let _launcher = crate::commands::start::install_supervisor_launcher(launch).expect("install seam");
+        let _cleanup = Cleanup {
+            seam: SEAM.get().expect("seam"),
+            pids: Mutex::new(Vec::new()),
+        };
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            apply_singbox_restart_for_profile(&manager, Some(PROFILE_B), false, None),
+        )
+        .await
+        .expect("the transaction must finish inside its own timeouts")
+        .expect_err("the first supervisor launch was injected to fail");
+        assert!(outcome.contains("injected supervisor launch failure"), "{outcome}");
+        assert_eq!(seam.attempts.load(Ordering::SeqCst), 2, "the rollback must retry once");
+        assert_eq!(
+            *seam.modes.lock().expect("modes"),
+            vec![
+                crate::commands::start::SupervisorLaunch::Regenerate,
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
+            ]
+        );
+
+        // The recovery is up: the controller answers again, on A's service.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while manager.api().version().await.is_err() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        manager.adopt_running_core();
+
+        // Disk: the restored config, byte for byte. A regeneration would
+        // have replaced it with the profile-B generation.
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&formal).expect("formal")).to_string(),
+            String::from_utf8_lossy(&config_a).to_string(),
+            "the restored configuration must survive the recovery"
+        );
+        // Service: the live core serves A, not B.
+        let rules = format!(
+            "{:?}",
+            manager.api().get_rules().await.expect("query the live core").rules
+        );
+        assert!(rules.contains("a-recovery-marker.example"), "{rules}");
+        assert!(
+            !rules.contains("b-apply-marker.example"),
+            "the recovered service must not be running the profile that failed to apply: {rules}"
+        );
+        // Identity: the answering core is a NEW one, recorded for it.
+        let record = pidfile::read_record(&pidfile::path_for(&socket)).expect("replacement record");
+        assert_eq!(record.kind, CoreKind::SingBox);
+        assert_ne!(record.pid, old_core.0.id(), "the recovery must start its own core");
+        assert!(pidfile::is_running(record.pid));
+
+        // The recovered core is the only process left to the cleanup guard
+        // (which also stops the placeholder children and the supervisor
+        // tasks), so even a failing assertion leaves nothing behind.
+        _cleanup.pids.lock().expect("pids").push(record.pid);
     }
 }

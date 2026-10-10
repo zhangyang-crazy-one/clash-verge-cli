@@ -21,7 +21,16 @@ use crate::subscribe::lifecycle::{ManagerLifecycle, reload_with_lifecycle};
 use crate::subscribe::scheduler::AutoUpdateScheduler;
 
 pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
+    let launch = crate::commands::start::requested_launch();
     let manager = commands::build_manager(config_dir).await?;
+    // P1 (reviewer): a RECOVERY supervisor (launched by a failed apply's
+    // rollback) must serve the runtime config already on disk — the
+    // previous one just restored — and never regenerate it from the active
+    // profile, which by then holds the newer config the apply failed on.
+    if launch == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+        tracing::info!(target: "daemon", "recovery start: serving the existing runtime config");
+        manager.set_use_existing_runtime_config(true);
+    }
     let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(64);
     manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary

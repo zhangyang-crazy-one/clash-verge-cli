@@ -48,6 +48,12 @@ pub struct ManagerInner {
     /// Path of the resolved mihomo binary (set on start; None before first
     /// start). Used by TUN capability setup.
     pub resolved_binary: Mutex<Option<PathBuf>>,
+    /// P1 (reviewer): set on a RECOVERY supervisor — the one a failed apply
+    /// launches to bring the restored configuration back. It makes the
+    /// start path consume the runtime config already on disk instead of
+    /// regenerating it from the active profile, which is the newer config
+    /// the failed apply was trying to install.
+    pub use_existing_runtime_config: AtomicBool,
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart. Kept alongside the generation
     /// counter for back-compat with the cross-process pidfile intent path
@@ -239,6 +245,7 @@ impl ManagerInner {
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
+            use_existing_runtime_config: AtomicBool::new(false),
             expected_exit: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
             owns_child: AtomicBool::new(false),
@@ -662,6 +669,44 @@ impl ManagerInner {
         Ok(path)
     }
 
+    /// The runtime config a start must run, honouring the recovery mode.
+    ///
+    /// P1 (reviewer): the recovery start MUST NOT regenerate. The apply
+    /// transaction restores the previous config (A) on disk and then asks a
+    /// supervisor to bring the service back; regenerating here rebuilds the
+    /// config from the active profile (B) — the newer one the failed apply
+    /// had just persisted — so the "recovered" service ran B and the
+    /// restored A was overwritten in the same breath. Recovery therefore
+    /// consumes the frozen, already-validated file verbatim.
+    pub(crate) async fn runtime_config_for_start(&self, config_dir: &Path) -> anyhow::Result<PathBuf> {
+        if !self
+            .use_existing_runtime_config
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Self::write_singbox_full(config_dir).await;
+        }
+        let path = Self::existing_singbox_config().await?;
+        tracing::info!(
+            target: "singbox",
+            "recovery start: serving the existing runtime config {} as-is (no regeneration)",
+            path.display()
+        );
+        Ok(path)
+    }
+
+    /// The existing, validated runtime config, or a clear error.
+    async fn existing_singbox_config() -> anyhow::Result<PathBuf> {
+        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        if !tokio::fs::try_exists(&path).await? {
+            anyhow::bail!(
+                "recovery start has no restored {} to serve; the previous configuration could not be \
+recovered",
+                path.display()
+            );
+        }
+        Ok(path)
+    }
+
     /// Persist a sing-box runtime config assembled from the given profile
     /// YAML (None → bare skeleton). Returns the written path plus the parts
     /// so callers can build a degradation report without re-converting.
@@ -810,6 +855,7 @@ impl SingboxParts {
             Some(y) => profile_route_rules(y, &conversion.outbound_tags(), &stored_tags).map_err(anyhow::Error::msg)?,
             None => ProfileRouteRules {
                 rules: Vec::new(),
+                slots: Vec::new(),
                 rule_sets: Vec::new(),
                 skipped: Vec::new(),
             },
@@ -820,15 +866,43 @@ impl SingboxParts {
         // user placed above a profile `MATCH` must stay above that catch-all,
         // or the core would never evaluate it. A sidecar without order
         // information keeps the historical append-after-profile behaviour.
+        //
+        // The order indexes the ORIGINAL profile rule list, so it is
+        // interleaved against the original slots (rules the conversion
+        // dropped keep their slot identity and are skipped) — never against
+        // the compressed converted list.
+        let profile_route_slots: Vec<Option<serde_json::Value>> = profile_routes
+            .slots
+            .iter()
+            .map(|slot| slot.map(|index| profile_route_values[index].clone()))
+            .collect();
         let route_rules = match &home {
             Some(home) => {
-                let order = crate::singbox::load_rule_order(home).map_err(anyhow::Error::msg)?;
-                crate::singbox::interleave_route_rules(&profile_route_values, &order)
+                let stored = crate::singbox::load_rule_order(home).map_err(anyhow::Error::msg)?;
+                // A subscription refresh can replace the profile rule list
+                // under the sidecar; every stored index stays in range and
+                // silently points at a different rule. Detect that and fall
+                // back to append-after, reported like any other loss.
+                let (order, drift) = match yaml.and_then(|y| crate::routing::load_profile_rules(y).ok()) {
+                    Some(profile_rules) => {
+                        stored.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&profile_rules))
+                    }
+                    // No parseable profile rule list: nothing to compare
+                    // against, so the stored order is used as-is.
+                    None => (stored.clone(), None),
+                };
+                let merged = crate::singbox::interleave_route_slots(&profile_route_slots, &order);
+                if let Some(note) = &drift {
+                    tracing::warn!(target: "config", "{note}");
+                }
+                (merged, drift)
             }
-            None => {
-                crate::singbox::interleave_route_rules(&profile_route_values, &crate::singbox::RuleOrder::default())
-            }
+            None => (
+                crate::singbox::interleave_route_slots(&profile_route_slots, &crate::singbox::RuleOrder::default()),
+                None,
+            ),
         };
+        let (route_rules, route_order_note) = route_rules;
         // Rules the conversion could not express are reported, never fatal.
         let route_report = profile_routes.skipped;
         let mut conversion = conversion;
@@ -858,6 +932,7 @@ impl SingboxParts {
         let default_domain_resolver = crate::singbox::dns::default_domain_resolver(&dns_spec);
         let dns_section = crate::singbox::dns::build_dns_section(&dns_spec).map_err(anyhow::Error::msg)?;
         conversion.notes.extend(route_report);
+        conversion.notes.extend(route_order_note);
         conversion.notes.extend(dns_notes);
         Ok(Self {
             conversion,
@@ -968,6 +1043,20 @@ impl MihomoManager {
     /// Whether this process spawned the core and supervises it.
     pub fn owns_child(&self) -> bool {
         self.inner.owns_child.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Bring the core up on the runtime config already on disk, without
+    /// regenerating it from the active profile.
+    ///
+    /// Set by the foreground supervisor when it was launched for a RECOVERY
+    /// (see [`crate::commands::start::SupervisorLaunch`]): the apply
+    /// transaction has just restored the previous config and needs the
+    /// service back on THAT one, not on a fresh generation of the newer
+    /// profile it failed to install.
+    pub fn set_use_existing_runtime_config(&self, enabled: bool) {
+        self.inner
+            .use_existing_runtime_config
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the action channel sender. Called by the TUI after it has
@@ -1737,7 +1826,10 @@ stop it where it was started",
                     Arc::clone(&self.inner),
                 );
                 async move {
-                    let config_path = ManagerInner::write_singbox_full(&config_dir).await?;
+                    // P1 (reviewer): a RECOVERY supervisor runs the config
+                    // that is already on disk (the restored previous one),
+                    // never a regeneration from the active profile.
+                    let config_path = ManagerInner::runtime_config_for_start(&inner, &config_dir).await?;
                     ManagerInner::spawn_core(
                         &path,
                         &version,
@@ -1806,6 +1898,10 @@ stop it where it was started",
             .map_err(anyhow::Error::msg)?;
         let config_path = clash_verge_core::utils::dirs::singbox_config_path()?;
         if !tokio::fs::try_exists(&config_path).await? {
+            // Recovery: the restored config MUST exist. Generating one here
+            // would silently serve the newer profile instead of what was
+            // just rolled back.
+            ManagerInner::existing_singbox_config().await?;
             ManagerInner::write_singbox_full(&self.config_dir).await?;
         }
         ManagerInner::spawn_core(
@@ -1849,11 +1945,21 @@ stop it where it was started",
     /// detached supervisor. Only a core with no pid record at all — one
     /// somebody else started — is refused.
     pub async fn restart_through_supervisor(&self) -> anyhow::Result<()> {
+        self.restart_through_supervisor_with(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+    }
+
+    /// [`restart_through_supervisor`] with an explicit launch mode; a
+    /// recovery asks the replacement to serve the config already on disk.
+    pub async fn restart_through_supervisor_with(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<()> {
         let authorization = self.capture_restart_authorization().await?;
         let Some(authorization) = authorization else {
             return self.restart().await.map(|_| ());
         };
-        self.apply_restart_authorization(&authorization).await
+        self.apply_restart_authorization_with(&authorization, mode).await
     }
 
     /// Validate the restart authorization for THIS manager right now, and
@@ -1891,6 +1997,23 @@ stop it where it was started",
     /// authorization captured at entry is the receipt: it is honoured for
     /// this call only, so the global "no record → refuse" rule is untouched.
     pub async fn apply_restart_authorization(&self, authorization: &RestartAuthorization) -> anyhow::Result<()> {
+        self.apply_restart_authorization_with(authorization, crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+    }
+
+    /// [`apply_restart_authorization`] with an explicit launch mode.
+    ///
+    /// `UseExistingConfig` is the RECOVERY half of the apply transaction:
+    /// the previous config has already been restored on disk, so the
+    /// replacement supervisor is told to serve that file instead of
+    /// regenerating it from the active profile. Without this the recovery
+    /// re-generated the newer profile the apply had just failed to install,
+    /// and the "restored" service was the config the user was rejecting.
+    pub async fn apply_restart_authorization_with(
+        &self,
+        authorization: &RestartAuthorization,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<()> {
         if self.owns_child() {
             return self.restart().await.map(|_| ());
         }
@@ -1900,11 +2023,105 @@ stop it where it was started",
         // two supervisors fighting over one controller socket.
         self.stop().await.context("failed to stop the recorded core")?;
         let log = crate::commands::start::supervisor_log_path(&self.config_dir);
-        let mut supervisor = crate::commands::start::launch_supervisor_via(&self.config_dir, &log)?;
-        crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await?;
+        let launched_at = std::time::SystemTime::now();
+        let mut supervisor = crate::commands::start::launch_supervisor_via(&self.config_dir, &log, mode)?;
+        if let Err(error) = crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await {
+            // P1 (reviewer): a supervisor that started but did not answer in
+            // time must be terminated AND reaped, and whatever core it had
+            // already spawned must be stopped — otherwise it keeps running
+            // unsupervised and competes for the controller socket with the
+            // recovery attempt that follows.
+            crate::commands::start::reap_supervisor(&mut supervisor);
+            self.stop_recorded_core().await;
+            return Err(error);
+        }
+        // Bind this transaction to the replacement's IDENTITY, not to
+        // "something answers on the port": a core started before the
+        // replacement was launched (or one that grabbed the socket in the
+        // meantime) is not what this recovery asked for.
+        self.verify_replacement_core(authorization, launched_at)?;
         // The replacement belongs to the new supervisor; adopt its pid
         // record so the rest of this process sees the running core.
         self.adopt_running_core();
+        Ok(())
+    }
+
+    /// Stop the core recorded on disk, whoever spawned it, without requiring
+    /// this manager to track it. Used to clean up after a supervisor whose
+    /// readiness window elapsed.
+    async fn stop_recorded_core(&self) {
+        let path = pidfile::path_for(&self.socket_path);
+        let Some(record) = pidfile::read_record(&path) else {
+            return;
+        };
+        if !pidfile::is_running(record.pid) {
+            pidfile::remove_if(&path, record.pid);
+            return;
+        }
+        if let Err(error) = signal::graceful_stop_by_pid(record.pid).await {
+            tracing::warn!(
+                target: "mihomo",
+                "failed to stop the partially started core {} after a readiness timeout: {error}",
+                record.pid
+            );
+            return;
+        }
+        pidfile::remove_if(&path, record.pid);
+        tracing::info!(
+            target: "mihomo",
+            "stopped the partially started core {} left by a timed-out supervisor",
+            record.pid
+        );
+    }
+
+    /// Require the core answering the controller to be THIS replacement.
+    ///
+    /// Fails when the pid record on disk is not a live core of this kind, or
+    /// when it names the core the transaction was replacing / a core that
+    /// started before the replacement was launched. "Something answers on the
+    /// port with a plausible version" is exactly what a predecessor (or a
+    /// foreign process that took the socket during the failure window) looks
+    /// like, and accepting it reports a recovery that never happened.
+    ///
+    /// The record is read raw (`read_record`) rather than adopted: full
+    /// adoption also validates the process shape (`/proc` cmdline/exe), which
+    /// is [`Self::adopt_running_core`]'s job — here only the identity of the
+    /// record itself decides which core answered.
+    fn verify_replacement_core(
+        &self,
+        authorization: &RestartAuthorization,
+        launched_at: std::time::SystemTime,
+    ) -> anyhow::Result<()> {
+        let path = pidfile::path_for(&self.socket_path);
+        let record = pidfile::read_record(&path)
+            .filter(|record| record.kind == self.core_kind() && pidfile::is_running(record.pid))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the replacement core answered on {} but left no live {} pid record; \
+it cannot be attributed to this restart",
+                    self.socket_path.display(),
+                    self.core_kind().as_str()
+                )
+            })?;
+        if record.pid == authorization.pid {
+            anyhow::bail!(
+                "pid {} on {} is still the core this transaction was replacing; the replacement \
+never started",
+                record.pid,
+                self.socket_path.display()
+            );
+        }
+        // Core records carry whole unix seconds, so allow a small truncation
+        // tolerance before calling the record stale.
+        let cutoff = chrono::DateTime::<Utc>::from(launched_at) - chrono::Duration::seconds(2);
+        if record.started_at().is_some_and(|started| started < cutoff) {
+            anyhow::bail!(
+                "the core answering on {} (pid {}) predates the replacement this restart launched; \
+the recovery is not serving its own core",
+                self.socket_path.display(),
+                record.pid
+            );
+        }
         Ok(())
     }
 
@@ -4463,6 +4680,11 @@ fn profile_tun_settings(
 #[derive(Debug)]
 struct ProfileRouteRules {
     rules: Vec<serde_json::Value>,
+    /// `rules[i]` is where ORIGINAL profile rule `i` landed, `None` where the
+    /// conversion dropped it. The rule-order sidecar indexes the original
+    /// list, so interleaving without this mapping shifts every index after
+    /// the first dropped rule onto the wrong rule.
+    slots: Vec<Option<usize>>,
     /// `route.rule_set` entries the converted rules reference (geo sets
     /// synthesized from `GEOIP`/`GEOSITE`, providers from `rule-providers`).
     rule_sets: Vec<serde_json::Value>,
@@ -4496,6 +4718,7 @@ fn profile_route_rules(
     let document: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).map_err(|error| error.to_string())?;
     let mut result = ProfileRouteRules {
         rules: Vec::new(),
+        slots: Vec::new(),
         rule_sets: Vec::new(),
         skipped: Vec::new(),
     };
@@ -4519,12 +4742,20 @@ fn profile_route_rules(
         return Ok(result);
     };
     let rules = rules.as_sequence().ok_or("profile rules must be a list")?.clone();
+    // One slot per ORIGINAL rule, so a dropped rule keeps its index identity
+    // even though nothing is emitted for it.
+    result.slots = vec![None; rules.len()];
     for (index, rule) in rules.iter().enumerate() {
         let rule = rule
             .as_str()
             .ok_or_else(|| format!("profile rules[{index}] must be a string"))?;
         match convert_one_rule(rule, known_outbounds, &available_sets, &mut result) {
-            Ok(()) => {}
+            Ok(()) => {
+                // Exactly one route rule is emitted per converted rule, so
+                // the slot is the position it was appended at.
+                debug_assert_eq!(result.slots[index], None, "slot {index} was already filled");
+                result.slots[index] = Some(result.rules.len() - 1);
+            }
             // Only a structurally broken rule list is fatal; a single
             // unrepresentable rule degrades into the report.
             Err(reason) => result.skipped.push(format!("profile rules[{index}]: {reason}")),
@@ -5094,6 +5325,7 @@ mod alignment_regressions {
             &RuleOrder {
                 logical: vec![block],
                 entries: vec![RuleOrderEntry::Logical(0), RuleOrderEntry::Profile(0)],
+                profile: None,
             },
         )
         .unwrap();
@@ -5126,5 +5358,421 @@ mod alignment_regressions {
             rules[logical_at]["rules"][0]["domain"],
             serde_json::json!(["blocked.example"])
         );
+    }
+}
+
+#[cfg(test)]
+/// P1 (reviewer), conditional race: a supervisor that started but missed the
+/// readiness window must be terminated AND reaped — otherwise it keeps
+/// watching a core that competes with the recovery's replacement for the
+/// controller socket.
+mod supervisor_reaping {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_supervisor_that_missed_the_readiness_window_is_killed_and_reaped() {
+        let _home = tempfile::tempdir().unwrap();
+        #[allow(clippy::zombie_processes)]
+        let mut supervisor = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = supervisor.id();
+        assert!(pidfile::is_running(pid));
+
+        crate::commands::start::reap_supervisor(&mut supervisor);
+
+        assert!(!pidfile::is_running(pid), "the timed-out supervisor must be gone");
+        // Reaped, not just signalled: `try_wait` collects it instead of
+        // leaving a zombie for the rest of the process' life.
+        let status = supervisor.try_wait().expect("reaped");
+        assert!(status.is_some(), "the supervisor child must have been waited on");
+    }
+}
+
+/// P1 (reviewer): the readiness probe after a supervisor launch must bind to
+/// THIS replacement's identity, not to "something answers on the port".
+mod replacement_identity {
+    use super::*;
+    use crate::mihomo_manager::pidfile::{self, CoreRecord};
+
+    fn manager_with_record(home: &std::path::Path, record: Option<CoreRecord>) -> MihomoManager {
+        let socket = home.join("controller.sock");
+        match record {
+            Some(record) => pidfile::write(&pidfile::path_for(&socket), record).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(pidfile::path_for(&socket));
+            }
+        }
+        MihomoManager::new(home.join("run"))
+            .with_socket(socket)
+            .with_singbox_controller("127.0.0.1:49715".parse().unwrap())
+            .with_core_kind(CoreKind::SingBox)
+    }
+
+    fn record(pid: u32, kind: CoreKind, started: chrono::DateTime<chrono::Utc>) -> CoreRecord {
+        CoreRecord::with_kind(pid, started, kind)
+    }
+
+    /// A live stand-in process: the identity check only asks whether the pid
+    /// is alive, so any process will do.
+    fn live_pid(live: &mut Vec<u32>) -> u32 {
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        live.push(child.id());
+        child.id()
+    }
+
+    fn authorization(pid: u32) -> RestartAuthorization {
+        RestartAuthorization {
+            kind: CoreKind::SingBox,
+            pid,
+            exe: None,
+        }
+    }
+
+    fn cleanup(live: &[u32]) {
+        for pid in live {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(*pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_record_for_this_kind_started_after_the_launch_is_the_replacement() {
+        let home = tempfile::tempdir().unwrap();
+        let mut live = Vec::new();
+        let replaced = live_pid(&mut live);
+        let replacement = live_pid(&mut live);
+        let launched_at = std::time::SystemTime::now();
+        let manager = manager_with_record(
+            home.path(),
+            Some(record(replacement, CoreKind::SingBox, chrono::Utc::now())),
+        );
+        manager
+            .verify_replacement_core(&authorization(replaced), launched_at)
+            .expect("a fresh live record of this kind is the replacement");
+        cleanup(&live);
+    }
+
+    #[test]
+    fn a_core_that_predates_the_launch_or_is_the_replaced_one_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let mut live = Vec::new();
+        let replaced = live_pid(&mut live);
+        let other = live_pid(&mut live);
+        let launched_at = std::time::SystemTime::now();
+
+        // The very core the transaction was authorized to replace, still
+        // answering: the replacement never started.
+        let manager = manager_with_record(
+            home.path(),
+            Some(record(replaced, CoreKind::SingBox, chrono::Utc::now())),
+        );
+        assert!(
+            manager
+                .verify_replacement_core(&authorization(replaced), launched_at)
+                .expect_err("the replaced core is not a replacement")
+                .to_string()
+                .contains("never started")
+        );
+
+        // A core that started well before this launch: something else is
+        // answering; this transaction did not start it.
+        let stale = chrono::Utc::now() - chrono::Duration::hours(1);
+        let manager = manager_with_record(home.path(), Some(record(other, CoreKind::SingBox, stale)));
+        assert!(
+            manager
+                .verify_replacement_core(&authorization(replaced), launched_at)
+                .expect_err("a predecessor is not a replacement")
+                .to_string()
+                .contains("predates the replacement")
+        );
+
+        // No record at all: nothing can be attributed to this restart.
+        let manager = manager_with_record(home.path(), None);
+        assert!(
+            manager
+                .verify_replacement_core(&authorization(replaced), launched_at)
+                .expect_err("no record, no attribution")
+                .to_string()
+                .contains("no live")
+        );
+
+        // A record of another core kind is not this replacement either.
+        let manager = manager_with_record(home.path(), Some(record(other, CoreKind::Mihomo, chrono::Utc::now())));
+        assert!(
+            manager
+                .verify_replacement_core(&authorization(replaced), launched_at)
+                .expect_err("a foreign kind is not a replacement")
+                .to_string()
+                .contains("no live")
+        );
+
+        cleanup(&live);
+    }
+}
+
+#[cfg(test)]
+/// Helper: the profile-scoped fixtures every conversion test in this module
+/// needs (mixed port, controller, secret) behind one temp app home.
+/// The app-home lock is process-wide (the home dir is global state), so the
+/// guard has to outlive the fixture: dropping it early would let a parallel
+/// test repoint every path lookup at ITS home.
+async fn conversion_fixture() -> (tempfile::TempDir, tokio::sync::MutexGuard<'static, ()>) {
+    let home = tempfile::tempdir().unwrap();
+    let guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+    std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: fixture\n",
+    )
+    .unwrap();
+    (home, guard)
+}
+
+#[cfg(test)]
+/// F2 (reviewer, minimal repro): the sidecar's `Profile(i)` indices are
+/// ORIGINAL profile-rule indices, but generation used to interleave against
+/// the COMPRESSED list. One dropped rule (here `DOMAIN-REGEX`, which the
+/// conversion cannot express) shifted every later index by one, so the block
+/// rule ordered between it and the `MATCH` was emitted AFTER the catch-all —
+/// where the core never evaluates it — and the editor reopened showing the
+/// two the other way round.
+mod rule_order_slots {
+    use super::*;
+    use crate::singbox::{RuleOrder, RuleOrderEntry};
+
+    const SCENE: &str = "proxies: []\nrules:\n  - DOMAIN-REGEX,ads\\..*,REJECT\n  - MATCH,DIRECT\n";
+
+    fn block_rule() -> crate::routing::IRouteRule {
+        use crate::routing::{IRouteRule, LogicOp, MatchField, RuleTarget};
+        IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![IRouteRule::Simple {
+                matches: vec![MatchField::Domain("blocked.example".into())],
+                target: RuleTarget::Direct,
+            }],
+            target: RuleTarget::Block,
+        }
+    }
+
+    fn generated_route_rules(path: &std::path::Path) -> Vec<serde_json::Value> {
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        config["route"]["rules"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("no route rules in {}", path.display()))
+    }
+
+    #[tokio::test]
+    async fn a_dropped_profile_rule_does_not_shift_the_saved_rule_order() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let fingerprint =
+            crate::singbox::profile_rule_fingerprint(&crate::routing::load_profile_rules(SCENE).expect("parse scene"));
+        // The editor's save for the buffer P0(dropable), L0(block), P1(MATCH).
+        crate::singbox::save_rule_order(
+            home.path(),
+            &RuleOrder {
+                logical: vec![block_rule()],
+                entries: vec![
+                    RuleOrderEntry::Profile(0),
+                    RuleOrderEntry::Logical(0),
+                    RuleOrderEntry::Profile(1),
+                ],
+                profile: Some(fingerprint),
+            },
+        )
+        .unwrap();
+
+        let generated = home.path().join("candidate.json");
+        ManagerInner::write_singbox_assembled_to(home.path(), Some(SCENE), false, &generated)
+            .await
+            .unwrap();
+        let rules = generated_route_rules(&generated);
+
+        // Precondition of the bug: the conversion dropped P0, so only the
+        // MATCH survived and the compressed list is one slot long.
+        let converted =
+            profile_route_rules(SCENE, &["direct".into()].into_iter().collect(), &Default::default()).unwrap();
+        assert_eq!(converted.rules.len(), 1, "{:?}", converted.rules);
+        assert_eq!(converted.slots, vec![None, Some(0)]);
+
+        let block_at = rules
+            .iter()
+            .position(|rule| rule["type"] == serde_json::json!("logical"))
+            .expect("the logical block rule must be emitted");
+        let catch_all_at = rules
+            .iter()
+            .position(|rule| {
+                rule.as_object()
+                    .is_some_and(|rule| rule.len() == 1 && rule.contains_key("outbound"))
+            })
+            .expect("the profile MATCH catch-all must be emitted");
+        assert!(
+            block_at < catch_all_at,
+            "the block rule landed after the catch-all and would never fire: {rules:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscription_refresh_that_replaced_the_rule_list_is_detected_as_drift() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let original = "proxies: []\nrules:\n  - DOMAIN,a.example,DIRECT\n  - MATCH,DIRECT\n";
+        let refreshed =
+            "proxies: []\nrules:\n  - DOMAIN,new1.example,DIRECT\n  - DOMAIN,new2.example,DIRECT\n  - MATCH,DIRECT\n";
+        // Stored against the ORIGINAL list.
+        let order = RuleOrder {
+            logical: vec![block_rule()],
+            entries: vec![
+                RuleOrderEntry::Profile(0),
+                RuleOrderEntry::Logical(0),
+                RuleOrderEntry::Profile(1),
+            ],
+            profile: Some(crate::singbox::profile_rule_fingerprint(
+                &crate::routing::load_profile_rules(original).unwrap(),
+            )),
+        };
+        crate::singbox::save_rule_order(home.path(), &order).unwrap();
+
+        let stored = crate::singbox::load_rule_order(home.path()).expect("sidecar");
+        assert_eq!(stored.profile, order.profile, "the fingerprint is persisted");
+
+        let actual = crate::singbox::profile_rule_fingerprint(&crate::routing::load_profile_rules(refreshed).unwrap());
+        assert!(
+            !stored.matches_profile(actual),
+            "a replaced rule list is an identity change"
+        );
+        let (effective, note) = stored.resolve_profile_drift(actual);
+        assert!(effective.entries.is_empty(), "the stale indices must be dropped");
+        assert!(effective.logical.len() == 1, "the logical rule itself is kept");
+        let note = note.expect("the fallback is reported, not silent");
+        assert!(note.contains("rule order reset"), "{note}");
+
+        // Generation applies the same demotion and reports it in the
+        // degradation notes.
+        let generated = home.path().join("candidate.json");
+        let (_path, parts) = ManagerInner::write_singbox_assembled_to(home.path(), Some(refreshed), false, &generated)
+            .await
+            .unwrap();
+        assert!(
+            parts
+                .conversion
+                .notes
+                .iter()
+                .any(|line| line.contains("rule order reset")),
+            "{:?}",
+            parts.conversion.notes
+        );
+        let rules = generated_route_rules(&generated);
+        let block_at = rules
+            .iter()
+            .position(|rule| rule["type"] == serde_json::json!("logical"))
+            .unwrap();
+        let catch_all_at = rules
+            .iter()
+            .position(|rule| {
+                rule.as_object()
+                    .is_some_and(|rule| rule.len() == 1 && rule.contains_key("outbound"))
+            })
+            .unwrap();
+        assert_eq!(
+            block_at,
+            rules.len() - 1,
+            "append-after is the documented fallback: {rules:?}"
+        );
+        assert!(
+            catch_all_at < block_at,
+            "the fallback still emits every profile rule first: {rules:?}"
+        );
+    }
+}
+
+/// F1 (reviewer): a recovery start must serve the config that is already on
+/// disk. The apply transaction restores the previous config (A) and then
+/// asks a supervisor to bring the service back; a supervisor launched the
+/// normal way regenerates the runtime config from the active profile — by
+/// then the NEWER profile (B) the failed apply had just persisted — so the
+/// "recovered" service ran B and overwrote A again.
+mod recovery_config_selection {
+    use super::*;
+
+    const PROFILE_A: &str = "proxies: []\nrules:\n  - DOMAIN,a-recovery-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+    const PROFILE_B: &str = "proxies: []\nrules:\n  - DOMAIN,b-apply-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+
+    #[tokio::test]
+    async fn a_recovery_start_serves_the_restored_config_instead_of_regenerating_it() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: base\nitems:\n  - {uid: base, type: remote, name: fixture, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("profiles/base.yaml"), PROFILE_B).unwrap();
+
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().unwrap();
+        let restored = ManagerInner::write_singbox_assembled_to(home.path(), Some(PROFILE_A), false, &formal)
+            .await
+            .unwrap()
+            .0;
+        let restored_bytes = std::fs::read(&restored).unwrap();
+        assert!(
+            String::from_utf8_lossy(&restored_bytes).contains("a-recovery-marker.example"),
+            "precondition: the restored config is A"
+        );
+
+        // A normal start regenerates from the active profile: that is what
+        // the recovery must NOT do.
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_socket(home.path().join("controller.sock"))
+            .with_singbox_controller("127.0.0.1:49715".parse().unwrap())
+            .with_core_kind(CoreKind::SingBox);
+        assert!(
+            !manager
+                .inner()
+                .use_existing_runtime_config
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        let regenerated = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
+            .await
+            .expect("a normal start generates");
+        assert_eq!(regenerated, restored);
+        let regenerated_bytes = std::fs::read(&restored).unwrap();
+        assert!(
+            String::from_utf8_lossy(&regenerated_bytes).contains("b-apply-marker.example"),
+            "a normal start serves the active profile"
+        );
+
+        // Put the restored A back and arm the recovery, exactly as
+        // `commands::daemon::run` does for a recovery supervisor.
+        std::fs::write(&restored, &restored_bytes).unwrap();
+        manager.set_use_existing_runtime_config(true);
+        let recovery = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
+            .await
+            .expect("a recovery start consumes the restored config");
+        assert_eq!(recovery, restored);
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            restored_bytes,
+            "the recovery must not touch the restored config"
+        );
+
+        // Nothing to recover from is an error, never a silent regeneration.
+        std::fs::remove_file(&restored).unwrap();
+        let error = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
+            .await
+            .expect_err("no restored config must not regenerate");
+        assert!(error.to_string().contains("no restored"), "{error}");
     }
 }
