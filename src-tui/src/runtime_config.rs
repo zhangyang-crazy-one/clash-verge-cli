@@ -99,21 +99,29 @@ pub async fn apply_singbox_restart_for_profile(
     // refused as "externally managed". A core with a verified pid record
     // is ours to replace — through its supervisor. Only a core with no
     // record at all is somebody else's.
+    //
+    // P1 (reviewer): the authorization is captured HERE, once, and the
+    // rollback retry re-uses it. The first restart stops the adopted core
+    // (clearing the manager's pid) and then fails to launch; re-running the
+    // policy on the retry would refuse it and leave the previous config on
+    // disk with nothing serving.
+    let authorization = if was_running {
+        match manager.capture_restart_authorization().await {
+            Ok(authorization) => authorization,
+            Err(error) => return Err(format!("cannot apply sing-box settings: {error}")),
+        }
+    } else {
+        // Stopped: the apply only persists; no restart is ever attempted.
+        None
+    };
     let restart = || async {
         // An owned child restarts in place; an adopted one is replaced by
         // a detached supervisor so the replacement outlives this process.
-        manager.restart_through_supervisor().await
+        match &authorization {
+            Some(authorization) => manager.apply_restart_authorization(authorization).await,
+            None => manager.restart_through_supervisor().await,
+        }
     };
-    if was_running
-        && let Err(error) = crate::mihomo_manager::manager::supervisor_restart_policy(
-            manager.owns_child(),
-            manager.pid(),
-            manager.core_kind(),
-            crate::mihomo_manager::manager::configured_core_kind().await,
-        )
-    {
-        return Err(format!("cannot apply sing-box settings: {error}"));
-    }
     let mut prepared_yaml = None;
     let mut dns_state = None;
     if let (Some(uid), Some(raw)) = (profile_uid, config_yaml)
@@ -193,7 +201,9 @@ pub async fn apply_singbox_restart_for_profile(
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
         // Retry with the previous configuration whenever a core was running
         // when we entered: the failed restart already cleared the pid, so the
-        // manager state can no longer answer this question.
+        // manager state can no longer answer this question — and the
+        // authorization captured at entry is what makes the retry possible at
+        // all.
         if should_retry_rollback_restart(transaction.previous.is_some(), was_running)
             && let Err(rollback_error) = restart().await
         {
@@ -1479,6 +1489,243 @@ mod tests {
         assert!(
             !should_retry_rollback_restart(false, true),
             "nothing to restore when there was no previous config"
+        );
+    }
+
+    /// P1 (reviewer): the adopted-core rollback must restore the SERVICE,
+    /// not just the file. The first restart stops the adopted core (which
+    /// clears the manager's pid) and then fails to launch the supervisor;
+    /// the retry cannot pass `supervisor_restart_policy` any more, so the
+    /// old config used to be left on disk with nothing serving it.
+    ///
+    /// This drives the real transaction (assemble → prevalidate → install →
+    /// restart → rollback → retry) against a real adopted pid, with only the
+    /// supervisor *process launch* injected, and a controller that answers
+    /// 200 only while the previous config is the one on disk.
+    #[tokio::test]
+    async fn an_adopted_core_rollback_restores_the_previous_config_and_its_service() {
+        use crate::mihomo_api::error::MihomoError;
+        use crate::mihomo_manager::MihomoManager;
+        use crate::mihomo_manager::pidfile::{self, CoreKind, CoreRecord};
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Mutex, OnceLock};
+
+        const PREVIOUS: &str =
+            r#"{"marker":"old","experimental":{"clash_api":{"external_controller":"127.0.0.1:19997"}}}}"#;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+
+        struct Seam {
+            attempts: AtomicUsize,
+            live: &'static Mutex<Vec<u32>>,
+            formal: PathBuf,
+            supervisor: &'static Mutex<Vec<u32>>,
+        }
+        static SEAM: OnceLock<&'static Seam> = OnceLock::new();
+        static AUTHED: AtomicUsize = AtomicUsize::new(0);
+
+        // A controller that only answers while the PREVIOUS config is
+        // installed: the recovery restart must come up on the restored one.
+        let blocking = std::net::TcpListener::bind("127.0.0.1:19997").expect("bind fake controller");
+        blocking.set_nonblocking(true).expect("nonblocking");
+        let listener = tokio::net::TcpListener::from_std(blocking).expect("tokio listener");
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("singbox config path");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let formal = formal.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    let Ok(count) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+                    let served_previous = std::fs::read_to_string(&formal)
+                        .map(|body| body.contains("\"marker\":\"old\""))
+                        .unwrap_or(false);
+                    let (status, body) = if served_previous {
+                        AUTHED.fetch_add(1, Ordering::SeqCst);
+                        ("200 OK", r#"{"version":"1.19.0"}"#)
+                    } else {
+                        ("503 Unavailable", r#"{"message":"candidate not serving"}"#)
+                    };
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    let _ = request;
+                });
+            }
+        });
+
+        #[allow(clippy::zombie_processes)]
+        fn spawn_dummy(live: &Mutex<Vec<u32>>) -> u32 {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn stand-in core");
+            live.lock().expect("live").push(child.id());
+            child.id()
+        }
+
+        fn launch(config_dir: &Path, log: &Path) -> anyhow::Result<std::process::Child> {
+            let seam = *SEAM.get().expect("seam");
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"stand-in supervisor\n")?;
+            let attempt = seam.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                // Injected failure: the core is stopped and nothing starts.
+                anyhow::bail!("injected supervisor launch failure");
+            }
+            let _ = config_dir;
+            // The replacement supervisor brings up a fresh core and records it.
+            let pid = spawn_dummy(seam.live);
+            pidfile::write(
+                &pidfile::path_for(&seam.formal.parent().expect("home").join("controller.sock")),
+                CoreRecord::with_kind_and_exe(
+                    pid,
+                    chrono::Utc::now(),
+                    CoreKind::SingBox,
+                    Some("/bin/sleep".to_string()),
+                ),
+            )
+            .expect("record");
+            #[allow(clippy::zombie_processes)]
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            seam.supervisor.lock().expect("supervisor").push(child.id());
+            Ok(child)
+        }
+
+        std::fs::write(home.path().join("verge.yaml"), "proxy_core: singbox\n").expect("verge");
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39183\nexternal-controller: 127.0.0.1:19997\nsecret: stable-test-secret\n",
+        )
+        .expect("config");
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("formal");
+        std::fs::write(&formal, PREVIOUS).expect("previous config");
+
+        let live: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let supervisor: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let seam: &'static Seam = Box::leak(Box::new(Seam {
+            attempts: AtomicUsize::new(0),
+            live,
+            supervisor,
+            formal: formal.clone(),
+        }));
+        SEAM.set(seam).ok().expect("seam once");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(socket.clone())
+            .with_singbox_controller("127.0.0.1:19997".parse().expect("addr"))
+            .with_core_kind(CoreKind::SingBox)
+            .with_secret("stable-test-secret".to_string());
+        *manager.inner().resolved_binary.lock() = Some(PathBuf::from("/bin/true"));
+
+        // An adopted core: this process never spawned it (owns_child false).
+        let adopted = spawn_dummy(live);
+        pidfile::write(
+            &pidfile::path_for(&socket),
+            CoreRecord::with_kind_and_exe(
+                adopted,
+                chrono::Utc::now(),
+                CoreKind::SingBox,
+                Some("/bin/sleep".to_string()),
+            ),
+        )
+        .expect("record");
+        manager.adopt_running_core();
+        // `adopt_running_core` validates the recorded process shape, which a
+        // stand-in `sleep` cannot satisfy; the transaction's own view of the
+        // adopted core is set the way a real adoption leaves it.
+        *manager.inner().pid.lock() = Some(adopted);
+        *manager.inner().state.lock() = crate::app::CoreState::Running;
+        assert!(!manager.owns_child(), "the case under test is an adopted core");
+
+        let _launcher = crate::commands::start::install_supervisor_launcher(launch).expect("install seam");
+        let error = apply_singbox_restart_for_profile(&manager, None, false, None)
+            .await
+            .expect_err("the first supervisor launch was injected to fail");
+        assert!(error.contains("injected supervisor launch failure"), "{error}");
+        for pid in supervisor.lock().expect("supervisor").drain(..) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+
+        assert_eq!(seam.attempts.load(Ordering::SeqCst), 2, "the rollback must retry once");
+        assert_eq!(
+            std::fs::read_to_string(&formal).expect("formal"),
+            PREVIOUS,
+            "the previous configuration must be back on disk"
+        );
+        assert!(
+            AUTHED.load(Ordering::SeqCst) >= 1,
+            "the recovery must reach a core serving the restored configuration"
+        );
+        assert!(
+            !crate::mihomo_manager::pidfile::is_running(adopted),
+            "the replaced core must be stopped, not left behind"
+        );
+        let running = live.lock().expect("live").clone();
+        assert_eq!(
+            running
+                .iter()
+                .filter(|pid| crate::mihomo_manager::pidfile::is_running(**pid))
+                .count(),
+            1,
+            "exactly one replacement core may be left running: {running:?}"
+        );
+        for pid in running {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+
+        // The controller is healthy on the restored config...
+        assert!(matches!(
+            manager.api().version().await,
+            Ok(_) | Err(MihomoError::CoreDown { .. })
+        ));
+        // ...and the no-pid foreign-core refusal is untouched: the receipt
+        // only covers the core the policy already accepted.
+        let foreign = MihomoManager::new(home.path().join("run"))
+            .with_socket(socket)
+            .with_singbox_controller("127.0.0.1:19997".parse().expect("addr"))
+            .with_core_kind(CoreKind::SingBox);
+        assert!(
+            foreign
+                .capture_restart_authorization()
+                .await
+                .expect_err("a core with no record stays somebody else's")
+                .to_string()
+                .contains("no clash-verge-cli pid record"),
+            "the global foreign-core refusal must not be loosened by the recovery path"
         );
     }
 }
