@@ -31,7 +31,7 @@ async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> R
         .join(file);
     let yaml = std::fs::read_to_string(&path).map_err(|e| format!("read profile: {e}"))?;
     let rules = crate::routing::load_profile_rules(&yaml).map_err(|e| e.to_string())?;
-    app.rules_edit_buffer = compose_edit_buffer(rules, &load_logical_rules(singbox)?);
+    app.rules_edit_buffer = compose_edit_buffer(rules, &load_rule_order(singbox)?);
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
         app.rule_sets_edit = crate::singbox::load_rule_sets(&home)?;
     }
@@ -41,29 +41,96 @@ async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> R
     Ok(())
 }
 
-/// Stored logical rules, or none when the active core cannot express them.
-/// A broken sidecar is reported rather than silently dropped: the user must
-/// fix it before saving, or the next save would overwrite it.
-fn load_logical_rules(singbox: bool) -> Result<Vec<crate::routing::IRouteRule>, String> {
+/// Stored logical rules and their interleaved order, or none when the
+/// active core cannot express them. A broken sidecar is reported rather
+/// than silently dropped: the user must fix it before saving, or the next
+/// save would overwrite it.
+fn load_rule_order(singbox: bool) -> Result<crate::singbox::RuleOrder, String> {
     if !singbox {
-        return Ok(Vec::new());
+        return Ok(crate::singbox::RuleOrder::default());
     }
     let home = clash_verge_core::utils::dirs::app_home_dir().map_err(|e| e.to_string())?;
-    crate::singbox::load_logical_rules(&home)
+    crate::singbox::load_rule_order(&home)
 }
 
-/// Profile rules first, stored logical rules after them — the same order the
-/// sing-box generator appends them in, so the editor list matches the order
-/// the core actually evaluates.
+/// Rebuild the interleaved edit buffer: profile rules and logical rules in
+/// the order the core actually evaluates them.
+///
+/// A sidecar written before the order was persisted carries no cross-type
+/// order (`entries` empty) and keeps the historical "profile rules, then
+/// logical rules" layout, which is also what the generator does with it.
+/// Profile rules the stored order does not mention (the profile was edited
+/// outside this editor) keep their relative order directly after the last
+/// referenced profile rule — the same fallback `singbox::interleave_route_rules`
+/// applies, so the editor and the generator cannot disagree.
 fn compose_edit_buffer(
     profile_rules: Vec<crate::routing::IRouteRule>,
-    logical: &[crate::routing::IRouteRule],
+    order: &crate::singbox::RuleOrder,
 ) -> Vec<crate::routing::IRouteRule> {
-    profile_rules.into_iter().chain(logical.iter().cloned()).collect()
+    if order.entries.is_empty() {
+        return profile_rules.into_iter().chain(order.logical.iter().cloned()).collect();
+    }
+    let mut buffer: Vec<crate::routing::IRouteRule> = Vec::new();
+    let mut referenced = vec![false; profile_rules.len()];
+    let mut last_profile_slot = None;
+    for entry in &order.entries {
+        match entry {
+            crate::singbox::RuleOrderEntry::Profile(index) => match profile_rules.get(*index) {
+                Some(rule) => {
+                    referenced[*index] = true;
+                    buffer.push(rule.clone());
+                    last_profile_slot = Some(buffer.len() - 1);
+                }
+                None => continue,
+            },
+            crate::singbox::RuleOrderEntry::Logical(index) => match order.logical.get(*index) {
+                Some(rule) => buffer.push(rule.clone()),
+                None => continue,
+            },
+        }
+    }
+    let unplaced: Vec<crate::routing::IRouteRule> = profile_rules
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !referenced[*index])
+        .map(|(_, rule)| rule.clone())
+        .collect();
+    if !unplaced.is_empty() {
+        let at = last_profile_slot.map_or(0, |slot| slot + 1);
+        buffer.splice(at..at, unplaced);
+    }
+    buffer
+}
+
+/// Split the interleaved buffer back into the two files, remembering where
+/// each logical rule sat relative to the profile rules.
+///
+/// `Profile(i)` indexes the clash rule list written to the profile YAML and
+/// `Logical(j)` the logical rule list written to the sidecar, so generation
+/// can rebuild the very order the editor showed. A logical rule dragged
+/// above a `MATCH` therefore stays above it instead of being re-emitted
+/// after the whole profile rule list, where the catch-all would shadow it.
+fn partition_edit_buffer(
+    buffer: Vec<crate::routing::IRouteRule>,
+) -> (Vec<crate::routing::IRouteRule>, crate::singbox::RuleOrder) {
+    use crate::singbox::{RuleOrder, RuleOrderEntry};
+    let mut clash = Vec::new();
+    let mut order = RuleOrder::default();
+    for rule in buffer {
+        if matches!(rule, crate::routing::IRouteRule::Logical { .. }) {
+            order.entries.push(RuleOrderEntry::Logical(order.logical.len()));
+            order.logical.push(rule);
+        } else {
+            order.entries.push(RuleOrderEntry::Profile(clash.len()));
+            clash.push(rule);
+        }
+    }
+    (clash, order)
 }
 
 /// Persist the split rule buffer: clash rules back into the profile YAML,
-/// logical rules into the sing-box sidecar.
+/// logical rules into the sing-box sidecar, plus the interleaved order that
+/// lets the generator put the two back together as the editor showed them.
 ///
 /// The sidecar is written — and removed when no logical rule is left (#59) —
 /// only under the sing-box core, which is the only core that consumes it.
@@ -81,21 +148,19 @@ fn persist_rules(
     buffer: Vec<crate::routing::IRouteRule>,
     kind: crate::mihomo_manager::CoreKind,
 ) -> Result<(), String> {
-    let (clash_rules, logical): (Vec<_>, Vec<_>) = buffer
-        .into_iter()
-        .partition(|r| !matches!(r, crate::routing::IRouteRule::Logical { .. }));
+    let (clash_rules, order) = partition_edit_buffer(buffer);
     let saved = crate::routing::save_profile_rules(yaml, &clash_rules)?;
     write_atomic(path, &saved)?;
     if kind != crate::mihomo_manager::CoreKind::SingBox {
         return Ok(());
     }
-    persist_logical_rules(home, &logical)
+    persist_logical_rules(home, &order)
 }
 
 /// Write the logical sidecar, or delete it when the list is empty so that a
 /// user who removed every logical rule actually loses them.
-fn persist_logical_rules(home: &std::path::Path, logical: &[crate::routing::IRouteRule]) -> Result<(), String> {
-    if logical.is_empty() {
+fn persist_logical_rules(home: &std::path::Path, order: &crate::singbox::RuleOrder) -> Result<(), String> {
+    if order.logical.is_empty() {
         return match std::fs::remove_file(home.join(crate::singbox::LOGICAL_RULES_FILE)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -105,7 +170,7 @@ fn persist_logical_rules(home: &std::path::Path, logical: &[crate::routing::IRou
             )),
         };
     }
-    crate::singbox::save_logical_rules(home, logical)
+    crate::singbox::save_rule_order(home, order)
 }
 
 /// Write through a uniquely-named temporary file in the same directory and
@@ -651,10 +716,15 @@ mod tests {
     }
 
     /// #59: already-saved logical rules must show up in the editor buffer,
-    /// after the profile rules — the order the sing-box generator uses.
+    /// after the profile rules — the order the sing-box generator uses for a
+    /// sidecar that carries no cross-type order.
     #[test]
     fn saved_logical_rules_are_visible_in_the_edit_buffer() {
-        let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &[logical("c.com")]);
+        let order = crate::singbox::RuleOrder {
+            logical: vec![logical("c.com")],
+            entries: Vec::new(),
+        };
+        let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &order);
         assert_eq!(buffer.len(), 3);
         assert!(matches!(buffer[2], IRouteRule::Logical { .. }));
         assert!(crate::routing::describe(&buffer[2]).contains("OR"));
@@ -662,8 +732,121 @@ mod tests {
 
     #[test]
     fn no_logical_rules_means_the_buffer_is_the_profile_rules() {
-        let buffer = compose_edit_buffer(vec![simple("a.com")], &[]);
+        let buffer = compose_edit_buffer(vec![simple("a.com")], &crate::singbox::RuleOrder::default());
         assert_eq!(buffer, vec![simple("a.com")]);
+    }
+
+    /// The order the editor persisted is the order the buffer is rebuilt in:
+    /// a logical rule the user moved above the profile `MATCH` comes back
+    /// above it, not appended at the end.
+    #[test]
+    fn the_saved_interleaved_order_drives_the_buffer() {
+        let order = crate::singbox::RuleOrder {
+            logical: vec![logical("blocked.example")],
+            entries: vec![
+                crate::singbox::RuleOrderEntry::Logical(0),
+                crate::singbox::RuleOrderEntry::Profile(0),
+                crate::singbox::RuleOrderEntry::Profile(1),
+            ],
+        };
+        let buffer = compose_edit_buffer(
+            vec![
+                simple("a.com"),
+                IRouteRule::Raw {
+                    clash_raw: "MATCH,DIRECT".into(),
+                },
+            ],
+            &order,
+        );
+        assert!(matches!(buffer[0], IRouteRule::Logical { .. }));
+        assert_eq!(buffer[1], simple("a.com"));
+        assert_eq!(
+            buffer[2],
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into()
+            }
+        );
+    }
+
+    /// Splitting the buffer keeps both partitions and the cross-type order:
+    /// the `MATCH` is profile rule 0, so the logical rule must be recorded
+    /// before it, not after the whole profile list.
+    #[test]
+    fn partitioning_the_buffer_records_where_each_rule_sat() {
+        let (clash, order) = partition_edit_buffer(vec![
+            logical("blocked.example"),
+            simple("a.com"),
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into(),
+            },
+        ]);
+        assert_eq!(clash.len(), 2);
+        assert_eq!(order.logical, vec![logical("blocked.example")]);
+        assert_eq!(
+            order.entries,
+            vec![
+                crate::singbox::RuleOrderEntry::Logical(0),
+                crate::singbox::RuleOrderEntry::Profile(0),
+                crate::singbox::RuleOrderEntry::Profile(1),
+            ]
+        );
+    }
+
+    /// Profile rules the stored order does not mention (profile edited outside
+    /// this editor) keep their relative order directly after the last
+    /// referenced profile rule, mirroring what the generator does.
+    #[test]
+    fn unmentioned_profile_rules_land_after_the_last_referenced_one() {
+        let order = crate::singbox::RuleOrder {
+            logical: vec![logical("c.com")],
+            entries: vec![
+                crate::singbox::RuleOrderEntry::Profile(0),
+                crate::singbox::RuleOrderEntry::Logical(0),
+            ],
+        };
+        let buffer = compose_edit_buffer(vec![simple("a.com"), simple("b.com")], &order);
+        assert_eq!(buffer, vec![simple("a.com"), simple("b.com"), logical("c.com")]);
+    }
+
+    /// Review regression (end to end on the editor side): a logical rule moved
+    /// BEFORE the `MATCH` is saved as a profile `MATCH` plus an ordered
+    /// sidecar entry, and reloading the buffer keeps it above the catch-all.
+    #[test]
+    fn a_logical_rule_moved_before_match_survives_a_save_and_reload() {
+        let dir = temp_dir("order-round-trip");
+        let profile = dir.join("profile.yaml");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::write(&profile, PROFILE).expect("seed");
+
+        persist_rules(
+            &profile,
+            &home,
+            PROFILE,
+            vec![
+                logical("blocked.example"),
+                IRouteRule::Raw {
+                    clash_raw: "MATCH,DIRECT".into(),
+                },
+            ],
+            CoreKind::SingBox,
+        )
+        .expect("save");
+
+        let saved_yaml = std::fs::read_to_string(&profile).expect("reread profile");
+        assert!(saved_yaml.contains("MATCH,DIRECT"), "{saved_yaml}");
+        assert!(!saved_yaml.contains("blocked.example"), "{saved_yaml}");
+
+        let order = crate::singbox::load_rule_order(&home).expect("load order");
+        let profile_rules = crate::routing::load_profile_rules(&saved_yaml).expect("load profile rules");
+        let buffer = compose_edit_buffer(profile_rules, &order);
+        assert!(matches!(buffer[0], IRouteRule::Logical { .. }), "{buffer:?}");
+        assert_eq!(
+            buffer[1],
+            IRouteRule::Raw {
+                clash_raw: "MATCH,DIRECT".into()
+            }
+        );
     }
 
     /// The save writes the edited rules into the profile YAML the restart

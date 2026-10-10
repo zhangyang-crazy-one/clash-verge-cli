@@ -24,9 +24,43 @@ pub const RULE_SETS_FILE: &str = "singbox-rule-sets.json";
 
 /// Task 7.5: durable storage for logical route rules. Logical rules have no
 /// clash YAML form (`routing::save_profile_rules` rejects them), so they
-/// live here as sing-box JSON objects and are appended after profile-derived
-/// rules during generation.
+/// live here as sing-box JSON objects next to the persisted cross-type
+/// [`RuleOrder`].
+///
+/// Two shapes are accepted on read:
+/// * the current one, `{"version":1,"entries":[{"profile":0},{"logical":0}]}`,
+///   which records the full interleaved order of profile and logical rules;
+/// * the legacy one, a bare JSON array of logical rules, which carries no
+///   order and keeps the old "append after the profile rules" behaviour.
 pub const LOGICAL_RULES_FILE: &str = "singbox-rules.json";
+
+/// Version tag written into [`LOGICAL_RULES_FILE`].
+const RULE_ORDER_VERSION: u64 = 1;
+
+/// One slot of the persisted interleaved rule order: either the clash rule
+/// at `index` of the profile YAML's `rules` list, or the logical rule at
+/// `index` of [`RuleOrder::logical`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleOrderEntry {
+    Profile(usize),
+    Logical(usize),
+}
+
+/// The durable ordering of profile rules and logical (AND/OR) rules.
+///
+/// The editor buffer is one interleaved list, but the two halves are stored
+/// in different files (profile YAML and sidecar). Persisting only the two
+/// partitions lost the order between them: a logical rule the user had
+/// dragged above a `MATCH` was re-emitted after the whole profile rule list,
+/// i.e. after the catch-all, and stopped matching.
+///
+/// `entries.is_empty()` is the legacy shape (no order information): profile
+/// rules first, logical rules appended after them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuleOrder {
+    pub logical: Vec<crate::routing::IRouteRule>,
+    pub entries: Vec<RuleOrderEntry>,
+}
 
 /// Task 8.1: structured DNS settings (1.12+ new format), TUI-owned.
 pub const DNS_CONFIG_FILE: &str = "singbox-dns.json";
@@ -91,13 +125,84 @@ pub fn save_rule_sets(home: &std::path::Path, sets: &[Value]) -> std::io::Result
 
 /// Load stored logical rules. Parse and reference failures are returned to
 /// the caller rather than converted into an empty/default settings value.
+/// Works for both [`LOGICAL_RULES_FILE`] shapes.
 pub fn load_logical_rules(home: &std::path::Path) -> Result<Vec<crate::routing::IRouteRule>, String> {
-    let values: Vec<Value> = read_json_file(home, LOGICAL_RULES_FILE)?;
+    Ok(load_rule_order(home)?.logical)
+}
+
+/// Load the persisted interleaved order plus the logical rules it indexes.
+pub fn load_rule_order(home: &std::path::Path) -> Result<RuleOrder, String> {
+    let path = home.join(LOGICAL_RULES_FILE);
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(RuleOrder::default()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    let value: Value = serde_json::from_str(&body).map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let order = parse_rule_order(&value).map_err(|error| format!("{}: {error}", path.display()))?;
+    validate_rule_set_references(home, &order.logical).map_err(|error| format!("{}: {error}", path.display()))?;
+    Ok(order)
+}
+
+/// Parse either supported sidecar shape into the typed order model.
+fn parse_rule_order(value: &Value) -> Result<RuleOrder, String> {
+    if value.is_array() {
+        // Legacy: a bare list of logical rules with no cross-type order.
+        return Ok(RuleOrder {
+            logical: parse_logical_values(value.as_array().expect("array"))?,
+            entries: Vec::new(),
+        });
+    }
+    if !value.is_object() {
+        return Err("rule order must be an object or a legacy array".into());
+    }
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(RULE_ORDER_VERSION);
+    if version != RULE_ORDER_VERSION {
+        return Err(format!("unsupported rule order version {version}"));
+    }
+    let entries = value
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or("rule order requires an `entries` array")?;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let profile = entry.get("profile").and_then(Value::as_u64);
+        let logical = entry.get("logical").and_then(Value::as_u64);
+        parsed.push(match (profile, logical) {
+            (Some(index), None) => RuleOrderEntry::Profile(
+                usize::try_from(index)
+                    .map_err(|_| format!("rule order entry {index} has an out-of-range profile index"))?,
+            ),
+            (None, Some(index)) => RuleOrderEntry::Logical(
+                usize::try_from(index)
+                    .map_err(|_| format!("rule order entry {index} has an out-of-range logical index"))?,
+            ),
+            _ => {
+                return Err(format!(
+                    "rule order entry {index} must name exactly one of profile/logical"
+                ));
+            }
+        });
+    }
+    let rules = value
+        .get("rules")
+        .and_then(Value::as_array)
+        .ok_or("rule order requires a `rules` array of logical rules")?;
+    Ok(RuleOrder {
+        logical: parse_logical_values(rules)?,
+        entries: parsed,
+    })
+}
+
+fn parse_logical_values(values: &[Value]) -> Result<Vec<crate::routing::IRouteRule>, String> {
     let rules: Vec<_> = values
-        .into_iter()
+        .iter()
         .enumerate()
         .map(|(index, value)| {
-            let rule = crate::routing::from_singbox_json(&value)
+            let rule = crate::routing::from_singbox_json(value)
                 .filter(|rule| matches!(rule, crate::routing::IRouteRule::Logical { .. }))
                 .ok_or_else(|| format!("{} entry {index} is not a supported logical rule", LOGICAL_RULES_FILE))?;
             // `from_singbox_json` intentionally extracts only the rule model's
@@ -106,7 +211,7 @@ pub fn load_logical_rules(home: &std::path::Path) -> Result<Vec<crate::routing::
             // cannot be partially accepted and then truncated by to_singbox_json.
             let round_trip = crate::routing::to_singbox_json(&rule)
                 .ok_or_else(|| format!("{} entry {index} is not sing-box expressible", LOGICAL_RULES_FILE))?;
-            if round_trip != value {
+            if round_trip != *value {
                 return Err(format!(
                     "{} entry {index} contains unsupported or lossy rule fields",
                     LOGICAL_RULES_FILE
@@ -115,28 +220,116 @@ pub fn load_logical_rules(home: &std::path::Path) -> Result<Vec<crate::routing::
             Ok(rule)
         })
         .collect::<Result<_, _>>()?;
-    validate_rule_set_references(home, &rules)
-        .map_err(|error| format!("{}: {error}", home.join(LOGICAL_RULES_FILE).display()))?;
     Ok(rules)
 }
 
 /// Persist logical rules as sing-box JSON objects (lossless round-trip;
 /// see the 6.3 property tests in `routing`).
+///
+/// This is the legacy "no cross-type order" shape: the rules are appended
+/// after the profile rules at generation time. Production saves go through
+/// [`save_rule_order`]; this writer stays for the legacy-format fixtures.
+#[cfg(test)]
 pub fn save_logical_rules(home: &std::path::Path, rules: &[crate::routing::IRouteRule]) -> Result<(), String> {
+    let values = logical_rule_values(rules)?;
+    validate_rule_set_references(home, rules)?;
+    let body = serde_json::to_string_pretty(&values).map_err(|e| e.to_string())?;
+    atomic_write(home, LOGICAL_RULES_FILE, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Persist the logical rules together with the interleaved order that says
+/// where each of them sits relative to the profile rules.
+pub fn save_rule_order(home: &std::path::Path, order: &RuleOrder) -> Result<(), String> {
+    let rules = logical_rule_values(&order.logical)?;
+    for (slot, entry) in order.entries.iter().enumerate() {
+        if let RuleOrderEntry::Logical(index) = entry
+            && *index >= order.logical.len()
+        {
+            return Err(format!(
+                "rule order entry {slot} references logical rule {index}, but only {} are stored",
+                order.logical.len()
+            ));
+        }
+    }
+    validate_rule_set_references(home, &order.logical)?;
+    let value = serde_json::json!({
+        "version": RULE_ORDER_VERSION,
+        "rules": rules,
+        "entries": order
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                RuleOrderEntry::Profile(index) => serde_json::json!({ "profile": index }),
+                RuleOrderEntry::Logical(index) => serde_json::json!({ "logical": index }),
+            })
+            .collect::<Vec<Value>>(),
+    });
+    let body = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    atomic_write(home, LOGICAL_RULES_FILE, body.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// Merge profile-derived route rules with the stored logical rules in the
+/// order the editor persisted.
+///
+/// A stale entry (an index past the end of what the profile actually yielded
+/// — a profile edited outside the editor, or a rule the converter dropped)
+/// is skipped instead of failing the whole generation. Profile rules the
+/// order does not mention keep their relative order directly after the last
+/// referenced one, so a subscription update cannot silently shadow the rules
+/// the user ordered on purpose: directly after the last referenced profile
+/// rule (in front of the profile block when nothing is referenced).
+pub fn interleave_route_rules(profile_rules: &[Value], order: &RuleOrder) -> Vec<Value> {
+    let logical_json: Vec<Option<Value>> = order.logical.iter().map(crate::routing::to_singbox_json).collect();
+    if order.entries.is_empty() {
+        // Legacy sidecar: no cross-type order was ever recorded.
+        let mut merged = profile_rules.to_vec();
+        merged.extend(logical_json.into_iter().flatten());
+        return merged;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(profile_rules.len() + order.logical.len());
+    let mut referenced = vec![false; profile_rules.len()];
+    let mut last_profile_slot = None;
+    for entry in &order.entries {
+        match entry {
+            RuleOrderEntry::Profile(index) => match profile_rules.get(*index) {
+                Some(rule) => {
+                    referenced[*index] = true;
+                    merged.push(rule.clone());
+                    last_profile_slot = Some(merged.len() - 1);
+                }
+                None => continue,
+            },
+            RuleOrderEntry::Logical(index) => match logical_json.get(*index).and_then(Option::as_ref) {
+                Some(rule) => merged.push(rule.clone()),
+                None => continue,
+            },
+        }
+    }
+    let unplaced: Vec<Value> = profile_rules
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !referenced[*index])
+        .map(|(_, rule)| rule.clone())
+        .collect();
+    if !unplaced.is_empty() {
+        let at = last_profile_slot.map_or(0, |slot| slot + 1);
+        merged.splice(at..at, unplaced);
+    }
+    merged
+}
+
+fn logical_rule_values(rules: &[crate::routing::IRouteRule]) -> Result<Vec<Value>, String> {
     if rules
         .iter()
         .any(|r| !matches!(r, crate::routing::IRouteRule::Logical { .. }))
     {
         return Err("logical rule storage accepts only IRouteRule::Logical entries".into());
     }
-    let values: Vec<Value> = rules
+    rules
         .iter()
         .map(crate::routing::to_singbox_json)
         .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| "logical rule storage requires sing-box-expressible rules".to_string())?;
-    validate_rule_set_references(home, rules)?;
-    let body = serde_json::to_string_pretty(&values).map_err(|e| e.to_string())?;
-    atomic_write(home, LOGICAL_RULES_FILE, body.as_bytes()).map_err(|e| e.to_string())
+        .ok_or_else(|| "logical rule storage requires sing-box-expressible rules".to_string())
 }
 
 fn validate_rule_set_references(home: &std::path::Path, rules: &[crate::routing::IRouteRule]) -> Result<(), String> {
@@ -338,6 +531,90 @@ mod storage_tests {
         let error = load_logical_rules(&home).unwrap_err();
         assert!(error.contains("unsupported or lossy rule fields"), "{error}");
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn the_interleaved_order_round_trips_and_keeps_the_legacy_shape_working() {
+        let home = temp_home("rule-order");
+        let logical = |domain: &str| IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![IRouteRule::Simple {
+                matches: vec![MatchField::Domain(domain.into())],
+                target: RuleTarget::Direct,
+            }],
+            target: RuleTarget::Block,
+        };
+        let order = RuleOrder {
+            logical: vec![logical("blocked.example")],
+            // logical rule first, then profile rule 0, then profile rule 1
+            entries: vec![
+                RuleOrderEntry::Logical(0),
+                RuleOrderEntry::Profile(0),
+                RuleOrderEntry::Profile(1),
+            ],
+        };
+        save_rule_order(&home, &order).expect("save");
+        assert_eq!(load_rule_order(&home).unwrap(), order);
+        // `load_logical_rules` still answers for callers that do not care
+        // about the order.
+        assert_eq!(load_logical_rules(&home).unwrap(), vec![logical("blocked.example")]);
+
+        // The persisted body carries the order explicitly.
+        let body: Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(LOGICAL_RULES_FILE)).unwrap()).unwrap();
+        assert_eq!(body["version"], Value::from(1));
+        assert_eq!(body["entries"][0]["logical"], Value::from(0));
+        assert_eq!(body["entries"][1]["profile"], Value::from(0));
+
+        // A legacy bare array still loads, with no cross-type order recorded,
+        // and generation keeps the historical append-after-profile layout.
+        std::fs::write(
+            home.join(LOGICAL_RULES_FILE),
+            serde_json::to_string(&vec![crate::routing::to_singbox_json(&logical("c.com")).unwrap()]).unwrap(),
+        )
+        .expect("write legacy fixture");
+        let legacy = load_rule_order(&home).unwrap();
+        assert!(legacy.entries.is_empty(), "{legacy:?}");
+        assert_eq!(legacy.logical, vec![logical("c.com")]);
+        let profile = vec![serde_json::json!({"outbound": "direct"})];
+        let merged = interleave_route_rules(&profile, &legacy);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0], profile[0]);
+        assert_eq!(merged[1]["outbound"], "block");
+
+        // A stale entry (index past the end of the profile rules) is skipped
+        // instead of failing the whole generation.
+        let stale = RuleOrder {
+            logical: vec![logical("c.com")],
+            entries: vec![RuleOrderEntry::Profile(9), RuleOrderEntry::Logical(0)],
+        };
+        let merged = interleave_route_rules(&profile, &stale);
+        assert_eq!(merged[0], profile[0]);
+        assert_eq!(merged[1]["outbound"], "block");
+        assert_eq!(merged.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_corrupt_rule_order_is_reported_rather_than_guessed() {
+        let home = temp_home("rule-order-corrupt");
+        std::fs::write(home.join(LOGICAL_RULES_FILE), r#"{"version":2,"entries":[]}"#).expect("write");
+        assert!(
+            load_rule_order(&home)
+                .unwrap_err()
+                .contains("unsupported rule order version")
+        );
+        std::fs::write(
+            home.join(LOGICAL_RULES_FILE),
+            r#"{"rules":[],"entries":[{"profile":0,"logical":0}]}"#,
+        )
+        .expect("write");
+        assert!(load_rule_order(&home).unwrap_err().contains("exactly one"));
+        std::fs::write(home.join(LOGICAL_RULES_FILE), r#"{"rules":[]}"#).expect("write");
+        assert!(load_rule_order(&home).unwrap_err().contains("entries"));
+        assert!(load_logical_rules(&home).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
