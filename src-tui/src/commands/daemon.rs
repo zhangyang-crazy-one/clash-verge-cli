@@ -27,15 +27,17 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
     // rollback) must serve the runtime config already on disk — the
     // previous one just restored — and never regenerate it from the active
     // profile, which by then holds the newer config the apply failed on.
+    //
+    // A5 (reviewer): the mode is an explicit argument of this launch, not
+    // ambient manager state some later start could inherit.
     if launch == crate::commands::start::SupervisorLaunch::UseExistingConfig {
         tracing::info!(target: "daemon", "recovery start: serving the existing runtime config");
-        manager.set_use_existing_runtime_config(true);
     }
     let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(64);
     manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
-    manager.start().await?;
+    manager.start_with(launch).await?;
     let manager = Arc::new(manager);
 
     // Reload target state for current-profile refreshes (owned core → running).

@@ -48,12 +48,6 @@ pub struct ManagerInner {
     /// Path of the resolved mihomo binary (set on start; None before first
     /// start). Used by TUN capability setup.
     pub resolved_binary: Mutex<Option<PathBuf>>,
-    /// P1 (reviewer): set on a RECOVERY supervisor — the one a failed apply
-    /// launches to bring the restored configuration back. It makes the
-    /// start path consume the runtime config already on disk instead of
-    /// regenerating it from the active profile, which is the newer config
-    /// the failed apply was trying to install.
-    pub use_existing_runtime_config: AtomicBool,
     /// Set by `stop()` so the watcher knows this exit was intentional and
     /// should NOT trigger an auto-restart. Kept alongside the generation
     /// counter for back-compat with the cross-process pidfile intent path
@@ -245,7 +239,6 @@ impl ManagerInner {
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
             resolved_binary: Mutex::new(None),
-            use_existing_runtime_config: AtomicBool::new(false),
             expected_exit: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
             owns_child: AtomicBool::new(false),
@@ -678,24 +671,36 @@ impl ManagerInner {
     /// disagree — the recovery restriction once leaked into the ordinary
     /// restart, which then demanded a file it should have generated.
     ///
-    /// P1 (reviewer): the recovery start MUST NOT regenerate. The apply
-    /// transaction restores the previous config (A) on disk and then asks a
-    /// supervisor to bring the service back; regenerating here rebuilds the
-    /// config from the active profile (B) — the newer one the failed apply
-    /// had just persisted — so the "recovered" service ran B and the
-    /// restored A was overwritten in the same breath. Recovery therefore
-    /// consumes the frozen, already-validated file verbatim.
-    pub(crate) async fn runtime_config_for_start(&self, config_dir: &Path) -> anyhow::Result<PathBuf> {
-        if !self
-            .use_existing_runtime_config
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+    /// The runtime config THIS launch must serve, prepared BEFORE the old
+    /// core goes away.
+    ///
+    /// `mode` travels with the launch (A5, reviewer):
+    ///
+    /// - [`SupervisorLaunch::Regenerate`] — a normal cold start/restart:
+    ///   generate the runtime config from the active profile, creating it
+    ///   when it is missing.
+    /// - [`SupervisorLaunch::UseExistingConfig`] — serve the file already on
+    ///   disk, verbatim. It is either an apply's *verified candidate* (frozen,
+    ///   `sing-box check`ed and installed by the transaction) or the
+    ///   *restored previous config* of a rollback recovery.
+    ///
+    /// Regenerating in the second case is the A5 defect: it rebuilds the
+    /// config from whatever the source says NOW — re-running a Script chain
+    /// item, picking up a profile edited since the check — so the core would
+    /// serve bytes that were never verified, and the restored config would be
+    /// overwritten in the same breath.
+    pub(crate) async fn runtime_config_for_start(
+        &self,
+        config_dir: &Path,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<PathBuf> {
+        if mode == crate::commands::start::SupervisorLaunch::Regenerate {
             return Self::write_singbox_full(config_dir).await;
         }
         let path = Self::existing_singbox_config().await?;
         tracing::info!(
             target: "singbox",
-            "recovery start: serving the existing runtime config {} as-is (no regeneration)",
+            "launch mode UseExistingConfig: serving the runtime config {} as-is (no regeneration)",
             path.display()
         );
         Ok(path)
@@ -706,8 +711,8 @@ impl ManagerInner {
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
         if !tokio::fs::try_exists(&path).await? {
             anyhow::bail!(
-                "recovery start has no restored {} to serve; the previous configuration could not be \
-recovered",
+                "launch mode UseExistingConfig: no restored {} to serve; \
+the previous configuration could not be recovered",
                 path.display()
             );
         }
@@ -986,12 +991,14 @@ fn direct_child_pids(pid: u32) -> Vec<u32> {
 /// Cleanup after a failed launch may only touch those. The pid record on
 /// disk is SHARED — it names whichever instance wrote it last — so it can
 /// never be the ownership proof on its own.
-struct LaunchOwnership {
+pub(crate) struct LaunchOwnership {
     supervisor_pid: u32,
 }
 
 impl LaunchOwnership {
-    fn new(supervisor_pid: u32) -> Self {
+    /// Bind a launch to the supervisor it started: the only processes its
+    /// cleanup may stop are the ones that supervisor forked.
+    pub(crate) fn new(supervisor_pid: u32) -> Self {
         Self { supervisor_pid }
     }
 
@@ -1010,6 +1017,39 @@ impl LaunchOwnership {
             queue.extend(direct_child_pids(pid));
         }
         found
+    }
+}
+
+/// Test seam (A5, reviewer): stands in for the spawn half of an OWNED
+/// restart, so a test can observe which [`SupervisorLaunch`](crate::commands::start::SupervisorLaunch)
+/// mode the owned branch was asked for — in particular that a rollback
+/// recovery keeps `UseExistingConfig` instead of falling back to
+/// `Regenerate`, and that it does not re-run the authorization policy.
+#[cfg(test)]
+pub(crate) type OwnedRestartHook = fn(crate::commands::start::SupervisorLaunch) -> anyhow::Result<()>;
+
+#[cfg(test)]
+static OWNED_RESTART: std::sync::Mutex<Option<OwnedRestartHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn owned_restart_hook() -> Option<OwnedRestartHook> {
+    *OWNED_RESTART.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Arm the owned-restart seam for one test; the guard disarms it on drop.
+#[cfg(test)]
+pub(crate) fn install_owned_restart_hook(hook: OwnedRestartHook) -> anyhow::Result<OwnedRestartHookGuard> {
+    *OWNED_RESTART.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    Ok(OwnedRestartHookGuard)
+}
+
+#[cfg(test)]
+pub(crate) struct OwnedRestartHookGuard;
+
+#[cfg(test)]
+impl Drop for OwnedRestartHookGuard {
+    fn drop(&mut self) {
+        *OWNED_RESTART.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -1111,20 +1151,6 @@ impl MihomoManager {
     /// Whether this process spawned the core and supervises it.
     pub fn owns_child(&self) -> bool {
         self.inner.owns_child.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Bring the core up on the runtime config already on disk, without
-    /// regenerating it from the active profile.
-    ///
-    /// Set by the foreground supervisor when it was launched for a RECOVERY
-    /// (see [`crate::commands::start::SupervisorLaunch`]): the apply
-    /// transaction has just restored the previous config and needs the
-    /// service back on THAT one, not on a fresh generation of the newer
-    /// profile it failed to install.
-    pub fn set_use_existing_runtime_config(&self, enabled: bool) {
-        self.inner
-            .use_existing_runtime_config
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Install the action channel sender. Called by the TUI after it has
@@ -1656,7 +1682,23 @@ impl MihomoManager {
     ///
     /// Returns details about which binary was used so the UI/CLI can report
     /// install vs reuse clearly.
+    /// A normal cold start: regenerate the runtime config from the active
+    /// profile. Equivalent to `start_with(SupervisorLaunch::Regenerate)`.
     pub async fn start(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        self.start_with(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+    }
+
+    /// Cold start with an explicit launch mode (A5, reviewer).
+    ///
+    /// `UseExistingConfig` is what the foreground supervisor uses when it was
+    /// launched to serve a specific runtime config — the apply's verified
+    /// candidate, or the config a failed apply restored — instead of
+    /// generating a fresh one from whatever the profile says now.
+    pub async fn start_with(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
         // Sing-box cold start has its own resolve→preflight→config→spawn
         // pipeline; the mihomo path below preserves owner main's pidfile
         // guards so an adopted core always wins over a re-spawn attempt.
@@ -1669,7 +1711,7 @@ impl MihomoManager {
             // — leaving the mihomo supervisor with a stale pidfile and any
             // cross-process `stop` targeting the wrong pid.
             check_cross_kind_record(&self.socket_path, self.core_kind())?;
-            return self.start_singbox().await;
+            return self.start_singbox(mode).await;
         }
         // P0 leftover: same guard for the mihomo branch. The Unix-socket
         // foreign-controller guard below also catches a running mihomo,
@@ -1779,6 +1821,33 @@ stop it where it was started",
     /// capability) returns explicit `tun setup` guidance and leaves the
     /// currently running core untouched. No sudo/setcap here.
     pub async fn restart(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        self.restart_with(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+    }
+
+    /// Restart with an explicit launch mode (A5, reviewer).
+    ///
+    /// Both authorization entry points' OWNED branches route through here
+    /// WITH their mode: an owned child restarts in place, and a recovery
+    /// (`UseExistingConfig`) must serve the config the transaction restored —
+    /// not a regeneration from the newer active profile.
+    pub async fn restart_with(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
+        // Test seam (A5): an owned restart would resolve a real core binary
+        // and spawn it; the hook replaces that whole step so a test can
+        // observe the LAUNCH MODE an owned restart was asked for — including
+        // the rollback recovery, which must not silently regenerate.
+        #[cfg(test)]
+        if let Some(hook) = owned_restart_hook() {
+            hook(mode)?;
+            return Ok(binary::ResolvedMihomo {
+                path: std::path::PathBuf::from("/bin/true"),
+                source: binary::MihomoBinarySource::System,
+                version: "owned-restart-fixture".to_string(),
+            });
+        }
         if self.inner.restarting.swap(true, std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("a core restart is already in progress");
         }
@@ -1790,7 +1859,7 @@ stop it where it was started",
         }
         let _restart_guard = RestartGuard(&self.inner.restarting);
         if self.inner.core_kind() == CoreKind::SingBox {
-            return self.restart_singbox().await;
+            return self.restart_singbox(mode).await;
         }
         self.reset_restart_history();
         orchestrate_restart(
@@ -1850,7 +1919,10 @@ resolved binary; the running core was left untouched",
     /// Production wiring delegates to [`orchestrate_start_singbox`] so
     /// the exact order is enforced by a higher-order helper that the
     /// unit tests drive with fake steps.
-    async fn start_singbox(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+    async fn start_singbox(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
         use super::singbox_binary::SingboxBinarySource;
         self.reset_restart_history();
 
@@ -1894,10 +1966,10 @@ stop it where it was started",
                     Arc::clone(&self.inner),
                 );
                 async move {
-                    // P1 (reviewer): a RECOVERY supervisor runs the config
-                    // that is already on disk (the restored previous one),
-                    // never a regeneration from the active profile.
-                    let config_path = ManagerInner::runtime_config_for_start(&inner, &config_dir).await?;
+                    // A5 (reviewer): the launch mode travels with the
+                    // launch — a supervisor told to serve the config on
+                    // disk must not regenerate it from the active profile.
+                    let config_path = ManagerInner::runtime_config_for_start(&inner, &config_dir, mode).await?;
                     ManagerInner::spawn_core(
                         &path,
                         &version,
@@ -1952,7 +2024,10 @@ stop it where it was started",
         Ok(())
     }
 
-    async fn restart_singbox(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+    async fn restart_singbox(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
         use super::singbox_binary::SingboxBinarySource;
         self.reset_restart_history();
         let resolved = super::singbox_binary::resolve_or_install()
@@ -1967,7 +2042,7 @@ stop it where it was started",
         // first also means a generation failure (an unconvertible profile, a
         // full disk) leaves the running service untouched instead of
         // dropping it and then failing to start a replacement.
-        let config_path = ManagerInner::runtime_config_for_start(&self.inner, &self.config_dir)
+        let config_path = ManagerInner::runtime_config_for_start(&self.inner, &self.config_dir, mode)
             .await
             .context("failed to prepare the sing-box runtime config; the running core was left untouched")?;
         self.stop().await.context("failed to stop running sing-box")?;
@@ -2026,10 +2101,30 @@ stop it where it was started",
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<()> {
         let authorization = self.capture_restart_authorization().await?;
-        let Some(authorization) = authorization else {
-            return self.restart().await.map(|_| ());
-        };
-        self.apply_restart_authorization_with(&authorization, mode).await
+        self.launch_replacement(authorization.as_ref(), mode).await
+    }
+
+    /// One replacement launch, given the authorization captured at
+    /// transaction entry (A5, reviewer).
+    ///
+    /// - `None` — an OWNED child: restart it in place, honouring `mode`.
+    ///   The authorization was taken at entry precisely so this half does not
+    ///   re-run [`supervisor_restart_policy`]: a first failure clears the
+    ///   pid/ownership, and a recovery that asked for permission again would
+    ///   be refused by the very no-record rule that only ever meant "this
+    ///   core belongs to somebody else".
+    /// - `Some(receipt)` — an ADOPTED core: replace it through a detached
+    ///   supervisor launched with `mode`, using the receipt as the proof this
+    ///   transaction may do so.
+    pub async fn launch_replacement(
+        &self,
+        authorization: Option<&RestartAuthorization>,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<()> {
+        match authorization {
+            None => self.restart_with(mode).await.map(|_| ()),
+            Some(receipt) => self.apply_restart_authorization_with(receipt, mode).await,
+        }
     }
 
     /// Validate the restart authorization for THIS manager right now, and
@@ -2079,13 +2174,18 @@ stop it where it was started",
     /// regenerating it from the active profile. Without this the recovery
     /// re-generated the newer profile the apply had just failed to install,
     /// and the "restored" service was the config the user was rejecting.
+    ///
+    /// A5 (reviewer): the OWNED branch forwards `mode` too — the owned
+    /// restart is a launch like any other and must not silently regenerate
+    /// what the transaction just restored (or re-run the chain that produced
+    /// the verified candidate).
     pub async fn apply_restart_authorization_with(
         &self,
         authorization: &RestartAuthorization,
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<()> {
         if self.owns_child() {
-            return self.restart().await.map(|_| ());
+            return self.restart_with(mode).await.map(|_| ());
         }
         self.authorize_still_ours(authorization)?;
         // A partially started previous attempt (supervisor alive, core not
@@ -2126,7 +2226,17 @@ stop it where it was started",
     /// launch captured: only processes that supervisor forked (read from
     /// `/proc` BEFORE the supervisor is killed, since killing it reparents
     /// them) are stopped.
-    async fn cleanup_failed_launch(&self, ownership: &LaunchOwnership, supervisor: &mut std::process::Child) {
+    ///
+    /// A5 (reviewer): this is the ONE launch-failure cleanup. Every launch
+    /// that can fail after a supervisor exists — the apply transaction's
+    /// restart AND the plain `start` in `commands::start::run` — routes its
+    /// failure here, so no launch path can leave a supervisor (or the core it
+    /// forked) holding the controller socket.
+    pub(crate) async fn cleanup_failed_launch(
+        &self,
+        ownership: &LaunchOwnership,
+        supervisor: &mut std::process::Child,
+    ) {
         // Enumerate first: once the supervisor is gone its children are
         // reparented to init and can no longer be attributed to it.
         let mut owned = ownership.descendant_pids();
@@ -3812,7 +3922,7 @@ mod tests {
             .with_core_kind(CoreKind::SingBox);
         let path = normal
             .inner
-            .runtime_config_for_start(&config_dir)
+            .runtime_config_for_start(&config_dir, crate::commands::start::SupervisorLaunch::Regenerate)
             .await
             .expect("a normal start regenerates the missing runtime config");
         assert!(path.exists(), "the regenerated config must exist");
@@ -3824,13 +3934,13 @@ mod tests {
         );
 
         // A recovery start, by contrast, must NOT regenerate: it exists to
-        // serve the file the failed apply restored.
+        // serve the file the failed apply restored — or the candidate an apply
+        // just verified and installed (A5: the same mode, same contract).
         let _ = tokio::fs::remove_file(&formal).await;
         let recovery = normal.clone();
-        recovery.set_use_existing_runtime_config(true);
         let error = recovery
             .inner
-            .runtime_config_for_start(&config_dir)
+            .runtime_config_for_start(&config_dir, crate::commands::start::SupervisorLaunch::UseExistingConfig)
             .await
             .expect_err("a recovery has nothing to serve when the file is gone");
         assert!(
@@ -3846,12 +3956,30 @@ mod tests {
 
         // With the file restored, the recovery serves it verbatim.
         std::fs::write(&formal, "{\"marker\":\"restored\"}").unwrap();
-        let served = recovery.inner.runtime_config_for_start(&config_dir).await.unwrap();
+        let served = recovery
+            .inner
+            .runtime_config_for_start(&config_dir, crate::commands::start::SupervisorLaunch::UseExistingConfig)
+            .await
+            .unwrap();
         assert_eq!(served, formal);
         assert_eq!(
             std::fs::read_to_string(&formal).unwrap(),
             "{\"marker\":\"restored\"}",
             "a recovery must not regenerate over the restored config"
+        );
+
+        // The two modes are independent: a recovery leaves no ambient state
+        // behind, so the next ordinary start still regenerates a missing
+        // runtime config (A5: the mode travels with the launch).
+        let _ = tokio::fs::remove_file(&formal).await;
+        let regenerated = recovery
+            .inner
+            .runtime_config_for_start(&config_dir, crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .expect("a normal start after a recovery still regenerates");
+        assert!(
+            regenerated.exists() && regenerated == formal,
+            "a recovery must not leave the next normal start unable to generate"
         );
     }
 
@@ -6254,15 +6382,13 @@ mod recovery_config_selection {
             .with_socket(home.path().join("controller.sock"))
             .with_singbox_controller("127.0.0.1:49715".parse().unwrap())
             .with_core_kind(CoreKind::SingBox);
-        assert!(
-            !manager
-                .inner()
-                .use_existing_runtime_config
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
-        let regenerated = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
-            .await
-            .expect("a normal start generates");
+        let regenerated = ManagerInner::runtime_config_for_start(
+            &manager.inner(),
+            home.path(),
+            crate::commands::start::SupervisorLaunch::Regenerate,
+        )
+        .await
+        .expect("a normal start generates");
         assert_eq!(regenerated, restored);
         let regenerated_bytes = std::fs::read(&restored).unwrap();
         assert!(
@@ -6270,13 +6396,16 @@ mod recovery_config_selection {
             "a normal start serves the active profile"
         );
 
-        // Put the restored A back and arm the recovery, exactly as
-        // `commands::daemon::run` does for a recovery supervisor.
+        // Put the restored A back, then launch with the recovery mode,
+        // exactly as `commands::daemon::run` does for a recovery supervisor.
         std::fs::write(&restored, &restored_bytes).unwrap();
-        manager.set_use_existing_runtime_config(true);
-        let recovery = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
-            .await
-            .expect("a recovery start consumes the restored config");
+        let recovery = ManagerInner::runtime_config_for_start(
+            &manager.inner(),
+            home.path(),
+            crate::commands::start::SupervisorLaunch::UseExistingConfig,
+        )
+        .await
+        .expect("a recovery start consumes the restored config");
         assert_eq!(recovery, restored);
         assert_eq!(
             std::fs::read(&restored).unwrap(),
@@ -6286,9 +6415,13 @@ mod recovery_config_selection {
 
         // Nothing to recover from is an error, never a silent regeneration.
         std::fs::remove_file(&restored).unwrap();
-        let error = ManagerInner::runtime_config_for_start(&manager.inner(), home.path())
-            .await
-            .expect_err("no restored config must not regenerate");
+        let error = ManagerInner::runtime_config_for_start(
+            &manager.inner(),
+            home.path(),
+            crate::commands::start::SupervisorLaunch::UseExistingConfig,
+        )
+        .await
+        .expect_err("no restored config must not regenerate");
         assert!(error.to_string().contains("no restored"), "{error}");
     }
 }

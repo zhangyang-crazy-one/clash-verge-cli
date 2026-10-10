@@ -21,6 +21,13 @@ use crate::mihomo_manager::pidfile;
 pub const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
+    run_with_ready_timeout(manager, READY_TIMEOUT).await
+}
+
+/// [`run`] with an explicit readiness budget — the production path uses
+/// [`READY_TIMEOUT`]; tests need a launch that is never ready without
+/// waiting it out.
+pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout: Duration) -> anyhow::Result<()> {
     if let Some(pid) = manager.pid() {
         anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
     }
@@ -43,7 +50,16 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
 
     let log = supervisor_log_path(manager.config_dir());
     let mut supervisor = launch_supervisor_via(manager.config_dir(), &log, SupervisorLaunch::Regenerate)?;
-    wait_until_ready(&manager, &mut supervisor, &log).await?;
+    // A5 (reviewer): a readiness failure is a LAUNCH failure like any other,
+    // and it gets the same cleanup: bound to the supervisor handle captured
+    // here, stop the supervisor AND the core it already forked. Returning the
+    // error directly left that core holding the controller socket and the
+    // mixed port while the next `start`/`restart` competed with it.
+    let ownership = crate::mihomo_manager::manager::LaunchOwnership::new(supervisor.id());
+    if let Err(error) = wait_until_ready_with_timeout(&manager, &mut supervisor, &log, ready_timeout).await {
+        manager.cleanup_failed_launch(&ownership, &mut supervisor).await;
+        return Err(error);
+    }
 
     let version = manager
         .api()
@@ -221,8 +237,18 @@ pub async fn wait_until_ready(
     supervisor: &mut std::process::Child,
     log: &Path,
 ) -> anyhow::Result<()> {
+    wait_until_ready_with_timeout(manager, supervisor, log, READY_TIMEOUT).await
+}
+
+/// [`wait_until_ready`] with an explicit readiness budget.
+pub(crate) async fn wait_until_ready_with_timeout(
+    manager: &MihomoManager,
+    supervisor: &mut std::process::Child,
+    log: &Path,
+    ready_timeout: Duration,
+) -> anyhow::Result<()> {
     let api = manager.api();
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + ready_timeout;
     loop {
         if super::core_running(&api).await {
             return Ok(());
@@ -234,7 +260,7 @@ pub async fn wait_until_ready(
             anyhow::bail!(
                 "mihomo did not answer on {} within {}s\n{}",
                 manager.socket_path().display(),
-                READY_TIMEOUT.as_secs(),
+                ready_timeout.as_secs(),
                 super::log_tail(log, 10)
             );
         }
@@ -461,5 +487,83 @@ mod tests {
 
     async fn prepare_controller_credentials_for_test() -> String {
         crate::enhance::resolve_controller_secret().await.expect("resolve")
+    }
+
+    /// A5 (reviewer): the readiness failure of the plain `start` is a LAUNCH
+    /// failure like any other and takes the same cleanup — the supervisor AND
+    /// the core it already forked are stopped, bound to the supervisor handle
+    /// this launch captured. Returning the error directly left that core
+    /// holding the controller socket and the mixed port while the next
+    /// start/restart competed with it.
+    #[tokio::test]
+    async fn a_readiness_failure_stops_the_supervisor_and_the_core_it_forked() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39186\nsecret: start-cleanup-fixture\ntun: {enable: false}\n",
+        )
+        .expect("seed config");
+        std::fs::write(home.path().join("verge.yaml"), "proxy_core: mihomo\n").expect("verge");
+
+        // The seam is a plain fn pointer, so it cannot capture: the pid file
+        // travels through a thread-local set by the test.
+        static CORE_PID_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let core_pid_file = home.path().join("forked-core.pid");
+        CORE_PID_FILE.set(core_pid_file.clone()).expect("pid file once");
+        fn forking_supervisor(
+            _config_dir: &Path,
+            log: &Path,
+            _mode: SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"stand-in supervisor\n")?;
+            // A supervisor that DOES spawn a core but never answers the
+            // controller: the readiness probe is what fails.
+            Ok(std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "sleep 300 & echo $! > {}; wait",
+                    CORE_PID_FILE
+                        .get()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?)
+        }
+        let _launcher = install_supervisor_launcher(forking_supervisor).expect("install seam");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        // A short readiness budget: this core is never coming.
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(home.path().join("controller.sock"))
+            .with_secret("start-cleanup-fixture".to_string());
+
+        let error = run_with_ready_timeout(manager, Duration::from_millis(300))
+            .await
+            .expect_err("the core never answers");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+
+        let mut core_pid = None;
+        for _ in 0..200 {
+            if let Ok(body) = std::fs::read_to_string(&core_pid_file)
+                && let Ok(pid) = body.trim().parse::<u32>()
+            {
+                core_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let core_pid = core_pid.expect("the stand-in supervisor forked a core");
+        assert!(
+            !crate::mihomo_manager::pidfile::is_running(core_pid),
+            "the core this launch forked must be stopped, not left holding the ports (pid {core_pid})"
+        );
     }
 }

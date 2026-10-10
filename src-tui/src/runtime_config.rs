@@ -114,16 +114,29 @@ pub async fn apply_singbox_restart_for_profile(
         // Stopped: the apply only persists; no restart is ever attempted.
         None
     };
+    // A5 (reviewer), CANDIDATE-BINDING CONTRACT: an apply's first launch must
+    // serve EXACTLY the artifact this transaction verified.
+    //
+    //   candidate = assemble(source snapshot)  -> `sing-box check` -> install
+    //   -> start the core on the formal file, which IS that candidate.
+    //
+    // The launch mode is therefore `UseExistingConfig` from the very first
+    // restart, not only on the rollback: the old `Regenerate` restart rebuilt
+    // the runtime config from the CURRENT source, so a Script chain item (or a
+    // profile edit between the check and the start) produced content that was
+    // never checked — and paid the composition cost twice. Binding the start
+    // to the installed candidate is what makes "the config the core started
+    // with hashes equal to the checked one" true by construction.
     use crate::commands::start::SupervisorLaunch;
     let restart = |mode: SupervisorLaunch| {
         let authorization = authorization.clone();
         async move {
-            // An owned child restarts in place; an adopted one is replaced by
-            // a detached supervisor so the replacement outlives this process.
-            match &authorization {
-                Some(authorization) => manager.apply_restart_authorization_with(authorization, mode).await,
-                None => manager.restart_through_supervisor_with(mode).await,
-            }
+            // `launch_replacement` keeps the authorization captured at entry:
+            // an owned child restarts in place (with `mode`), an adopted core
+            // is replaced through a detached supervisor (with `mode`).
+            // Neither half re-runs the policy, so a recovery still works after
+            // the first failure cleared the pid/ownership.
+            manager.launch_replacement(authorization.as_ref(), mode).await
         }
     };
     let mut prepared_yaml = None;
@@ -199,7 +212,7 @@ pub async fn apply_singbox_restart_for_profile(
         });
     }
 
-    if let Err(restart_error) = restart(SupervisorLaunch::Regenerate).await {
+    if let Err(restart_error) = restart(SupervisorLaunch::UseExistingConfig).await {
         transaction
             .rollback()
             .map_err(|rollback_error| format!("{restart_error}; rollback failed: {rollback_error}"))?;
@@ -214,7 +227,9 @@ pub async fn apply_singbox_restart_for_profile(
         // persisted the newer profile (B); a supervisor launched the normal
         // way regenerates the runtime config from the active profile, so the
         // "recovered" service ran B and overwrote A again. The recovery must
-        // start the core on the restored file, verbatim.
+        // start the core on the restored file, verbatim — and it re-uses the
+        // authorization captured at entry, so the pid/ownership the failed
+        // launch cleared cannot refuse it.
         if should_retry_rollback_restart(transaction.previous.is_some(), was_running)
             && let Err(rollback_error) = restart(SupervisorLaunch::UseExistingConfig).await
         {
@@ -1762,10 +1777,15 @@ mod tests {
         // P1 (reviewer): the retry is a RECOVERY — it must be launched to
         // serve the restored config, not to regenerate it from the (newer)
         // active profile.
+        //
+        // A5 (reviewer): the FIRST launch is bound to the candidate this
+        // transaction verified and installed, so it is not a `Regenerate`
+        // either — the core must start on the bytes `sing-box check` passed,
+        // not on a fresh generation of whatever the source says now.
         assert_eq!(
             *seam.modes.lock().expect("modes"),
             vec![
-                crate::commands::start::SupervisorLaunch::Regenerate,
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
                 crate::commands::start::SupervisorLaunch::UseExistingConfig,
             ]
         );
@@ -2085,10 +2105,13 @@ secret: fixture-secret\ntun: {{enable: false}}\n",
         .expect_err("the first supervisor launch was injected to fail");
         assert!(outcome.contains("injected supervisor launch failure"), "{outcome}");
         assert_eq!(seam.attempts.load(Ordering::SeqCst), 2, "the rollback must retry once");
+        // A5 (reviewer): BOTH launches serve the config already on disk —
+        // first the verified candidate, then the restored previous config.
+        // Neither regenerates from the active profile that still holds B.
         assert_eq!(
             *seam.modes.lock().expect("modes"),
             vec![
-                crate::commands::start::SupervisorLaunch::Regenerate,
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
                 crate::commands::start::SupervisorLaunch::UseExistingConfig,
             ]
         );
@@ -2127,5 +2150,359 @@ secret: fixture-secret\ntun: {{enable: false}}\n",
         // (which also stops the placeholder children and the supervisor
         // tasks), so even a failing assertion leaves nothing behind.
         _cleanup.pids.lock().expect("pids").push(record.pid);
+    }
+
+    // ---------------------------------------------------------------------
+    // A5 (reviewer): the apply's CANDIDATE-BINDING contract.
+    //
+    // `the_started_core_serves_exactly_the_candidate_the_apply_checked`
+    // ---------------------------------------------------------------------
+
+    /// A stand-in supervisor that behaves like the REAL one with respect to
+    /// the thing under test: on `UseExistingConfig` it starts the core on
+    /// the file already on disk, on `Regenerate` it rebuilds the runtime
+    /// config from the CURRENT source first (which is exactly what a
+    /// Script chain item re-run / a profile edited in between would change).
+    /// Either way it records the bytes the core was started with.
+    struct BindingSeam {
+        modes: std::sync::Mutex<Vec<crate::commands::start::SupervisorLaunch>>,
+        served: std::sync::Mutex<Vec<Vec<u8>>>,
+        core_pids: std::sync::Mutex<Vec<u32>>,
+        supervisors: std::sync::Mutex<Vec<u32>>,
+        socket: std::sync::Mutex<Option<std::path::PathBuf>>,
+    }
+
+    fn binding_seam() -> &'static BindingSeam {
+        static SEAM: std::sync::OnceLock<&'static BindingSeam> = std::sync::OnceLock::new();
+        SEAM.get_or_init(|| {
+            Box::leak(Box::new(BindingSeam {
+                modes: std::sync::Mutex::new(Vec::new()),
+                served: std::sync::Mutex::new(Vec::new()),
+                core_pids: std::sync::Mutex::new(Vec::new()),
+                supervisors: std::sync::Mutex::new(Vec::new()),
+                socket: std::sync::Mutex::new(None),
+            }))
+        })
+    }
+
+    /// A controller that always answers, so readiness is the ONLY thing the
+    /// launch depends on — the config it serves is read from disk.
+    fn always_answering_controller() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let addr = listener.local_addr().expect("addr");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    if stream.read(&mut buffer).await.is_err() {
+                        return;
+                    }
+                    let body = r#"{"version":"1.19.0"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn the_started_core_serves_exactly_the_candidate_the_apply_checked() {
+        use crate::mihomo_manager::MihomoManager;
+        use crate::mihomo_manager::pidfile::{self, CoreKind, CoreRecord};
+        use std::path::Path;
+
+        // The config the apply SNAPSHOTS and verifies...
+        const APPLIED: &str = "proxies: []\nrules:\n  - DOMAIN,a-candidate-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+        // ...and the source as it stands when the core is launched. A
+        // regenerating supervisor composes THIS, not the candidate.
+        const SOURCE_ON_DISK: &str =
+            "proxies: []\nrules:\n  - DOMAIN,b-disk-source-marker.example,DIRECT\n  - MATCH,DIRECT\n";
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let controller = always_answering_controller();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            format!("mixed-port: 39184\nexternal-controller: {controller}\nsecret: a5-fixture-secret\n"),
+        )
+        .expect("config");
+        std::fs::write(home.path().join("verge.yaml"), "proxy_core: singbox\n").expect("verge");
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rsource\nitems:\n  - {uid: Rsource, type: remote, name: source, file: source.yaml}\n",
+        )
+        .expect("profiles");
+        std::fs::create_dir_all(home.path().join("profiles")).expect("profiles dir");
+        std::fs::write(home.path().join("profiles/source.yaml"), SOURCE_ON_DISK).expect("source profile");
+
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("formal");
+        std::fs::write(
+            &formal,
+            r#"{"marker":"previous","experimental":{"clash_api":{"external_controller":"127.0.0.1:19998"}}}"#,
+        )
+        .expect("previous config");
+
+        fn launch(
+            config_dir: &Path,
+            log: &Path,
+            mode: crate::commands::start::SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
+            let seam = binding_seam();
+            seam.modes.lock().expect("modes").push(mode);
+            let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("formal");
+            // What the core is STARTED with, before any supervisor action.
+            seam.served
+                .lock()
+                .expect("served")
+                .push(std::fs::read(&formal).unwrap_or_default());
+            if mode == crate::commands::start::SupervisorLaunch::Regenerate {
+                // A regenerating supervisor composes the ACTIVE PROFILE and
+                // overwrites the runtime config before starting the core.
+                let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().expect("profiles dir");
+                let source = std::fs::read_to_string(profiles_dir.join("source.yaml")).unwrap_or_default();
+                std::fs::write(&formal, format!(r#"{{"marker":"regenerated","source":{source:?}}}"#))?;
+            }
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"stand-in supervisor\n")?;
+            #[allow(clippy::zombie_processes)]
+            let core = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            seam.core_pids.lock().expect("pids").push(core.id());
+            let socket = binding_seam()
+                .socket
+                .lock()
+                .expect("socket")
+                .clone()
+                .unwrap_or_else(|| config_dir.join("controller.sock"));
+            pidfile::write(
+                &pidfile::path_for(&socket),
+                CoreRecord::with_kind_and_exe(
+                    core.id(),
+                    chrono::Utc::now(),
+                    CoreKind::SingBox,
+                    Some("/bin/sleep".to_string()),
+                ),
+            )
+            .expect("record");
+            #[allow(clippy::zombie_processes)]
+            let supervisor = std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            seam.supervisors.lock().expect("supervisors").push(supervisor.id());
+            Ok(supervisor)
+        }
+        let _launcher = crate::commands::start::install_supervisor_launcher(launch).expect("seam");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(socket.clone())
+            .with_singbox_controller(controller)
+            .with_core_kind(CoreKind::SingBox)
+            .with_secret("a5-fixture-secret".to_string());
+        *manager.inner().resolved_binary.lock() = Some(std::path::PathBuf::from("/bin/true"));
+        *binding_seam().socket.lock().expect("socket") = Some(socket.clone());
+
+        // An adopted core, as a `profile use` from another CLI invocation sees it.
+        #[allow(clippy::zombie_processes)]
+        let adopted = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stand-in core");
+        pidfile::write(
+            &pidfile::path_for(&socket),
+            CoreRecord::with_kind_and_exe(
+                adopted.id(),
+                chrono::Utc::now(),
+                CoreKind::SingBox,
+                Some("/bin/sleep".into()),
+            ),
+        )
+        .expect("record");
+        *manager.inner().pid.lock() = Some(adopted.id());
+        *manager.inner().state.lock() = crate::app::CoreState::Running;
+
+        let outcome = apply_singbox_restart_for_profile(&manager, Some(APPLIED), false, None).await;
+        let formal_after = std::fs::read(&formal).expect("formal");
+        for pid in binding_seam()
+            .core_pids
+            .lock()
+            .expect("pids")
+            .drain(..)
+            .chain(binding_seam().supervisors.lock().expect("supervisors").drain(..))
+            .chain(std::iter::once(adopted.id()))
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        outcome.expect("the injected-free launch must succeed");
+
+        let seam = binding_seam();
+        assert_eq!(
+            *seam.modes.lock().expect("modes"),
+            vec![crate::commands::start::SupervisorLaunch::UseExistingConfig],
+            "A5: the start must consume the verified candidate, not regenerate it"
+        );
+        let served = seam.served.lock().expect("served")[0].clone();
+        assert_eq!(
+            served, formal_after,
+            "the config the core started with must be the config left on disk"
+        );
+        let served_text = String::from_utf8_lossy(&served).to_string();
+        assert!(
+            served_text.contains("a-candidate-marker.example"),
+            "the started config must be the candidate this apply checked: {served_text}"
+        );
+        assert!(
+            !served_text.contains("b-disk-source-marker.example") && !served_text.contains("\"regenerated\""),
+            "the start re-generated from the current source instead of serving the candidate: {served_text}"
+        );
+    }
+
+    /// A5 (reviewer), OWNED branch: the first owned launch fails and clears
+    /// the pid/ownership (what `rollback_failed_spawn` leaves behind); the
+    /// rollback recovery must still bring the service back on the restored
+    /// config — with the SAME explicit old-config identity, and without
+    /// re-running the "no pid record ⇒ somebody else's core" policy that
+    /// had just stopped applying to a core this process owns.
+    #[tokio::test]
+    async fn an_owned_child_rollback_recovers_after_the_first_failure_cleared_its_pid() {
+        use crate::mihomo_manager::MihomoManager;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const PREVIOUS: &str =
+            r#"{"marker":"old","experimental":{"clash_api":{"external_controller":"127.0.0.1:19999"}}}"#;
+
+        struct Seam {
+            attempts: AtomicUsize,
+            modes: std::sync::Mutex<Vec<crate::commands::start::SupervisorLaunch>>,
+            manager: std::sync::OnceLock<&'static MihomoManager>,
+        }
+        static SEAM: std::sync::OnceLock<&'static Seam> = std::sync::OnceLock::new();
+
+        fn owned_restart(mode: crate::commands::start::SupervisorLaunch) -> anyhow::Result<()> {
+            let seam = *SEAM.get().expect("seam");
+            seam.modes.lock().expect("modes").push(mode);
+            if seam.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Exactly what a failed owned launch leaves behind: the
+                // manager's pid AND ownership cleared.
+                let manager = *seam.manager.get().expect("manager");
+                manager
+                    .inner()
+                    .owns_child
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                *manager.inner().pid.lock() = None;
+                anyhow::bail!("injected owned restart failure");
+            }
+            Ok(())
+        }
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39185\nexternal-controller: 127.0.0.1:19999\nsecret: a5-owned-secret\n",
+        )
+        .expect("config");
+        std::fs::write(home.path().join("verge.yaml"), "proxy_core: singbox\n").expect("verge");
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().expect("formal");
+        std::fs::write(&formal, PREVIOUS).expect("previous config");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        let manager: &'static MihomoManager = Box::leak(Box::new(
+            MihomoManager::new(config_dir)
+                .with_socket(home.path().join("controller.sock"))
+                .with_singbox_controller("127.0.0.1:19999".parse().expect("addr"))
+                .with_core_kind(crate::mihomo_manager::CoreKind::SingBox)
+                .with_secret("a5-owned-secret".to_string()),
+        ));
+        *manager.inner().resolved_binary.lock() = Some(std::path::PathBuf::from("/bin/true"));
+        // An OWNED child: this process spawned it, so the policy always
+        // allowed restarting it in place.
+        #[allow(clippy::zombie_processes)]
+        let owned = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("stand-in core");
+        manager
+            .inner()
+            .owns_child
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *manager.inner().pid.lock() = Some(owned.id());
+        *manager.inner().state.lock() = crate::app::CoreState::Running;
+        assert!(manager.owns_child());
+
+        let seam: &'static Seam = Box::leak(Box::new(Seam {
+            attempts: AtomicUsize::new(0),
+            modes: std::sync::Mutex::new(Vec::new()),
+            manager: std::sync::OnceLock::new(),
+        }));
+        seam.manager.set(manager).ok().expect("manager once");
+        SEAM.set(seam).ok().expect("seam once");
+        let _hook = crate::mihomo_manager::manager::install_owned_restart_hook(owned_restart).expect("hook");
+
+        let error = apply_singbox_restart_for_profile(manager, None, false, None)
+            .await
+            .expect_err("the first owned launch was injected to fail");
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(owned.id() as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+
+        assert_eq!(
+            seam.attempts.load(Ordering::SeqCst),
+            2,
+            "the recovery must launch once more"
+        );
+        assert_eq!(
+            *seam.modes.lock().expect("modes"),
+            vec![
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
+                crate::commands::start::SupervisorLaunch::UseExistingConfig,
+            ],
+            "A5: an owned restart is a launch like any other — the recovery must not regenerate"
+        );
+        assert!(
+            !error.contains("no clash-verge-cli pid record"),
+            "the recovery must not re-run the foreign-core policy after the failure cleared the pid: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&formal).expect("formal"),
+            PREVIOUS,
+            "the previous configuration must be back on disk"
+        );
     }
 }
