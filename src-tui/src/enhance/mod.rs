@@ -369,7 +369,10 @@ fn tighten_clash_config_mode(_path: &std::path::Path) -> anyhow::Result<()> {
 ///   never re-emitted from `IClashTemp`: that mapping is template-filled and
 ///   `guard`-normalized (`port: 0` means "listener disabled" and is rewritten
 ///   back to a default), so re-serializing it would silently re-enable
-///   listeners the user had switched off (P2).
+///   listeners the user had switched off (P2). A layout the line-based edit
+///   cannot express exactly (flow mapping, multi-document, quoted `secret`
+///   key, block scalar, anchor/alias) is REFUSED with the file untouched —
+///   failing the start is safer than committing an unparseable config.
 /// - Persisting happens here (before any core starts), so a later CLI
 ///   invocation authenticates against the same value.
 /// - A save failure is an error; we never silently fall back to the weak
@@ -442,13 +445,113 @@ fn raw_secret(mapping: &Mapping) -> Option<String> {
 async fn rotate_secret_in_place(path: &std::path::Path, secret: &str) -> anyhow::Result<()> {
     let body =
         std::fs::read_to_string(path).map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
-    save_clash_body_private(path, &rewrite_secret_line(&body, secret)).await
+    // The rewrite is verified *before* the staging rename, so a refusal here
+    // means not a single byte of the user's file changed.
+    let body = rewrite_secret_line(&body, secret)
+        .map_err(|error| anyhow::anyhow!("{error}; {} was left untouched", path.display()))?;
+    save_clash_body_private(path, &body).await
 }
 
-/// Pure body rewrite: swap the top-level `secret` entry for `secret`, or
-/// append one when the file has none. A nested `secret:` (indented) is left
-/// alone — only a document-root key guards the controller.
-fn rewrite_secret_line(body: &str, secret: &str) -> String {
+/// Whether a root-level `secret` key is spelled with YAML quotes (`'secret'`
+/// / `"secret"`), which a plain textual key comparison cannot match.
+fn is_quoted_secret_key(key: &str) -> bool {
+    matches!(key, "'secret'" | "\"secret\"")
+}
+
+/// Why `body` is a layout the line-based `secret` rewrite must refuse.
+///
+/// The rewrite works on raw lines so it can keep the user's comments and
+/// disabled `port: 0` listeners byte-for-byte, which no round-trip through
+/// `serde_yaml_ng` can do (re-serializing drops comments and reorders keys).
+/// That fidelity is only worth anything if it cannot corrupt the file, so a
+/// layout the line-based edit cannot express exactly is refused *before* any
+/// write: a rotation that fails leaves a loadable config and a failed start
+/// (fail closed), while a corrupted `config.yaml` would keep every later start
+/// failing until the user hand-repaired it.
+fn secret_layout_refusal(body: &str) -> Option<String> {
+    let mut root_secret_lines = 0usize;
+    for line in body.split_inclusive('\n') {
+        let bare = line.trim_end_matches(['\n', '\r']);
+        let trimmed = bare.trim();
+        if matches!(trimmed, "---" | "...") || trimmed.starts_with("--- ") {
+            return Some("it is a multi-document YAML file".to_string());
+        }
+        if trimmed.is_empty() || trimmed.starts_with('#') || bare.starts_with([' ', '\t']) {
+            continue;
+        }
+        if trimmed.starts_with('{') || trimmed.starts_with('[') {
+            // A flow collection as the document root: `secret` lives inside
+            // `{...}` on one line, which no line-based edit can rewrite (the
+            // old code appended a block `secret:` line, which is invalid YAML).
+            return Some("its root value is written as a flow collection".to_string());
+        }
+        let Some((key, value)) = bare.split_once(':') else {
+            continue;
+        };
+        let key = key.trim_end_matches([' ', '\t']);
+        let value = value.trim();
+        if is_quoted_secret_key(key) {
+            return Some("its `secret` key is written in quotes".to_string());
+        }
+        if key == "secret" {
+            root_secret_lines += 1;
+            if root_secret_lines > 1 {
+                return Some("it declares a root `secret` key more than once".to_string());
+            }
+            if value.is_empty() || value.starts_with(['|', '>', '*', '&']) {
+                // Replacing the header would orphan the block's indented body
+                // (invalid), and an anchor/alias value has no textual scalar
+                // to swap (the alias points elsewhere in the document).
+                return Some("its `secret` value is empty, a block scalar, or an anchor/alias".to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Swap the top-level `secret` entry for `secret`, or append one when the file
+/// has none, and **verify** the result before it is written anywhere.
+///
+/// Layouts [`secret_layout_refusal`] cannot prove safe (flow mappings,
+/// multi-document files, quoted `secret` keys, block scalars, anchors/aliases,
+/// duplicate root keys) are refused. Everything else still goes through the
+/// line-based edit, but the candidate is re-parsed and compared against the
+/// original mapping with only the secret changed — so an unforeseen layout
+/// (explicit `?` keys, exotic escapes, …) is caught too, instead of writing a
+/// file that no longer parses.
+fn rewrite_secret_line(body: &str, secret: &str) -> anyhow::Result<String> {
+    if let Some(reason) = secret_layout_refusal(body) {
+        anyhow::bail!("cannot rotate the controller secret in place because {reason}");
+    }
+    let mut expected = match serde_yaml_ng::from_str::<Value>(body) {
+        Ok(Value::Mapping(mapping)) => mapping,
+        Ok(_) => anyhow::bail!("cannot rotate the controller secret in place: the document root is not a mapping"),
+        Err(error) => {
+            anyhow::bail!("cannot rotate the controller secret in place: it is not valid YAML ({error})");
+        }
+    };
+
+    let candidate = rewrite_secret_line_unchecked(body, secret);
+    let parsed: Mapping = match serde_yaml_ng::from_str(&candidate) {
+        Ok(mapping) => mapping,
+        Err(error) => {
+            anyhow::bail!(
+                "cannot rotate the controller secret in place: the rewritten body would not be valid YAML ({error})"
+            );
+        }
+    };
+    expected.insert(Value::from("secret"), Value::from(secret));
+    if parsed != expected {
+        anyhow::bail!(
+            "cannot rotate the controller secret in place: the rewritten body would change more than the secret"
+        );
+    }
+    Ok(candidate)
+}
+
+/// The unchecked line-based edit used only by [`rewrite_secret_line`], which
+/// owns layout refusal and the post-edit verification.
+fn rewrite_secret_line_unchecked(body: &str, secret: &str) -> String {
     // A JSON string is a valid YAML double-quoted scalar.
     let quoted = serde_json::to_string(secret).unwrap_or_else(|_| format!("\"{secret}\""));
     let replacement = format!("secret: {quoted}");
@@ -795,19 +898,121 @@ rules: [MATCH,PROXY]
     #[test]
     fn the_secret_rewrite_appends_a_root_key_and_leaves_nested_ones_alone() {
         assert_eq!(
-            rewrite_secret_line("mixed-port: 7897\n", "abc"),
+            rewrite_secret_line("mixed-port: 7897\n", "abc").expect("rewrite"),
             "mixed-port: 7897\nsecret: \"abc\"\n"
         );
         assert_eq!(
-            rewrite_secret_line("tun:\n  secret: nested\nsecret: old\n", "abc"),
+            rewrite_secret_line("tun:\n  secret: nested\nsecret: old\n", "abc").expect("rewrite"),
             "tun:\n  secret: nested\nsecret: \"abc\"\n"
         );
         // CRLF and a final line without a newline both stay valid YAML.
         assert_eq!(
-            rewrite_secret_line("port: 0\r\nsecret: old\r\n", "a"),
+            rewrite_secret_line("port: 0\r\nsecret: old\r\n", "a").expect("rewrite"),
             "port: 0\r\nsecret: \"a\"\r\n"
         );
-        assert_eq!(rewrite_secret_line("port: 0", "a"), "port: 0\nsecret: \"a\"\n");
+        assert_eq!(
+            rewrite_secret_line("port: 0", "a").expect("rewrite"),
+            "port: 0\nsecret: \"a\"\n"
+        );
+    }
+
+    /// P2 (reviewer): layouts the line-based edit cannot express exactly are
+    /// refused, and every rewritten candidate is re-parsed and compared to the
+    /// original mapping before it can be written.
+    ///
+    /// The old code appended a block `secret:` line to a root flow mapping and
+    /// overwrote the file — valid YAML in, unparseable YAML out, and every
+    /// later start kept failing.
+    #[test]
+    fn unsafe_secret_layouts_are_refused_instead_of_corrupting_the_file() {
+        for (label, body) in [
+            // Flow mapping: `secret` lives inside `{...}`, unreachable line-wise.
+            ("flow mapping", "{secret: set-your-secret, port: 0}\n"),
+            (
+                "multiline flow mapping",
+                "mixed-port: 7897\n{secret: set-your-secret, port: 0}\n",
+            ),
+            // Block scalar: replacing the header would orphan its indented body.
+            ("block scalar", "secret: |\n  set-your-secret\nport: 0\n"),
+            ("folded scalar", "secret: >-\n  set-your-secret\nport: 0\n"),
+            // Quoted key: a textual comparison never matches it.
+            ("quoted key", "'secret': set-your-secret\nport: 0\n"),
+            ("double-quoted key", "\"secret\": set-your-secret\nport: 0\n"),
+            // Anchors/aliases: the scalar is defined elsewhere in the document.
+            ("anchor value", "secret: &s set-your-secret\nport: 0\n"),
+            ("alias value", "anchor: &s set-your-secret\nsecret: *s\n"),
+            // Duplicate root keys: which one a core honours is undefined.
+            ("duplicate root keys", "secret: set-your-secret\nsecret: other\n"),
+            // Multi-document: the appended line would land in a later document.
+            ("multi-document", "secret: set-your-secret\n---\nport: 0\n"),
+        ] {
+            let error = rewrite_secret_line(body, "rotated").expect_err(label);
+            assert!(
+                error
+                    .to_string()
+                    .contains("cannot rotate the controller secret in place"),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    /// An anchor elsewhere in the document is not a problem: the appended root
+    /// `secret:` key is a plain scalar and the anchored (nested) mapping keeps
+    /// its own `secret`, so the rewrite stays valid.
+    #[test]
+    fn an_anchor_elsewhere_in_the_document_still_rotates_the_root_secret() {
+        let body = "defaults: &d\n  secret: nested\nport: 0\n";
+        let rewritten = rewrite_secret_line(body, "abc").expect("rewrite");
+        assert_eq!(rewritten, "defaults: &d\n  secret: nested\nport: 0\nsecret: \"abc\"\n");
+        assert_eq!(
+            serde_yaml_ng::from_str::<Mapping>(&rewritten).expect("still parses"),
+            mapping("defaults: &d\n  secret: nested\nport: 0\nsecret: abc\n")
+        );
+    }
+
+    /// The refusal has to be a *pre-write* refusal: `resolve_controller_secret`
+    /// must fail loudly and leave the user's bytes exactly as they were.
+    #[tokio::test]
+    async fn a_flow_mapping_config_is_left_byte_identical_instead_of_invalidated() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let path = home.path().join("config.yaml");
+        let original = "{secret: set-your-secret, port: 0, mixed-port: 35123}\n";
+        std::fs::write(&path, original).expect("seed");
+
+        let error = resolve_controller_secret()
+            .await
+            .expect_err("flow mapping must be refused");
+        assert!(error.to_string().contains("flow collection"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reread"),
+            original,
+            "a refused rotation must not touch the file"
+        );
+    }
+
+    /// The happy path is still a pure line swap, and a second rotation over the
+    /// already-rotated file is idempotent (the supervisor child re-resolves it).
+    #[tokio::test]
+    async fn a_block_mapping_rotation_is_idempotent_and_preserves_comments() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let path = home.path().join("config.yaml");
+        let original = "# keep me\nsecret: set-your-secret\nport: 0\ndns: {enable: false}\n";
+        std::fs::write(&path, original).expect("seed");
+
+        let secret = resolve_controller_secret().await.expect("rotate");
+        let rotated = std::fs::read_to_string(&path).expect("reread");
+        assert_eq!(
+            rotated,
+            format!("# keep me\nsecret: \"{secret}\"\nport: 0\ndns: {{enable: false}}\n")
+        );
+        // The nested flow mapping elsewhere in the file is untouched.
+        assert!(rotated.contains("dns: {enable: false}"));
+
+        // Second resolution reads the stored secret: no rotation, no rewrite.
+        assert_eq!(resolve_controller_secret().await.expect("second"), secret);
+        assert_eq!(std::fs::read_to_string(&path).expect("reread"), rotated);
     }
 
     /// A strong secret is returned untouched — the file is never rewritten
