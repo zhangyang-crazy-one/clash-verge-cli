@@ -671,6 +671,13 @@ impl ManagerInner {
 
     /// The runtime config a start must run, honouring the recovery mode.
     ///
+    /// A NORMAL start/restart regenerates the config from the active profile
+    /// (and may create or overwrite the file); a RECOVERY start consumes the
+    /// frozen, already-validated file verbatim and fails when it is absent.
+    /// The two are decided HERE so the start and the restart path cannot
+    /// disagree — the recovery restriction once leaked into the ordinary
+    /// restart, which then demanded a file it should have generated.
+    ///
     /// P1 (reviewer): the recovery start MUST NOT regenerate. The apply
     /// transaction restores the previous config (A) on disk and then asks a
     /// supervisor to bring the service back; regenerating here rebuilds the
@@ -867,7 +874,7 @@ impl SingboxParts {
         // or the core would never evaluate it. A sidecar without order
         // information keeps the historical append-after-profile behaviour.
         //
-        // The order indexes the ORIGINAL profile rule list, so it is
+        // The order indexes the ORIGINAL composed profile rule list, so it is
         // interleaved against the original slots (rules the conversion
         // dropped keep their slot identity and are skipped) — never against
         // the compressed converted list.
@@ -883,6 +890,13 @@ impl SingboxParts {
                 // under the sidecar; every stored index stays in range and
                 // silently points at a different rule. Detect that and fall
                 // back to append-after, reported like any other loss.
+                //
+                // The identity compared here is the COMPOSED rule list — the
+                // very list the slots above were built from and the one the
+                // stored `Profile(i)` indices address. The editor's save
+                // fingerprints the same list (see
+                // `runtime_config::composed_profile_rules`), so a fresh save
+                // can no longer be misread as a refresh.
                 let (order, drift) = match yaml.and_then(|y| crate::routing::load_profile_rules(y).ok()) {
                     Some(profile_rules) => {
                         stored.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&profile_rules))
@@ -942,6 +956,60 @@ impl SingboxParts {
             dns_section,
             default_domain_resolver,
         })
+    }
+}
+
+/// A process forked by `pid`, read from `/proc/<pid>/task/*/children`.
+///
+/// Linux exposes the child list per thread group; the union over the group's
+/// threads is the process's direct children. A pid that is gone (or a
+/// `/proc` that is not mounted) simply yields nothing — ownership then falls
+/// back to "nothing can be attributed", never to "everything can".
+fn direct_child_pids(pid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(body) = std::fs::read_to_string(entry.path().join("children")) else {
+            continue;
+        };
+        children.extend(body.split_whitespace().filter_map(|token| token.parse::<u32>().ok()));
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+/// What one supervisor launch owns: the processes that supervisor forked.
+///
+/// Cleanup after a failed launch may only touch those. The pid record on
+/// disk is SHARED — it names whichever instance wrote it last — so it can
+/// never be the ownership proof on its own.
+struct LaunchOwnership {
+    supervisor_pid: u32,
+}
+
+impl LaunchOwnership {
+    fn new(supervisor_pid: u32) -> Self {
+        Self { supervisor_pid }
+    }
+
+    /// Every descendant of the supervisor, breadth-first.
+    ///
+    /// Must be read BEFORE the supervisor is killed: once it exits, its
+    /// children are reparented to init and no longer identify it.
+    fn descendant_pids(&self) -> Vec<u32> {
+        let mut found: Vec<u32> = Vec::new();
+        let mut queue = direct_child_pids(self.supervisor_pid);
+        while let Some(pid) = queue.pop() {
+            if found.contains(&pid) {
+                continue;
+            }
+            found.push(pid);
+            queue.extend(direct_child_pids(pid));
+        }
+        found
     }
 }
 
@@ -1892,18 +1960,20 @@ stop it where it was started",
             .context("failed to resolve or auto-install sing-box core")?;
         let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
         preflight_tun_capability(&resolved.path, tun_enabled)?;
+        // P1 (reviewer): prepare the runtime config BEFORE the old core goes
+        // away. A normal start/restart REGENERATES it (and may overwrite a
+        // stale/missing file); only a recovery start — which must serve the
+        // restored file verbatim — requires it to already exist. Doing this
+        // first also means a generation failure (an unconvertible profile, a
+        // full disk) leaves the running service untouched instead of
+        // dropping it and then failing to start a replacement.
+        let config_path = ManagerInner::runtime_config_for_start(&self.inner, &self.config_dir)
+            .await
+            .context("failed to prepare the sing-box runtime config; the running core was left untouched")?;
         self.stop().await.context("failed to stop running sing-box")?;
         crate::enhance::ensure_mixed_port_available()
             .await
             .map_err(anyhow::Error::msg)?;
-        let config_path = clash_verge_core::utils::dirs::singbox_config_path()?;
-        if !tokio::fs::try_exists(&config_path).await? {
-            // Recovery: the restored config MUST exist. Generating one here
-            // would silently serve the newer profile instead of what was
-            // just rolled back.
-            ManagerInner::existing_singbox_config().await?;
-            ManagerInner::write_singbox_full(&self.config_dir).await?;
-        }
         ManagerInner::spawn_core(
             &resolved.path,
             &resolved.version,
@@ -2025,53 +2095,77 @@ stop it where it was started",
         let log = crate::commands::start::supervisor_log_path(&self.config_dir);
         let launched_at = std::time::SystemTime::now();
         let mut supervisor = crate::commands::start::launch_supervisor_via(&self.config_dir, &log, mode)?;
-        if let Err(error) = crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await {
-            // P1 (reviewer): a supervisor that started but did not answer in
-            // time must be terminated AND reaped, and whatever core it had
-            // already spawned must be stopped — otherwise it keeps running
-            // unsupervised and competes for the controller socket with the
-            // recovery attempt that follows.
-            crate::commands::start::reap_supervisor(&mut supervisor);
-            self.stop_recorded_core().await;
+        let ownership = LaunchOwnership::new(supervisor.id());
+        // Readiness and identity verification share ONE failure path: once
+        // the supervisor has been launched, every failure — a timeout, an
+        // early exit, or a core that answers but cannot be attributed to this
+        // restart — must take the supervisor and the core it spawned back
+        // down. Leaving the new core alive would hold the controller socket
+        // and the mixed port while the caller rolls the config back to A.
+        let outcome = match crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await {
+            Ok(()) => self.verify_replacement_core(authorization, launched_at),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            self.cleanup_failed_launch(&ownership, &mut supervisor).await;
             return Err(error);
         }
-        // Bind this transaction to the replacement's IDENTITY, not to
-        // "something answers on the port": a core started before the
-        // replacement was launched (or one that grabbed the socket in the
-        // meantime) is not what this recovery asked for.
-        self.verify_replacement_core(authorization, launched_at)?;
         // The replacement belongs to the new supervisor; adopt its pid
         // record so the rest of this process sees the running core.
         self.adopt_running_core();
         Ok(())
     }
 
-    /// Stop the core recorded on disk, whoever spawned it, without requiring
-    /// this manager to track it. Used to clean up after a supervisor whose
-    /// readiness window elapsed.
-    async fn stop_recorded_core(&self) {
+    /// Stop everything THIS launch created, and nothing else.
+    ///
+    /// P1 (reviewer): the old cleanup read the SHARED pid record and
+    /// signalled the pid it named. That record is written by whichever
+    /// instance touched it last, so a concurrent launch that overwrote it —
+    /// or a recycled pid — made this transaction kill a process that has
+    /// nothing to do with it. Cleanup is bound to the supervisor handle this
+    /// launch captured: only processes that supervisor forked (read from
+    /// `/proc` BEFORE the supervisor is killed, since killing it reparents
+    /// them) are stopped.
+    async fn cleanup_failed_launch(&self, ownership: &LaunchOwnership, supervisor: &mut std::process::Child) {
+        // Enumerate first: once the supervisor is gone its children are
+        // reparented to init and can no longer be attributed to it.
+        let mut owned = ownership.descendant_pids();
+        crate::commands::start::reap_supervisor(supervisor);
+        // The record is only ever a hint about which pid to look at, never
+        // the proof: the process still has to be one this launch forked.
         let path = pidfile::path_for(&self.socket_path);
-        let Some(record) = pidfile::read_record(&path) else {
-            return;
-        };
-        if !pidfile::is_running(record.pid) {
-            pidfile::remove_if(&path, record.pid);
-            return;
+        if let Some(record) = pidfile::read_record(&path)
+            && owned.contains(&record.pid)
+        {
+            owned.retain(|pid| *pid != record.pid);
+            owned.push(record.pid);
         }
-        if let Err(error) = signal::graceful_stop_by_pid(record.pid).await {
+        if owned.is_empty() {
             tracing::warn!(
                 target: "mihomo",
-                "failed to stop the partially started core {} after a readiness timeout: {error}",
-                record.pid
+                "no process could be attributed to the failed launch (supervisor pid {}); nothing was stopped",
+                ownership.supervisor_pid
             );
-            return;
         }
-        pidfile::remove_if(&path, record.pid);
-        tracing::info!(
-            target: "mihomo",
-            "stopped the partially started core {} left by a timed-out supervisor",
-            record.pid
-        );
+        for pid in owned {
+            match signal::graceful_stop_by_pid(pid).await {
+                Ok(()) => {
+                    pidfile::remove_if(&path, pid);
+                    tracing::info!(
+                        target: "mihomo",
+                        "stopped pid {pid} left behind by the failed launch of supervisor {}",
+                        ownership.supervisor_pid
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "mihomo",
+                        "failed to stop pid {pid} left behind by the failed launch of supervisor {}: {error}",
+                        ownership.supervisor_pid
+                    );
+                }
+            }
+        }
     }
 
     /// Require the core answering the controller to be THIS replacement.
@@ -3450,6 +3544,428 @@ mod tests {
             "proxy_core: mihomo\nunknown: preserved"
         );
     }
+    // ---- F2 / F3: supervisor-launch ownership and cleanup ----------------
+
+    /// A fake sing-box clash_api that always answers, so a launch reaches the
+    /// READY point and the failure under test is the identity check alone.
+    fn answering_controller() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 4096];
+                    if stream.read(&mut buffer).await.is_err() {
+                        return;
+                    }
+                    let body = r#"{"version":"1.19.0"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// The pid file the forking stand-in supervisor writes its child's pid
+    /// into (the seam is a plain fn pointer, so it cannot capture).
+    static STANDIN_CORE_PID_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+    /// A stand-in supervisor that forks a REAL child process standing in for
+    /// the core and records its pid in [`STANDIN_CORE_PID_FILE`]. The child
+    /// is a genuine descendant, so the cleanup path is exercised across the
+    /// process boundary instead of through in-process bookkeeping.
+    fn forking_supervisor(
+        _config_dir: &Path,
+        log: &Path,
+        _mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<std::process::Child> {
+        if let Some(dir) = log.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(log, b"stand-in supervisor\n")?;
+        let core_pid_file = STANDIN_CORE_PID_FILE
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("the stand-in supervisor was launched without a pid file"))?
+            .display()
+            .to_string();
+        Ok(std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("sleep 300 & echo $! > {core_pid_file}; wait"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?)
+    }
+
+    fn wait_for_pid_file(path: &std::path::Path) -> u32 {
+        for _ in 0..200 {
+            if let Ok(body) = std::fs::read_to_string(path)
+                && let Ok(pid) = body.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the stand-in core never reported its pid");
+    }
+
+    /// A receipt for a predecessor that is no longer running: the launch it
+    /// authorizes must bring up a core that is NOT that pid.
+    fn stopped_predecessor_receipt() -> RestartAuthorization {
+        RestartAuthorization {
+            kind: CoreKind::SingBox,
+            pid: 0x00C0_FFEE,
+            exe: Some("/opt/verge-mihomo".to_string()),
+        }
+    }
+
+    /// P1 (reviewer), F2: the core's API answers, but the pidfile write the
+    /// supervisor should have done failed — the identity check then fails.
+    /// The launched supervisor AND the core it forked must both be stopped:
+    /// leaving the new core alive would hold the controller socket and the
+    /// mixed port while the caller rolls the config back to A.
+    #[tokio::test]
+    async fn an_identity_failure_after_a_ready_api_stops_the_launched_core() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+        let root = test_app_home_root();
+        let _home = claim_test_app_home(root.clone()).await;
+        let home = tempfile::tempdir().unwrap();
+        let controller = answering_controller();
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(socket.clone())
+            .with_singbox_controller(controller)
+            .with_core_kind(CoreKind::SingBox)
+            .with_secret("ownership-fixture".to_string());
+        let core_pid_file = home.path().join("core.pid");
+        STANDIN_CORE_PID_FILE.set(core_pid_file.clone()).ok();
+
+        let _launcher = crate::commands::start::install_supervisor_launcher(forking_supervisor).expect("install seam");
+        let error = manager
+            .apply_restart_authorization_with(
+                &stopped_predecessor_receipt(),
+                crate::commands::start::SupervisorLaunch::Regenerate,
+            )
+            .await
+            .expect_err("no pid record means the replacement cannot be attributed");
+        assert!(error.to_string().contains("no live singbox pid record"), "{error}");
+
+        let core = wait_for_pid_file(&core_pid_file);
+        assert!(
+            !pidfile::is_running(core),
+            "the core this launch forked must be stopped, not left holding the ports (pid {core})"
+        );
+        // Nothing of anyone else's was removed: the record was never written.
+        assert!(!pidfile::path_for(&socket).exists());
+    }
+
+    /// P1 (reviewer), F3: the shared pid record names ANOTHER live instance.
+    /// A launch that fails must stop only what it forked — this record, and
+    /// the process it names, belong to somebody else.
+    #[tokio::test]
+    async fn a_failed_launch_leaves_another_instances_core_and_record_alone() {
+        use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
+        let root = test_app_home_root();
+        let _home = claim_test_app_home(root.clone()).await;
+        let home = tempfile::tempdir().unwrap();
+        let controller = answering_controller();
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(socket.clone())
+            .with_singbox_controller(controller)
+            .with_core_kind(CoreKind::SingBox)
+            .with_secret("ownership-fixture".to_string());
+
+        // Somebody else's live core, recorded in the SHARED record.
+        #[allow(clippy::zombie_processes)]
+        let foreign = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let foreign_pid = foreign.id();
+        let record_path = pidfile::path_for(&socket);
+        pidfile::write(
+            &record_path,
+            pidfile::CoreRecord::with_kind_and_exe(
+                foreign_pid,
+                Utc::now(),
+                CoreKind::SingBox,
+                Some("/bin/sleep".into()),
+            ),
+        )
+        .unwrap();
+
+        // The receipt names that instance, so the transaction is allowed to
+        // proceed and replace it — it is the CONCURRENT launch that then
+        // fails, and its cleanup must not reach back into this record.
+        let receipt = RestartAuthorization {
+            kind: CoreKind::SingBox,
+            pid: foreign_pid,
+            exe: Some("/bin/sleep".into()),
+        };
+
+        // A supervisor that stays up but never records a core of its own: the
+        // controller keeps answering (it belongs to the instance above), so
+        // readiness succeeds and the identity check is what fails.
+        fn idle_supervisor(
+            _config_dir: &Path,
+            log: &Path,
+            _mode: crate::commands::start::SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"stand-in supervisor\n")?;
+            Ok(std::process::Command::new("/bin/sleep")
+                .arg("300")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?)
+        }
+        let _launcher = crate::commands::start::install_supervisor_launcher(idle_supervisor).expect("install seam");
+        let error = manager
+            .apply_restart_authorization_with(&receipt, crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .expect_err("the answering core is not the replacement this launch forked");
+        assert!(error.to_string().contains("never started"), "{error}");
+
+        assert!(
+            pidfile::is_running(foreign_pid),
+            "the shared record names another instance's core; cleanup must not signal it"
+        );
+        assert_eq!(
+            pidfile::read_record(&record_path).map(|record| record.pid),
+            Some(foreign_pid),
+            "cleanup must not delete a record it does not own"
+        );
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(foreign_pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+
+    /// P2 (reviewer), F4: the recovery restriction ("the runtime config must
+    /// already exist") leaked into the ORDINARY start/restart path: the
+    /// missing-file branch called the recovery check first, so its
+    /// regeneration line was unreachable and `restart` with a missing
+    /// `singbox.json` just failed. A normal start regenerates (and may
+    /// overwrite); a recovery requires the restored file to be there.
+    #[tokio::test]
+    async fn a_normal_start_regenerates_a_missing_runtime_config_while_a_recovery_requires_one() {
+        use crate::profile_store::store::tests::claim_test_app_home;
+        let home = tempfile::tempdir().unwrap();
+        let _home = claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "proxy_core: singbox\nverge_mixed_port: 39192\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39192\nport: 0\nsocks-port: 0\nsecret: f4-fixture-secret\nexternal-controller: 127.0.0.1:19992\ntun: {enable: false}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rstart\nitems:\n  - {uid: Rstart, type: remote, name: f4, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+        std::fs::write(
+            home.path().join("profiles/base.yaml"),
+            "proxies: []\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().unwrap();
+        let _ = tokio::fs::remove_file(&formal).await;
+        assert!(!formal.exists(), "precondition: the runtime config is missing");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let socket = home.path().join("controller.sock");
+        let normal = MihomoManager::new(config_dir.clone())
+            .with_socket(socket.clone())
+            .with_singbox_controller("127.0.0.1:19992".parse().unwrap())
+            .with_core_kind(CoreKind::SingBox);
+        let path = normal
+            .inner
+            .runtime_config_for_start(&config_dir)
+            .await
+            .expect("a normal start regenerates the missing runtime config");
+        assert!(path.exists(), "the regenerated config must exist");
+        assert_eq!(path, formal);
+        let body = std::fs::read_to_string(&formal).unwrap();
+        assert!(
+            body.contains("clash_api"),
+            "the regenerated config is a real sing-box config"
+        );
+
+        // A recovery start, by contrast, must NOT regenerate: it exists to
+        // serve the file the failed apply restored.
+        let _ = tokio::fs::remove_file(&formal).await;
+        let recovery = normal.clone();
+        recovery.set_use_existing_runtime_config(true);
+        let error = recovery
+            .inner
+            .runtime_config_for_start(&config_dir)
+            .await
+            .expect_err("a recovery has nothing to serve when the file is gone");
+        assert!(
+            error
+                .to_string()
+                .contains("previous configuration could not be recovered"),
+            "{error}"
+        );
+        assert!(
+            !formal.exists(),
+            "a failed recovery must not leave a generated config behind"
+        );
+
+        // With the file restored, the recovery serves it verbatim.
+        std::fs::write(&formal, "{\"marker\":\"restored\"}").unwrap();
+        let served = recovery.inner.runtime_config_for_start(&config_dir).await.unwrap();
+        assert_eq!(served, formal);
+        assert_eq!(
+            std::fs::read_to_string(&formal).unwrap(),
+            "{\"marker\":\"restored\"}",
+            "a recovery must not regenerate over the restored config"
+        );
+    }
+
+    /// P2 (reviewer), F4, REAL chain: the ordinary start path
+    /// (`commands::daemon::run` → `manager.start` → `start_singbox`) comes up
+    /// on a profile whose runtime JSON does not exist yet. Before the fix it
+    /// demanded the file (the recovery restriction had leaked into the
+    /// ordinary start), so a normal start could never create it.
+    ///
+    /// Tagged `#[ignore]` like the repository's other real-core e2e tests
+    /// (it spawns a real binary and binds ports); runs with:
+    /// `cargo test -p clash-verge-cli -- --ignored`.
+    #[tokio::test]
+    #[ignore = "spawns a real sing-box core; run: cargo test -p clash-verge-cli -- --ignored"]
+    async fn a_normal_foreground_start_regenerates_a_missing_runtime_config() {
+        if crate::mihomo_manager::singbox_binary::candidate_without_install().is_none() {
+            eprintln!("skipping: no sing-box binary found");
+            return;
+        }
+        use crate::profile_store::store::tests::claim_test_app_home;
+        let home = tempfile::tempdir().unwrap();
+        let _home = claim_test_app_home(home.path().to_path_buf()).await;
+
+        let controller = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr")
+        };
+        let mixed_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let socket = home.path().join("controller.sock");
+        std::fs::write(
+            home.path().join("config.yaml"),
+            format!(
+                "mixed-port: {mixed_port}\nexternal-controller: {controller}\nexternal-controller-unix: {}\n\
+secret: f4-fixture-secret\ntun: {{enable: false}}\n",
+                socket.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            format!("proxy_core: singbox\nverge_mixed_port: {mixed_port}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rfg4\nitems:\n  - {uid: Rfg4, type: remote, name: f4, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join("profiles")).unwrap();
+        std::fs::write(
+            home.path().join("profiles/base.yaml"),
+            "proxies: []\nrules:\n  - DOMAIN,f4-marker.example,DIRECT\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().unwrap();
+        let _ = std::fs::remove_file(&formal);
+        assert!(!formal.exists(), "precondition: the runtime config is missing");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        // The REAL start path (`commands::daemon::run`'s `manager.start()`),
+        // against a real sing-box binary. The default launch mode is a NORMAL
+        // start (no recovery env var).
+        let manager = MihomoManager::new(config_dir.clone())
+            .with_socket(socket.clone())
+            .with_singbox_controller(controller)
+            .with_core_kind(CoreKind::SingBox);
+        let started = manager.start().await;
+        let record = pidfile::path_for(&socket);
+        if let Some(core) = pidfile::read_record(&record) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(core.pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = std::fs::remove_file(&record);
+        }
+        let _ = manager.stop().await;
+        started.expect("a normal start with a missing runtime config must succeed");
+        assert!(
+            formal.exists(),
+            "a normal start must regenerate the missing runtime config"
+        );
+        assert!(
+            std::fs::read_to_string(&formal).unwrap().contains("f4-marker.example"),
+            "the active profile must be served"
+        );
+
+        // The RESTART path: the runtime JSON is gone again. A normal restart
+        // must regenerate it instead of demanding the file, and must do so
+        // BEFORE the old core is stopped (asserted by the restart
+        // succeeding: the old code stopped the core and then failed).
+        let _ = tokio::fs::remove_file(&formal).await;
+        assert!(!formal.exists(), "precondition: the runtime config is gone again");
+        let restarted = manager.restart().await;
+        if let Some(core) = pidfile::read_record(&record) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(core.pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            let _ = std::fs::remove_file(&record);
+        }
+        let _ = manager.stop().await;
+        restarted.expect("a normal restart must regenerate a missing runtime config");
+        assert!(
+            formal.exists() && std::fs::read_to_string(&formal).unwrap().contains("f4-marker.example"),
+            "the restarted core must serve a regenerated runtime config"
+        );
+        let body = std::fs::read_to_string(&formal).expect("generated config");
+        assert!(body.contains("f4-marker.example"), "the active profile must be served");
+    }
+
     #[tokio::test]
     async fn guided_core_clash_subscription_prepares_nodes_groups_match_dns_before_stop() {
         use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
