@@ -38,10 +38,38 @@ struct MetadataNetwork {
 impl MetadataNetwork {
     fn describe(&self) -> String {
         match &self.proxy {
-            Some(proxy) => format!("via proxy {proxy} from the environment"),
+            Some(proxy) => match sanitize_proxy_endpoint(proxy) {
+                Some(endpoint) => format!("via proxy {endpoint} from the environment"),
+                // A malformed proxy value is still a credential carrier
+                // (`user:pass@` leaks even when the URL does not parse), so it
+                // is never echoed verbatim.
+                None => "via proxy (endpoint redacted: malformed proxy URL) from the environment".to_string(),
+            },
             None => "directly, no proxy environment is set".to_string(),
         }
     }
+}
+
+/// Reduce a proxy URL to `scheme://host[:port]` for diagnostics.
+///
+/// Anything userinfo (`user:pass@`), query, and fragment is dropped: those
+/// carry credentials and must never reach application logs or shareable
+/// diagnostics. Values that do not parse as a URL are reported as `None`
+/// rather than printed raw.
+fn sanitize_proxy_endpoint(proxy: &str) -> Option<String> {
+    let url = url::Url::parse(proxy.trim()).ok()?;
+    let host = url.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    let sanitized = match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    };
+    if sanitized.contains('@') || sanitized.contains('?') || sanitized.contains('#') {
+        return None;
+    }
+    Some(sanitized)
 }
 
 /// Pure environment projection so the policy is testable without touching the
@@ -92,6 +120,16 @@ fn metadata_client_builder(timeout: Duration, connect_timeout: Duration) -> reqw
         .user_agent(format!("clash-verge-cli/{}", env!("CARGO_PKG_VERSION")))
 }
 
+/// Single warn site for a failed metadata request, so the proxy endpoint is
+/// always described through the credential-stripping `describe()`.
+fn warn_metadata_failure(network: &MetadataNetwork, url: &str, detail: &str) {
+    tracing::warn!(
+        target: "subscribe",
+        "release metadata request failed ({url}) {}: {detail}",
+        network.describe()
+    );
+}
+
 /// Shared: query the GitHub releases API for `owner/repo` and return the
 /// `tag_name` stripped of a leading `v`/`V`.
 ///
@@ -112,20 +150,19 @@ pub(crate) async fn fetch_latest_release_tag(owner_repo: &str) -> Option<String>
     {
         Ok(response) => response,
         Err(error) => {
-            tracing::warn!(
-                target: "subscribe",
-                "release metadata request failed ({url}) {}: {error}",
-                network.describe()
-            );
+            warn_metadata_failure(&network, &url, &error.to_string());
             return None;
         }
     };
     if !response.status().is_success() {
-        tracing::warn!(
-            target: "subscribe",
-            "release metadata request failed ({url}) {}: {}",
-            network.describe(),
-            metadata_status_hint(response.status().as_u16())
+        warn_metadata_failure(
+            &network,
+            &url,
+            &format!(
+                "status {} — {}",
+                response.status().as_u16(),
+                metadata_status_hint(response.status().as_u16())
+            ),
         );
         return None;
     }
@@ -415,13 +452,112 @@ mod tests {
             MetadataNetwork { proxy: None }.describe(),
             "directly, no proxy environment is set"
         );
-        assert!(
+        assert_eq!(
             MetadataNetwork {
-                proxy: Some("http://p:1".into())
+                proxy: Some("http://127.0.0.1:7890".into())
             }
-            .describe()
-            .contains("via proxy http://p:1")
+            .describe(),
+            "via proxy http://127.0.0.1:7890 from the environment"
         );
+        assert_eq!(
+            MetadataNetwork {
+                proxy: Some("socks5h://127.0.0.1:1080".into())
+            }
+            .describe(),
+            "via proxy socks5h://127.0.0.1:1080 from the environment"
+        );
+    }
+
+    /// Finding A (#P2): a proxy URL with userinfo (`http://user:pass@host`) must
+    /// never have its credentials written to logs or shareable diagnostics;
+    /// the sanitized scheme/host/port keeps the line useful.
+    #[test]
+    fn metadata_failure_logs_redact_proxy_credentials() {
+        let network = MetadataNetwork {
+            proxy: Some("http://metrics-user:s3cr3t-p4ss@proxy.internal:3128".into()),
+        };
+        let described = network.describe();
+        assert!(!described.contains("metrics-user"), "{described}");
+        assert!(!described.contains("s3cr3t-p4ss"), "{described}");
+        assert!(described.contains("http://proxy.internal:3128"), "{described}");
+        assert!(
+            !described.contains('@') && described.contains("from the environment"),
+            "{described}"
+        );
+
+        // Query / fragment credentials are dropped too.
+        assert_eq!(
+            sanitize_proxy_endpoint("https://token@proxy.example:8443?key=abc#frag").as_deref(),
+            Some("https://proxy.example:8443")
+        );
+        // A malformed proxy value must NOT be echoed raw (it can still carry
+        // `user:pass@`); it is reported as redacted instead.
+        let malformed = MetadataNetwork {
+            proxy: Some("http://user:pa ss@host:not-a-port/x".into()),
+        };
+        let text = malformed.describe();
+        assert!(!text.contains("user"), "{text}");
+        assert!(!text.contains("pa ss"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+        assert_eq!(sanitize_proxy_endpoint("not a url at all"), None);
+        assert_eq!(sanitize_proxy_endpoint(""), None);
+    }
+
+    /// End-to-end regression on the emitted log lines (request-error path and
+    /// HTTP 403 path): captured output stays diagnostic but credential-free.
+    #[test]
+    fn captured_metadata_failure_logs_contain_no_proxy_credentials() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedBuffer {
+            type Writer = SharedBuffer;
+            fn make_writer(&'writer self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .finish();
+
+        let url = "https://api.github.com/repos/MetaCubeX/mihomo/releases/tags/v1.19.32";
+        let network = MetadataNetwork {
+            proxy: Some("socks5://alice:hunter2@10.0.0.9:1080?token=zzz".into()),
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            // request error path
+            warn_metadata_failure(&network, url, "error sending request for url");
+            // HTTP 403 path
+            warn_metadata_failure(
+                &network,
+                url,
+                &format!("status {} — {}", 403, metadata_status_hint(403)),
+            );
+        });
+
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("release metadata request failed"), "{logs}");
+        assert!(logs.contains("status 403"), "{logs}");
+        assert!(logs.contains("rate limit"), "{logs}");
+        assert!(logs.contains("socks5://10.0.0.9:1080"), "{logs}");
+        for secret in ["alice", "hunter2", "token=zzz", "@10.0.0.9"] {
+            assert!(!logs.contains(secret), "credential {secret} leaked: {logs}");
+        }
     }
 
     #[test]
