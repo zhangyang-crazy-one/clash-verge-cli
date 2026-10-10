@@ -251,6 +251,13 @@ impl ManagerInner {
     }
 
     /// Publish the secret that was just resolved/persisted for this spawn.
+    ///
+    /// P1 (reviewer): `start` completes the rotation in the PARENT process
+    /// before it launches the detached supervisor. The manager was built
+    /// from the pre-rotation `config.yaml`, so without this its snapshot
+    /// still carries `set-your-secret` and every controller call is
+    /// rejected — a 15s start timeout on a perfectly healthy sing-box
+    /// (whose clash_api is a TCP transport that enforces the bearer).
     pub fn set_secret_override(&self, secret: String) {
         *self.secret_override.lock() = Some(secret);
     }
@@ -807,12 +814,21 @@ impl SingboxParts {
                 skipped: Vec::new(),
             },
         };
-        let mut route_rules: Vec<serde_json::Value> = profile_routes.rules;
+        let profile_route_values = profile_routes.rules;
         let rule_sets = merge_rule_sets(stored_rule_sets, profile_routes.rule_sets);
-        if let Some(home) = &home {
-            let logical = crate::singbox::load_logical_rules(home).map_err(anyhow::Error::msg)?;
-            route_rules.extend(logical.iter().filter_map(crate::routing::to_singbox_json));
-        }
+        // The editor's interleaved order is authoritative: a logical rule the
+        // user placed above a profile `MATCH` must stay above that catch-all,
+        // or the core would never evaluate it. A sidecar without order
+        // information keeps the historical append-after-profile behaviour.
+        let route_rules = match &home {
+            Some(home) => {
+                let order = crate::singbox::load_rule_order(home).map_err(anyhow::Error::msg)?;
+                crate::singbox::interleave_route_rules(&profile_route_values, &order)
+            }
+            None => {
+                crate::singbox::interleave_route_rules(&profile_route_values, &crate::singbox::RuleOrder::default())
+            }
+        };
         // Rules the conversion could not express are reported, never fatal.
         let route_report = profile_routes.skipped;
         let mut conversion = conversion;
@@ -1011,6 +1027,17 @@ impl MihomoManager {
         self.secret = secret;
         // An explicit assignment supersedes anything the spawn path published.
         self.inner.clear_secret_override();
+    }
+
+    /// Publish a secret resolved before the supervisor was launched.
+    ///
+    /// P1 (reviewer): `start` completes the rotation in the PARENT, which
+    /// built this manager from the pre-rotation `config.yaml`; without the
+    /// override its snapshot still carries `set-your-secret` and every
+    /// controller call is rejected (fatal on sing-box's authenticated TCP
+    /// clash_api).
+    pub fn set_secret_override(&self, secret: String) {
+        self.inner.set_secret_override(secret);
     }
 
     pub fn set_socket_path(&mut self, path: PathBuf) {
@@ -1822,19 +1849,100 @@ stop it where it was started",
     /// detached supervisor. Only a core with no pid record at all — one
     /// somebody else started — is refused.
     pub async fn restart_through_supervisor(&self) -> anyhow::Result<()> {
+        let authorization = self.capture_restart_authorization().await?;
+        let Some(authorization) = authorization else {
+            return self.restart().await.map(|_| ());
+        };
+        self.apply_restart_authorization(&authorization).await
+    }
+
+    /// Validate the restart authorization for THIS manager right now, and
+    /// capture what it was granted for.
+    ///
+    /// `None` means "an owned child" (restarted in place, no record
+    /// involved). `Some(_)` means the core is ours to replace through a
+    /// detached supervisor, and the returned [`RestartAuthorization`] is the
+    /// proof: the running kind, the recorded pid and the recorded
+    /// executable, all checked at this instant.
+    pub async fn capture_restart_authorization(&self) -> anyhow::Result<Option<RestartAuthorization>> {
         let configured = configured_core_kind().await;
         supervisor_restart_policy(self.owns_child(), self.pid(), self.core_kind(), configured)?;
         if self.owns_child() {
-            self.restart().await.map(|_| ())
-        } else {
-            self.stop().await.context("failed to stop the recorded core")?;
-            let log = crate::commands::start::supervisor_log_path(&self.config_dir);
-            let mut supervisor = crate::commands::start::launch_supervisor(&self.config_dir, &log)?;
-            crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await?;
-            // The replacement belongs to the new supervisor; adopt its pid
-            // record so the rest of this process sees the running core.
-            self.adopt_running_core();
-            Ok(())
+            return Ok(None);
+        }
+        let socket = self.socket_path.clone();
+        let record = pidfile::read_record(&pidfile::path_for(&socket));
+        Ok(Some(RestartAuthorization {
+            kind: self.core_kind(),
+            pid: self
+                .pid()
+                .ok_or_else(|| anyhow::anyhow!("the authorized core lost its pid record mid-transaction"))?,
+            exe: record.as_ref().and_then(|record| record.exe.clone()),
+        }))
+    }
+
+    /// Replace the authorized core with a fresh supervisor-launched one.
+    ///
+    /// P1 (reviewer): this is the recovery half of a transaction. The first
+    /// restart attempt stops the adopted core — which clears the manager's
+    /// pid — and then fails to launch; the rollback retry cannot use
+    /// [`Self::restart_through_supervisor`] any more because that re-runs
+    /// the policy, and a core with no pid record is somebody else's. The
+    /// authorization captured at entry is the receipt: it is honoured for
+    /// this call only, so the global "no record → refuse" rule is untouched.
+    pub async fn apply_restart_authorization(&self, authorization: &RestartAuthorization) -> anyhow::Result<()> {
+        if self.owns_child() {
+            return self.restart().await.map(|_| ());
+        }
+        self.authorize_still_ours(authorization)?;
+        // A partially started previous attempt (supervisor alive, core not
+        // yet answering) must be cleared first, or the recovery would leave
+        // two supervisors fighting over one controller socket.
+        self.stop().await.context("failed to stop the recorded core")?;
+        let log = crate::commands::start::supervisor_log_path(&self.config_dir);
+        let mut supervisor = crate::commands::start::launch_supervisor_via(&self.config_dir, &log)?;
+        crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await?;
+        // The replacement belongs to the new supervisor; adopt its pid
+        // record so the rest of this process sees the running core.
+        self.adopt_running_core();
+        Ok(())
+    }
+
+    /// Re-check an authorization against what is on disk right now. A
+    /// foreign core that took the controller socket while the transaction
+    /// was failing is refused — the receipt only covers the core it named.
+    fn authorize_still_ours(&self, authorization: &RestartAuthorization) -> anyhow::Result<()> {
+        let path = pidfile::path_for(&self.socket_path);
+        match pidfile::read_record(&path) {
+            Some(record) if record.kind == authorization.kind => {
+                if record.pid != authorization.pid {
+                    // Only a core with a *different* record may be replaceable
+                    // here: that is our own replacement from an earlier
+                    // attempt in the same transaction.
+                    let same_exe = record.exe == authorization.exe;
+                    if !same_exe {
+                        anyhow::bail!(
+                            "a {} core (pid {}) now holds {}; it is not the core this transaction was \
+authorized to replace — stop it where it was started",
+                            record.kind.as_str(),
+                            record.pid,
+                            self.socket_path.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            // No record at all: the authorized core is gone, which is exactly
+            // the state a failed first attempt leaves behind.
+            None => Ok(()),
+            Some(record) => anyhow::bail!(
+                "a {} core (pid {}) is recorded for {}, not the {} this transaction was authorized \
+to replace; switch the core first",
+                record.kind.as_str(),
+                record.pid,
+                self.socket_path.display(),
+                authorization.kind.as_str(),
+            ),
         }
     }
 
@@ -1946,6 +2054,26 @@ pub(crate) fn rollback_failed_spawn(inner: &ManagerInner, socket_path: &Path, pi
 /// Pure helper: only reads the on-disk record + checks `/proc/<pid>/stat`
 /// liveness; no manager state, no awaits. Unit-testable in isolation by
 /// staging a temporary record and a known-dead pid.
+/// The proof a configuration transaction was granted to replace a core
+/// this process did not spawn.
+///
+/// Captured once, at transaction entry, by
+/// [`MihomoManager::capture_restart_authorization`]; the same transaction
+/// then carries it into the rollback recovery after its first launch failed
+/// and cleared the pid. It is deliberately NOT a way to relax
+/// [`supervisor_restart_policy`]: the policy still refuses any core with no
+/// record at capture time, and this receipt only names the one core the
+/// policy already accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartAuthorization {
+    /// Core kind the running record carried when the authorization was taken.
+    pub kind: CoreKind,
+    /// Pid the manager had adopted.
+    pub pid: u32,
+    /// Executable the record named, when it named one (#54).
+    pub exe: Option<String>,
+}
+
 /// Whether a configuration restart may replace the running core (#55).
 ///
 /// - an owned child is always restartable in place;
@@ -2725,6 +2853,73 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         home
+    }
+
+    /// P1 (reviewer): the recovery receipt only covers the core the policy
+    /// already accepted. A foreign core that took the controller socket
+    /// while the transaction was failing is still refused.
+    #[test]
+    fn a_recovery_authorization_only_covers_the_core_it_named() {
+        let home = private_socket_fixture();
+        let socket = home.path().join("controller.sock");
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_socket(socket.clone());
+        let authorized = RestartAuthorization {
+            kind: CoreKind::Mihomo,
+            pid: 4242,
+            exe: Some("/opt/verge-mihomo".to_string()),
+        };
+        let record_path = pidfile::path_for(&socket);
+
+        // No record: the authorized core is gone (the failed first attempt).
+        assert!(manager.authorize_still_ours(&authorized).is_ok());
+
+        // Our own replacement from an earlier attempt in this transaction.
+        pidfile::write(
+            &record_path,
+            pidfile::CoreRecord::with_kind_and_exe(
+                5151,
+                Utc::now(),
+                CoreKind::Mihomo,
+                Some("/opt/verge-mihomo".to_string()),
+            ),
+        )
+        .unwrap();
+        assert!(manager.authorize_still_ours(&authorized).is_ok());
+
+        // A different executable under a different pid is somebody else's.
+        pidfile::write(
+            &record_path,
+            pidfile::CoreRecord::with_kind_and_exe(
+                6161,
+                Utc::now(),
+                CoreKind::Mihomo,
+                Some("/usr/bin/other".to_string()),
+            ),
+        )
+        .unwrap();
+        assert!(
+            manager.authorize_still_ours(&authorized).is_err(),
+            "a foreign core must not be replaceable through an old receipt"
+        );
+
+        // A different KIND is a core switch, never a recovery.
+        pidfile::write(
+            &record_path,
+            pidfile::CoreRecord::with_kind_and_exe(
+                5151,
+                Utc::now(),
+                CoreKind::SingBox,
+                Some("/opt/verge-mihomo".to_string()),
+            ),
+        )
+        .unwrap();
+        assert!(manager.authorize_still_ours(&authorized).is_err());
+
+        // And the global policy still refuses a core with no record at all.
+        assert!(
+            supervisor_restart_policy(false, None, CoreKind::Mihomo, CoreKind::Mihomo).is_err(),
+            "the no-pid foreign-core refusal must stay in place"
+        );
     }
 
     #[test]
@@ -4863,5 +5058,73 @@ mod alignment_regressions {
             serde_json::Value::from(generated_secret.as_str())
         );
         assert_eq!(manager.effective_secret(), generated_secret);
+    }
+
+    /// Review regression: the TUI rules editor lets a logical (AND/OR) rule be
+    /// moved above the profile `MATCH`. Persisting it must keep it above the
+    /// catch-all in the generated config — appended after the whole profile
+    /// rule list the logical rule was dead code, so a request matching it was
+    /// never blocked.
+    #[tokio::test]
+    async fn a_logical_rule_ordered_before_the_profile_match_still_precedes_the_catch_all() {
+        use crate::routing::{IRouteRule, LogicOp, MatchField, RuleTarget};
+        use crate::singbox::{RuleOrder, RuleOrderEntry};
+
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: fixture\n",
+        )
+        .unwrap();
+
+        // What the editor persists for the buffer
+        // `OR(domain=blocked.example) -> block`, `MATCH -> DIRECT`.
+        let block = IRouteRule::Logical {
+            op: LogicOp::Or,
+            rules: vec![IRouteRule::Simple {
+                matches: vec![MatchField::Domain("blocked.example".into())],
+                target: RuleTarget::Direct,
+            }],
+            target: RuleTarget::Block,
+        };
+        crate::singbox::save_rule_order(
+            home.path(),
+            &RuleOrder {
+                logical: vec![block],
+                entries: vec![RuleOrderEntry::Logical(0), RuleOrderEntry::Profile(0)],
+            },
+        )
+        .unwrap();
+
+        let yaml = "proxies: []\nrules:\n  - MATCH,DIRECT\n";
+        let generated = home.path().join("candidate.json");
+        ManagerInner::write_singbox_assembled_to(home.path(), Some(yaml), false, &generated)
+            .await
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&generated).unwrap()).unwrap();
+        let rules = config["route"]["rules"].as_array().expect("route rules");
+        let logical_at = rules
+            .iter()
+            .position(|rule| rule["outbound"] == "block")
+            .expect("the ordered logical rule must be emitted");
+        let catch_all_at = rules
+            .iter()
+            .position(|rule| {
+                rule.as_object()
+                    .is_some_and(|rule| rule.len() == 1 && rule.contains_key("outbound"))
+            })
+            .expect("the profile MATCH catch-all must be emitted");
+        assert!(
+            logical_at < catch_all_at,
+            "logical rule landed after the catch-all: {rules:?}"
+        );
+        assert_eq!(rules[logical_at]["type"], serde_json::json!("logical"));
+        assert_eq!(rules[logical_at]["mode"], serde_json::json!("or"));
+        assert_eq!(
+            rules[logical_at]["rules"][0]["domain"],
+            serde_json::json!(["blocked.example"])
+        );
     }
 }
