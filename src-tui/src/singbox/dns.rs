@@ -134,6 +134,12 @@ pub struct DnsConfigSpec {
     /// and as `route.default_domain_resolver` for outbound name resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_resolver: Option<String>,
+    /// The server unmatched queries are sent to (`dns.final`). Without it
+    /// sing-box uses `servers[0]`, which during a profile conversion is the
+    /// plaintext `default-nameserver` bootstrap — that would silently
+    /// downgrade every normal lookup to cleartext DNS. Never a fake-IP pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_server: Option<String>,
 }
 
 const DEFAULT_FAKEIP_V4: &str = "198.18.0.0/15";
@@ -193,6 +199,32 @@ impl DnsConfigSpec {
             if server.kind == DnsServerKind::Fakeip {
                 return Err("a fake-IP server cannot be a DNS bootstrap resolver".into());
             }
+        }
+        if let Some(final_server) = &self.final_server {
+            let server = self
+                .servers
+                .iter()
+                .find(|server| &server.tag == final_server)
+                .ok_or_else(|| {
+                    // sing-box 1.14.2 accepts this at `check` and only fails
+                    // at startup ("default DNS server not found"), so the
+                    // core would die on a config we generated.
+                    format!("dns.final references unknown DNS server {final_server:?}")
+                })?;
+            if server.kind == DnsServerKind::Fakeip {
+                return Err("a fake-IP server cannot be the default DNS server (dns.final)".into());
+            }
+        } else if self
+            .servers
+            .first()
+            .is_some_and(|server| server.kind == DnsServerKind::Fakeip)
+        {
+            // Without `final`, sing-box defaults to servers[0] and refuses a
+            // fake-IP pool there ("default server cannot be fakeip").
+            return Err(format!(
+                "dns server {:?}: a fake-IP pool needs `final` to point at a real upstream",
+                self.servers[0].tag
+            ));
         }
         for rule in &self.rules {
             if rule.is_empty() {
@@ -343,6 +375,12 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
 
     let mut spec = DnsConfigSpec::default();
     let mut tags = std::collections::HashMap::<String, String>::new();
+    // Tags registered from `default-nameserver`. They exist only to resolve
+    // the *hostnames* of the encrypted upstreams, so they must never become
+    // the default query path (see `final_server` below).
+    let mut bootstrap_tags: Vec<String> = Vec::new();
+    // Tags registered from the profile's `nameserver` list, in order.
+    let mut upstream_tags: Vec<String> = Vec::new();
 
     // `default-nameserver` is the bootstrap that resolves the *hostnames* of
     // the encrypted upstreams (doh.pub, dns.alidns.com, …). Without it the
@@ -351,7 +389,9 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
     if let Some(defaults) = get("default-nameserver").filter(|value| !value.is_null()) {
         let entries = as_string_list(defaults, "default-nameserver")?;
         for entry in &entries {
-            add_bootstrap_server(entry, &mut spec, &mut tags, &mut report);
+            if let Some(tag) = add_bootstrap_server(entry, &mut spec, &mut tags, &mut report) {
+                bootstrap_tags.push(tag);
+            }
         }
         add_system_bootstrap(&entries, &mut spec, &mut report);
         report.note(
@@ -366,7 +406,9 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
 
     if let Some(nameservers) = get("nameserver").filter(|value| !value.is_null()) {
         for endpoint in as_string_list(nameservers, "nameserver")? {
-            add_clash_dns_endpoint(&endpoint, &mut spec, &mut tags, &mut report);
+            if let Some(tag) = add_clash_dns_endpoint(&endpoint, &mut spec, &mut tags, &mut report) {
+                upstream_tags.push(tag);
+            }
         }
     }
     if let Some(policy) = get("nameserver-policy").filter(|value| !value.is_null()) {
@@ -385,6 +427,15 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                 );
                 continue;
             };
+            // A policy with no server (or only dropped servers) simply does
+            // not apply; indexing the list here used to panic.
+            let Some(first) = entries.first() else {
+                report.note(
+                    format!("nameserver-policy.{pattern}"),
+                    "the server list is empty, so the policy is not applied",
+                );
+                continue;
+            };
             if entries.len() > 1 {
                 report.note(
                     format!("nameserver-policy.{pattern}"),
@@ -395,7 +446,7 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                     ),
                 );
             }
-            let Some(tag) = add_clash_dns_endpoint(&entries[0], &mut spec, &mut tags, &mut report) else {
+            let Some(tag) = add_clash_dns_endpoint(first, &mut spec, &mut tags, &mut report) else {
                 report.note(
                     format!("nameserver-policy.{pattern}"),
                     "every listed server was dropped, so the policy is not applied",
@@ -474,32 +525,9 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
         ),
     }
 
-    // A fake-IP pool may not be sing-box's default server, so the profile
-    // needs at least one real upstream before it.
-    if spec
-        .servers
-        .first()
-        .is_some_and(|server| server.kind == DnsServerKind::Fakeip)
-    {
-        spec.servers.insert(
-            0,
-            DnsServerSpec {
-                tag: SYSTEM_SERVER_TAG.into(),
-                kind: DnsServerKind::Local,
-                server: None,
-                server_port: None,
-                path: None,
-                detour: None,
-                tls_insecure: None,
-                inet4_range: None,
-                inet6_range: None,
-            },
-        );
-        report.note(
-            "nameserver",
-            "the profile lists no upstream resolver, so the system resolver is used as sing-box's default server",
-        );
-    }
+    // Whether the profile asked for any DNS policy at all — a block that is
+    // dropped because nothing survived still has to be reported.
+    let requested_servers = spec.servers.len();
 
     // `default-nameserver` wins; otherwise fall back to the first
     // IP-literal plain-DNS upstream so hostname-addressed servers
@@ -527,6 +555,60 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
             });
             spec.rules
                 .retain(|rule| spec.servers.iter().any(|server| server.tag == rule.server));
+        }
+    }
+
+    // The default query path is the profile's own upstream, never the
+    // plaintext bootstrap: sing-box would otherwise default to `servers[0]`
+    // and quietly downgrade every unmatched lookup to cleartext DNS.
+    upstream_tags.retain(|tag| spec.servers.iter().any(|server| &server.tag == tag));
+    let final_server = upstream_tags
+        .iter()
+        .find(|tag| {
+            spec.servers
+                .iter()
+                .any(|server| &server.tag == *tag && server.kind.is_remote())
+        })
+        .or_else(|| {
+            upstream_tags.iter().find(|tag| {
+                spec.servers
+                    .iter()
+                    .any(|server| &server.tag == *tag && server.kind != DnsServerKind::Fakeip)
+            })
+        })
+        .cloned();
+    match &final_server {
+        Some(tag) => spec.final_server = Some(tag.clone()),
+        None => {
+            // Fail visible, not silently wrong: with no usable upstream the
+            // only way to reach it as `final` would be the bootstrap
+            // (`system://` in `default-nameserver` counts as a bootstrap
+            // here), which is exactly the plaintext downgrade we refuse.
+            // Emitting nothing keeps the caller's sidecar/default resolver,
+            // so the profile's DNS block is dropped with a note instead.
+            if requested_servers > 0 || !spec.rules.is_empty() {
+                let described = spec
+                    .servers
+                    .iter()
+                    .map(|server| {
+                        if bootstrap_tags.contains(&server.tag) {
+                            format!("{} (bootstrap from default-nameserver)", server.kind.as_str())
+                        } else {
+                            format!("{} ({})", server.kind.as_str(), server.tag)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.note(
+                    "nameserver",
+                    format!(
+                        "no usable upstream resolver is left, so the profile's DNS block is dropped \
+                         (available: {described}); the stored/default resolver is used instead \
+                         rather than routing normal queries through the plaintext bootstrap"
+                    ),
+                );
+            }
+            return Ok(report);
         }
     }
 
@@ -558,16 +640,17 @@ fn first_ip_literal_server(spec: &DnsConfigSpec) -> Option<String> {
         .map(|server| server.tag.clone())
 }
 
-/// Register one `default-nameserver` entry as a plain-UDP bootstrap server.
+/// Register one `default-nameserver` entry as a plain-UDP bootstrap server,
+/// returning its tag. Bootstrap servers only resolve upstream hostnames.
 fn add_bootstrap_server(
     entry: &str,
     spec: &mut DnsConfigSpec,
     tags: &mut std::collections::HashMap<String, String>,
     report: &mut DnsConversionReport,
-) {
+) -> Option<String> {
     let entry = entry.trim();
     if entry.is_empty() || matches!(entry, "system" | "system://") {
-        return;
+        return None;
     }
     let (address, port) = split_host_port(entry);
     if !looks_like_ip(&address) {
@@ -575,7 +658,7 @@ fn add_bootstrap_server(
             "default-nameserver",
             format!("{entry:?} is not an IP literal and is dropped from the bootstrap list"),
         );
-        return;
+        return None;
     }
     let tag = register_server(
         spec,
@@ -593,11 +676,11 @@ fn add_bootstrap_server(
         },
     );
     // The first IP-literal entry wins; a `system` entry is only used when the
-    // profile offers nothing else, so sing-box's default server stays a real
-    // upstream rather than the host resolver.
+    // profile offers nothing else, so the bootstrap stays a real upstream.
     if spec.domain_resolver.is_none() {
-        spec.domain_resolver = Some(tag);
+        spec.domain_resolver = Some(tag.clone());
     }
+    Some(tag)
 }
 
 /// Clash's `system` bootstrap, used only when no IP-literal resolver exists.
@@ -973,6 +1056,11 @@ pub fn build_dns_section(spec: &DnsConfigSpec) -> Result<Option<Value>, String> 
     if !rules.is_empty() {
         section["rules"] = Value::Array(rules);
     }
+    if let Some(final_server) = &spec.final_server {
+        // Explicit default query path: without it the core would use
+        // `servers[0]`, i.e. the plaintext bootstrap.
+        section["final"] = json!(final_server);
+    }
     Ok(Some(section))
 }
 
@@ -1160,6 +1248,7 @@ dns:
                 ip_cidr: vec!["10.0.0.0/8".into()],
             }],
             domain_resolver: Some("dns-local".into()),
+            final_server: Some("dns-remote".into()),
         }
     }
 
@@ -1217,6 +1306,7 @@ dns:
             }],
             rules: Vec::new(),
             domain_resolver: Some("dns-fakeip".into()),
+            final_server: None,
         };
 
         assert!(spec.validate().unwrap_err().contains("fake-IP server"));
@@ -1350,6 +1440,203 @@ dns:
     }
 
     #[test]
+    fn normal_queries_go_to_the_profile_nameserver_and_never_the_bootstrap() {
+        // Review finding #1: sing-box defaults `final` to servers[0], which is
+        // the plaintext bootstrap during a conversion — that silently routed
+        // every unmatched lookup to cleartext DNS.
+        let yaml = "dns:\n  default-nameserver: [180.76.76.76]\n  nameserver:\n    - https://doh.pub/dns-query\n    - 1.1.1.1\n";
+        let report = dns_conversion_from_clash_yaml(yaml).expect("converted");
+        let spec = report.spec.expect("spec");
+        let bootstrap = spec.domain_resolver.clone().expect("bootstrap");
+        assert_eq!(
+            spec.servers[0].kind,
+            DnsServerKind::Udp,
+            "the bootstrap is registered first, which is exactly why `final` must be explicit"
+        );
+        assert_eq!(spec.servers[0].tag, bootstrap);
+        assert_ne!(
+            spec.final_server.as_deref(),
+            Some(bootstrap.as_str()),
+            "a plaintext bootstrap must never become the default query path"
+        );
+        let final_server = spec
+            .servers
+            .iter()
+            .find(|s| &s.tag == spec.final_server.as_ref().unwrap())
+            .expect("final");
+        assert_eq!(final_server.kind, DnsServerKind::Https);
+        assert_eq!(final_server.server.as_deref(), Some("doh.pub"));
+
+        let section = build_dns_section(&spec).unwrap().unwrap();
+        assert_eq!(section["final"], final_server.tag.as_str());
+        assert_eq!(
+            section["servers"][0]["domain_resolver"],
+            json!(null),
+            "bootstrap is IP-literal"
+        );
+        let doh = &section["servers"][1];
+        assert_eq!(doh["server"], "doh.pub");
+        assert_eq!(
+            doh["domain_resolver"], bootstrap,
+            "the DoH hostname is still bootstrapped through the plaintext resolver"
+        );
+    }
+
+    #[test]
+    fn final_follows_the_first_usable_upstream_including_local_resolvers() {
+        // `tcp://` is dropped, so the first *surviving* upstream is the plain
+        // UDP entry; a `system://` upstream may be the final when it is all
+        // the profile has.
+        let spec = spec_from_clash_yaml("dns:\n  nameserver: ['tcp://1.1.1.1', 8.8.8.8, system://]\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.final_server.as_deref(), Some(spec.servers[0].tag.as_str()));
+        assert_eq!(spec.servers[0].server.as_deref(), Some("8.8.8.8"));
+
+        let local_only =
+            spec_from_clash_yaml("dns:\n  default-nameserver: [180.76.76.76]\n  nameserver: [system://]\n")
+                .unwrap()
+                .unwrap();
+        let final_server = local_only
+            .servers
+            .iter()
+            .find(|s| Some(&s.tag) == local_only.final_server.as_ref())
+            .expect("final");
+        assert_eq!(final_server.kind, DnsServerKind::Local);
+    }
+
+    #[test]
+    fn nameserver_policy_server_never_becomes_the_default_query_path() {
+        let spec = spec_from_clash_yaml(
+            "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver: [9.9.9.9]\n  nameserver-policy:\n    +.policy.example: 1.1.1.1\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spec.final_server.as_deref(),
+            spec.servers
+                .iter()
+                .find(|s| s.server.as_deref() == Some("9.9.9.9"))
+                .map(|s| s.tag.as_str()),
+            "`nameserver-policy` targets are not defaults"
+        );
+        assert!(spec.servers.iter().any(|s| s.server.as_deref() == Some("1.1.1.1")));
+    }
+
+    #[test]
+    fn profile_without_a_usable_upstream_drops_the_dns_block_with_a_note() {
+        // Fail visible: a bootstrap must not silently inherit the default
+        // query path, and a config whose only DNS content is a bootstrap would
+        // ship cleartext lookups the profile never asked for.
+        for (yaml, expected) in [
+            (
+                "dns:\n  enable: true\n  default-nameserver: [180.76.76.76]\n",
+                "no usable upstream resolver is left",
+            ),
+            (
+                "dns:\n  enable: true\n  default-nameserver: [180.76.76.76]\n  nameserver: ['tcp://1.1.1.1']\n",
+                "no usable upstream resolver is left",
+            ),
+            (
+                "dns:\n  enable: true\n  nameserver-policy:\n    +.example.com: 1.1.1.1\n",
+                "no usable upstream resolver is left",
+            ),
+        ] {
+            let report = dns_conversion_from_clash_yaml(yaml).expect("degraded");
+            assert_eq!(report.spec, None, "{yaml} must not ship a DNS section");
+            assert!(
+                report.notes.iter().any(|note| note.contains(expected)),
+                "{yaml}: {:?}",
+                report.notes
+            );
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("stored/default resolver is used instead")),
+                "{yaml}: {:?}",
+                report.notes
+            );
+        }
+        // The bootstrap is named in the note so the loss is traceable.
+        let report = dns_conversion_from_clash_yaml("dns:\n  default-nameserver: [180.76.76.76]\n").expect("degraded");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("bootstrap from default-nameserver")),
+            "{:?}",
+            report.notes
+        );
+        // An empty DNS block has nothing to report and changes nothing.
+        let empty = dns_conversion_from_clash_yaml("dns:\n  enable: true\n").expect("empty");
+        assert_eq!(empty.spec, None);
+        assert!(empty.notes.is_empty(), "{:?}", empty.notes);
+    }
+
+    #[test]
+    fn final_server_is_validated_before_generation() {
+        let mut spec = sample_spec();
+        // Unknown tag: sing-box 1.14.2 only fails at startup, so we refuse to
+        // write it at all.
+        spec.final_server = Some("ghost".into());
+        let error = spec.validate().expect_err("unknown final");
+        assert!(error.contains("dns.final"), "{error}");
+        assert!(build_dns_section(&spec).is_err());
+
+        // A fake-IP pool can never be the default server.
+        let mut spec = sample_spec();
+        spec.final_server = Some("dns-fakeip".into());
+        assert!(spec.validate().expect_err("fakeip final").contains("dns.final"));
+
+        // Without `final`, a fake-IP pool at index 0 would be the default and
+        // the core would refuse the config ("default server cannot be fakeip").
+        let mut spec = sample_spec();
+        spec.servers.swap(0, 2);
+        spec.final_server = None;
+        assert!(spec.validate().expect_err("fakeip default").contains("`final`"));
+
+        // Old sidecars without `final` keep working.
+        let mut spec = sample_spec();
+        spec.final_server = None;
+        spec.validate().expect("legacy spec");
+        assert!(build_dns_section(&spec).unwrap().unwrap().get("final").is_none());
+    }
+
+    #[test]
+    fn empty_nameserver_policy_list_is_reported_instead_of_panicking() {
+        // Review finding #2: `entries[0]` panicked on an empty list.
+        let report = dns_conversion_from_clash_yaml(
+            "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver: [9.9.9.9]\n  nameserver-policy:\n    +.empty.example: []\n    '+.other.example': ''\n",
+        )
+        .expect("degraded");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("dns.nameserver-policy.+.empty.example:") && note.contains("empty")),
+            "{:?}",
+            report.notes
+        );
+        let spec = report.spec.expect("spec");
+        assert!(
+            spec.rules.is_empty(),
+            "an empty policy must not produce a rule: {:?}",
+            spec.rules
+        );
+        assert_eq!(
+            spec.final_server.as_deref(),
+            spec.servers
+                .iter()
+                .find(|s| s.server.as_deref() == Some("9.9.9.9"))
+                .map(|s| s.tag.as_str()),
+            "an empty policy does not disturb the default query path"
+        );
+        let section = build_dns_section(&spec).unwrap().unwrap();
+        assert!(section.get("rules").is_none(), "{section}");
+    }
+
+    #[test]
     fn h3_query_fragment_selects_the_h3_transport() {
         let spec = spec_from_clash_yaml(
             "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver: ['https://223.6.6.6/dns-query#skip-cert-verify=true&h3=true']\n",
@@ -1436,7 +1723,7 @@ dns:
     #[test]
     fn nameserver_policy_keeps_the_first_server_and_reports_the_rest() {
         let report = dns_conversion_from_clash_yaml(
-            "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver-policy:\n    +.example.com: ['https://1.1.1.1/dns-query', 'https://2.2.2.2/dns-query']\n",
+            "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver: [https://9.9.9.9/dns-query]\n  nameserver-policy:\n    +.example.com: ['https://1.1.1.1/dns-query', 'https://2.2.2.2/dns-query']\n",
         )
         .expect("policy");
         assert!(
@@ -1459,8 +1746,9 @@ dns:
             ("domain:example.com", "exact-domain"),
             ("geosite:cn", "geosite"),
         ] {
-            let yaml =
-                format!("dns:\n  default-nameserver: [223.5.5.5]\n  nameserver-policy:\n    {pattern}: 1.1.1.1\n");
+            let yaml = format!(
+                "dns:\n  default-nameserver: [223.5.5.5]\n  nameserver: [https://9.9.9.9/dns-query]\n  nameserver-policy:\n    {pattern}: 1.1.1.1\n"
+            );
             let report = dns_conversion_from_clash_yaml(&yaml).expect("degraded");
             assert!(
                 report
@@ -1493,6 +1781,9 @@ dns:
 
     #[test]
     fn hostname_upstreams_without_any_bootstrap_are_dropped_with_a_note() {
+        // doh.pub cannot be resolved (no IP-literal bootstrap), so it is
+        // dropped — and with it the last upstream, so the whole DNS block
+        // goes away instead of shipping a config that cannot resolve anything.
         let report =
             dns_conversion_from_clash_yaml("dns:\n  nameserver: [https://doh.pub/dns-query]\n").expect("degraded");
         assert!(
@@ -1503,9 +1794,15 @@ dns:
             "{:?}",
             report.notes
         );
-        let spec = report.spec.expect("spec");
-        assert!(spec.servers.is_empty(), "{:?}", spec.servers);
-        assert_eq!(spec.domain_resolver, None);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("no usable upstream resolver")),
+            "{:?}",
+            report.notes
+        );
+        assert_eq!(report.spec, None, "the DNS block is dropped, not shipped broken");
     }
 
     #[test]
@@ -1543,16 +1840,29 @@ dns:
     }
 
     #[test]
-    fn fake_ip_without_any_upstream_still_generates_a_startable_spec() {
-        // sing-box refuses `default server cannot be fakeip`.
-        let spec = spec_from_clash_yaml("dns:\n  enable: true\n  enhanced-mode: fake-ip\n")
+    fn fake_ip_without_any_upstream_drops_the_block_instead_of_defaulting_to_bootstrap() {
+        // A fake-IP pool may never be the default server, and without an
+        // upstream there is nothing else to point `final` at.
+        let report =
+            dns_conversion_from_clash_yaml("dns:\n  enable: true\n  enhanced-mode: fake-ip\n").expect("dropped");
+        assert_eq!(report.spec, None);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("no usable upstream resolver")),
+            "{:?}",
+            report.notes
+        );
+        // With an upstream it is generated again, and `final` keeps the pool
+        // off the default path.
+        let spec = spec_from_clash_yaml("dns:\n  enhanced-mode: fake-ip\n  nameserver: [1.1.1.1]\n")
             .unwrap()
             .unwrap();
-        assert_eq!(spec.servers[0].kind, DnsServerKind::Local);
         assert_eq!(spec.servers[1].kind, DnsServerKind::Fakeip);
+        assert_eq!(spec.final_server.as_deref(), Some(spec.servers[0].tag.as_str()));
         let section = build_dns_section(&spec).unwrap().unwrap();
-        assert_eq!(section["servers"][0]["type"], "local");
-        assert_eq!(section["servers"][1]["type"], "fakeip");
+        assert_eq!(section["final"], spec.servers[0].tag.as_str());
     }
 
     #[test]

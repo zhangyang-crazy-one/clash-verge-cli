@@ -359,6 +359,7 @@ mod storage_tests {
             }],
             rules: Vec::new(),
             domain_resolver: None,
+            final_server: None,
         };
         save_dns_spec(&home, &spec).expect("save");
         assert_eq!(load_dns_spec(&home).unwrap(), spec);
