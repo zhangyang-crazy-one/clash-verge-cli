@@ -38,30 +38,37 @@ pub const LOGICAL_RULES_FILE: &str = "singbox-rules.json";
 const RULE_ORDER_VERSION: u64 = 1;
 
 /// One slot of the persisted interleaved rule order: either the clash rule
-/// at `index` of the profile YAML's `rules` list, or the logical rule at
-/// `index` of [`RuleOrder::logical`].
+/// at `index` of the COMPOSED profile rule list (the profile's `rules:` after
+/// the Rules/Merge/Script chain), or the logical rule at `index` of
+/// [`RuleOrder::logical`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuleOrderEntry {
     Profile(usize),
     Logical(usize),
 }
 
-/// Cheap identity of the profile rule list an order was saved against.
+/// Identity of the rule list an order was saved against.
 ///
-/// The order's `Profile(i)` entries are indices into the profile YAML's
-/// `rules:` list, so they only mean anything while that list is the one the
-/// user actually arranged. A subscription refresh replaces the list under
-/// the sidecar: the indices stay perfectly in range and every one of them
-/// now points at a different rule, which silently reorders the generated
-/// config. Storing the rule count plus a hash of the rule descriptors turns
-/// that into a detectable identity change instead of a silent one.
+/// The order's `Profile(i)` entries are indices into the COMPOSED profile
+/// rule list — the one the generator interleaves into the sing-box config —
+/// so they only mean anything while that list is the one the user actually
+/// arranged. A subscription refresh replaces the list under the sidecar: the
+/// indices stay perfectly in range and every one of them now points at a
+/// different rule, which silently reorders the generated config. Storing the
+/// rule count plus a hash of the rule descriptors turns that into a
+/// detectable identity change instead of a silent one.
+///
+/// Both the editor's save and generation must fingerprint THIS list (see
+/// [`crate::runtime_config::composed_profile_rules`]); fingerprinting the raw
+/// profile file instead makes every save look like drift as soon as the
+/// profile has a prepend fragment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProfileFingerprint {
     pub count: usize,
     pub hash: u64,
 }
 
-/// Fingerprint of the profile rules a saved order refers to.
+/// Fingerprint of the composed profile rules a saved order refers to.
 ///
 /// FNV-1a over [`crate::routing::describe`] rather than
 /// `DefaultHasher`, whose keys are an implementation detail: this value is
@@ -98,8 +105,8 @@ pub fn profile_rule_fingerprint(rules: &[crate::routing::IRouteRule]) -> Profile
 pub struct RuleOrder {
     pub logical: Vec<crate::routing::IRouteRule>,
     pub entries: Vec<RuleOrderEntry>,
-    /// Identity of the profile rule list `entries` was recorded against.
-    /// `None` on a sidecar written before drift detection existed.
+    /// Identity of the COMPOSED profile rule list `entries` was recorded
+    /// against. `None` on a sidecar written before drift detection existed.
     pub profile: Option<ProfileFingerprint>,
 }
 

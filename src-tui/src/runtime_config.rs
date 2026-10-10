@@ -509,7 +509,60 @@ pub async fn load_remote_profile_with_rules(
     crate::enhance::apply_verge_ports(&mut app_config).await;
     let verge = clash_verge_core::config::IVerge::new().await;
     app_config = crate::enhance::use_tun(app_config, verge.enable_tun_mode.unwrap_or(false));
-    compose_profile_with_controls(item, &profiles_dir, &all_items, Some(&app_config)).await
+    compose_profile_with_controls(item, &profiles_dir, &all_items, Some(&app_config), None).await
+}
+
+/// The rule list the core actually evaluates: the profile's `rules:` AFTER
+/// the Rules/Merge/Script chain has been applied.
+///
+/// This is THE canonical rule identity. A rule order's `Profile(i)` entries
+/// are indices into this list (the generator interleaves the composed rules),
+/// so the fingerprint recorded next to them must be this list's fingerprint
+/// too. Fingerprinting the raw profile file instead made every save look like
+/// a subscription drift as soon as the profile had a prepend fragment, and
+/// the saved interleaving was demoted to append-after.
+pub async fn composed_profile_rules(
+    item: &clash_verge_core::config::PrfItem,
+) -> Result<Vec<crate::routing::IRouteRule>, String> {
+    let yaml = load_profile_yaml(item).await?;
+    crate::routing::load_profile_rules(&yaml)
+}
+
+/// Compose `item` with `file_rules` substituted for the profile file's
+/// `rules:` list and return the composed list — what a write of
+/// `file_rules` to the profile would produce once the chain runs.
+///
+/// The rules editor uses it to prove a save before it touches the profile:
+/// the chain re-applies its own contribution on top of whatever the file
+/// holds, so writing the composed list back verbatim would duplicate every
+/// fragment rule.
+pub async fn compose_profile_rules(
+    item: &clash_verge_core::config::PrfItem,
+    file_rules: &[crate::routing::IRouteRule],
+) -> Result<Vec<crate::routing::IRouteRule>, String> {
+    let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir().map_err(|error| error.to_string())?;
+    let all_items = crate::profile_store::store::ProfileStore::snapshot()
+        .await
+        .map_err(|error| error.to_string())?
+        .all_items();
+    let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    crate::enhance::apply_verge_ports(&mut app_config).await;
+    let verge = clash_verge_core::config::IVerge::new().await;
+    app_config = crate::enhance::use_tun(app_config, verge.enable_tun_mode.unwrap_or(false));
+    let substituted: Vec<serde_yaml_ng::Value> = file_rules
+        .iter()
+        .map(|rule| {
+            let raw = match rule {
+                crate::routing::IRouteRule::Raw { clash_raw, .. } => clash_raw.clone(),
+                other => crate::routing::to_clash_rule_str(other),
+            };
+            serde_yaml_ng::Value::String(raw)
+        })
+        .collect();
+    let mapping =
+        compose_profile_with_controls(item, &profiles_dir, &all_items, Some(&app_config), Some(substituted)).await?;
+    let yaml = serde_yaml_ng::to_string(&mapping).map_err(|error| error.to_string())?;
+    crate::routing::load_profile_rules(&yaml)
 }
 
 /// Compose the runtime mapping for a remote profile: the upstream profile
@@ -524,14 +577,18 @@ async fn compose_remote_profile(
     profiles_dir: &std::path::Path,
     all_items: &[clash_verge_core::config::PrfItem],
 ) -> Result<serde_yaml_ng::Mapping, String> {
-    compose_profile_with_controls(item, profiles_dir, all_items, None).await
+    compose_profile_with_controls(item, profiles_dir, all_items, None, None).await
 }
 
+/// `rules_override` replaces the profile's `rules:` list BEFORE the chain
+/// runs, i.e. exactly as if the profile file had been rewritten with those
+/// rules and re-read.
 async fn compose_profile_with_controls(
     item: &clash_verge_core::config::PrfItem,
     profiles_dir: &std::path::Path,
     all_items: &[clash_verge_core::config::PrfItem],
     app_controls: Option<&serde_yaml_ng::Mapping>,
+    rules_override: Option<Vec<serde_yaml_ng::Value>>,
 ) -> Result<serde_yaml_ng::Mapping, String> {
     let file = item
         .file
@@ -547,6 +604,9 @@ async fn compose_profile_with_controls(
         .map_err(|error| format!("failed to read {}: {error}", profile_path.display()))?;
     let mut profile: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(&raw)
         .map_err(|error| format!("invalid YAML in {}: {error}", profile_path.display()))?;
+    if let Some(rules) = rules_override {
+        profile.insert("rules".into(), serde_yaml_ng::Value::Sequence(rules));
+    }
 
     let option = item.option.as_ref();
     let profile_name = item.name.as_deref().unwrap_or_default();
@@ -1238,7 +1298,7 @@ mod tests {
             "mode: rule\nmixed-port: 35123\nsecret: fixture\ntun: {enable: false, mtu: 1500}\n",
         )
         .unwrap();
-        let result = compose_profile_with_controls(&item, home.path(), &all, Some(&controls))
+        let result = compose_profile_with_controls(&item, home.path(), &all, Some(&controls), None)
             .await
             .unwrap();
         assert_eq!(result["observed"][0], Value::from("rule"));
