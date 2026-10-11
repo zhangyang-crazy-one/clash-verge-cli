@@ -49,7 +49,7 @@
 
 ## 验证证据
 
-最终冻结源码的串行套件：840 CLI + 4 integration + 14 core = **858 passed，0 failed，5 ignored**。其中两项 opt-in 实核测试单独执行并通过；剩余三项 ignored 测试未运行。`cargo fmt --all -- --check`、`git diff --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、两份 OpenSpec strict 校验及 locked release 构建通过。本机未安装 `cargo-deny`，其 CI 检查未在本地执行。
+首次冻结源码（PR 提交 `73170f8d`）的串行套件：840 CLI + 4 integration + 14 core = **858 passed，0 failed，5 ignored**。其中两项 opt-in 实核测试单独执行并通过；剩余三项 ignored 测试未运行。`cargo fmt --all -- --check`、`git diff --check`、`cargo clippy --workspace --all-targets --locked -- -D warnings`、两份 OpenSpec strict 校验及 locked release 构建通过。本机未安装 `cargo-deny`，其 CI 检查未在本地执行。
 
 新产物为 `target/release/clash-verge-cli`，SHA-256 `82717d6ce46de059b439ce7ce038d5d5a1df82007422d84b7369a6e6882b7657`，版本仍为 `0.2.7`；这是基于 `df0b7a73` 加本轮修复构建的产物（构建时修改尚未提交）。已用该产物在 `/tmp/clash-review-20261011/release-smoke` 实际执行白名单 set/get 及恢复空列表，确认有效来源读回正确。没有安装覆盖系统入口。
 
@@ -91,3 +91,11 @@ Rust 单元测试及 opt-in 实核夹具随源码保留：
 - DNS 实测使用 sing-box 1.14.2，revision `af6e64c3b69e6132ebaee0e1a3d24e93903f6709`，二进制 SHA-256 `fc9c6e6ab345f045b16a0ed10d1ff28d68e8e56e7749fca30738d1406e98d7b8`。源码规则集语义依据：[HTTP client](https://sing-box.sagernet.org/configuration/shared/http-client/)、[rule-set](https://sing-box.sagernet.org/configuration/rule-set/)、[1.14.2 dialer](https://github.com/SagerNet/sing-box/blob/v1.14.2/common/dialer/dialer.go)、[Mihomo DNS](https://wiki.metacubex.one/config/dns/)。
 
 核查与测试阶段未修改用户真实配置、系统授权、已安装程序或远端 issue/PR。核查完成后，用户授权将这些修复提交并创建面向 `main` 的 PR；issue 的未验收门禁保持开放。工作区已有 `.agents/`、`.omo/` 和 ZIP 保留，不纳入 PR。
+
+## PR #74 CI 夹具修复
+
+[首次 Actions 运行](https://github.com/zhangyang-crazy-one/clash-verge-cli/actions/runs/38137067934) 的格式、Clippy、依赖审计和 aarch64 构建通过；workspace 测试为 838 passed、2 failed、5 ignored，因此该 job 的 release 构建被跳过。这两项 adopted-core 测试的 `sleep` 子进程继承 hosted runner 的 `hosted-compute-agent.service` cgroup，触发实际 systemd 接管保护，尚未进入待测启动/回滚路径。
+
+修复仅增加 `#[cfg(test)]` 的每实例 cgroup setter，并在两项夹具中明确提供非服务 `terminal.scope`；默认值仍为 `None`，生产 `/proc` 读取和拒绝逻辑不变。既有 system/user service 拒绝测试复用同一入口，没有跳过测试或禁用保护。
+
+将 runner service cgroup 临时注入两项测试后，均以退出码 101 复现原错误；修复后两项启动/回滚测试、system/user service 拒绝测试及纯策略矩阵单独通过。随后在隔离 XDG 目录运行与 CI 一致的默认并行 `cargo test --workspace --all-targets --locked`：**858 passed、0 failed、5 ignored**；fmt、diff 和 workspace Clippy 通过。日志保存在 `/tmp/clash-pr74-ci-fix/logs/`。这次仅改变测试代码，前述 release 和实核验证属于首次修复产物的历史证据。

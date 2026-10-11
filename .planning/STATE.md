@@ -2,6 +2,7 @@
 
 ## Current work
 
+- PR #74 CI follow-up：首次 hosted 测试有两个 adopted-core 夹具继承 runner 的 service cgroup，提前被保护拦截。仅新增 cfg(test) 每实例注入并给两项夹具设置 terminal.scope；生产逻辑不变。两项 RED 均复现、四项 focused GREEN 通过；默认并行 workspace 858 passed/0 failed/5 ignored，fmt/diff/clippy 通过。推送该修复后继续核对 Actions；记录 `.planning/debug/pr74-ci-cgroup.md` 与 `/tmp/clash-pr74-ci-fix/logs/`。
 - 2026-10-11：接续远端 #70–#73 的本人意见，分支 `fix/review-round5`，基线 `df0b7a73cfd4e9a537e3a908780198f22e040425`；核查时远端 main 为 `f0ecde3c`。用户随后授权提交、推送并创建面向 main 的 PR；不关闭仍有实机验收门禁的 issue。
 - 已保留并复验 A5/C7，补齐 native 引用/services 校验、systemd 外部替换预检、UUID/pidfd 启动清理及 exec 竞态、显式恢复模式、规则集 Go HTTP-client、节点 DNS/fake-IP 转换、持久规则覆盖及备份恢复、双核 CLI 文案/JSON。
 - C3 用户已选择“新增可配置外部白名单，默认仍仅本地”。`verge.yaml controller_allowed_origins` 与 `config get/set` 已实现，实际两核 CORS/PNA 及隔离 release set/get 验证通过；没有设置用户真实配置。

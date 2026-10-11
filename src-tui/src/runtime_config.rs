@@ -1756,6 +1756,11 @@ mod tests {
             .with_singbox_controller("127.0.0.1:19997".parse().expect("addr"))
             .with_core_kind(CoreKind::SingBox)
             .with_secret("stable-test-secret".to_string());
+        // This adopted core is outside a service, regardless of the test
+        // runner's inherited cgroup. Service refusal has its own fixture.
+        manager
+            .inner()
+            .set_service_cgroup_for_test("0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n");
         *manager.inner().resolved_binary.lock() = Some(PathBuf::from("/bin/true"));
 
         // An adopted core: this process never spawned it (owns_child false).
@@ -2326,6 +2331,11 @@ secret: fixture-secret\ntun: {{enable: false}}\n",
             .with_singbox_controller(controller)
             .with_core_kind(CoreKind::SingBox)
             .with_secret("a5-fixture-secret".to_string());
+        // This adopted core is outside a service, regardless of the test
+        // runner's inherited cgroup. Service refusal has its own fixture.
+        manager
+            .inner()
+            .set_service_cgroup_for_test("0::/user.slice/user-1000.slice/user@1000.service/app.slice/terminal.scope\n");
         *manager.inner().resolved_binary.lock() = Some(std::path::PathBuf::from("/bin/true"));
         *binding_seam().socket.lock().expect("socket") = Some(socket.clone());
 

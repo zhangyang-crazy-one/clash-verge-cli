@@ -254,6 +254,12 @@ impl ManagerInner {
         }
     }
 
+    /// Override this manager's cgroup evidence for adopted-core fixtures.
+    #[cfg(test)]
+    pub(crate) fn set_service_cgroup_for_test(&self, cgroup: &str) {
+        *self.service_cgroup.lock() = Some(cgroup.to_string());
+    }
+
     /// Publish the secret that was just resolved/persisted for this spawn.
     ///
     /// P1 (reviewer): `start` completes the rotation in the PARENT process
@@ -3174,7 +3180,7 @@ mod tests {
                 "systemctl --user restart clash-verge-cli.service",
             ),
         ] {
-            *manager.inner.service_cgroup.lock() = Some(group.to_string());
+            manager.inner.set_service_cgroup_for_test(group);
             let error = crate::runtime_config::apply_singbox_restart(
                 &manager,
                 Some("proxies: []\nrules: [MATCH,DIRECT]\n"),
