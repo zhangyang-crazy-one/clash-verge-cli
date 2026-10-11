@@ -78,6 +78,8 @@ pub struct ManagerInner {
     /// controller call would answer 401 — fatal for sing-box, whose clash_api
     /// is a TCP transport that really enforces the bearer secret.
     secret_override: Mutex<Option<String>>,
+    #[cfg(test)]
+    service_cgroup: Mutex<Option<String>>,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -247,6 +249,8 @@ impl ManagerInner {
             core_kind: AtomicU8::new(0),
             singbox_port: AtomicU16::new(9090),
             secret_override: Mutex::new(None),
+            #[cfg(test)]
+            service_cgroup: Mutex::new(None),
         }
     }
 
@@ -473,7 +477,7 @@ impl ManagerInner {
         // NOTE: the `match inner.core_kind()` arm above already appends
         // `-ext-ctl-unix <socket_path>` for the mihomo case; sing-box binds
         // its controller via the generated JSON's `clash_api.listen`.
-        let child = command
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -485,6 +489,21 @@ impl ManagerInner {
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
+        let identity = match super::process::ProcessIdentity::capture(pid) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(error.context("cannot bind the spawned core's process identity"));
+            }
+        };
+        if let Some(config) = config_path.as_deref()
+            && let Err(error) = super::process::record_launch(pid, kind, config)
+        {
+            let _ = identity.stop().await;
+            let _ = child.wait().await;
+            return Err(error.context("cannot write this launch's core receipt"));
+        }
 
         let started_at = Utc::now();
         let core_kind = kind;
@@ -538,7 +557,7 @@ impl ManagerInner {
                 // started_at and re-try the adopted-core bail path. The
                 // pidfile still names us at the time of the kill, so
                 // remove_if can confidently drop it.
-                let _ = signal::graceful_stop_by_pid(pid).await;
+                let _ = identity.stop().await;
                 rollback_failed_spawn(&inner, socket_path, pid, error.to_string());
                 return Err(error);
             }
@@ -747,6 +766,7 @@ the previous configuration could not be recovered",
         // same non-conflicting port as the mihomo runtime config.
         let mixed_port = crate::enhance::effective_mixed_port().await;
         let core_config = clash_verge_core::config::IClashTemp::new().await;
+        let controller_origins = crate::enhance::configured_controller_origins().await?;
         let tun = profile_tun_settings(yaml, &core_config.0).map_err(anyhow::Error::msg)?;
         let clash_api = crate::singbox::ClashApiSettings {
             listen: configured_singbox_controller(&core_config.0)?,
@@ -768,6 +788,7 @@ the previous configuration could not be recovered",
                 serde_json::from_str(text).context("failed to parse native sing-box JSON profile")?;
             crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
             crate::singbox::config_gen::apply_control_plane(&mut config, mixed_port, enable_tun, &tun, &clash_api);
+            crate::singbox::config_gen::apply_controller_origins(&mut config, &controller_origins);
             let home = clash_verge_core::utils::dirs::app_home_dir()?;
             apply_native_sidecars(&mut config, &home)?;
             crate::singbox::config_gen::validate_native_config(&config).map_err(anyhow::Error::msg)?;
@@ -813,6 +834,7 @@ the previous configuration could not be recovered",
             dns: parts.dns_section.clone(),
         };
         let mut config = crate::singbox::generate_config(&input).map_err(anyhow::Error::msg)?;
+        crate::singbox::config_gen::apply_controller_origins(&mut config, &controller_origins);
         // 1.12+ bootstrap: tell the core which DNS server resolves outbound
         // node domains (see D8).
         if let Some(resolver) = &parts.default_domain_resolver {
@@ -949,6 +971,8 @@ impl SingboxParts {
             (profile_dns.unwrap_or(stored_dns), dns_report.notes)
         };
         let default_domain_resolver = crate::singbox::dns::default_domain_resolver(&dns_spec);
+        crate::singbox::dns::apply_outbound_domain_resolvers(&dns_spec, &mut conversion.outbounds, &conversion.groups)
+            .map_err(anyhow::Error::msg)?;
         let dns_section = crate::singbox::dns::build_dns_section(&dns_spec).map_err(anyhow::Error::msg)?;
         conversion.notes.extend(route_report);
         conversion.notes.extend(route_order_note);
@@ -993,30 +1017,91 @@ fn direct_child_pids(pid: u32) -> Vec<u32> {
 /// never be the ownership proof on its own.
 pub(crate) struct LaunchOwnership {
     supervisor_pid: u32,
+    supervisor_identity: Option<super::process::OwnedProcess>,
+    receipt: Option<super::process::ReceiptTarget>,
 }
 
 impl LaunchOwnership {
     /// Bind a launch to the supervisor it started: the only processes its
     /// cleanup may stop are the ones that supervisor forked.
     pub(crate) fn new(supervisor_pid: u32) -> Self {
-        Self { supervisor_pid }
+        Self {
+            supervisor_pid,
+            supervisor_identity: super::process::OwnedProcess::capture(supervisor_pid).ok(),
+            receipt: None,
+        }
+    }
+
+    pub(crate) fn with_receipt(supervisor_pid: u32, receipt: super::process::ReceiptTarget) -> Self {
+        Self {
+            supervisor_pid,
+            supervisor_identity: super::process::OwnedProcess::capture(supervisor_pid).ok(),
+            receipt: Some(receipt),
+        }
+    }
+
+    pub(crate) fn verify_core(&self, manager: &MihomoManager) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if crate::commands::start::supervisor_launcher_installed() {
+            return Ok(());
+        }
+        let identity = self
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.identity())
+            .ok_or_else(|| anyhow::anyhow!("core has no matching per-launch identity receipt"))?;
+        let record = pidfile::read_live_for_kind(
+            &pidfile::path_for(manager.socket_path()),
+            manager.socket_path(),
+            manager.core_kind(),
+            Some(manager.singbox_controller),
+        )
+        .ok_or_else(|| anyhow::anyhow!("core has no verified live shared pid record"))?;
+        anyhow::ensure!(
+            record.pid == identity.pid,
+            "shared record does not name this launch's core"
+        );
+        Ok(())
     }
 
     /// Every descendant of the supervisor, breadth-first.
     ///
     /// Must be read BEFORE the supervisor is killed: once it exits, its
     /// children are reparented to init and no longer identify it.
-    fn descendant_pids(&self) -> Vec<u32> {
-        let mut found: Vec<u32> = Vec::new();
-        let mut queue = direct_child_pids(self.supervisor_pid);
-        while let Some(pid) = queue.pop() {
-            if found.contains(&pid) {
-                continue;
+    async fn owned_descendants(&self) -> Vec<super::process::OwnedProcess> {
+        let Some(supervisor) = self
+            .supervisor_identity
+            .as_ref()
+            .filter(|process| process.matches_process())
+        else {
+            return Vec::new();
+        };
+        let mut owned: Vec<super::process::OwnedProcess> = Vec::new();
+        // None names the supervisor; Some(index) names an already-bound child.
+        let mut parents = vec![None];
+        while let Some(index) = parents.pop() {
+            let parent = index.map_or(supervisor, |index| &owned[index]);
+            let children: Vec<_> = direct_child_pids(parent.pid)
+                .into_iter()
+                .filter(|pid| !owned.iter().any(|process| process.pid == *pid))
+                .filter_map(|pid| match super::process::OwnedProcess::capture_child(pid, parent) {
+                    Ok(process) => Some(process),
+                    Err(error) => {
+                        tracing::debug!(target: "mihomo", "launch child pid {pid} could not be bound: {error}");
+                        None
+                    }
+                })
+                .collect();
+            for child in children {
+                if let Err(error) = child.freeze().await {
+                    tracing::warn!(target: "mihomo", "failed to freeze launch child {}: {error}", child.pid);
+                }
+                tracing::debug!(target: "mihomo", "bound failed-launch child {} to its kernel process", child.pid);
+                parents.push(Some(owned.len()));
+                owned.push(child);
             }
-            found.push(pid);
-            queue.extend(direct_child_pids(pid));
         }
-        found
+        owned
     }
 }
 
@@ -1493,6 +1578,7 @@ impl MihomoManager {
                     None => clash_verge_core::config::IClashTemp::new().await.0,
                 };
                 crate::enhance::apply_verge_ports(&mut config).await;
+                crate::enhance::apply_controller_cors(&mut config).await?;
                 let config = crate::enhance::prepare_runtime_config(config, enable_tun);
                 std::fs::write(&candidate, serde_yaml_ng::to_string(&config)?)?;
             }
@@ -2141,6 +2227,7 @@ stop it where it was started",
         if self.owns_child() {
             return Ok(None);
         }
+        self.ensure_external_replacement_allowed()?;
         let socket = self.socket_path.clone();
         let record = pidfile::read_record(&pidfile::path_for(&socket));
         Ok(Some(RestartAuthorization {
@@ -2187,6 +2274,7 @@ stop it where it was started",
         if self.owns_child() {
             return self.restart_with(mode).await.map(|_| ());
         }
+        self.ensure_external_replacement_allowed()?;
         self.authorize_still_ours(authorization)?;
         // A partially started previous attempt (supervisor alive, core not
         // yet answering) must be cleared first, or the recovery would leave
@@ -2194,8 +2282,7 @@ stop it where it was started",
         self.stop().await.context("failed to stop the recorded core")?;
         let log = crate::commands::start::supervisor_log_path(&self.config_dir);
         let launched_at = std::time::SystemTime::now();
-        let mut supervisor = crate::commands::start::launch_supervisor_via(&self.config_dir, &log, mode)?;
-        let ownership = LaunchOwnership::new(supervisor.id());
+        let (mut supervisor, ownership) = crate::commands::start::launch_owned_supervisor(self, &log, mode)?;
         // Readiness and identity verification share ONE failure path: once
         // the supervisor has been launched, every failure — a timeout, an
         // early exit, or a core that answers but cannot be attributed to this
@@ -2203,7 +2290,9 @@ stop it where it was started",
         // down. Leaving the new core alive would hold the controller socket
         // and the mixed port while the caller rolls the config back to A.
         let outcome = match crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await {
-            Ok(()) => self.verify_replacement_core(authorization, launched_at),
+            Ok(()) => self
+                .verify_replacement_core(authorization, launched_at)
+                .and_then(|()| ownership.verify_core(self)),
             Err(error) => Err(error),
         };
         if let Err(error) = outcome {
@@ -2237,19 +2326,34 @@ stop it where it was started",
         ownership: &LaunchOwnership,
         supervisor: &mut std::process::Child,
     ) {
+        if let Some(identity) = ownership.supervisor_identity.as_ref()
+            && let Err(error) = identity.freeze().await
+        {
+            tracing::warn!(target: "mihomo", "failed to freeze launch supervisor for cleanup: {error}");
+        }
         // Enumerate first: once the supervisor is gone its children are
         // reparented to init and can no longer be attributed to it.
-        let mut owned = ownership.descendant_pids();
+        let mut owned = ownership.owned_descendants().await;
+        if let Some(identity) = ownership.receipt.as_ref().and_then(|receipt| receipt.identity())
+            && !owned.iter().any(|process| process.pid == identity.pid)
+        {
+            match identity.bind() {
+                Ok(process) => owned.push(process),
+                Err(error) => {
+                    tracing::warn!(target: "mihomo", "failed to bind per-launch core {}: {error}", identity.pid)
+                }
+            }
+        }
+        #[cfg(test)]
+        eprintln!(
+            "[launch-cleanup] supervisor={} bound_pids={:?}",
+            ownership.supervisor_pid,
+            owned.iter().map(|process| process.pid).collect::<Vec<_>>()
+        );
         crate::commands::start::reap_supervisor(supervisor);
         // The record is only ever a hint about which pid to look at, never
         // the proof: the process still has to be one this launch forked.
         let path = pidfile::path_for(&self.socket_path);
-        if let Some(record) = pidfile::read_record(&path)
-            && owned.contains(&record.pid)
-        {
-            owned.retain(|pid| *pid != record.pid);
-            owned.push(record.pid);
-        }
         if owned.is_empty() {
             tracing::warn!(
                 target: "mihomo",
@@ -2257,10 +2361,20 @@ stop it where it was started",
                 ownership.supervisor_pid
             );
         }
-        for pid in owned {
-            match signal::graceful_stop_by_pid(pid).await {
+        for identity in owned {
+            let pid = identity.pid;
+            let owned_record = pidfile::read_record(&path).filter(|record| record.pid == pid);
+            match identity.stop().await {
                 Ok(()) => {
-                    pidfile::remove_if(&path, pid);
+                    // A changed/reused live PID is never signalled, and its
+                    // record must remain intact too. Compare the whole saved
+                    // record before unlinking, not just its numeric PID.
+                    if !pidfile::is_running(pid)
+                        && owned_record.is_some()
+                        && pidfile::read_record(&path) == owned_record
+                    {
+                        pidfile::remove_if(&path, pid);
+                    }
                     tracing::info!(
                         target: "mihomo",
                         "stopped pid {pid} left behind by the failed launch of supervisor {}",
@@ -2276,6 +2390,27 @@ stop it where it was started",
                 }
             }
         }
+    }
+
+    fn ensure_external_replacement_allowed(&self) -> anyhow::Result<()> {
+        if self.owns_child() {
+            return Ok(());
+        }
+        if let Some(pid) = self.pid().filter(|pid| pidfile::is_running(*pid)) {
+            #[cfg(test)]
+            let cgroup = self
+                .inner
+                .service_cgroup
+                .lock()
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| std::fs::read_to_string(format!("/proc/{pid}/cgroup")));
+            #[cfg(not(test))]
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"));
+            let cgroup = cgroup.context("cannot establish recorded core's service ownership; no core was stopped")?;
+            super::process::refuse_external_systemd_apply(false, &cgroup)?;
+        }
+        Ok(())
     }
 
     /// Require the core answering the controller to be THIS replacement.
@@ -3011,6 +3146,65 @@ pub struct CoreStatus {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     #[tokio::test]
+    async fn systemd_external_apply_refuses_before_writing_or_stopping_the_core() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "proxy_core: singbox\nenable_tun_mode: false\nenable_system_proxy: false\n",
+        )
+        .unwrap();
+        let config = clash_verge_core::utils::dirs::singbox_config_path().unwrap();
+        let old = b"{\"marker\":\"old-service\"}";
+        std::fs::write(&config, old).unwrap();
+        let mut core = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf())
+            .with_core_kind(CoreKind::SingBox)
+            .with_socket(home.path().join("controller.sock"));
+        *manager.inner.pid.lock() = Some(core.id());
+        *manager.inner.state.lock() = CoreState::Running;
+        for (group, command) in [
+            (
+                "0::/system.slice/clash-verge-cli.service\n",
+                "systemctl restart clash-verge-cli.service",
+            ),
+            (
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/clash-verge-cli.service\n",
+                "systemctl --user restart clash-verge-cli.service",
+            ),
+        ] {
+            *manager.inner.service_cgroup.lock() = Some(group.to_string());
+            let error = crate::runtime_config::apply_singbox_restart(
+                &manager,
+                Some("proxies: []\nrules: [MATCH,DIRECT]\n"),
+                false,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains(command), "{error}");
+            assert_eq!(
+                std::fs::read(&config).unwrap(),
+                old,
+                "refusal must precede config replacement"
+            );
+            assert!(
+                core.try_wait().unwrap().is_none(),
+                "refusal must precede stopping the old service"
+            );
+            assert_eq!(manager.pid(), Some(core.id()));
+            manager.inner.owns_child.store(true, Ordering::SeqCst);
+            assert!(
+                manager.capture_restart_authorization().await.unwrap().is_none(),
+                "owned daemon refresh is permitted"
+            );
+            manager.inner.owns_child.store(false, Ordering::SeqCst);
+        }
+        core.kill().unwrap();
+        core.wait().unwrap();
+    }
+
+    #[tokio::test]
     async fn stopped_selection_ignores_profiles_tun_and_candidate_without_starting() {
         let home = private_socket_fixture();
         let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
@@ -3712,13 +3906,17 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("the stand-in supervisor was launched without a pid file"))?
             .display()
             .to_string();
-        Ok(std::process::Command::new("/bin/sh")
+        let child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(format!("sleep 300 & echo $! > {core_pid_file}; wait"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()?)
+            .spawn()?;
+        // The fake API is already ready. Ensure this fixture has really
+        // forked its core before the identity-failure path starts cleanup.
+        wait_for_pid_file(Path::new(&core_pid_file));
+        Ok(child)
     }
 
     fn wait_for_pid_file(path: &std::path::Path) -> u32 {
@@ -3758,31 +3956,34 @@ mod tests {
         let config_dir = home.path().join("run");
         std::fs::create_dir_all(&config_dir).unwrap();
         let socket = home.path().join("controller.sock");
-        let manager = MihomoManager::new(config_dir)
-            .with_socket(socket.clone())
-            .with_singbox_controller(controller)
-            .with_core_kind(CoreKind::SingBox)
-            .with_secret("ownership-fixture".to_string());
         let core_pid_file = home.path().join("core.pid");
         STANDIN_CORE_PID_FILE.set(core_pid_file.clone()).ok();
 
         let _launcher = crate::commands::start::install_supervisor_launcher(forking_supervisor).expect("install seam");
-        let error = manager
-            .apply_restart_authorization_with(
-                &stopped_predecessor_receipt(),
-                crate::commands::start::SupervisorLaunch::Regenerate,
-            )
-            .await
-            .expect_err("no pid record means the replacement cannot be attributed");
-        assert!(error.to_string().contains("no live singbox pid record"), "{error}");
+        for attempt in 0..32 {
+            let _ = std::fs::remove_file(&core_pid_file);
+            let manager = MihomoManager::new(config_dir.clone())
+                .with_socket(socket.clone())
+                .with_singbox_controller(controller)
+                .with_core_kind(CoreKind::SingBox)
+                .with_secret("ownership-fixture".to_string());
+            let error = manager
+                .apply_restart_authorization_with(
+                    &stopped_predecessor_receipt(),
+                    crate::commands::start::SupervisorLaunch::Regenerate,
+                )
+                .await
+                .expect_err("no pid record means the replacement cannot be attributed");
+            assert!(error.to_string().contains("no live singbox pid record"), "{error}");
 
-        let core = wait_for_pid_file(&core_pid_file);
-        assert!(
-            !pidfile::is_running(core),
-            "the core this launch forked must be stopped, not left holding the ports (pid {core})"
-        );
-        // Nothing of anyone else's was removed: the record was never written.
-        assert!(!pidfile::path_for(&socket).exists());
+            let core = wait_for_pid_file(&core_pid_file);
+            assert!(
+                !pidfile::is_running(core),
+                "the core this launch forked must be stopped (attempt {attempt}, pid {core})"
+            );
+            // Nothing of anyone else's was removed: the record was never written.
+            assert!(!pidfile::path_for(&socket).exists());
+        }
     }
 
     /// P1 (reviewer), F3: the shared pid record names ANOTHER live instance.
@@ -4238,9 +4439,9 @@ secret: f4-fixture-secret\ntun: {{enable: false}}\n",
         use crate::profile_store::store::tests::{claim_test_app_home, test_app_home_root};
         let root = test_app_home_root();
         let _home = claim_test_app_home(root.clone()).await;
-        let yaml = "dns:\n  enable: true\n  listen: 127.0.0.1:5335\n  enhanced-mode: fake-ip\n  fake-ip-filter: ['*.lan']\n  nameserver: [8.8.8.8]\n";
+        let yaml = "dns:\n  enable: true\n  listen: 127.0.0.1:5335\n  enhanced-mode: fake-ip\n  fake-ip-filter: ['*.lan', 'geosite:cn']\n  nameserver: [8.8.8.8]\n";
         let parts = SingboxParts::assemble(Some(yaml)).await.expect("assemble");
-        for expected in ["dns.listen:", "dns.fake-ip-filter:"] {
+        for expected in ["dns.listen:", "dns.fake-ip-filter[1]:"] {
             assert!(
                 parts.conversion.notes.iter().any(|note| note.starts_with(expected)),
                 "status surface must report {expected}: {:?}",
@@ -4248,6 +4449,18 @@ secret: f4-fixture-secret\ntun: {{enable: false}}\n",
             );
         }
         let dns = parts.dns_section.as_ref().expect("dns section");
+        assert!(
+            dns.to_string().contains("lan"),
+            "the supported wildcard is converted: {dns}"
+        );
+        assert!(
+            !parts
+                .conversion
+                .notes
+                .iter()
+                .any(|note| note.starts_with("dns.fake-ip-filter[0]:")),
+            "the supported filter must not be reported as lost"
+        );
         assert!(
             dns["servers"]
                 .as_array()

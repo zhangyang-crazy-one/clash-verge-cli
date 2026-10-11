@@ -23,7 +23,7 @@ stop it where it was started",
 /// Where the running core is reachable. sing-box's clash_api is TCP-only,
 /// mihomo listens on the unix socket (#54): naming the right endpoint is
 /// what tells the user which controller answered.
-fn controller_description(manager: &MihomoManager) -> String {
+pub(super) fn controller_description(manager: &MihomoManager) -> String {
     match manager.core_kind() {
         crate::mihomo_manager::CoreKind::Mihomo => {
             format!("unix socket {}", manager.socket_path().display())
@@ -31,5 +31,23 @@ fn controller_description(manager: &MihomoManager) -> String {
         crate::mihomo_manager::CoreKind::SingBox => {
             format!("tcp {}", manager.singbox_controller_addr())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn controller_description_uses_the_selected_core_transport() {
+        let manager = MihomoManager::new("/tmp/core-description".into())
+            .with_socket("/tmp/core-description/controller.sock".into())
+            .with_singbox_controller("127.0.0.1:19999".parse().unwrap());
+        assert_eq!(
+            controller_description(&manager),
+            "unix socket /tmp/core-description/controller.sock"
+        );
+        let manager = manager.with_core_kind(crate::mihomo_manager::CoreKind::SingBox);
+        assert_eq!(controller_description(&manager), "tcp 127.0.0.1:19999");
     }
 }

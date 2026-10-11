@@ -2,6 +2,18 @@
 
 ## Current work
 
+- 2026-10-11：接续远端 #70–#73 的本人意见，分支 `fix/review-round5`，基线 `df0b7a73cfd4e9a537e3a908780198f22e040425`；核查时远端 main 为 `f0ecde3c`。用户随后授权提交、推送并创建面向 main 的 PR；不关闭仍有实机验收门禁的 issue。
+- 已保留并复验 A5/C7，补齐 native 引用/services 校验、systemd 外部替换预检、UUID/pidfd 启动清理及 exec 竞态、显式恢复模式、规则集 Go HTTP-client、节点 DNS/fake-IP 转换、持久规则覆盖及备份恢复、双核 CLI 文案/JSON。
+- C3 用户已选择“新增可配置外部白名单，默认仍仅本地”。`verge.yaml controller_allowed_origins` 与 `config get/set` 已实现，实际两核 CORS/PNA 及隔离 release set/get 验证通过；没有设置用户真实配置。
+- 最终冻结验证：840 CLI +4 integration +14 core =858 passed/0 failed/5 ignored；两项 pinned-core DNS/HTTP-client/CORS 单独通过，剩余三项 ignored 未运行。fmt/diff/clippy、两份 OpenSpec strict、locked release build 通过；本地 cargo-deny 未执行。
+- 新产物 `target/release/clash-verge-cli` SHA256 `82717d6ce46de059b439ce7ce038d5d5a1df82007422d84b7369a6e6882b7657`；版本仍0.2.7，系统 `/usr/local/bin/clash-verge-cli` 未覆盖。源码清单 `/tmp/clash-review-20261011/source.sha256`（27文件全匹配，清单 SHA256 `ff483bd3f14ea899a9f684d3d0c7f4225b53caf6753e3ce7531f793d77c377ac`）。
+- 持续证据与边界：[逐项报告](../docs/REVIEW-ISSUES-70-73.md)、[debug状态](debug/review-issues-70-73.md)，日志 `/tmp/clash-review-20261011/logs/`。align change 10.1–10.6 完成；add-singbox-dual-core 9.2–9.6 未勾选，不同步/归档未完成规格。
+- 待实际验收：完整 TUN start/restart/switch 授权、真实 system/user unit、完整切核/回滚/路由命中/GUI互斥、DoH/DoT握手、第三方浏览器及旧内核 pidfd。隔离证据不替代这些门禁。CLI后合成规则覆盖不会由GUI自动消费。
+
+Last activity: 2026-10-11 - Review #70–#73 continuation implemented and scoped verification passed; full user-environment acceptance pending
+
+## Earlier work (historical evidence)
+
 - debug `profile-script-core-switch` 已 resolved：GUI 兼容脚本引擎（有界 Boa）、双核心共享 composition、停止态选型仅提交 marker、owned-PID socket inode 端口归属证明、反向 selector 映射、FD 权限回退均已落地；OpenSpec 9.1–9.3 完成，累计 36/36。
 - 接管收尾（Pi 父代理）：发现并修复 `owns_listener` 的 /proc fd ENOENT 竞态（全套件并发下 1/3 概率失败），新增 churn 回归测试；连续 5 轮全套件 672 项测试 0 失败（仅 real-sing-box E2E 排除）；locked debug/release build、fmt、OpenSpec strict 通过。
 - 最终私有实际复验（产物 SHA256 `af80820f…f52522c`，含竞态修复）：sing-box 1.14.2 带脚本订阅启动成功（原报错路径），脚本改写进入 singbox.json 与 config.yaml；运行中双向切换 singbox↔mihomo 均成功；两核心 mixed 35123 HTTP 代理转发通过；GUI/服务/用户核心 4 个 PID+starttime 不变，46 个用户配置文件 hash 全同；私有端口已释放、tmux 夹具已拆除。证据 `/tmp/clash-script-live-n4g0e9jx/logs/pifix-*`。

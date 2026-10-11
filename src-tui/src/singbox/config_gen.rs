@@ -96,12 +96,13 @@ pub const CLASH_MODES: &[&str] = &["Rule", "Global", "Direct"];
 /// rotates it before the core starts (see `enhance::resolve_controller_secret`).
 pub const PLACEHOLDER_SECRET: &str = "set-your-secret";
 
-/// Origins allowed to reach the generated clash_api over CORS.
+/// Default origins allowed to reach the generated clash_api over CORS.
 ///
 /// sing-box defaults `access_control_allow_origin` to `["*"]`, which lets any
 /// web page the user visits drive the local controller cross-origin. The CLI's
 /// own controller client is a loopback TCP client that never sends `Origin`,
-/// so the allow-list is restricted to loopback origins only.
+/// so the default allow-list is restricted to loopback origins. Explicit
+/// controller_allowed_origins settings extend it during runtime assembly.
 pub const CLASH_API_ALLOW_ORIGINS: &[&str] = &[
     "http://localhost",
     "https://localhost",
@@ -133,12 +134,25 @@ pub fn validate_control_plane_security(config: &Value) -> Result<(), String> {
     if origins.is_empty() {
         return Err("generated sing-box clash_api has an empty access_control_allow_origin".into());
     }
+    for origin in origins {
+        let origin = origin
+            .as_str()
+            .ok_or("generated sing-box CORS origins must be strings")?;
+        let canonical = crate::enhance::canonical_controller_origin(origin)?;
+        if canonical != origin {
+            return Err("generated sing-box CORS origins must be canonical http(s) origins".into());
+        }
+    }
+    let private_network = origins
+        .iter()
+        .filter_map(Value::as_str)
+        .any(|origin| !CLASH_API_ALLOW_ORIGINS.contains(&origin));
     if clash_api
         .get("access_control_allow_private_network")
         .and_then(Value::as_bool)
-        != Some(false)
+        != Some(private_network)
     {
-        return Err("generated sing-box clash_api must set access_control_allow_private_network to false".into());
+        return Err("generated sing-box clash_api access_control_allow_private_network must match its explicit extra-origin policy".into());
     }
     // #53: without an explicit default_mode sing-box derives the mode list
     // from route rules alone and mode switching silently no-ops.
@@ -283,7 +297,7 @@ fn cache_file_path() -> Option<PathBuf> {
 }
 
 /// The `experimental.clash_api` object the CLI owns: loopback listener,
-/// resolved secret and an explicit, non-wildcard CORS policy.
+/// resolved secret and an explicit, non-wildcard default CORS policy.
 fn clash_api_json(clash_api: &ClashApiSettings, default_mode: &str) -> Value {
     json!({
         "external_controller": clash_api.listen.to_string(),
@@ -292,6 +306,14 @@ fn clash_api_json(clash_api: &ClashApiSettings, default_mode: &str) -> Value {
         "access_control_allow_origin": CLASH_API_ALLOW_ORIGINS,
         "access_control_allow_private_network": false,
     })
+}
+
+/// Apply only the user-authorized origin list supplied by verge.yaml.
+/// Provider CORS has already been replaced by the CLI control-plane block.
+pub fn apply_controller_origins(config: &mut Value, origins: &[String]) {
+    config["experimental"]["clash_api"]["access_control_allow_origin"] = json!(origins);
+    config["experimental"]["clash_api"]["access_control_allow_private_network"] =
+        json!(crate::enhance::controller_allows_private_network(origins));
 }
 
 /// Wire mode switching (#53): stamp `default_mode` and prepend the
@@ -547,6 +569,12 @@ fn validate_references(config: &Value) -> Result<(), String> {
     if dns_tags.len() != dns_servers.len() {
         return Err("DNS servers must have unique string tags".into());
     }
+    if let Some(final_tag) = config["dns"].get("final") {
+        if !final_tag.is_string() {
+            return Err("dns.final must be a DNS server tag string".into());
+        }
+        validate_dns_reference(final_tag, "dns.final", &dns_servers_by_tag, false)?;
+    }
     for outbound in config["outbounds"].as_array().into_iter().flatten() {
         for key in ["detour", "default"] {
             if let Some(target) = outbound.get(key).and_then(Value::as_str)
@@ -563,25 +591,23 @@ fn validate_references(config: &Value) -> Result<(), String> {
                 }
             }
         }
+        if let Some(resolver) = outbound.get("domain_resolver") {
+            let tag = outbound.get("tag").and_then(Value::as_str).unwrap_or("<outbound>");
+            validate_dns_reference(
+                resolver,
+                &format!("outbound {tag:?}.domain_resolver"),
+                &dns_servers_by_tag,
+                true,
+            )?;
+        }
     }
     if let Some(final_tag) = route.get("final").and_then(Value::as_str)
         && !tags.contains(final_tag)
     {
         return Err(format!("route.final references missing outbound {final_tag:?}"));
     }
-    if let Some(resolver) = route.get("default_domain_resolver").and_then(Value::as_str)
-        && !dns_tags.contains(resolver)
-    {
-        return Err(format!(
-            "route.default_domain_resolver references missing DNS server {resolver:?}"
-        ));
-    }
-    if let Some(resolver) = route.get("default_domain_resolver").and_then(Value::as_str)
-        && dns_servers_by_tag
-            .get(resolver)
-            .is_some_and(|server| server.get("type").and_then(Value::as_str) == Some("fakeip"))
-    {
-        return Err("route.default_domain_resolver cannot reference a fake-IP DNS server".into());
+    if let Some(resolver) = route.get("default_domain_resolver") {
+        validate_dns_reference(resolver, "route.default_domain_resolver", &dns_servers_by_tag, true)?;
     }
     for (index, server) in dns_servers.iter().enumerate() {
         if let Some(detour) = server.get("detour").and_then(Value::as_str)
@@ -589,29 +615,25 @@ fn validate_references(config: &Value) -> Result<(), String> {
         {
             return Err(format!("dns.servers[{index}] references missing outbound {detour:?}"));
         }
-        if let Some(resolver) = server.get("domain_resolver").and_then(Value::as_str) {
-            if !dns_tags.contains(resolver) {
-                return Err(format!(
-                    "dns.servers[{index}].domain_resolver references missing DNS server {resolver:?}"
-                ));
-            }
-            if dns_servers_by_tag
-                .get(resolver)
-                .is_some_and(|server| server.get("type").and_then(Value::as_str) == Some("fakeip"))
-            {
-                return Err(format!(
-                    "dns.servers[{index}].domain_resolver cannot reference a fake-IP DNS server"
-                ));
-            }
+        if let Some(resolver) = server.get("domain_resolver") {
+            validate_dns_reference(
+                resolver,
+                &format!("dns.servers[{index}].domain_resolver"),
+                &dns_servers_by_tag,
+                true,
+            )?;
         }
     }
+    let known_rule_sets: std::collections::HashSet<&str> = route["rule_set"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|set| set.get("tag").and_then(Value::as_str))
+        .collect();
     if let Some(rules) = config["dns"]["rules"].as_array() {
         for (index, rule) in rules.iter().enumerate() {
-            if let Some(server) = rule.get("server").and_then(Value::as_str)
-                && !dns_tags.contains(server)
-            {
-                return Err(format!("dns.rules[{index}] references missing DNS server {server:?}"));
-            }
+            validate_nested_dns_rule(rule, &dns_servers_by_tag, &known_rule_sets)
+                .map_err(|error| format!("dns.rules[{index}]: {error}"))?;
         }
     }
     if let Some(rules) = route.get("rules").and_then(Value::as_array) {
@@ -656,6 +678,104 @@ fn validate_references(config: &Value) -> Result<(), String> {
             }
         }
     }
+    validate_http_client_references(config, &tags, &dns_servers_by_tag)?;
+    Ok(())
+}
+
+/// DNS resolver fields support a server tag or the DNS route-action object.
+fn validate_dns_reference(
+    value: &Value,
+    field: &str,
+    servers: &std::collections::HashMap<&str, &Value>,
+    forbid_fakeip: bool,
+) -> Result<(), String> {
+    let tag = value
+        .as_str()
+        .or_else(|| value.get("server").and_then(Value::as_str))
+        .ok_or_else(|| format!("{field} must be a DNS server tag or an object with a string server"))?;
+    let server = servers
+        .get(tag)
+        .ok_or_else(|| format!("{field} references missing DNS server {tag:?}"))?;
+    if forbid_fakeip && server.get("type").and_then(Value::as_str) == Some("fakeip") {
+        return Err(format!("{field} cannot reference a fake-IP DNS server"));
+    }
+    Ok(())
+}
+
+fn validate_nested_dns_rule(
+    rule: &Value,
+    servers: &std::collections::HashMap<&str, &Value>,
+    rule_sets: &std::collections::HashSet<&str>,
+) -> Result<(), String> {
+    if let Some(server) = rule.get("server") {
+        validate_dns_reference(server, "server", servers, false)?;
+    }
+    validate_rule_set_reference(rule, rule_sets)?;
+    if let Some(children) = rule.get("rules") {
+        for child in children.as_array().ok_or("logical DNS rules must be a list")? {
+            validate_nested_dns_rule(child, servers, rule_sets)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_client_references(
+    config: &Value,
+    outbounds: &std::collections::HashSet<&str>,
+    servers: &std::collections::HashMap<&str, &Value>,
+) -> Result<(), String> {
+    let mut clients = std::collections::HashSet::new();
+    if let Some(shared) = config.get("http_clients") {
+        for (index, client) in shared
+            .as_array()
+            .ok_or("http_clients must be a list")?
+            .iter()
+            .enumerate()
+        {
+            let tag = client
+                .get("tag")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("http_clients[{index}] has no string tag"))?;
+            if !clients.insert(tag) {
+                return Err(format!("duplicate HTTP client tag: {tag}"));
+            }
+            validate_http_client_dial(client, &format!("http_clients[{index}]"), outbounds, servers)?;
+        }
+    }
+    for (index, set) in config["route"]["rule_set"].as_array().into_iter().flatten().enumerate() {
+        if let Some(client) = set.get("http_client") {
+            let field = format!("route.rule_set[{index}].http_client");
+            if let Some(tag) = client.as_str() {
+                if !clients.contains(tag) {
+                    return Err(format!("{field} references missing HTTP client {tag:?}"));
+                }
+            } else if client.is_object() {
+                validate_http_client_dial(client, &field, outbounds, servers)?;
+            } else {
+                return Err(format!("{field} must be an HTTP client tag or object"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_http_client_dial(
+    client: &Value,
+    field: &str,
+    outbounds: &std::collections::HashSet<&str>,
+    servers: &std::collections::HashMap<&str, &Value>,
+) -> Result<(), String> {
+    if let Some(detour) = client.get("detour") {
+        let tag = detour
+            .as_str()
+            .ok_or_else(|| format!("{field}.detour must be a string"))?;
+        if !outbounds.contains(tag) {
+            return Err(format!("{field}.detour references missing outbound {tag:?}"));
+        }
+    }
+    if let Some(resolver) = client.get("domain_resolver") {
+        validate_dns_reference(resolver, &format!("{field}.domain_resolver"), servers, true)?;
+    }
     Ok(())
 }
 
@@ -669,6 +789,16 @@ fn validate_nested_route_rule(
     {
         return Err(format!("references missing outbound {outbound:?}"));
     }
+    validate_rule_set_reference(rule, rule_sets)?;
+    if let Some(children) = rule.get("rules") {
+        for child in children.as_array().ok_or("logical rules must be a list")? {
+            validate_nested_route_rule(child, outbounds, rule_sets)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_set_reference(rule: &Value, rule_sets: &std::collections::HashSet<&str>) -> Result<(), String> {
     if let Some(sets) = rule.get("rule_set") {
         let names: Vec<&str> = if let Some(name) = sets.as_str() {
             vec![name]
@@ -686,11 +816,6 @@ fn validate_nested_route_rule(
             }
         }
     }
-    if let Some(children) = rule.get("rules") {
-        for child in children.as_array().ok_or("logical rules must be a list")? {
-            validate_nested_route_rule(child, outbounds, rule_sets)?;
-        }
-    }
     Ok(())
 }
 
@@ -702,6 +827,12 @@ pub fn validate_native_config(config: &Value) -> Result<(), String> {
 
 pub fn validate_native_config_for_version(config: &Value, version: &str) -> Result<(), String> {
     let matrix = crate::singbox::capabilities::require_for_version(version)?;
+    if let Some(services) = config.get("services") {
+        let services = services.as_array().ok_or("native sing-box services must be a list")?;
+        if !services.is_empty() {
+            return Err("native sing-box services are unsupported: additional service listeners cannot be managed by the CLI; remove services from the profile".into());
+        }
+    }
     if config.get("rule_set").is_some() {
         return Err(format!(
             "sing-box rule_set must be nested under route for version {}",
@@ -1188,6 +1319,141 @@ mod tests {
         assert!(validate_native_config(&removed).unwrap_err().contains("wireguard"));
     }
 
+    #[test]
+    fn native_review_rejects_dangling_dns_final() {
+        let mut native = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {},
+            "dns": { "servers": [{ "type": "local", "tag": "local" }], "final": "missing" }
+        });
+        assert!(validate_native_config(&native).unwrap_err().contains("dns.final"));
+        native["dns"]["final"] = json!("local");
+        validate_native_config(&native).expect("known final server");
+    }
+
+    #[test]
+    fn native_review_rejects_additional_service_listeners() {
+        let mut native = json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {},
+            "services": [{ "type": "ssm-api", "listen": "0.0.0.0", "listen_port": 8080 }]
+        });
+        assert!(validate_native_config(&native).unwrap_err().contains("services"));
+        native["services"] = json!([]);
+        validate_native_config(&native).expect("empty services");
+        native["services"] = json!({});
+        assert!(validate_native_config(&native).unwrap_err().contains("services"));
+    }
+
+    fn native_reference_fixture() -> Value {
+        json!({
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": { "rule_set": [{ "type": "inline", "tag": "domains", "rules": [] }] },
+            "dns": { "servers": [
+                { "type": "local", "tag": "local" },
+                { "type": "fakeip", "tag": "fake", "inet4_range": "198.18.0.0/15" }
+            ] }
+        })
+    }
+
+    #[test]
+    fn native_review_checks_string_and_object_domain_resolvers() {
+        for field in [
+            "/route/default_domain_resolver",
+            "/outbounds/0/domain_resolver",
+            "/dns/servers/0/domain_resolver",
+        ] {
+            for resolver in [json!("local"), json!({ "server": "local", "strategy": "prefer_ipv4" })] {
+                let mut native = native_reference_fixture();
+                // Insert the optional field through its owning object.
+                let (parent, key) = field.rsplit_once('/').unwrap();
+                native.pointer_mut(parent).unwrap()[key] = resolver;
+                validate_native_config(&native).expect("valid resolver reference");
+                native.pointer_mut(parent).unwrap()[key] = json!({ "server": "missing" });
+                assert!(
+                    validate_native_config(&native)
+                        .unwrap_err()
+                        .contains("missing DNS server")
+                );
+                native.pointer_mut(parent).unwrap()[key] = json!({ "server": "fake" });
+                assert!(validate_native_config(&native).unwrap_err().contains("fake-IP"));
+                native.pointer_mut(parent).unwrap()[key] = json!({ "strategy": "prefer_ipv4" });
+                assert!(validate_native_config(&native).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn native_review_checks_nested_dns_rules_and_rule_sets() {
+        let mut native = native_reference_fixture();
+        native["dns"]["rules"] = json!([{
+            "type": "logical", "mode": "and", "rules": [{ "rule_set": "domains", "server": "local" }]
+        }]);
+        validate_native_config(&native).expect("nested references");
+        native["dns"]["rules"][0]["rules"][0]["server"] = json!("missing");
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing DNS server")
+        );
+        native["dns"]["rules"][0]["rules"][0]["server"] = json!("local");
+        native["dns"]["rules"][0]["rules"][0]["rule_set"] = json!("missing");
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing rule_set")
+        );
+    }
+
+    #[test]
+    fn native_review_checks_inline_and_shared_rule_set_http_clients() {
+        let mut native = native_reference_fixture();
+        native["outbounds"].as_array_mut().unwrap().push(json!({
+            "type": "socks", "tag": "download-node", "server": "127.0.0.1", "server_port": 1080
+        }));
+        native["route"]["rule_set"][0] = json!({
+            "type": "remote", "tag": "domains", "format": "source", "url": "https://example.com/domains.json",
+            "http_client": { "detour": "download-node", "domain_resolver": { "server": "local" } }
+        });
+        validate_native_config(&native).expect("inline HTTP client");
+        native["route"]["rule_set"][0]["http_client"]["detour"] = json!("missing");
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing outbound")
+        );
+        native["route"]["rule_set"][0]["http_client"]["detour"] = json!("download-node");
+        native["route"]["rule_set"][0]["http_client"]["domain_resolver"] = json!({ "server": "missing" });
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing DNS server")
+        );
+
+        native["route"]["rule_set"][0]["http_client"] = json!("download");
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing HTTP client")
+        );
+        native["http_clients"] = json!([{ "tag": "download", "detour": "download-node", "domain_resolver": "local" }]);
+        validate_native_config(&native).expect("shared HTTP client");
+        native["http_clients"][0]["detour"] = json!("missing");
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("missing outbound")
+        );
+        native["http_clients"][0]["detour"] = json!("download-node");
+        let duplicate = native["http_clients"][0].clone();
+        native["http_clients"].as_array_mut().unwrap().push(duplicate);
+        assert!(
+            validate_native_config(&native)
+                .unwrap_err()
+                .contains("duplicate HTTP client")
+        );
+    }
+
     /// Regression #48: the generated clash_api must never carry the publicly
     /// known template secret nor a wildcard CORS policy.
     #[test]
@@ -1505,7 +1771,7 @@ mod tests {
                 "only the CLI-owned cache may be emitted: {path}"
             ),
             None => assert!(
-                !native["experimental"]["cache_file"].is_null(),
+                native["experimental"].get("cache_file").is_none(),
                 "an absent cache must be absent, not null"
             ),
         }

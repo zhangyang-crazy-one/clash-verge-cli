@@ -15,6 +15,7 @@ mod mihomo_manager;
 mod profile_script;
 mod profile_store;
 mod routing;
+mod rule_overlay;
 mod runtime_config;
 mod service_cmd;
 mod services;
@@ -91,9 +92,17 @@ async fn run() -> anyhow::Result<i32> {
         Some(cli::Command::Askpass | cli::Command::Completions { .. } | cli::Command::Man { .. }) => {
             unreachable!("handled before config resolution")
         }
-        Some(cli::Command::Start { foreground }) => {
+        Some(cli::Command::Start {
+            foreground,
+            start_use_existing_config,
+        }) => {
             if foreground {
-                commands::daemon::run(config_dir).await?;
+                let launch = if start_use_existing_config {
+                    commands::start::SupervisorLaunch::UseExistingConfig
+                } else {
+                    commands::start::SupervisorLaunch::Regenerate
+                };
+                commands::daemon::run(config_dir, launch).await?;
             } else {
                 let manager = commands::build_manager(config_dir).await?;
                 commands::start::run(manager).await?;
@@ -192,6 +201,10 @@ async fn run() -> anyhow::Result<i32> {
         Some(cli::Command::Core { action }) => match action.unwrap_or(cli::CoreCommand::Show) {
             cli::CoreCommand::Show => commands::core::show(config_dir, json).await?,
             cli::CoreCommand::Use { core } => commands::core::use_core(config_dir, core).await?,
+        },
+        Some(cli::Command::Config { action }) => match action {
+            cli::ConfigCommand::Get { key } => commands::config::get(&key, json).await?,
+            cli::ConfigCommand::Set { key, value } => commands::config::set(&key, &value, json).await?,
         },
         Some(cli::Command::Connections { action }) => {
             let manager = commands::build_manager(config_dir).await?;

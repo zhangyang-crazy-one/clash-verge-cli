@@ -4,10 +4,8 @@
 use crate::app::{Action, App, InputMode, Overlay};
 use crate::tui::handlers::Ctx;
 
-/// Load the active remote profile's rule list into the edit buffer. Used by
-/// `toggle_edit_mode` on entry. Kept private to this module so it does not
-/// widen the surface owned by other workers (it never spawns, only reads
-/// the profile store and the YAML file on disk).
+/// Load the active profile's effective rule list into the edit buffer. Used
+/// by `toggle_edit_mode` on entry; profile overlays follow the complete chain.
 ///
 /// Logical (AND/OR) rules live in the sing-box sidecar, not in the profile
 /// YAML, so they are appended to the buffer as well (#59): without them a
@@ -31,7 +29,7 @@ async fn load_edit_buffer_from_active_profile(app: &mut App, singbox: bool) -> R
         return Err("no active profile".into());
     };
     if item.file.is_none() {
-        return Err("no active remote profile to edit".into());
+        return Err("active profile has no file to edit".into());
     }
     let rules = crate::runtime_config::composed_profile_rules(&item).await?;
     let (order, drift) = match load_rule_order(singbox)? {
@@ -252,9 +250,9 @@ fn persist_rules(
     persist_logical_rules(home, &order)
 }
 
-/// [`persist_rules`] for a real profile: computes the chain contribution and
-/// proves, BEFORE the profile file is touched, that writing the derived list
-/// reproduces the composed list the editor is showing.
+/// Remote edits use a per-profile overlay so refresh cannot erase them. A
+/// local profile can retain its direct YAML save only when composing that
+/// save reproduces the edited list; otherwise it also uses an overlay.
 async fn persist_rules_for_profile(
     item: &clash_verge_core::config::PrfItem,
     path: &std::path::Path,
@@ -263,21 +261,65 @@ async fn persist_rules_for_profile(
     buffer: Vec<crate::routing::IRouteRule>,
     kind: crate::mihomo_manager::CoreKind,
 ) -> Result<(), String> {
+    let profiles_dir = path.parent().ok_or("profile file has no directory")?;
+    let overlay_path = crate::rule_overlay::path(profiles_dir, item)?;
+    if item.itype.as_deref() == Some("remote") || overlay_path.exists() {
+        return persist_rule_overlay(item, &overlay_path, home, yaml, buffer, kind).await;
+    }
     let chain_rules = crate::runtime_config::compose_profile_rules(item, &[]).await?;
     let (composed, _) = partition_edit_buffer(buffer.clone());
-    let file_rules = strip_chain_rules(&composed, &chain_rules)?;
+    let file_rules = match strip_chain_rules(&composed, &chain_rules) {
+        Ok(rules) => rules,
+        Err(_) => return persist_rule_overlay(item, &overlay_path, home, yaml, buffer, kind).await,
+    };
     let reproduced = crate::runtime_config::compose_profile_rules(item, &file_rules).await?;
     if !rules_equivalent(&reproduced, &composed) {
-        return Err(
-            "the configured Rules/Merge/Script chain rewrites the profile rule list, so this profile's \
-rules cannot be saved from the editor; nothing was written"
-                .into(),
-        );
+        return persist_rule_overlay(item, &overlay_path, home, yaml, buffer, kind).await;
     }
     // `reproduced` keeps the chain's real position, so passing it as the
     // fingerprint source cannot describe a list other than the one the next
     // composition will produce.
     persist_rules(path, home, yaml, buffer, kind, &chain_rules, &reproduced)
+}
+
+/// Store edits separately from the subscription and enhancement fragments.
+/// The baseline is the complete composition without its existing overlay.
+async fn persist_rule_overlay(
+    item: &clash_verge_core::config::PrfItem,
+    overlay_path: &std::path::Path,
+    home: &std::path::Path,
+    yaml: &str,
+    buffer: Vec<crate::routing::IRouteRule>,
+    kind: crate::mihomo_manager::CoreKind,
+) -> Result<(), String> {
+    let (edited, mut order) = partition_edit_buffer(buffer);
+    if kind != crate::mihomo_manager::CoreKind::SingBox && !order.logical.is_empty() {
+        return Err("logical rules require the sing-box core".into());
+    }
+    let raw_rules = crate::routing::load_profile_rules(yaml)?;
+    let baseline = crate::runtime_config::compose_profile_rules(item, &raw_rules).await?;
+    let overlay = crate::rule_overlay::RuleOverlay::from_edit(&baseline, &edited)?;
+    let body = overlay.serialize()?;
+    let previous = match std::fs::read_to_string(overlay_path) {
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read {}: {error}", overlay_path.display())),
+    };
+    write_atomic(overlay_path, &body)?;
+    if kind == crate::mihomo_manager::CoreKind::SingBox {
+        order.profile = Some(crate::singbox::profile_rule_fingerprint(&edited));
+        if let Err(error) = persist_logical_rules(home, &order) {
+            let rollback = match previous {
+                Some(previous) => write_atomic(overlay_path, &previous),
+                None => std::fs::remove_file(overlay_path).map_err(|error| error.to_string()),
+            };
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}; rule overlay rollback failed: {rollback}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Write the logical sidecar, or delete it when the list is empty so that a
@@ -603,9 +645,9 @@ pub(super) fn note_rules_failed(app: &mut App, error: String) {
     app.status_msg = Some(format!("rule save failed: {error}"));
 }
 
-/// Task 7.1/7.5: persist edited profile rules and apply them per core kind.
-/// Clash-expressible rules go back into the profile YAML; logical rules have
-/// no clash form and live in the sing-box sidecar instead.
+/// Persist edited profile rules and apply them per core kind. Remote and
+/// non-contiguous-chain edits live in per-profile overlays; logical rules
+/// have no Clash form and remain in the sing-box sidecar.
 fn spawn_rules_save(
     manager: crate::mihomo_manager::MihomoManager,
     enable_tun: bool,
@@ -1439,6 +1481,177 @@ mod tests {
                 .expect("appended chain"),
             vec![simple("a.com")]
         );
+    }
+
+    /// A4/C4: edits survive a refresh and a Script that inserts rules in the
+    /// middle. Neither the subscription nor the hook is rewritten.
+    #[tokio::test]
+    async fn rule_overlay_survives_refresh_and_non_contiguous_script() {
+        for profile_type in ["remote", "local"] {
+            let home = tempfile::tempdir().unwrap();
+            let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+            std::fs::write(
+                home.path().join("config.yaml"),
+                "mixed-port: 39193\nsecret: overlay-test\n",
+            )
+            .unwrap();
+            std::fs::write(home.path().join("profiles.yaml"), format!(
+                "current: Rbase\nitems:\n  - {{uid: Rbase, type: {profile_type}, file: base.yaml, option: {{script: Sedit}}}}\n  - {{uid: Sedit, type: script, file: hook.js}}\n"
+            )).unwrap();
+            let profiles = home.path().join("profiles");
+            let path = profiles.join("base.yaml");
+            let source =
+                "proxies: []\nrules: ['DOMAIN,one.example,DIRECT', 'DOMAIN,two.example,DIRECT', 'MATCH,DIRECT']\n";
+            let hook =
+                "function main(config) { config.rules.splice(1, 0, 'DOMAIN,hook.example,DIRECT'); return config; }";
+            std::fs::write(&path, source).unwrap();
+            std::fs::write(profiles.join("hook.js"), hook).unwrap();
+            let item = crate::profile_store::store::ProfileStore::snapshot()
+                .await
+                .unwrap()
+                .items()
+                .remove(0);
+            let baseline = crate::runtime_config::composed_profile_rules(&item).await.unwrap();
+            assert_eq!(baseline.len(), 4);
+            let edited = vec![
+                baseline[1].clone(),
+                simple("local.example"),
+                baseline[2].clone(),
+                logical("blocked.example"),
+                baseline[3].clone(),
+            ];
+            for _ in 0..2 {
+                persist_rules_for_profile(&item, &path, home.path(), source, edited.clone(), CoreKind::SingBox)
+                    .await
+                    .unwrap();
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+                assert_eq!(std::fs::read_to_string(profiles.join("hook.js")).unwrap(), hook);
+                let after = crate::runtime_config::composed_profile_rules(&item).await.unwrap();
+                let order = crate::singbox::load_rule_order(home.path()).unwrap();
+                let (order, note) = order.resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&after));
+                assert!(note.is_none());
+                assert_eq!(compose_edit_buffer(after, &order), edited);
+            }
+            // Simulate the byte replacement performed by subscription refresh.
+            let refreshed = "proxies: []\nrules: ['DOMAIN,one.example,DIRECT', 'DOMAIN,new.example,DIRECT', 'DOMAIN,two.example,DIRECT', 'MATCH,DIRECT']\n";
+            std::fs::write(&path, refreshed).unwrap();
+            let after = crate::runtime_config::composed_profile_rules(&item).await.unwrap();
+            let descriptions: Vec<_> = after.iter().map(crate::routing::describe).collect();
+            assert_eq!(
+                descriptions,
+                vec![
+                    "DOMAIN,hook.example,DIRECT",
+                    "DOMAIN,local.example,DIRECT",
+                    "DOMAIN,new.example,DIRECT",
+                    "DOMAIN,two.example,DIRECT",
+                    "MATCH,DIRECT"
+                ]
+            );
+            assert_eq!(
+                descriptions.iter().filter(|rule| rule.contains("hook.example")).count(),
+                1
+            );
+            let order = crate::singbox::load_rule_order(home.path()).unwrap();
+            assert!(
+                order
+                    .resolve_profile_drift(crate::singbox::profile_rule_fingerprint(&after))
+                    .1
+                    .is_some(),
+                "a real upstream change still invalidates logical indices"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), refreshed);
+            // Regular per-profile files are included by the existing backup.
+            let backup = home.path().join("backup.zip");
+            crate::services::backup::create(home.path(), &backup, false).unwrap();
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(backup).unwrap()).unwrap();
+            let name = crate::rule_overlay::path(&profiles, &item)
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(archive.by_name(&format!("profiles/{name}")).is_ok());
+            crate::profile_store::store::ProfileStore::delete_locked("Rbase")
+                .await
+                .unwrap();
+            assert!(!crate::rule_overlay::path(&profiles, &item).unwrap().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_overlay_rolls_back_when_logical_sidecar_cannot_be_saved() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39194\nsecret: overlay-failure-test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rbase\nitems:\n  - {uid: Rbase, type: remote, file: base.yaml}\n",
+        )
+        .unwrap();
+        let profiles = home.path().join("profiles");
+        let path = profiles.join("base.yaml");
+        let source = "proxies: []\nrules: ['MATCH,DIRECT']\n";
+        std::fs::write(&path, source).unwrap();
+        let item = crate::profile_store::store::ProfileStore::snapshot()
+            .await
+            .unwrap()
+            .items()
+            .remove(0);
+        let baseline = crate::runtime_config::composed_profile_rules(&item).await.unwrap();
+        let edited = vec![simple("new.example"), logical("blocked.example"), baseline[0].clone()];
+        let overlay = crate::rule_overlay::path(&profiles, &item).unwrap();
+        std::fs::create_dir(home.path().join(crate::singbox::LOGICAL_RULES_FILE)).unwrap();
+        let error = persist_rules_for_profile(&item, &path, home.path(), source, edited.clone(), CoreKind::SingBox)
+            .await
+            .unwrap_err();
+        assert!(
+            !overlay.exists(),
+            "failed initial save must not leave an overlay: {error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        let old = crate::rule_overlay::RuleOverlay::from_edit(&baseline, &baseline)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        write_atomic(&overlay, &old).unwrap();
+        persist_rules_for_profile(&item, &path, home.path(), source, edited, CoreKind::SingBox)
+            .await
+            .unwrap_err();
+        assert_eq!(std::fs::read_to_string(overlay).unwrap(), old);
+    }
+
+    #[tokio::test]
+    async fn rule_overlay_malformed_file_blocks_composition() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39195\nsecret: overlay-invalid-test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: Rbase\nitems:\n  - {uid: Rbase, type: remote, file: base.yaml}\n",
+        )
+        .unwrap();
+        let profiles = home.path().join("profiles");
+        std::fs::write(profiles.join("base.yaml"), "proxies: []\nrules: ['MATCH,DIRECT']\n").unwrap();
+        let item = crate::profile_store::store::ProfileStore::snapshot()
+            .await
+            .unwrap()
+            .items()
+            .remove(0);
+        std::fs::write(
+            crate::rule_overlay::path(&profiles, &item).unwrap(),
+            "version: 55\nsource: []\nentries: []\n",
+        )
+        .unwrap();
+        let error = crate::runtime_config::composed_profile_rules(&item).await.unwrap_err();
+        assert!(error.contains("unsupported rule overlay version 55"), "{error}");
     }
 
     /// The atomic write follows the `singbox` convention: unique staging

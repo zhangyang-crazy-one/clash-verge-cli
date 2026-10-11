@@ -20,9 +20,9 @@ use crate::commands;
 use crate::subscribe::lifecycle::{ManagerLifecycle, reload_with_lifecycle};
 use crate::subscribe::scheduler::AutoUpdateScheduler;
 
-pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
-    let launch = crate::commands::start::requested_launch();
+pub async fn run(config_dir: PathBuf, launch: crate::commands::start::SupervisorLaunch) -> anyhow::Result<()> {
     let manager = commands::build_manager(config_dir).await?;
+    let kind = manager.core_kind().as_str();
     // P1 (reviewer): a RECOVERY supervisor (launched by a failed apply's
     // rollback) must serve the runtime config already on disk — the
     // previous one just restored — and never regenerate it from the active
@@ -63,7 +63,7 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                 };
                 match action {
                 crate::app::Action::CoreExited(_) if manager.state() == crate::app::CoreState::Stopped => {
-                    tracing::info!(target: "daemon", "mihomo was stopped, exiting");
+                    tracing::info!(target: "daemon", "{kind} was stopped, exiting");
                     if let Some(handle) = in_flight.take() {
                         handle.abort();
                         let _ = handle.await;
@@ -75,7 +75,7 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                         handle.abort();
                         let _ = handle.await;
                     }
-                    anyhow::bail!("mihomo stopped: {error}");
+                    anyhow::bail!("{kind} stopped: {error}");
                 }
                 _ => {}
                 }
@@ -154,6 +154,6 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
         let _ = handle.await;
     }
     manager.stop().await?;
-    tracing::info!(target: "daemon", "mihomo stopped, exiting");
+    tracing::info!(target: "daemon", "{kind} stopped, exiting");
     Ok(())
 }

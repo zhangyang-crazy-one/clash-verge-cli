@@ -103,7 +103,7 @@ fn metadata_network() -> MetadataNetwork {
 fn metadata_status_hint(status: u16) -> &'static str {
     match status {
         401 | 403 | 429 => {
-            "GitHub API rate limit or auth required (set GITHUB_TOKEN, or retry later; a shared proxy exit IP is rate limited)"
+            "GitHub API access denied or rate limit reached; retry later and check the configured proxy exit IP (metadata requests are anonymous)"
         }
         404 => "release or tag not found in the official repository",
         _ => "see the HTTP status above",
@@ -565,6 +565,9 @@ mod tests {
         for status in [401_u16, 403, 429] {
             let hint = metadata_status_hint(status);
             assert!(hint.contains("rate limit"), "status {status} hint: {hint}");
+            assert!(hint.contains("retry later"), "status {status} hint: {hint}");
+            assert!(hint.contains("anonymous"), "status {status} hint: {hint}");
+            assert!(!hint.contains("GITHUB_TOKEN"), "unsupported token advice: {hint}");
         }
         assert!(metadata_status_hint(404).contains("not found"));
         // The metadata client builder must stay proxy-env driven: building it

@@ -1,31 +1,64 @@
 # clash-verge-cli
 
-A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo). It provides an interactive Ratatui interface and small non-interactive commands, fully standalone: it owns its data directory, its mihomo core, and its controller socket, with no runtime dependency on the Clash Verge Rev GUI.
+A Linux-first terminal client for [mihomo](https://github.com/MetaCubeX/mihomo) and [sing-box](https://github.com/SagerNet/sing-box). It provides an interactive Ratatui interface and small non-interactive commands, fully standalone: it owns its data directory, its selected proxy core, and its controller endpoint, with no runtime dependency on the Clash Verge Rev GUI.
 
 ## Features
 
 - Eight terminal views for status, proxies, profiles, connections, rules, logs, unlock status, and settings
 - Proxy selection, delay tests, and ordered proxy-chain editing
 - Subscription import, update, and active-profile switching
-- Live traffic, connection, and log streams over the mihomo controller socket
+- Live traffic, connection, and log streams over the selected core's controller
 - English and Simplified Chinese interfaces
 - `start`, `stop`, `restart`, and machine-readable `status` commands
 - TUN mode with one-time capability setup (bordered askpass popup, works
   over SSH on headless servers; no root service or daemon)
 
-## Mihomo core
+## Proxy cores
 
-On `start` (TUI `s` or `clash-verge-cli start`), the CLI resolves mihomo as follows:
+Use `clash-verge-cli core` to inspect the selected/running core and
+`clash-verge-cli core use mihomo` or `core use singbox` to switch.
+Mihomo uses a Unix controller socket; sing-box uses a loopback TCP controller.
+`status` shows the core and controller endpoint; `status --json` includes
+`core` and `controller` alongside its existing fields.
 
-1. Use a system `verge-mihomo` if present
-2. Otherwise auto-download the latest release (fallback **v1.19.29**) into
-   `$XDG_DATA_HOME/clash-verge-cli/mihomo` (or `~/.local/share/clash-verge-cli/mihomo`)
-   and keep that managed binary in sync. Downloads are checked against the
-   sha256 digest GitHub publishes for the asset, must be an ELF binary that
-   reports the expected version, and are installed atomically under a lock
-   shared by all running instances.
+On `start` (TUI `s` or `clash-verge-cli start`), the CLI inspects installed
+and managed binaries against its offline compatibility policy. The pinned
+download targets are **mihomo v1.19.32** and **sing-box v1.14.2**. The TUI
+asks for confirmation before downloading a missing or older core.
+Stable newer releases in the same major line remain usable; unsupported
+or malformed versions are rejected.
+Managed binaries live under `$XDG_DATA_HOME/clash-verge-cli/` (or
+`~/.local/share/clash-verge-cli/`). Downloads require an official release
+digest or exact checksum-manifest entry, a matching executable version,
+and atomic installation under a shared lock.
 
-No separate install step is required for normal use.
+Native sing-box profiles keep their routing, DNS and unknown provider fields,
+with reference validation before launch. Nonempty `services` are rejected:
+the CLI manages its mixed/TUN inbounds and controller, and cannot manage
+additional provider service listeners.
+
+Browser dashboards are limited to local origins by default. To authorize
+specific external origins for both cores, set the user-owned whitelist in
+`verge.yaml` through the CLI:
+
+```bash
+clash-verge-cli config set controller_allowed_origins '["https://yacd.metacubex.one", "https://dashboard.example:8443"]'
+clash-verge-cli config get controller_allowed_origins --json
+clash-verge-cli restart
+# Return to local-only origins:
+clash-verge-cli config set controller_allowed_origins '[]'
+```
+
+Only `http://host[:port]` and `https://host[:port]` origins are accepted;
+wildcards, credentials, paths (including a trailing `/`), queries and fragments
+are rejected. Values are canonicalized and deduplicated. The explicit origins
+extend the local defaults; missing/empty settings keep the original policy.
+Provider profiles cannot authorize CORS origins. Saving preserves other YAML
+fields, keeps an owner-private `verge.yaml.bak`, and displays the reloaded
+configured/effective lists. A restart applies the changes. Explicit additional
+origins also enable Private Network Access (PNA) preflight permission so those
+dashboards can reach the local controller; local-only defaults keep PNA disabled.
+The exact origin whitelist, controller binding and secret authentication still apply.
 
 ## Install
 
@@ -187,9 +220,9 @@ server's `clash-verge-rev-backup/` folder, the one the GUI uses.
 ## System proxy
 
 With *System proxy* enabled in Settings, the desktop proxy (GNOME, or KDE
-Plasma 5/6) follows the core: it is applied when mihomo starts, with the
+Plasma 5/6) follows the core: it is applied when the proxy core starts, with the
 default LAN/localhost bypass list plus `system_proxy_bypass`, and released
-when mihomo stops or exits, restoring the previous desktop settings. On
+when the proxy core stops or exits, restoring the previous desktop settings. On
 headless machines use `clash-verge-cli sysproxy env` (or `--unset`) instead.
 
 ## Logs
@@ -236,7 +269,7 @@ The CLI never reads the GUI directory at runtime; migration is one-shot.
 | `o` | Proxies: order nodes by profile order, delay, or name |
 | `Shift+h` | Proxies: hide or show nodes whose delay test failed |
 | `c`, `a`, `x` | Toggle, apply, or clear proxy-chain editing |
-| `Shift+l` | Logs: switch mihomo's log level (debug, info, warning, error) until the next restart |
+| `Shift+l` | Logs: switch the core's log level (debug, info, warning, error) until the next restart |
 | `Enter`, `r` | Rules: update the selected rule provider, refresh the rules |
 | `r` | Unlock: check which services the exit node reaches |
 

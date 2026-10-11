@@ -12,7 +12,7 @@
 //!
 //! Profile conversion degrades instead of aborting (#52 philosophy): every
 //! Clash DNS policy the typed model cannot express (`fallback`,
-//! `fallback-filter`, `listen`, `fake-ip-filter`, …) is dropped with an
+//! `fallback-filter`, `listen`, …) is dropped with an
 //! explicit report note. Only structural breakage — a `dns` block that is not
 //! a mapping, a `nameserver` that is not a list of strings — fails the
 //! conversion.
@@ -102,12 +102,20 @@ pub struct DnsServerSpec {
     pub inet6_range: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsRuleSpec {
     /// Server tag the matched queries are routed to.
     pub server: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub query_type: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_regex: Vec<String>,
+    /// Logical AND of matchers, used to retain nameserver-policy when a
+    /// fake-IP filter requests real answers. Children contain no actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<DnsRuleSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub domain_suffix: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -119,6 +127,9 @@ pub struct DnsRuleSpec {
 impl DnsRuleSpec {
     fn is_empty(&self) -> bool {
         self.query_type.is_empty()
+            && self.domain.is_empty()
+            && self.domain_regex.is_empty()
+            && self.conditions.is_empty()
             && self.domain_suffix.is_empty()
             && self.domain_keyword.is_empty()
             && self.ip_cidr.is_empty()
@@ -131,7 +142,8 @@ pub struct DnsConfigSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<DnsRuleSpec>,
     /// Bootstrap server tag written onto remote servers addressed by domain
-    /// and as `route.default_domain_resolver` for outbound name resolution.
+    /// Only bootstraps upstream hostnames; node dialing uses real policy
+    /// resolvers or the business final server independently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_resolver: Option<String>,
     /// The server unmatched queries are sent to (`dns.final`). Without it
@@ -233,6 +245,7 @@ impl DnsConfigSpec {
             if !tags.contains(&rule.server) {
                 return Err(format!("dns rule targets unknown server {:?}", rule.server));
             }
+            validate_matcher(rule)?;
         }
         Ok(())
     }
@@ -332,22 +345,15 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
             }
         }
     }
-    if let Some(filter) = get("fake-ip-filter").filter(|value| !value.is_null()) {
-        let count = filter.as_sequence().map_or(1, |values| values.len());
-        report.note(
-            "fake-ip-filter",
-            format!(
-                "dropped ({count} entr{}); those domains now resolve into the fake-IP pool",
-                if count == 1 { "y" } else { "ies" }
-            ),
-        );
-    }
-    if get("fake-ip-filter-mode").is_some_and(|value| !value.is_null()) {
-        report.note(
-            "fake-ip-filter-mode",
-            "dropped; sing-box has no fake-IP filter mode selector",
-        );
-    }
+    let fake_filters = get("fake-ip-filter")
+        .filter(|value| !value.is_null())
+        .map(|value| as_string_list(value, "fake-ip-filter"))
+        .transpose()?
+        .unwrap_or_default();
+    let fake_filter_mode = match get("fake-ip-filter-mode").filter(|value| !value.is_null()) {
+        Some(value) => value.as_str().ok_or("dns.fake-ip-filter-mode must be a string")?,
+        None => "blacklist",
+    };
     for key in dns.keys().filter_map(Yaml::as_str) {
         if !matches!(
             key,
@@ -415,7 +421,13 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
         let Some(policy) = policy.as_mapping() else {
             return Err("dns.nameserver-policy must be a mapping".into());
         };
-        for (pattern, endpoints) in policy {
+        // Mihomo's domain trie chooses static labels before '*' before
+        // subdomain wildcards, regardless of YAML insertion order.
+        let mut policies: Vec<_> = policy.iter().collect();
+        policies.sort_by(|(left, _), (right, _)| {
+            policy_priority(right.as_str().unwrap_or_default()).cmp(&policy_priority(left.as_str().unwrap_or_default()))
+        });
+        for (pattern, endpoints) in policies {
             let Some(pattern) = pattern.as_str() else {
                 return Err("dns.nameserver-policy keys must be strings".to_string());
             };
@@ -423,7 +435,7 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
             let Some((field, value)) = parse_clash_dns_policy_pattern(pattern) else {
                 report.note(
                     format!("nameserver-policy.{pattern}"),
-                    "unsupported matcher; use +.domain, keyword:, or ipcidr:",
+                    "unsupported matcher; use an exact domain, +.suffix, *.label, .suffix, or keyword:",
                 );
                 continue;
             };
@@ -459,8 +471,11 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                 domain_suffix: Vec::new(),
                 domain_keyword: Vec::new(),
                 ip_cidr: Vec::new(),
+                ..Default::default()
             };
             match field {
+                "domain" => rule.domain.push(value),
+                "domain_regex" => rule.domain_regex.push(value),
                 "domain_suffix" => rule.domain_suffix.push(value),
                 "domain_keyword" => rule.domain_keyword.push(value),
                 _ => unreachable!("ipcidr policies are rejected by parse_clash_dns_policy_pattern"),
@@ -508,16 +523,6 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                 inet4_range,
                 inet6_range,
             });
-            spec.rules.insert(
-                0,
-                DnsRuleSpec {
-                    server: FAKEIP_SERVER_TAG.into(),
-                    query_type: vec!["A".into(), "AAAA".into()],
-                    domain_suffix: Vec::new(),
-                    domain_keyword: Vec::new(),
-                    ip_cidr: Vec::new(),
-                },
-            );
         }
         mode => report.note(
             "enhanced-mode",
@@ -612,6 +617,11 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
         }
     }
 
+    if spec.servers.iter().any(|server| server.kind == DnsServerKind::Fakeip) {
+        compile_fake_ip_filters(&mut spec, &fake_filters, fake_filter_mode, &mut report)?;
+    } else if !fake_filters.is_empty() || get("fake-ip-filter-mode").is_some() {
+        report.note("fake-ip-filter", "ignored; enhanced-mode is not fake-ip");
+    }
     spec.validate()?;
     report.spec = Some(spec);
     Ok(report)
@@ -636,7 +646,11 @@ fn as_string_list(value: &Yaml, key: &str) -> Result<Vec<String>, String> {
 fn first_ip_literal_server(spec: &DnsConfigSpec) -> Option<String> {
     spec.servers
         .iter()
-        .find(|server| server.kind == DnsServerKind::Udp && server.server.as_deref().is_some_and(looks_like_ip))
+        .find(|server| {
+            server.kind == DnsServerKind::Udp
+                && server.server.as_deref().is_some_and(looks_like_ip)
+                && server.detour.as_deref().is_none_or(|tag| tag == "direct")
+        })
         .map(|server| server.tag.clone())
 }
 
@@ -742,6 +756,7 @@ fn add_clash_dns_endpoint(
     let host = endpoint_host(base);
     let mut force_h3 = false;
     let mut insecure = false;
+    let mut detour = None;
     for option in fragment.split(['&', ',']).filter(|part| !part.trim().is_empty()) {
         let (name, value) = option.split_once('=').unwrap_or((option, ""));
         match name.trim().to_ascii_lowercase().as_str() {
@@ -761,7 +776,15 @@ fn add_clash_dns_endpoint(
                 }
             }
             other => {
-                report.note(key, format!("{host}: unsupported '#{other}' option is dropped"));
+                if !option.contains('=') && !other.is_empty() {
+                    detour = if option.trim().eq_ignore_ascii_case("DIRECT") {
+                        None
+                    } else {
+                        Some(option.trim().to_string())
+                    };
+                } else {
+                    report.note(key, format!("{host}: unsupported '#{other}' option is dropped"));
+                }
             }
         }
     }
@@ -777,7 +800,7 @@ fn add_clash_dns_endpoint(
                 server: Some(address.to_string()),
                 server_port: None,
                 path: None,
-                detour: None,
+                detour: detour.clone(),
                 tls_insecure: None,
                 inet4_range: None,
                 inet6_range: None,
@@ -834,7 +857,7 @@ fn add_clash_dns_endpoint(
             );
         }
     }
-    let Some(server) = url.host_str().map(str::to_string) else {
+    let Some(server) = url.host_str().map(|host| host.trim_matches(['[', ']']).to_string()) else {
         report.note(key, "a nameserver entry without a host is dropped");
         return None;
     };
@@ -866,7 +889,7 @@ fn add_clash_dns_endpoint(
             server: Some(server),
             server_port: url.port(),
             path,
-            detour: None,
+            detour,
             tls_insecure: insecure.then_some(true),
             inet4_range: None,
             inet6_range: None,
@@ -908,12 +931,13 @@ fn register_server(
     mut server: DnsServerSpec,
 ) -> String {
     let key = format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}",
         server.kind.as_str(),
         server.server.clone().unwrap_or_default(),
         server.server_port.unwrap_or_default(),
         server.path.clone().unwrap_or_default(),
-        server.tls_insecure.unwrap_or_default()
+        server.tls_insecure.unwrap_or_default(),
+        server.detour.as_deref().unwrap_or_default()
     );
     if let Some(tag) = tags.get(&key) {
         return tag.clone();
@@ -931,37 +955,189 @@ fn register_server(
 /// `None` means the matcher has no typed equivalent (the policy line is
 /// reported and dropped instead of failing the whole DNS layer).
 fn parse_clash_dns_policy_pattern(pattern: &str) -> Option<(&'static str, String)> {
-    let value = |field: &'static str, value: &str| {
-        let value = value.trim();
-        (!value.is_empty()).then(|| (field, value.to_string()))
-    };
-    if let Some(rest) = pattern.strip_prefix("+.") {
-        return value("domain_suffix", rest);
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if let Some(keyword) = pattern.strip_prefix("keyword:") {
+        return (!keyword.is_empty()).then(|| ("domain_keyword", keyword.to_string()));
     }
-    for (prefix, field) in [
-        ("domain:", "domain_suffix"),
-        ("keyword:", "domain_keyword"),
-        ("ipcidr:", "ip_cidr"),
-    ] {
-        if let Some(rest) = pattern.strip_prefix(prefix) {
-            let value = value(field, rest)?;
-            if field == "domain_suffix" {
-                // `domain:` matches one exact name; the typed rule only has
-                // `domain_suffix`, and widening it to a suffix would send
-                // unrelated names to this resolver.
-                return None;
+    let pattern = pattern.strip_prefix("domain:").unwrap_or(&pattern);
+    if pattern.contains(':') || pattern.contains(',') || pattern.contains('/') {
+        // geosite/rule-set/IP-response selectors cannot be represented by
+        // a query-domain matcher. Never broaden them to a suffix.
+        return None;
+    }
+    let suffix = pattern.strip_prefix("+.");
+    let subdomains = pattern.strip_prefix('.');
+    let labels: Vec<_> = suffix.or(subdomains).unwrap_or(pattern).split('.').collect();
+    if labels
+        .iter()
+        .any(|label| label.is_empty() || label.contains('+') || (label.contains('*') && *label != "*"))
+    {
+        return None;
+    }
+    if let Some(suffix) = suffix.filter(|_| !pattern.contains('*')) {
+        return Some(("domain_suffix", suffix.to_string()));
+    }
+    if suffix.is_some() || subdomains.is_some() || pattern.contains('*') {
+        let body = labels
+            .iter()
+            .map(|label| {
+                if *label == "*" {
+                    "[^.]+".into()
+                } else {
+                    regex::escape(label)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\\.");
+        let prefix = if suffix.is_some() {
+            "(?:[^.]+\\.)*"
+        } else if subdomains.is_some() {
+            "(?:[^.]+\\.)+"
+        } else {
+            ""
+        };
+        return Some(("domain_regex", format!("^{prefix}{body}$")));
+    }
+    Some(("domain", pattern.to_string()))
+}
+
+fn policy_priority(pattern: &str) -> Vec<(u8, String)> {
+    if pattern.starts_with("keyword:") {
+        return Vec::new();
+    }
+    pattern
+        .strip_prefix("domain:")
+        .unwrap_or(pattern)
+        .to_ascii_lowercase()
+        .split('.')
+        .rev()
+        .map(|label| {
+            (
+                match label {
+                    "" | "+" => 0,
+                    "*" => 1,
+                    _ => 2,
+                },
+                label.to_string(),
+            )
+        })
+        .collect()
+}
+
+fn domain_matcher(field: &str, value: String) -> DnsRuleSpec {
+    let mut rule = DnsRuleSpec::default();
+    match field {
+        "domain" => rule.domain.push(value),
+        "domain_suffix" => rule.domain_suffix.push(value),
+        "domain_keyword" => rule.domain_keyword.push(value),
+        "domain_regex" => rule.domain_regex.push(value),
+        _ => unreachable!("only domain matchers are parsed"),
+    }
+    rule
+}
+
+/// Compile client fake-IP decisions ahead of normal DNS rules. Real-IP
+/// decisions retain the matching nameserver-policy rather than bypassing it
+/// through dns.final. Node dialing ignores these A/AAAA-only decisions.
+fn compile_fake_ip_filters(
+    spec: &mut DnsConfigSpec,
+    filters: &[String],
+    mode: &str,
+    report: &mut DnsConversionReport,
+) -> Result<(), String> {
+    if !matches!(mode, "blacklist" | "whitelist" | "rule") {
+        return Err(format!(
+            "dns.fake-ip-filter-mode {mode:?} is unsupported (use blacklist, whitelist, or rule)"
+        ));
+    }
+    let final_server = spec
+        .final_server
+        .clone()
+        .ok_or("fake-IP filters require a real final DNS server")?;
+    let policies = spec.rules.clone();
+    let mut decisions = Vec::new();
+    for (index, entry) in filters.iter().enumerate() {
+        let (matcher, fake) = if mode == "rule" {
+            let parts: Vec<_> = entry.split(',').map(str::trim).collect();
+            let parsed = match parts.as_slice() {
+                ["MATCH", target] => Some((DnsRuleSpec::default(), *target)),
+                [kind, value, target] => {
+                    let field = match *kind {
+                        "DOMAIN" => Some("domain"),
+                        "DOMAIN-SUFFIX" => Some("domain_suffix"),
+                        "DOMAIN-KEYWORD" => Some("domain_keyword"),
+                        "DOMAIN-REGEX" if regex::Regex::new(value).is_ok() => Some("domain_regex"),
+                        _ => None,
+                    };
+                    field.filter(|_| !value.is_empty()).map(|field| {
+                        let value = if field == "domain_regex" {
+                            value.to_string()
+                        } else {
+                            value.to_ascii_lowercase()
+                        };
+                        (domain_matcher(field, value), *target)
+                    })
+                }
+                _ => None,
+            };
+            match parsed {
+                Some((matcher, "fake-ip")) => (matcher, true),
+                Some((matcher, "real-ip")) => (matcher, false),
+                _ => {
+                    report.note(
+                        format!("fake-ip-filter[{index}]"),
+                        format!("{entry:?}: unsupported rule or target; dropped"),
+                    );
+                    continue;
+                }
             }
-            if field == "ip_cidr" {
-                // sing-box 1.14.2 rejects an `ip_cidr` DNS rule without a
-                // response-evaluation rule ("Response Match Fields ...
-                // require match_response to be enabled"), and the typed spec
-                // cannot express one — so the policy is dropped.
-                return None;
+        } else {
+            let Some((field, value)) = parse_clash_dns_policy_pattern(entry) else {
+                report.note(
+                    format!("fake-ip-filter[{index}]"),
+                    format!("{entry:?}: unsupported matcher; dropped"),
+                );
+                continue;
+            };
+            if field == "domain_keyword" {
+                report.note(
+                    format!("fake-ip-filter[{index}]"),
+                    format!("{entry:?}: keyword matchers require rule mode DOMAIN-KEYWORD; dropped"),
+                );
+                continue;
             }
-            return Some(value);
+            (domain_matcher(field, value), mode == "whitelist")
+        };
+        let mut matched = matcher;
+        matched.query_type = vec!["A".into(), "AAAA".into()];
+        if fake {
+            matched.server = FAKEIP_SERVER_TAG.into();
+            decisions.push(matched);
+        } else {
+            for policy in &policies {
+                let mut condition = policy.clone();
+                condition.server.clear();
+                decisions.push(DnsRuleSpec {
+                    server: policy.server.clone(),
+                    conditions: vec![matched.clone(), condition],
+                    ..Default::default()
+                });
+            }
+            matched.server = final_server.clone();
+            decisions.push(matched);
         }
     }
-    None
+    if mode == "blacklist" || mode == "rule" {
+        // Mihomo rule-mode defaults to fake-IP when no decision matches.
+        decisions.push(DnsRuleSpec {
+            server: FAKEIP_SERVER_TAG.into(),
+            query_type: vec!["A".into(), "AAAA".into()],
+            ..Default::default()
+        });
+    }
+    decisions.extend(policies);
+    spec.rules = decisions;
+    Ok(())
 }
 
 fn validate_cidr(value: &str) -> Result<(), ()> {
@@ -1001,7 +1177,7 @@ pub fn build_dns_section(spec: &DnsConfigSpec) -> Result<Option<Value>, String> 
                 if let Some(path) = &s.path {
                     entry["path"] = json!(path);
                 }
-                if let (Some(detour), false) = (&s.detour, s.detour.as_deref().unwrap_or("").is_empty()) {
+                if let Some(detour) = s.detour.as_deref().filter(|tag| !tag.is_empty() && *tag != "direct") {
                     entry["detour"] = json!(detour);
                 }
                 // Clash's `#skip-cert-verify=true`. Verified accepted by
@@ -1037,19 +1213,9 @@ pub fn build_dns_section(spec: &DnsConfigSpec) -> Result<Option<Value>, String> 
         .rules
         .iter()
         .map(|r| {
-            let mut rule = json!({ "server": r.server });
-            if !r.query_type.is_empty() {
-                rule["query_type"] = json!(r.query_type);
-            }
-            if !r.domain_suffix.is_empty() {
-                rule["domain_suffix"] = json!(r.domain_suffix);
-            }
-            if !r.domain_keyword.is_empty() {
-                rule["domain_keyword"] = json!(r.domain_keyword);
-            }
-            if !r.ip_cidr.is_empty() {
-                rule["ip_cidr"] = json!(r.ip_cidr);
-            }
+            let mut rule = render_matcher(r);
+            rule["action"] = json!("route");
+            rule["server"] = json!(r.server);
             rule
         })
         .collect();
@@ -1064,13 +1230,192 @@ pub fn build_dns_section(spec: &DnsConfigSpec) -> Result<Option<Value>, String> 
     Ok(Some(section))
 }
 
-/// The `route.default_domain_resolver` companion value, or None.
+fn validate_matcher(rule: &DnsRuleSpec) -> Result<(), String> {
+    if !rule.conditions.is_empty()
+        && (!rule.query_type.is_empty()
+            || !rule.domain.is_empty()
+            || !rule.domain_regex.is_empty()
+            || !rule.domain_suffix.is_empty()
+            || !rule.domain_keyword.is_empty()
+            || !rule.ip_cidr.is_empty())
+    {
+        return Err("logical DNS rules must put all match fields in conditions".into());
+    }
+    for pattern in &rule.domain_regex {
+        regex::Regex::new(pattern).map_err(|error| format!("invalid DNS domain_regex {pattern:?}: {error}"))?;
+    }
+    for condition in &rule.conditions {
+        if !condition.server.is_empty() {
+            return Err("logical DNS conditions cannot contain a server action".into());
+        }
+        if condition.is_empty() {
+            return Err("logical DNS rule has an empty condition".into());
+        }
+        validate_matcher(condition)?;
+    }
+    Ok(())
+}
+
+fn render_matcher(r: &DnsRuleSpec) -> Value {
+    if !r.conditions.is_empty() {
+        return json!({"type": "logical", "mode": "and", "rules": r.conditions.iter().map(render_matcher).collect::<Vec<_>>()});
+    }
+    let mut rule = json!({});
+    for (key, values) in [
+        ("query_type", &r.query_type),
+        ("domain", &r.domain),
+        ("domain_regex", &r.domain_regex),
+        ("domain_suffix", &r.domain_suffix),
+        ("domain_keyword", &r.domain_keyword),
+        ("ip_cidr", &r.ip_cidr),
+    ] {
+        if !values.is_empty() {
+            rule[key] = json!(values);
+        }
+    }
+    rule
+}
+
+/// Default real domain resolver for node dialing; upstream bootstrap stays
+/// on the DNS server's own domain_resolver field. Fake-IP is never eligible.
 pub fn default_domain_resolver(spec: &DnsConfigSpec) -> Option<String> {
-    spec.domain_resolver.clone().filter(|tag| {
-        spec.servers
+    spec.final_server
+        .iter()
+        .chain(spec.domain_resolver.iter())
+        .find(|tag| {
+            spec.servers
+                .iter()
+                .any(|server| &server.tag == *tag && server.kind != DnsServerKind::Fakeip)
+        })
+        .cloned()
+}
+
+fn matches_domain(rule: &DnsRuleSpec, hostname: &str) -> bool {
+    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+    rule.domain.contains(&hostname)
+        || rule
+            .domain_suffix
             .iter()
-            .any(|server| &server.tag == tag && server.kind != DnsServerKind::Fakeip)
-    })
+            .any(|suffix| hostname == *suffix || hostname.ends_with(&format!(".{suffix}")))
+        || rule.domain_keyword.iter().any(|keyword| hostname.contains(keyword))
+        || rule
+            .domain_regex
+            .iter()
+            .any(|pattern| regex::Regex::new(pattern).is_ok_and(|re| re.is_match(&hostname)))
+}
+
+/// Select policy resolvers for node hostnames before generation. IP literals
+/// need no lookup. Reject DNS -> proxy -> resolver cycles, including group
+/// members and outbound detour dependencies, before starting the core.
+pub fn apply_outbound_domain_resolvers(
+    spec: &DnsConfigSpec,
+    outbounds: &mut [Value],
+    groups: &[super::GroupSpec],
+) -> Result<(), String> {
+    if spec.is_empty() {
+        return Ok(());
+    }
+    spec.validate()?;
+    let fallback = default_domain_resolver(spec);
+    for outbound in outbounds.iter_mut() {
+        let Some(hostname) = outbound.get("server").and_then(Value::as_str) else {
+            continue;
+        };
+        if looks_like_ip(hostname.trim_matches(['[', ']'])) {
+            continue;
+        }
+        let resolver = spec
+            .rules
+            .iter()
+            .find(|rule| {
+                rule.query_type.is_empty()
+                    && rule.conditions.is_empty()
+                    && rule.ip_cidr.is_empty()
+                    && matches_domain(rule, hostname)
+                    && spec
+                        .servers
+                        .iter()
+                        .any(|server| server.tag == rule.server && server.kind != DnsServerKind::Fakeip)
+            })
+            .map(|rule| rule.server.clone())
+            .or_else(|| fallback.clone());
+        if let Some(resolver) = resolver {
+            outbound["domain_resolver"] = json!({"server": resolver});
+        }
+    }
+    let mut graph = std::collections::HashMap::<String, Vec<String>>::new();
+    for outbound in outbounds.iter() {
+        let Some(tag) = outbound.get("tag").and_then(Value::as_str) else {
+            continue;
+        };
+        let edges = graph.entry(format!("outbound:{tag}")).or_default();
+        if let Some(detour) = outbound.get("detour").and_then(Value::as_str) {
+            edges.push(format!("outbound:{detour}"));
+        }
+        if outbound
+            .get("server")
+            .and_then(Value::as_str)
+            .is_some_and(|host| !looks_like_ip(host.trim_matches(['[', ']'])))
+            && let Some(resolver) = outbound
+                .get("domain_resolver")
+                .and_then(|r| r.as_str().or_else(|| r.get("server").and_then(Value::as_str)))
+        {
+            edges.push(format!("dns:{resolver}"));
+        }
+    }
+    for group in groups {
+        graph.insert(
+            format!("outbound:{}", group.name),
+            group
+                .members
+                .iter()
+                .map(|tag| format!("outbound:{}", if tag == "DIRECT" { "direct" } else { tag }))
+                .collect(),
+        );
+    }
+    for server in &spec.servers {
+        let edges = graph.entry(format!("dns:{}", server.tag)).or_default();
+        if let Some(detour) = server.detour.as_deref().filter(|tag| *tag != "direct") {
+            edges.push(format!("outbound:{detour}"));
+        }
+        if server.kind.is_remote() && server.server.as_deref().is_some_and(|host| !looks_like_ip(host)) {
+            let resolver = spec
+                .domain_resolver
+                .as_ref()
+                .ok_or_else(|| format!("DNS server {:?} needs a bootstrap domain_resolver", server.tag))?;
+            edges.push(format!("dns:{resolver}"));
+        }
+    }
+    fn visit(
+        node: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        visiting: &mut Vec<String>,
+        done: &mut std::collections::HashSet<String>,
+    ) -> Result<(), String> {
+        if done.contains(node) {
+            return Ok(());
+        }
+        if let Some(index) = visiting.iter().position(|n| n == node) {
+            return Err(format!(
+                "DNS/outbound resolver dependency cycle: {} -> {node}",
+                visiting[index..].join(" -> ")
+            ));
+        }
+        visiting.push(node.to_string());
+        if let Some(edges) = graph.get(node) {
+            for edge in edges {
+                visit(edge, graph, visiting, done)?;
+            }
+        }
+        visiting.pop();
+        done.insert(node.to_string());
+        Ok(())
+    }
+    let mut done = std::collections::HashSet::new();
+    for node in graph.keys() {
+        visit(node, &graph, &mut Vec::new(), &mut done)?;
+    }
+    Ok(())
 }
 
 // ---------- Task 8.1: compact one-line form specs ----------
@@ -1136,6 +1481,7 @@ pub fn parse_rule_spec(spec: &str) -> Result<DnsRuleSpec, String> {
         domain_suffix: Vec::new(),
         domain_keyword: Vec::new(),
         ip_cidr: Vec::new(),
+        ..Default::default()
     };
     for part in &parts[1..] {
         let Some((kind, values)) = part.split_once('=') else {
@@ -1161,9 +1507,233 @@ pub fn parse_rule_spec(spec: &str) -> Result<DnsRuleSpec, String> {
 }
 
 #[cfg(test)]
+#[path = "dns_runtime_tests.rs"]
+mod runtime_tests;
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn real_server<'a>(spec: &'a DnsConfigSpec, address: &str) -> &'a str {
+        &spec
+            .servers
+            .iter()
+            .find(|s| s.server.as_deref() == Some(address))
+            .unwrap()
+            .tag
+    }
+
+    fn client_server<'a>(spec: &'a DnsConfigSpec, hostname: &str, query_type: &str) -> &'a str {
+        fn matches(rule: &DnsRuleSpec, host: &str, query: &str) -> bool {
+            if !rule.conditions.is_empty() {
+                return rule.conditions.iter().all(|r| matches(r, host, query));
+            }
+            let has_domain = !rule.domain.is_empty()
+                || !rule.domain_suffix.is_empty()
+                || !rule.domain_keyword.is_empty()
+                || !rule.domain_regex.is_empty();
+            (rule.query_type.is_empty() || rule.query_type.iter().any(|q| q == query))
+                && (!has_domain || matches_domain(rule, host))
+        }
+        spec.rules
+            .iter()
+            .find(|r| matches(r, hostname, query_type))
+            .map(|r| r.server.as_str())
+            .or(spec.final_server.as_deref())
+            .unwrap()
+    }
+
+    #[test]
+    fn fake_ip_blacklist_preserves_exact_wildcard_and_suffix_semantics() {
+        let spec = spec_from_clash_yaml(
+            r#"
+dns:
+  nameserver: [1.1.1.1]
+  enhanced-mode: fake-ip
+  fake-ip-filter: [exact.example, '*.lan', '.internal', '+.corp', 'xbox.*.example']
+"#,
+        )
+        .unwrap()
+        .unwrap();
+        for query in ["A", "AAAA"] {
+            for domain in [
+                "exact.example",
+                "host.lan",
+                "a.b.internal",
+                "corp",
+                "x.corp",
+                "xbox.one.example",
+            ] {
+                assert_eq!(
+                    client_server(&spec, domain, query),
+                    real_server(&spec, "1.1.1.1"),
+                    "{domain}/{query}"
+                );
+            }
+            for domain in [
+                "sub.exact.example",
+                "lan",
+                "deep.host.lan",
+                "internal",
+                "notcorp",
+                "xbox.two.one.example",
+                "elsewhere.example",
+            ] {
+                assert_eq!(
+                    client_server(&spec, domain, query),
+                    FAKEIP_SERVER_TAG,
+                    "{domain}/{query}"
+                );
+            }
+        }
+        assert_eq!(
+            client_server(&spec, "elsewhere.example", "TXT"),
+            real_server(&spec, "1.1.1.1")
+        );
+    }
+
+    #[test]
+    fn fake_ip_whitelist_and_rule_mode_keep_direction_and_order() {
+        let whitelist = spec_from_clash_yaml("dns:\n  nameserver: [1.1.1.1]\n  enhanced-mode: fake-ip\n  fake-ip-filter-mode: whitelist\n  fake-ip-filter: ['+.example']\n").unwrap().unwrap();
+        assert_eq!(client_server(&whitelist, "example", "A"), FAKEIP_SERVER_TAG);
+        assert_eq!(
+            client_server(&whitelist, "elsewhere.test", "A"),
+            real_server(&whitelist, "1.1.1.1")
+        );
+        let spec = spec_from_clash_yaml(
+            r#"
+dns:
+  nameserver: [1.1.1.1]
+  nameserver-policy: {'+.example': 9.9.9.9}
+  enhanced-mode: fake-ip
+  fake-ip-filter-mode: rule
+  fake-ip-filter:
+    - DOMAIN,real.example,real-ip
+    - DOMAIN-SUFFIX,example,fake-ip
+    - DOMAIN-KEYWORD,clock,real-ip
+    - MATCH,real-ip
+"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(client_server(&spec, "real.example", "A"), real_server(&spec, "9.9.9.9"));
+        assert_eq!(client_server(&spec, "sub.real.example", "AAAA"), FAKEIP_SERVER_TAG);
+        assert_eq!(client_server(&spec, "clock.test", "A"), real_server(&spec, "1.1.1.1"));
+        assert_eq!(client_server(&spec, "other.test", "A"), real_server(&spec, "1.1.1.1"));
+        assert_eq!(
+            client_server(&spec, "sub.real.example", "TXT"),
+            real_server(&spec, "9.9.9.9")
+        );
+        let built = build_dns_section(&spec).unwrap().unwrap();
+        assert_eq!(built["rules"][0]["type"], "logical");
+        assert!(built["rules"][0]["rules"][0].get("server").is_none());
+    }
+
+    #[test]
+    fn unsupported_fake_ip_entries_are_reported_individually() {
+        let report = dns_conversion_from_clash_yaml("dns:\n  nameserver: [1.1.1.1]\n  enhanced-mode: fake-ip\n  fake-ip-filter-mode: whitelist\n  fake-ip-filter: ['geosite:cn', 'rule-set:private', '*bad.example', 'keyword:clock', exact.example]\n").unwrap();
+        for index in 0..4 {
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains(&format!("fake-ip-filter[{index}]"))),
+                "{:?}",
+                report.notes
+            );
+        }
+        let spec = report.spec.unwrap();
+        assert_eq!(client_server(&spec, "exact.example", "A"), FAKEIP_SERVER_TAG);
+        assert_ne!(client_server(&spec, "other.example", "A"), FAKEIP_SERVER_TAG);
+        assert!(
+            dns_conversion_from_clash_yaml(
+                "dns:\n  nameserver: [1.1.1.1]\n  enhanced-mode: fake-ip\n  fake-ip-filter-mode: surprise\n"
+            )
+            .unwrap_err()
+            .contains("fake-ip-filter-mode")
+        );
+    }
+
+    #[test]
+    fn nodes_use_policy_or_business_dns_and_literals_need_no_lookup() {
+        let spec = spec_from_clash_yaml(
+            r#"
+dns:
+  default-nameserver: [223.5.5.5]
+  nameserver: [https://resolver.example/dns-query]
+  nameserver-policy:
+    '+.example': 9.9.9.9
+    node.example: 'udp://[::1]:5353'
+  enhanced-mode: fake-ip
+  fake-ip-filter: [node.example]
+"#,
+        )
+        .unwrap()
+        .unwrap();
+        let mut nodes = vec![
+            json!({"type":"http", "tag":"exact", "server":"node.example"}),
+            json!({"type":"http", "tag":"suffix", "server":"a.example"}),
+            json!({"type":"http", "tag":"miss", "server":"other.test"}),
+            json!({"type":"http", "tag":"ipv4", "server":"127.0.0.1"}),
+            json!({"type":"http", "tag":"ipv6", "server":"::1"}),
+        ];
+        apply_outbound_domain_resolvers(&spec, &mut nodes, &[]).unwrap();
+        assert_eq!(nodes[0]["domain_resolver"]["server"], real_server(&spec, "::1"));
+        assert_eq!(nodes[1]["domain_resolver"]["server"], real_server(&spec, "9.9.9.9"));
+        assert_eq!(
+            nodes[2]["domain_resolver"]["server"],
+            spec.final_server.clone().unwrap()
+        );
+        assert!(nodes[3].get("domain_resolver").is_none());
+        assert!(nodes[4].get("domain_resolver").is_none());
+        assert_ne!(default_domain_resolver(&spec), spec.domain_resolver);
+        let dns = build_dns_section(&spec).unwrap().unwrap();
+        assert_eq!(
+            dns["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["server"] == "resolver.example")
+                .unwrap()["domain_resolver"],
+            spec.domain_resolver.clone().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolver_detour_cycles_through_nodes_groups_and_dependencies_are_rejected() {
+        for detour in ["node", "group", "chain"] {
+            let spec = spec_from_clash_yaml(&format!(
+                "dns:\n  default-nameserver: [1.1.1.1]\n  nameserver: ['udp://9.9.9.9#{detour}']\n"
+            ))
+            .unwrap()
+            .unwrap();
+            let mut nodes = vec![
+                json!({"type":"http", "tag":"node", "server":"node.example"}),
+                json!({"type":"http", "tag":"chain", "server":"127.0.0.1", "detour":"node"}),
+            ];
+            let groups = vec![super::super::GroupSpec {
+                name: "group".into(),
+                kind: super::super::GroupKind::Selector,
+                members: vec!["DIRECT".into(), "node".into()],
+            }];
+            let error = apply_outbound_domain_resolvers(&spec, &mut nodes, &groups).unwrap_err();
+            assert!(error.contains("dependency cycle"), "{detour}: {error}");
+        }
+        let spec = spec_from_clash_yaml("dns:\n  nameserver: ['udp://9.9.9.9#node']\n")
+            .unwrap()
+            .unwrap();
+        let mut nodes = vec![json!({"type":"http", "tag":"node", "server":"127.0.0.1"})];
+        apply_outbound_domain_resolvers(&spec, &mut nodes, &[]).unwrap();
+        let mut invalid = spec;
+        invalid.servers[0].server = Some("dns.example".into());
+        invalid.domain_resolver = Some(invalid.servers[0].tag.clone());
+        assert!(
+            apply_outbound_domain_resolvers(&invalid, &mut nodes, &[])
+                .unwrap_err()
+                .contains("dependency cycle")
+        );
+    }
 
     /// Trimmed copy of a real subscription `dns` block: every field below is
     /// emitted by commercial Clash providers (trimmed for length).
@@ -1246,6 +1816,7 @@ dns:
                 domain_suffix: vec!["cn".into(), "example.com".into()],
                 domain_keyword: vec![],
                 ip_cidr: vec!["10.0.0.0/8".into()],
+                ..Default::default()
             }],
             domain_resolver: Some("dns-local".into()),
             final_server: Some("dns-remote".into()),
@@ -1343,13 +1914,12 @@ dns:
             build_dns_section(&doh).unwrap().unwrap()["servers"][0]["path"],
             "/custom-path"
         );
-        let filtered = dns_conversion_from_clash_yaml("dns:\n  enhanced-mode: fake-ip\n  fake-ip-filter: ['+.lan']\n")
-            .expect("fake-ip-filter is degraded");
-        assert!(
-            filtered.notes.iter().any(|note| note.contains("dns.fake-ip-filter:")),
-            "{:?}",
-            filtered.notes
-        );
+        let filtered = dns_conversion_from_clash_yaml(
+            "dns:\n  nameserver: [1.1.1.1]\n  enhanced-mode: fake-ip\n  fake-ip-filter: ['+.lan']\n",
+        )
+        .expect("fake-ip-filter converts");
+        assert!(!filtered.notes.iter().any(|note| note.contains("dns.fake-ip-filter:")));
+        assert_eq!(filtered.spec.unwrap().rules[0].domain_suffix, ["lan"]);
     }
 
     #[test]
@@ -1360,7 +1930,6 @@ dns:
         let notes = &report.notes;
         for expected in [
             "dns.listen:",
-            "dns.fake-ip-filter:",
             "dns.fallback-filter:",
             "dns.default-nameserver:",
             "'#skip-cert-verify=true' mapped to `tls.insecure`",
@@ -1381,8 +1950,12 @@ dns:
             .find(|s| s.kind == DnsServerKind::Fakeip)
             .expect("fakeip");
         assert_eq!(fakeip.inet4_range.as_deref(), Some("198.18.0.1/16"));
-        assert_eq!(spec.rules[0].server, fakeip.tag);
-        assert_eq!(spec.rules[0].query_type, ["A", "AAAA"]);
+        assert!(
+            spec.rules
+                .iter()
+                .any(|rule| rule.server == fakeip.tag && rule.query_type == ["A", "AAAA"])
+        );
+        assert_ne!(spec.rules[0].server, fakeip.tag, "real-IP exclusions precede fake-IP");
 
         // default-nameserver became the bootstrap that resolves doh.pub & co.
         let resolver = spec.domain_resolver.clone().expect("bootstrap resolver");
@@ -1436,7 +2009,7 @@ dns:
             }
             assert!(server.get("domain_resolver").is_none() || server["type"] != "fakeip");
         }
-        assert_eq!(default_domain_resolver(&spec).as_deref(), Some(resolver.as_str()));
+        assert_eq!(default_domain_resolver(&spec).as_deref(), spec.final_server.as_deref());
     }
 
     #[test]
@@ -1743,7 +2316,6 @@ dns:
     fn unsupported_policy_matchers_are_dropped_with_a_note() {
         for (pattern, why) in [
             ("ipcidr:10.0.0.0/8", "sing-box rejects `ip_cidr` DNS rules"),
-            ("domain:example.com", "exact-domain"),
             ("geosite:cn", "geosite"),
         ] {
             let yaml = format!(
@@ -2020,7 +2592,8 @@ dns:
     #[test]
     fn default_domain_resolver_requires_a_known_server() {
         let mut spec = sample_spec();
-        assert_eq!(default_domain_resolver(&spec).as_deref(), Some("dns-local"));
+        assert_eq!(default_domain_resolver(&spec).as_deref(), Some("dns-remote"));
+        spec.final_server = Some("ghost-final".into());
         spec.domain_resolver = Some("ghost".into());
         assert_eq!(default_domain_resolver(&spec), None);
     }

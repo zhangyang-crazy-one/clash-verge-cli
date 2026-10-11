@@ -2,7 +2,11 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "clash-verge-cli", version, about = "Terminal-native proxy client for mihomo")]
+#[command(
+    name = "clash-verge-cli",
+    version,
+    about = "Terminal-native proxy client for mihomo and sing-box"
+)]
 pub struct Cli {
     /// Configuration directory (default: ~/.local/share/clash-verge-cli).
     /// Accepted before or after the subcommand; the systemd unit passes it
@@ -26,17 +30,20 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
-    /// Start the mihomo core (non-interactive)
+    /// Start the selected proxy core (non-interactive)
     Start {
         /// Run in foreground, blocking until SIGTERM (for systemd)
         #[arg(long)]
         foreground: bool,
+        /// Serve the existing runtime config without regenerating it
+        #[arg(long, requires = "foreground")]
+        start_use_existing_config: bool,
     },
-    /// Stop the mihomo core
+    /// Stop the proxy core
     Stop,
-    /// Restart the mihomo core
+    /// Restart the selected proxy core
     Restart,
-    /// Show mihomo status (exit 0 running, 3 not running, 1 error)
+    /// Show proxy core status (exit 0 running, 3 not running, 1 error)
     Status {
         /// Wait until the core is running (exit 3 on timeout)
         #[arg(long)]
@@ -49,6 +56,11 @@ pub enum Command {
     Core {
         #[command(subcommand)]
         action: Option<CoreCommand>,
+    },
+    /// Read or set controller browser-origin settings in verge.yaml
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
     },
     /// Manage subscription profiles
     Profile {
@@ -116,6 +128,14 @@ pub enum Command {
     /// Internal: sudo askpass helper (SUDO_ASKPASS target).
     #[command(hide = true)]
     Askpass,
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Show configured and effective values (controller_allowed_origins)
+    Get { key: String },
+    /// Set controller_allowed_origins using a YAML/JSON list of http(s) origins
+    Set { key: String, value: String },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -301,10 +321,10 @@ pub enum TunCommand {
     On,
     /// Disable TUN mode (reloads the running core)
     Off,
-    /// Grant TUN capabilities to the mihomo binary (one-time sudo; the only
+    /// Grant TUN capabilities to the selected proxy core (one-time sudo; the only
     /// explicit privilege operation)
     Setup,
-    /// Show the TUN capability state of the resolved mihomo binary
+    /// Show the TUN capability state of the resolved proxy core binary
     Status,
 }
 
@@ -418,8 +438,35 @@ mod tests {
             .find_map(|line| line.strip_prefix("ExecStart="))
             .expect("unit has an ExecStart line");
         let cli = parse(&exec.split_whitespace().skip(1).collect::<Vec<_>>()).expect("ExecStart parses");
-        assert!(matches!(cli.command, Some(Command::Start { foreground: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: false
+            })
+        ));
         assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
+    }
+
+    #[test]
+    fn existing_config_start_requires_an_explicit_foreground_flag() {
+        assert!(parse(&["start", "--start-use-existing-config"]).is_err());
+        let cli = parse(&["start", "--foreground", "--start-use-existing-config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: true
+            })
+        ));
+        let cli = parse(&["start", "--foreground"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: false
+            })
+        ));
     }
 
     #[test]

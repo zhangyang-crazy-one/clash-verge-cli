@@ -310,7 +310,8 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
             serde_yaml_ng::from_slice::<Value>(&data)
                 .with_context(|| format!("{name} in the archive is not valid YAML"))?;
         }
-        validate_json_file(&name, &data).with_context(|| format!("{name} in the archive is not valid JSON"))?;
+        validate_json_file(&name, &data)
+            .with_context(|| format!("{name} in the archive is not valid configuration"))?;
         files.push((name, data));
     }
     if !files.iter().any(|(name, _)| name == "profiles.yaml") {
@@ -361,6 +362,9 @@ fn is_restorable(name: &str) -> bool {
 }
 
 fn validate_json_file(name: &str, data: &[u8]) -> anyhow::Result<()> {
+    if name.starts_with("profiles/cli-rule-overlay-") && name.ends_with(".yaml") {
+        return crate::rule_overlay::validate_document(data).map_err(anyhow::Error::msg);
+    }
     if !JSON_FILES.contains(&name) {
         return Ok(());
     }
@@ -372,17 +376,7 @@ fn validate_json_file(name: &str, data: &[u8]) -> anyhow::Result<()> {
             spec.validate().map_err(anyhow::Error::msg)?;
         }
         "singbox-rules.json" => {
-            let rules = value
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("{name} must contain a JSON array"))?;
-            for (index, rule) in rules.iter().enumerate() {
-                if !matches!(
-                    crate::routing::from_singbox_json(rule),
-                    Some(crate::routing::IRouteRule::Logical { .. })
-                ) {
-                    bail!("{name} entry {index} is not a supported logical rule");
-                }
-            }
+            crate::singbox::parse_rule_order(&value).map_err(anyhow::Error::msg)?;
         }
         "singbox-rule-sets.json" => {
             let sets = value
@@ -700,7 +694,10 @@ mod tests {
             ],
         );
         let error = restore(&home, &wrong_shape, &backups).unwrap_err();
-        assert!(format!("{error:#}").contains("must contain a JSON array"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("rule order requires an `entries` array"),
+            "{error:#}"
+        );
         assert!(read(&home.join("config.yaml")).contains("mixed-port: 7897"));
         assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
 
@@ -866,5 +863,32 @@ mod tests {
         assert!(!is_backup_name("../x.zip"));
         assert!(!is_backup_name("x.tar"));
         assert!(list(Path::new("/nonexistent/backups")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rule_overlays_round_trip_in_backup_and_invalid_versions_block_restore() {
+        let home = sample_home("rule-overlay");
+        let name = "profiles/cli-rule-overlay-fixture.yaml";
+        let valid = "version: 1\nsource: ['MATCH,DIRECT']\nentries: [{kind: source, value: 0}]\n";
+        write(&home.join(name), valid);
+        let archive = home.join("backups/linux-backup-overlay.zip");
+        create(&home, &archive, false).unwrap();
+        let fresh = temp_dir("rule-overlay-restore");
+        restore(&fresh, &archive, &fresh.join("backups")).unwrap();
+        assert_eq!(read(&fresh.join(name)), valid);
+
+        let invalid = home.join("backups/linux-backup-invalid-overlay.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&invalid).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("profiles.yaml", options).unwrap();
+        zip.write_all(b"current: changed\nitems: []\n").unwrap();
+        zip.start_file(name, options).unwrap();
+        zip.write_all(b"version: 55\nsource: []\nentries: []\n").unwrap();
+        zip.finish().unwrap();
+        let before = read(&fresh.join("profiles.yaml"));
+        let error = restore(&fresh, &invalid, &fresh.join("backups")).unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported rule overlay version 55"));
+        assert_eq!(read(&fresh.join("profiles.yaml")), before);
+        assert_eq!(read(&fresh.join(name)), valid);
     }
 }

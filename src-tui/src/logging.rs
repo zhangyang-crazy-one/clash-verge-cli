@@ -30,7 +30,7 @@ impl Mode {
     pub fn for_command(command: Option<&crate::cli::Command>) -> Self {
         match command {
             None => Self::Tui,
-            Some(crate::cli::Command::Start { foreground: true }) => Self::Daemon,
+            Some(crate::cli::Command::Start { foreground: true, .. }) => Self::Daemon,
             Some(_) => Self::OneShot,
         }
     }

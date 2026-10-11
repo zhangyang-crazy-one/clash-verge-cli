@@ -2931,7 +2931,12 @@ pub fn geo_rule_set(tag: &str) -> Option<Value> {
         "url": format!("{base}/{tag}.srs"),
         // Fetching the geo lists must never recurse through the proxy
         // chain they are about to shape.
-        "download_detour": "direct",
+        // Inline HTTPClientOptions is available since 1.14.0 (our pinned
+        // 1.14.2 supports it). Without a detour this explicit Go client uses
+        // a direct socket, independent of route.final. A detour to an empty
+        // direct outbound is rejected at runtime by the pinned core.
+        // This also avoids the implicit client removed in 1.16.
+        "http_client": { "engine": "go" },
         "update_interval": "168h",
     }))
 }
@@ -2990,7 +2995,7 @@ pub fn convert_rule_providers(config_yaml: &str) -> Result<RuleProviderConversio
                 "tag": name,
                 "format": "binary",
                 "url": url,
-                "download_detour": "direct",
+                "http_client": { "engine": "go" },
                 "update_interval": "168h",
             })),
             Some(url) => result.skipped.push(format!(
@@ -3164,7 +3169,8 @@ proxy-groups:
     fn geo_rule_sets_point_at_the_official_srs_repositories() {
         let ip = geo_rule_set("geoip-cn").expect("geoip");
         assert_eq!(ip["url"], format!("{GEOIP_RULE_SET_BASE}/geoip-cn.srs"));
-        assert_eq!(ip["download_detour"], "direct");
+        assert_eq!(ip["http_client"], json!({"engine":"go"}));
+        assert!(ip.get("download_detour").is_none());
         let site = geo_rule_set("geosite-geolocation-!cn").expect("geosite");
         assert_eq!(
             site["url"],
@@ -3494,6 +3500,8 @@ rule-providers:
             "https://example.com/ads.srs?version=3&token=abc"
         );
         assert_eq!(result.rule_sets[0]["format"], "binary");
+        assert_eq!(result.rule_sets[0]["http_client"], json!({"engine":"go"}));
+        assert!(result.rule_sets[0].get("download_detour").is_none());
         assert_eq!(result.skipped.len(), 3, "{:?}", result.skipped);
         assert!(
             result.skipped.iter().any(|line| line.contains("cn.mrs")),

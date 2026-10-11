@@ -103,8 +103,18 @@ impl ProfileStore {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
         let uid_key = CompactString::from(uid);
+        let item = store.profiles.get_item(&uid_key).context("profile not found")?.clone();
         let was_current = store.profiles.delete_item(&uid_key).await?;
         let _ = was_current;
+        let profiles = clash_verge_core::utils::dirs::app_profiles_dir()?;
+        let overlay = crate::rule_overlay::path(&profiles, &item).map_err(anyhow::Error::msg)?;
+        match tokio::fs::remove_file(&overlay).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove rule overlay {}", overlay.display()));
+            }
+        }
         Ok(())
     }
 

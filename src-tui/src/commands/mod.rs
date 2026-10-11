@@ -1,5 +1,6 @@
 pub mod askpass;
 pub mod backup;
+pub mod config;
 pub mod connections;
 pub mod core;
 pub mod daemon;
@@ -143,12 +144,12 @@ pub async fn running_api(manager: &MihomoManager) -> anyhow::Result<MihomoApi> {
         Ok(_) => Ok(api),
         Err(MihomoError::CoreDown { .. } | MihomoError::Io(_)) => Err(crate::exit::CoreNotRunning(format!(
             "{core} is not running (controller {} not reachable); start it with `clash-verge-cli start`",
-            manager.socket_path().display()
+            stop::controller_description(manager)
         ))
         .into()),
         Err(error) => Err(anyhow::Error::new(error).context(format!(
             "{core} controller {} answered with an error",
-            manager.socket_path().display()
+            stop::controller_description(manager)
         ))),
     }
 }

@@ -522,6 +522,9 @@ pub async fn load_remote_profile_with_rules(
         .all_items();
     let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
     crate::enhance::apply_verge_ports(&mut app_config).await;
+    crate::enhance::apply_controller_cors(&mut app_config)
+        .await
+        .map_err(|error| error.to_string())?;
     let verge = clash_verge_core::config::IVerge::new().await;
     app_config = crate::enhance::use_tun(app_config, verge.enable_tun_mode.unwrap_or(false));
     compose_profile_with_controls(item, &profiles_dir, &all_items, Some(&app_config), None).await
@@ -562,6 +565,9 @@ pub async fn compose_profile_rules(
         .all_items();
     let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
     crate::enhance::apply_verge_ports(&mut app_config).await;
+    crate::enhance::apply_controller_cors(&mut app_config)
+        .await
+        .map_err(|error| error.to_string())?;
     let verge = clash_verge_core::config::IVerge::new().await;
     app_config = crate::enhance::use_tun(app_config, verge.enable_tun_mode.unwrap_or(false));
     let substituted: Vec<serde_yaml_ng::Value> = file_rules
@@ -605,6 +611,7 @@ async fn compose_profile_with_controls(
     app_controls: Option<&serde_yaml_ng::Mapping>,
     rules_override: Option<Vec<serde_yaml_ng::Value>>,
 ) -> Result<serde_yaml_ng::Mapping, String> {
+    let apply_rule_overlay = rules_override.is_none();
     let file = item
         .file
         .as_deref()
@@ -703,6 +710,9 @@ async fn compose_profile_with_controls(
         authority.insert("tun".into(), tun.into());
         profile = crate::enhance::enforce_control_plane(profile, authority);
     }
+    if apply_rule_overlay {
+        crate::rule_overlay::apply(profiles_dir, item, &mut profile)?;
+    }
     Ok(profile)
 }
 
@@ -736,6 +746,10 @@ async fn validate_native_profile_hooks(
     profiles_dir: &std::path::Path,
     all: &[clash_verge_core::config::PrfItem],
 ) -> Result<(), String> {
+    if item.uid.as_deref().is_some_and(|uid| !uid.is_empty()) && crate::rule_overlay::path(profiles_dir, item)?.exists()
+    {
+        return Err("native sing-box JSON cannot use a saved Clash rule overlay; select a Clash YAML profile".into());
+    }
     let option = item.option.as_ref();
     for (kind, default_uid, explicit) in [
         ("merge", "Merge", option.and_then(|option| option.merge.as_deref())),
@@ -882,6 +896,9 @@ pub async fn write_runtime_config_unlocked(
     // Honour the CLI's own verge.yaml port settings before the control plane
     // is snapshotted, so a port chosen to avoid the Clash Verge GUI sticks.
     crate::enhance::apply_verge_ports(&mut config).await;
+    crate::enhance::apply_controller_cors(&mut config)
+        .await
+        .map_err(|error| error.to_string())?;
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
     let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
     let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
@@ -2055,23 +2072,8 @@ secret: fixture-secret\ntun: {{enable: false}}\n",
             }
             let dir = seam.config_dir.clone();
             seam.daemons.lock().expect("daemons").push(tokio::spawn(async move {
-                // The detached child learns its mode from the
-                // environment; reproduce that here.
-                let guard = if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
-                    "existing"
-                } else {
-                    ""
-                };
-                let previous = std::env::var_os(crate::commands::start::START_CONFIG_MODE_ENV);
-                // SAFETY: single-threaded access to the environment is
-                // guarded by the app-home lock held for this test.
-                unsafe { std::env::set_var(crate::commands::start::START_CONFIG_MODE_ENV, guard) };
-                let outcome = crate::commands::daemon::run(dir).await;
-                match previous {
-                    Some(value) => unsafe { std::env::set_var(crate::commands::start::START_CONFIG_MODE_ENV, value) },
-                    None => unsafe { std::env::remove_var(crate::commands::start::START_CONFIG_MODE_ENV) },
-                }
-                outcome
+                // Mode is explicit in the foreground supervisor's CLI.
+                crate::commands::daemon::run(dir, mode).await
             }));
             let _ = config_dir;
             Ok(placeholder)

@@ -237,7 +237,7 @@ pub fn load_rule_order(home: &std::path::Path) -> Result<RuleOrder, String> {
 }
 
 /// Parse either supported sidecar shape into the typed order model.
-fn parse_rule_order(value: &Value) -> Result<RuleOrder, String> {
+pub(crate) fn parse_rule_order(value: &Value) -> Result<RuleOrder, String> {
     if value.is_array() {
         // Legacy: a bare list of logical rules with no cross-type order.
         return Ok(RuleOrder {

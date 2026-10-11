@@ -65,6 +65,7 @@ flate2 = "1"
 tokio-stream = "0.1"
 url = "2"
 percent-encoding = "2"
+regex = "1"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 serde_yaml_ng = { workspace = true }

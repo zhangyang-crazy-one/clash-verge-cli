@@ -19,6 +19,7 @@ mod gui_isolation;
 pub mod manager;
 pub mod ownership;
 pub mod pidfile;
+pub(crate) mod process;
 pub mod signal;
 pub mod singbox_binary;
 #[cfg(test)]

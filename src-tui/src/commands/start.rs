@@ -28,8 +28,9 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
 /// [`READY_TIMEOUT`]; tests need a launch that is never ready without
 /// waiting it out.
 pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout: Duration) -> anyhow::Result<()> {
+    let kind = manager.core_kind().as_str();
     if let Some(pid) = manager.pid() {
-        anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
+        anyhow::bail!("{kind} is already running (pid {pid}); use `restart` to replace it");
     }
     // P1 (reviewer): complete the credential rotation in the PARENT before
     // anything is launched. The supervisor child resolves the secret again at
@@ -43,20 +44,22 @@ pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout
     let api = manager.api();
     if super::core_running(&api).await {
         anyhow::bail!(
-            "a mihomo core already answers on {} without a clash-verge-cli pid record; stop it where it was started",
-            manager.socket_path().display()
+            "a proxy core already answers on {} without a clash-verge-cli pid record; stop it where it was started",
+            super::stop::controller_description(&manager)
         );
     }
 
     let log = supervisor_log_path(manager.config_dir());
-    let mut supervisor = launch_supervisor_via(manager.config_dir(), &log, SupervisorLaunch::Regenerate)?;
+    let (mut supervisor, ownership) = launch_owned_supervisor(&manager, &log, SupervisorLaunch::Regenerate)?;
     // A5 (reviewer): a readiness failure is a LAUNCH failure like any other,
     // and it gets the same cleanup: bound to the supervisor handle captured
     // here, stop the supervisor AND the core it already forked. Returning the
     // error directly left that core holding the controller socket and the
     // mixed port while the next `start`/`restart` competed with it.
-    let ownership = crate::mihomo_manager::manager::LaunchOwnership::new(supervisor.id());
-    if let Err(error) = wait_until_ready_with_timeout(&manager, &mut supervisor, &log, ready_timeout).await {
+    let outcome = wait_until_ready_with_timeout(&manager, &mut supervisor, &log, ready_timeout)
+        .await
+        .and_then(|()| ownership.verify_core(&manager));
+    if let Err(error) = outcome {
         manager.cleanup_failed_launch(&ownership, &mut supervisor).await;
         return Err(error);
     }
@@ -67,8 +70,8 @@ pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout
         .await
         .map(|v| v.version)
         .unwrap_or_else(|_| "?".into());
-    let core = pidfile::read_live(&pidfile::path_for(manager.socket_path()), manager.socket_path());
-    println!("mihomo started");
+    let core = pidfile::read_record(&pidfile::path_for(manager.socket_path()));
+    println!("{kind} started");
     println!("  version:    {version}");
     if let Some(core) = core {
         println!("  pid:        {}", core.pid);
@@ -92,21 +95,6 @@ pub enum SupervisorLaunch {
     Regenerate,
     /// Recovery: bring the core up on the config already on disk, verbatim.
     UseExistingConfig,
-}
-
-/// Environment variable carrying [`SupervisorLaunch`] to the detached child.
-///
-/// The supervisor is launched as `start --foreground`, whose argument parser
-/// lives outside this module; an environment variable is what lets the
-/// recovery request travel to the child without a new CLI flag.
-pub const START_CONFIG_MODE_ENV: &str = "CLASH_VERGE_CLI_START_CONFIG";
-
-/// The launch mode this process was started with (default [`SupervisorLaunch::Regenerate`]).
-pub fn requested_launch() -> SupervisorLaunch {
-    match std::env::var(START_CONFIG_MODE_ENV).as_deref() {
-        Ok("existing") => SupervisorLaunch::UseExistingConfig,
-        _ => SupervisorLaunch::Regenerate,
-    }
 }
 
 /// Where the detached supervisor writes its own and the core's output.
@@ -136,7 +124,12 @@ pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::
 ///
 /// Also used by [`crate::mihomo_manager::MihomoManager::restart_through_supervisor`]
 /// to hand a replacement core to a supervisor after stopping an adopted one.
-pub fn launch_supervisor(config_dir: &Path, log: &Path, mode: SupervisorLaunch) -> anyhow::Result<std::process::Child> {
+fn launch_supervisor_with_receipt(
+    config_dir: &Path,
+    log: &Path,
+    mode: SupervisorLaunch,
+    receipt: Option<&crate::mihomo_manager::process::ReceiptTarget>,
+) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
 
     if let Some(dir) = log.parent() {
@@ -157,40 +150,65 @@ pub fn launch_supervisor(config_dir: &Path, log: &Path, mode: SupervisorLaunch) 
         .stdout(out)
         .stderr(err)
         .process_group(0);
-    if mode == SupervisorLaunch::UseExistingConfig {
-        command.env(START_CONFIG_MODE_ENV, "existing");
-    }
+    configure_launch(&mut command, mode, receipt);
     command.spawn().context("failed to launch the core supervisor")
 }
 
-/// Launch the detached supervisor, or the test-installed stand-in.
-///
-/// Every detached start goes through here (the plain `start`, the adopted
-/// core replacement and the apply transaction's rollback recovery), so a
-/// test can inject a *failing* supervisor launch at the real process
-/// boundary without spawning a core — and can observe the launch mode the
-/// production path would have put on the child's command line.
-pub(crate) fn launch_supervisor_via(
-    config_dir: &Path,
+fn configure_launch(
+    command: &mut std::process::Command,
+    mode: SupervisorLaunch,
+    receipt: Option<&crate::mihomo_manager::process::ReceiptTarget>,
+) {
+    use crate::mihomo_manager::process::{LAUNCH_ID_ENV, RECEIPT_PATH_ENV};
+    // Never inherit a prior launch's recovery mode or ownership receipt.
+    command
+        .env_remove("CLASH_VERGE_CLI_START_CONFIG")
+        .env_remove(RECEIPT_PATH_ENV)
+        .env_remove(LAUNCH_ID_ENV);
+    if mode == SupervisorLaunch::UseExistingConfig {
+        command.arg("--start-use-existing-config");
+    }
+    if let Some(receipt) = receipt {
+        command
+            .env(RECEIPT_PATH_ENV, &receipt.path)
+            .env(LAUNCH_ID_ENV, &receipt.launch_id);
+    }
+}
+
+pub(crate) fn launch_owned_supervisor(
+    manager: &MihomoManager,
     log: &Path,
     mode: SupervisorLaunch,
-) -> anyhow::Result<std::process::Child> {
+) -> anyhow::Result<(std::process::Child, crate::mihomo_manager::manager::LaunchOwnership)> {
+    let receipt = crate::mihomo_manager::process::ReceiptTarget::new(manager.config_dir(), manager.core_kind())?;
     #[cfg(test)]
     if let Some(launcher) = *SUPERVISOR_LAUNCHER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
-        return launcher(config_dir, log, mode);
+        let child = launcher(manager.config_dir(), log, mode)?;
+        let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
+        return Ok((child, ownership));
     }
-    launch_supervisor(config_dir, log, mode)
+    let child = launch_supervisor_with_receipt(manager.config_dir(), log, mode, Some(&receipt))?;
+    let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
+    Ok((child, ownership))
 }
 
-/// Test seam: the launcher [`launch_supervisor_via`] prefers while armed.
+/// Test seam: the launcher [`launch_owned_supervisor`] prefers while armed.
 #[cfg(test)]
 pub(crate) type SupervisorLauncher = fn(&Path, &Path, SupervisorLaunch) -> anyhow::Result<std::process::Child>;
 
 #[cfg(test)]
 static SUPERVISOR_LAUNCHER: std::sync::Mutex<Option<SupervisorLauncher>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn supervisor_launcher_installed() -> bool {
+    SUPERVISOR_LAUNCHER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
 
 /// Arm the seam for one test and restore the real launcher afterwards.
 #[cfg(test)]
@@ -248,18 +266,19 @@ pub(crate) async fn wait_until_ready_with_timeout(
     ready_timeout: Duration,
 ) -> anyhow::Result<()> {
     let api = manager.api();
+    let kind = manager.core_kind().as_str();
     let deadline = tokio::time::Instant::now() + ready_timeout;
     loop {
         if super::core_running(&api).await {
             return Ok(());
         }
         if let Some(status) = supervisor.try_wait()? {
-            anyhow::bail!("mihomo failed to start ({status})\n{}", super::log_tail(log, 10));
+            anyhow::bail!("{kind} failed to start ({status})\n{}", super::log_tail(log, 10));
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "mihomo did not answer on {} within {}s\n{}",
-                manager.socket_path().display(),
+                "{kind} did not answer on {} within {}s\n{}",
+                super::stop::controller_description(manager),
                 ready_timeout.as_secs(),
                 super::log_tail(log, 10)
             );
@@ -273,6 +292,29 @@ pub(crate) async fn wait_until_ready_with_timeout(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn launch_modes_are_explicit_and_clear_inherited_environment() {
+        use crate::mihomo_manager::process::{LAUNCH_ID_ENV, RECEIPT_PATH_ENV};
+        for mode in [SupervisorLaunch::Regenerate, SupervisorLaunch::UseExistingConfig] {
+            let mut command = std::process::Command::new("true");
+            command
+                .env("CLASH_VERGE_CLI_START_CONFIG", "existing")
+                .env(LAUNCH_ID_ENV, "previous-launch")
+                .env(RECEIPT_PATH_ENV, "/previous/receipt");
+            configure_launch(&mut command, mode, None);
+            for name in ["CLASH_VERGE_CLI_START_CONFIG", LAUNCH_ID_ENV, RECEIPT_PATH_ENV] {
+                assert!(
+                    command.get_envs().any(|(key, value)| key == name && value.is_none()),
+                    "{name} must not leak across launches"
+                );
+            }
+            assert_eq!(
+                command.get_args().any(|arg| arg == "--start-use-existing-config"),
+                mode == SupervisorLaunch::UseExistingConfig
+            );
+        }
+    }
 
     /// Armed by the stand-in supervisor: a fake core must not answer before
     /// one was launched, or `run`'s "a core already answers" guard would
