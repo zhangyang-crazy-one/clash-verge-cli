@@ -80,6 +80,21 @@ pub struct ManagerInner {
     secret_override: Mutex<Option<String>>,
     #[cfg(test)]
     service_cgroup: Mutex<Option<String>>,
+    #[cfg(test)]
+    restart_stages: Mutex<Option<Arc<RestartStages>>>,
+}
+
+/// Instance-local seams replace process effects, never restart preparation.
+#[cfg(test)]
+type RestartPreflight = dyn Fn(&Path, bool) -> anyhow::Result<()> + Send + Sync;
+#[cfg(test)]
+type RestartSpawn = dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync;
+#[cfg(test)]
+struct RestartStages {
+    resolve: Box<dyn Fn() -> anyhow::Result<binary::ResolvedMihomo> + Send + Sync>,
+    preflight: Box<RestartPreflight>,
+    stop: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    spawn: Box<RestartSpawn>,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -278,6 +293,8 @@ impl ManagerInner {
             secret_override: Mutex::new(None),
             #[cfg(test)]
             service_cgroup: Mutex::new(None),
+            #[cfg(test)]
+            restart_stages: Mutex::new(None),
         }
     }
 
@@ -375,6 +392,14 @@ impl ManagerInner {
         config_path: Option<PathBuf>,
         inner: Arc<ManagerInner>,
     ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(stages) = inner.restart_stages.lock().clone() {
+            return (stages.spawn)(
+                config_path
+                    .as_deref()
+                    .context("restart fixture requires a prepared file")?,
+            );
+        }
         let kind = inner.core_kind();
         Self::spawn_core_as(
             kind,
@@ -696,8 +721,18 @@ impl ManagerInner {
     /// active profile currently holds (task 7.5): converted outbounds/groups,
     /// route rules, stored logical rules, rule-sets and structured DNS.
     pub(crate) async fn write_singbox_full(config_dir: &Path, binary: &Path) -> anyhow::Result<PathBuf> {
-        let yaml = Self::active_profile_yaml().await?;
         let enable_tun = runtime_tun_enabled().await?;
+        preflight_tun_capability(binary, enable_tun)?;
+        Self::write_singbox_full_with_tun(config_dir, binary, enable_tun).await
+    }
+
+    /// Full private candidate pipeline; the caller already checked capability.
+    async fn write_singbox_full_with_tun(
+        config_dir: &Path,
+        binary: &Path,
+        enable_tun: bool,
+    ) -> anyhow::Result<PathBuf> {
+        let yaml = Self::active_profile_yaml().await?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
         let parent = path.parent().context("runtime config has no parent")?;
         std::fs::create_dir_all(parent)?;
@@ -716,7 +751,6 @@ impl ManagerInner {
             Some(secret.clone()),
         )
         .await?;
-        preflight_tun_capability(binary, enable_tun)?;
         crate::runtime_config::prevalidate_singbox_config(binary, &candidate)
             .await
             .map_err(anyhow::Error::msg)?;
@@ -832,16 +866,21 @@ impl ManagerInner {
             return Self::existing_mihomo_config().await;
         }
         let _guard = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
-        let path = clash_verge_core::utils::dirs::clash_path()?;
-        let parent = path.parent().context("runtime config has no parent")?;
-        std::fs::create_dir_all(parent)?;
-        let candidate = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
         let enable_tun = clash_verge_core::config::IVerge::try_new()
             .await?
             .enable_tun_mode
             .unwrap_or(false);
-        crate::runtime_config::write_mihomo_candidate(enable_tun, &candidate).await?;
         preflight_tun_capability(binary, enable_tun)?;
+        Self::prepare_mihomo_unlocked(config_dir, binary, enable_tun).await
+    }
+
+    /// The caller owns runtime IO and has checked the chosen binary capability.
+    async fn prepare_mihomo_unlocked(config_dir: &Path, binary: &Path, enable_tun: bool) -> anyhow::Result<PathBuf> {
+        let path = clash_verge_core::utils::dirs::clash_path()?;
+        let parent = path.parent().context("runtime config has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let candidate = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+        crate::runtime_config::write_mihomo_candidate(enable_tun, &candidate).await?;
         crate::runtime_config::prevalidate_mihomo_config(binary, config_dir, &candidate).await?;
         std::fs::rename(&candidate, &path).context("failed to install validated mihomo config")?;
         Ok(path)
@@ -2192,6 +2231,10 @@ stop it where it was started",
     /// `start()` moves the `Child` into the exit watcher, so we only have
     /// the PID to signal. `stop()` always uses the by-PID path.
     pub async fn stop(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(stages) = self.inner.restart_stages.lock().clone() {
+            return (stages.stop)();
+        }
         // Set a flag so the watcher knows this was intentional and skips
         // auto-restart.  The flag is cleared by the next successful start.
         let current_gen = self.inner.generation.load(std::sync::atomic::Ordering::SeqCst);
@@ -2256,12 +2299,37 @@ stop it where it was started",
         &self,
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<binary::ResolvedMihomo> {
+        self.restart_with_tun(mode, None).await
+    }
+
+    /// TUN apply owns the IO lock through preparation, stop and exact-file
+    /// spawn. Its explicit flag overrides persisted settings, without a
+    /// preliminary write or a second lock acquisition.
+    pub(crate) async fn restart_tun_unlocked(
+        &self,
+        _io_guard: &tokio::sync::MutexGuard<'_, ()>,
+        enable_tun: bool,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
+        self.restart_with_tun(
+            crate::commands::start::SupervisorLaunch::UseExistingConfig,
+            Some(enable_tun),
+        )
+        .await
+    }
+
+    async fn restart_with_tun(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+        tun_override: Option<bool>,
+    ) -> anyhow::Result<binary::ResolvedMihomo> {
         // Test seam (A5): an owned restart would resolve a real core binary
         // and spawn it; the hook replaces that whole step so a test can
         // observe the LAUNCH MODE an owned restart was asked for — including
         // the rollback recovery, which must not silently regenerate.
         #[cfg(test)]
-        if let Some(hook) = owned_restart_hook() {
+        if tun_override.is_none()
+            && let Some(hook) = owned_restart_hook()
+        {
             hook(mode)?;
             return Ok(binary::ResolvedMihomo {
                 path: std::path::PathBuf::from("/bin/true"),
@@ -2280,25 +2348,29 @@ stop it where it was started",
         }
         let _restart_guard = RestartGuard(&self.inner.restarting);
         if self.inner.core_kind() == CoreKind::SingBox {
-            return self.restart_singbox(mode).await;
+            return self.restart_singbox(mode, tun_override).await;
         }
         self.reset_restart_history();
         orchestrate_restart(
-            || async {
-                binary::resolve_or_install()
-                    .await
-                    .context("failed to resolve or auto-install mihomo core")
-            },
+            || self.resolve_restart_binary(),
             |resolved| {
                 // Own the path so the future does not borrow the closure
                 // argument across an await point.
                 let path = resolved.path.clone();
                 async move {
-                    let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
-                    preflight_tun_capability(&path, tun_enabled).context(
+                    let tun_enabled = match tun_override {
+                        Some(enabled) => enabled,
+                        None => runtime_tun_enabled().await.unwrap_or(false),
+                    };
+                    self.restart_preflight(&path, tun_enabled).context(
                         "TUN capability preflight failed — run `clash-verge-cli tun setup` for the \
 resolved binary; the running core was left untouched",
                     )?;
+                    if let Some(enabled) = tun_override {
+                        ManagerInner::prepare_mihomo_unlocked(&self.config_dir, &path, enabled).await?;
+                    }
+                    // TUN preparation installed a complete validated candidate;
+                    // UseExistingConfig binds this launch to those exact bytes.
                     ManagerInner::runtime_config_for_mihomo_start(&self.config_dir, &path, mode).await?;
                     Ok(())
                 }
@@ -2327,6 +2399,39 @@ resolved binary; the running core was left untouched",
             },
         )
         .await
+    }
+
+    async fn resolve_restart_binary(&self) -> anyhow::Result<binary::ResolvedMihomo> {
+        #[cfg(test)]
+        if let Some(stages) = self.inner.restart_stages.lock().clone() {
+            return (stages.resolve)();
+        }
+        if self.core_kind() == CoreKind::Mihomo {
+            return binary::resolve_or_install()
+                .await
+                .context("failed to resolve or auto-install mihomo core");
+        }
+        use super::singbox_binary::SingboxBinarySource;
+        let resolved = super::singbox_binary::resolve_or_install()
+            .await
+            .context("failed to resolve or auto-install sing-box core")?;
+        Ok(binary::ResolvedMihomo {
+            path: resolved.path,
+            source: match resolved.source {
+                SingboxBinarySource::System => binary::MihomoBinarySource::System,
+                SingboxBinarySource::ManagedCached => binary::MihomoBinarySource::ManagedCached,
+                SingboxBinarySource::Downloaded => binary::MihomoBinarySource::Downloaded,
+            },
+            version: resolved.version,
+        })
+    }
+
+    fn restart_preflight(&self, binary: &Path, enabled: bool) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(stages) = self.inner.restart_stages.lock().clone() {
+            return (stages.preflight)(binary, enabled);
+        }
+        preflight_tun_capability(binary, enabled)
     }
 
     /// Sing-box cold start: foreign-ctrl guard → resolve → preflight →
@@ -2451,14 +2556,15 @@ stop it where it was started",
     async fn restart_singbox(
         &self,
         mode: crate::commands::start::SupervisorLaunch,
+        tun_override: Option<bool>,
     ) -> anyhow::Result<binary::ResolvedMihomo> {
-        use super::singbox_binary::SingboxBinarySource;
         self.reset_restart_history();
-        let resolved = super::singbox_binary::resolve_or_install()
-            .await
-            .context("failed to resolve or auto-install sing-box core")?;
-        let tun_enabled = runtime_tun_enabled().await.unwrap_or(false);
-        preflight_tun_capability(&resolved.path, tun_enabled)?;
+        let resolved = self.resolve_restart_binary().await?;
+        let tun_enabled = match tun_override {
+            Some(enabled) => enabled,
+            None => runtime_tun_enabled().await.unwrap_or(false),
+        };
+        self.restart_preflight(&resolved.path, tun_enabled)?;
         // P1 (reviewer): prepare the runtime config BEFORE the old core goes
         // away. A normal start/restart REGENERATES it (and may overwrite a
         // stale/missing file); only a recovery start — which must serve the
@@ -2466,13 +2572,14 @@ stop it where it was started",
         // first also means a generation failure (an unconvertible profile, a
         // full disk) leaves the running service untouched instead of
         // dropping it and then failing to start a replacement.
+        if let Some(enabled) = tun_override {
+            ManagerInner::write_singbox_full_with_tun(&self.config_dir, &resolved.path, enabled).await?;
+        }
         let config_path = ManagerInner::runtime_config_for_start(&self.inner, &self.config_dir, mode)
             .await
             .context("failed to prepare the sing-box runtime config; the running core was left untouched")?;
         self.stop().await.context("failed to stop running sing-box")?;
-        crate::enhance::ensure_mixed_port_available()
-            .await
-            .map_err(anyhow::Error::msg)?;
+        self.restart_port_check().await?;
         ManagerInner::spawn_core(
             &resolved.path,
             &resolved.version,
@@ -2484,15 +2591,17 @@ stop it where it was started",
         )
         .await
         .context("failed to spawn sing-box")?;
-        Ok(binary::ResolvedMihomo {
-            path: resolved.path,
-            source: match resolved.source {
-                SingboxBinarySource::System => binary::MihomoBinarySource::System,
-                SingboxBinarySource::ManagedCached => binary::MihomoBinarySource::ManagedCached,
-                SingboxBinarySource::Downloaded => binary::MihomoBinarySource::Downloaded,
-            },
-            version: resolved.version,
-        })
+        Ok(resolved)
+    }
+
+    async fn restart_port_check(&self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if self.inner.restart_stages.lock().is_some() {
+            return Ok(());
+        }
+        crate::enhance::ensure_mixed_port_available()
+            .await
+            .map_err(anyhow::Error::msg)
     }
 
     /// Replace the running core with a fresh one that picks up a
@@ -7915,3 +8024,8 @@ mod mihomo_regeneration {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+#[path = "tun_restart_tests.rs"]
+mod tun_restart_tests;

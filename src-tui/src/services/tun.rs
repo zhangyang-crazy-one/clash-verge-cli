@@ -16,9 +16,11 @@ use crate::runtime_config::{RUNTIME_CONFIG_IO, commit_runtime_config_unlocked, w
 pub async fn apply_tun_runtime(manager: &MihomoManager, owns_core: bool, enable_tun: bool) -> Result<(), String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     if owns_core {
-        let config = clash_verge_core::config::IClashTemp::new().await.0;
-        write_runtime_config_unlocked(config, enable_tun).await?;
-        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())
+        manager
+            .restart_tun_unlocked(&_guard, enable_tun)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     } else {
         commit_runtime_config_unlocked(&manager.api(), enable_tun, true, None, Ok)
             .await
