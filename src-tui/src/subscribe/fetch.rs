@@ -6,10 +6,17 @@ use std::time::Duration;
 use anyhow::Context;
 use base64::{Engine as _, engine::general_purpose};
 use clash_verge_core::config::{IClashTemp, PrfOption};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue, LOCATION};
 use url::Url;
 
 use super::ssrf;
+
+const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
+const MAX_REDIRECTS: usize = 10;
+
+#[cfg(test)]
+#[path = "fetch_tests.rs"]
+mod security_tests;
 
 /// How the HTTP client should reach the subscription host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +43,9 @@ pub async fn fetch_subscription(
     option: Option<&PrfOption>,
     allowlist: &[String],
 ) -> anyhow::Result<FetchResult> {
-    ssrf::check_url_host(url, allowlist).map_err(|e| anyhow::anyhow!(e))?;
+    let mode = proxy_mode_from_option(option);
+    let (request_url, auth_headers) = prepare_request_url(url)?;
+    ssrf::check_fetch_url(&request_url, allowlist, mode != ProxyMode::None)?;
 
     let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
     let accept_invalid = option.and_then(|o| o.danger_accept_invalid_certs).unwrap_or(false);
@@ -45,12 +54,11 @@ pub async fn fetch_subscription(
         _ => super::client_meta::default_subscription_user_agent().await,
     };
 
-    let mode = proxy_mode_from_option(option);
     let mut builder = subscription_client_builder(user_agent, Duration::from_secs(timeout), accept_invalid);
 
     match mode {
         ProxyMode::None => {
-            builder = builder.no_proxy();
+            builder = builder.no_proxy().dns_resolver(ssrf::SafeResolver::new(allowlist));
         }
         ProxyMode::System => {
             // reqwest defaults to env proxies when no_proxy is not set.
@@ -65,16 +73,59 @@ pub async fn fetch_subscription(
     }
 
     let client = builder.build().context("failed to build reqwest client")?;
-    let (request_url, auth_headers) = prepare_request_url(url)?;
+    // Keep the complete redirect/body operation within the configured budget,
+    // rather than granting each redirect a fresh timeout.
+    tokio::time::timeout(
+        Duration::from_secs(timeout),
+        fetch_with_client(&client, request_url, auth_headers, allowlist, mode),
+    )
+    .await
+    .context("subscription fetch timed out")?
+}
 
-    let response = match client.get(request_url).headers(auth_headers).send().await {
-        Ok(resp) => resp,
-        Err(err) => return Err(context_fetch_error(err, url)),
+async fn fetch_with_client(
+    client: &reqwest::Client,
+    mut request_url: Url,
+    mut auth_headers: HeaderMap,
+    allowlist: &[String],
+    mode: ProxyMode,
+) -> anyhow::Result<FetchResult> {
+    let mut redirects = 0;
+    let mut response = loop {
+        ssrf::check_fetch_url(&request_url, allowlist, mode != ProxyMode::None)?;
+        let response = client
+            .get(request_url.clone())
+            .headers(auth_headers.clone())
+            .send()
+            .await
+            .map_err(|err| context_fetch_error(err, request_url.as_str()))?;
+        if matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = response.headers().get(LOCATION)
+        {
+            if redirects >= MAX_REDIRECTS {
+                anyhow::bail!("subscription redirect limit exceeded (10)");
+            }
+            let mut next = request_url
+                .join(location.to_str().context("invalid redirect Location header")?)
+                .context("invalid subscription redirect URL")?;
+            // Redirect userinfo must never introduce fresh credentials.
+            let _ = next.set_username("");
+            let _ = next.set_password(None);
+            if request_url.origin() != next.origin() {
+                auth_headers.remove(AUTHORIZATION);
+            }
+            request_url = next;
+            redirects += 1;
+            continue;
+        }
+        if let Err(err) = response.error_for_status_ref() {
+            return Err(anyhow::Error::new(err.without_url()).context(format!(
+                "subscription request failed: {}",
+                redact_url(request_url.as_str())
+            )));
+        }
+        break response;
     };
-
-    let response = response
-        .error_for_status()
-        .with_context(|| format!("subscription request failed: {url}"))?;
 
     let final_url = response.url().to_string();
     let mut headers = HashMap::new();
@@ -84,7 +135,29 @@ pub async fn fetch_subscription(
         }
     }
 
-    let body = response.text().await.context("failed to read response body")?;
+    // reqwest chunks are decoded (including gzip). Content-Length alone is
+    // insufficient for chunked bodies and compressed expansion.
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_BODY_BYTES as u64)
+    {
+        anyhow::bail!("subscription response exceeds 20 MiB decoded body limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| anyhow::Error::new(err.without_url()).context("failed to read response body"))?
+    {
+        if chunk.len() > MAX_BODY_BYTES - bytes.len() {
+            anyhow::bail!("subscription response exceeds 20 MiB decoded body limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&bytes).into_owned();
+    if body.len() > MAX_BODY_BYTES {
+        anyhow::bail!("subscription response exceeds 20 MiB decoded body limit");
+    }
 
     Ok(FetchResult {
         body,
@@ -108,7 +181,7 @@ fn subscription_client_builder(
         .user_agent(user_agent)
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10).min(timeout))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(accept_invalid_certs)
         .tls_version_min(reqwest::tls::Version::TLS_1_2)
 }
@@ -118,7 +191,7 @@ fn subscription_client_builder(
 /// Empty passwords still produce `Basic user:` (upstream NetworkManager behavior).
 /// Password-only userinfo (`:secret@host`) produces `Basic :secret`.
 fn prepare_request_url(url: &str) -> anyhow::Result<(Url, HeaderMap)> {
-    let mut parsed = Url::parse(url).with_context(|| format!("invalid subscription URL: {url}"))?;
+    let mut parsed = Url::parse(url).context("invalid subscription URL")?;
     let mut headers = HeaderMap::new();
 
     let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
@@ -141,7 +214,7 @@ fn prepare_request_url(url: &str) -> anyhow::Result<(Url, HeaderMap)> {
 
 fn context_fetch_error(err: reqwest::Error, url: &str) -> anyhow::Error {
     let legacy_tls = is_legacy_tls_protocol_error(&err);
-    let err = anyhow::Error::new(err).context(format!("failed to fetch URL: {url}"));
+    let err = anyhow::Error::new(err.without_url()).context(format!("failed to fetch URL: {}", redact_url(url)));
     if legacy_tls {
         err.context("Subscription server uses legacy TLS; only TLS 1.2/1.3 is supported. TLS 1.0/1.1 is insecure")
     } else {
@@ -170,7 +243,7 @@ pub fn proxy_mode_from_option(option: Option<&PrfOption>) -> ProxyMode {
 pub fn redact_url(raw: &str) -> String {
     let parsed = match Url::parse(raw) {
         Ok(u) => u,
-        Err(_) => return raw.to_string(),
+        Err(_) => return "(invalid URL redacted)".into(),
     };
     let scheme = parsed.scheme();
     let host = parsed.host_str().unwrap_or("");

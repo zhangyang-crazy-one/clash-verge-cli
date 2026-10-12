@@ -232,6 +232,47 @@ With `webdav_url`, `webdav_username`, and `webdav_password` in
 `--webdav` to upload (`backup create --webdav`), list, or restore from the
 server's `clash-verge-rev-backup/` folder, the one the GUI uses.
 
+## Subscription download security
+
+Every subscription redirect is checked independently, with at most ten hops.
+Untrusted hosts cannot connect directly to loopback, private, link-local,
+IPv4-mapped private IPv6, `0.0.0.0/8`, CGNAT `100.64.0.0/10`, IPv6 site-local
+`fec0::/10`, multicast or broadcast addresses. Direct connections validate the
+actual DNS answers used to connect, including every address in a mixed answer;
+a public preflight answer does not authorize a later private answer.
+The decoded response body is limited to 20 MiB, including chunked transfers and
+gzip expansion. URL Basic Auth is retained on same-origin redirects and removed
+when the scheme, host or port changes.
+
+`option.trusted_hosts` in `profiles.yaml` is a host-specific exemption: trusting
+a host deliberately allows its private addresses, including future DNS answers.
+CLI `profile import URL` treats the explicitly supplied initial host as trusted
+and stores that trust; the TUI asks before trusting a blocked host. Redirect
+targets never gain trust automatically. Only add redirect hosts that you intend
+to authorize, preserving the existing option fields, for example:
+
+```yaml
+option:
+  trusted_hosts:
+    - subscription.example.com
+    - approved-redirect.example.com
+```
+
+For `with_proxy` (environment proxy) or `self_proxy` (local mixed-port), domain
+targets must be explicitly trusted because HTTP proxies resolve the target
+remotely and the client cannot inspect the proxy's actual target DNS answers.
+This rule also applies conservatively when `NO_PROXY` excludes that domain or
+no environment proxy is set. Public IP literals remain permitted; private IP
+literals still require host trust. Each fetch keeps its configured transport,
+and environment `NO_PROXY` exclusions are honored. A proxy failure does not
+make that fetch silently try a direct connection; the existing import/update
+workflow may separately retry its configured strategies. If a proxy fetch
+reports an untrusted domain, authorize that specific host in `trusted_hosts`
+(CLI import already authorizes its initial host), or deliberately use direct
+fetching. The current build supports HTTP/HTTPS proxies; SOCKS support is not
+enabled. Trusted proxy requests do **not** claim protection against remote DNS
+rebinding for the exempted host.
+
 ## System proxy
 
 With *System proxy* enabled in Settings, the desktop proxy (GNOME, or KDE

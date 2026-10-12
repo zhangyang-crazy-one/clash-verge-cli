@@ -2,7 +2,10 @@
 // Allowlist: user may whitelist specific hosts.
 
 use std::fmt;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
+
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 type BlockedRange = (fn(&IpAddr) -> bool, &'static str);
 
@@ -16,6 +19,17 @@ const BLOCKED_RANGES: &[BlockedRange] = &[
     ),
     (|ip| matches!(ip, IpAddr::V6(v6) if is_ula_v6(v6)), "unique-local"),
     (|ip| ip.is_unspecified(), "unspecified"),
+    (|ip| matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 0), "this-network"),
+    (
+        |ip| matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1])),
+        "shared-address",
+    ),
+    (
+        |ip| matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfec0),
+        "site-local",
+    ),
+    (|ip| ip.is_multicast(), "multicast"),
+    (|ip| matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()), "broadcast"),
 ];
 
 fn is_private(ip: &IpAddr) -> bool {
@@ -91,7 +105,11 @@ pub fn check_url_host(url: &str, allowlist: &[String]) -> Result<(), CheckError>
     }
 
     // Resolve host to IPs
-    let addrs: Vec<_> = format!("{host}:0")
+    // URL hosts include brackets for IPv6, while socket tuples do not.
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
+        return check_ip(&host, ip);
+    }
+    let addrs: Vec<_> = (host.as_str(), 0)
         .to_socket_addrs()
         .map_err(|source| CheckError::DnsFailed {
             host: host.clone(),
@@ -99,24 +117,117 @@ pub fn check_url_host(url: &str, allowlist: &[String]) -> Result<(), CheckError>
         })?
         .collect();
 
-    if addrs.is_empty() {
-        return Err(CheckError::NoAddress { host });
-    }
+    check_addresses(&host, &addrs, allowlist)
+}
 
-    for addr in &addrs {
-        let ip = addr.ip();
-        for (predicate, label) in BLOCKED_RANGES {
-            if predicate(&ip) {
-                return Err(CheckError::Blocked {
-                    host: host.clone(),
-                    label,
-                    ip,
-                });
-            }
+fn check_ip(host: &str, ip: IpAddr) -> Result<(), CheckError> {
+    let classified = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    };
+    for (predicate, label) in BLOCKED_RANGES {
+        if predicate(&classified) {
+            return Err(CheckError::Blocked {
+                host: host.into(),
+                label,
+                ip,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn check_addresses(host: &str, addrs: &[SocketAddr], allowlist: &[String]) -> Result<(), CheckError> {
+    if addrs.is_empty() {
+        return Err(CheckError::NoAddress { host: host.into() });
+    }
+    if !is_trusted(host, allowlist) {
+        for addr in addrs {
+            check_ip(host, addr.ip())?;
+        }
+    }
+    Ok(())
+}
+
+fn is_trusted(host: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|entry| entry == host)
+}
+
+/// Validate each request before reqwest can skip DNS for an IP literal.
+/// Domain connections in direct mode are checked by `SafeResolver` instead.
+/// Remote-DNS proxies cannot provide verifiable target addresses, so domain
+/// targets in proxy modes require an explicit, per-host trust exemption.
+pub fn check_fetch_url(url: &url::Url, allowlist: &[String], proxy_mode: bool) -> anyhow::Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("subscription URL must use http or https");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| CheckError::InvalidUrl("URL has no host".into()))?;
+    if is_trusted(host, allowlist) {
+        return Ok(());
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => check_ip(host, IpAddr::V4(ip))?,
+        Some(url::Host::Ipv6(ip)) => check_ip(host, IpAddr::V6(ip))?,
+        Some(url::Host::Domain(_)) if proxy_mode => {
+            anyhow::bail!(
+                "SSRF protection cannot verify remote proxy DNS for host '{host}'; add this specific host to option.trusted_hosts only if you trust it, or explicitly choose direct fetching"
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+struct SystemResolver;
+
+impl Resolve for SystemResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Checks the exact DNS answers handed to the direct connection, eliminating
+/// the gap between a preflight DNS lookup and reqwest's independent lookup.
+/// Do not install on proxy clients: selected proxy endpoints may be private.
+pub struct SafeResolver {
+    inner: Arc<dyn Resolve>,
+    allowlist: Vec<String>,
+}
+
+impl SafeResolver {
+    pub fn new(allowlist: &[String]) -> Self {
+        Self {
+            inner: Arc::new(SystemResolver),
+            allowlist: allowlist.to_vec(),
         }
     }
 
-    Ok(())
+    #[cfg(test)]
+    pub(super) fn with_inner(inner: Arc<dyn Resolve>, allowlist: &[String]) -> Self {
+        Self {
+            inner,
+            allowlist: allowlist.to_vec(),
+        }
+    }
+}
+
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        let future = self.inner.resolve(name);
+        let allowlist = self.allowlist.clone();
+        Box::pin(async move {
+            let addrs: Vec<_> = future.await?.collect();
+            check_addresses(&host, &addrs, &allowlist)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
 }
 
 /// Extract the hostname from a URL string.
@@ -131,6 +242,73 @@ fn extract_host(url: &str) -> Result<String, CheckError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn special_ranges_and_mapped_addresses_are_blocked_without_dns() {
+        for host in [
+            "0.1.2.3",
+            "100.64.0.1",
+            "100.127.255.254",
+            "[fec0::1]",
+            "[feff::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:10.1.2.3]",
+            "[::ffff:100.64.0.1]",
+            "224.0.0.1",
+            "255.255.255.255",
+        ] {
+            let raw = format!("http://{host}/sub");
+            assert!(
+                matches!(check_url_host(&raw, &[]), Err(CheckError::Blocked { .. })),
+                "{host}"
+            );
+            let url = url::Url::parse(&raw).unwrap();
+            assert!(check_fetch_url(&url, &[], false).is_err(), "{host}");
+            assert!(check_fetch_url(&url, &[], true).is_err(), "{host}");
+            let trusted = vec![url.host_str().unwrap().into()];
+            assert!(check_url_host(&raw, &trusted).is_ok(), "explicit trust exempts {host}");
+            assert!(check_fetch_url(&url, &trusted, true).is_ok());
+        }
+        for host in [
+            "100.63.255.254",
+            "100.128.0.1",
+            "8.8.8.8",
+            "[::ffff:8.8.8.8]",
+            "[2001:4860:4860::8888]",
+        ] {
+            assert!(check_url_host(&format!("http://{host}/sub"), &[]).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn mixed_public_private_dns_answer_rejected_and_trust_exempts_exact_host_only() {
+        let addrs = vec!["8.8.8.8:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()];
+        assert!(matches!(
+            check_addresses("mixed.test", &addrs, &[]),
+            Err(CheckError::Blocked { .. })
+        ));
+        assert!(check_addresses("mixed.test", &addrs, &["mixed.test".into()]).is_ok());
+        assert!(check_addresses("other.test", &addrs, &["mixed.test".into()]).is_err());
+        assert!(matches!(
+            check_addresses("mixed.test", &[], &["mixed.test".into()]),
+            Err(CheckError::NoAddress { .. })
+        ));
+    }
+
+    #[test]
+    fn proxy_domains_need_explicit_trust_but_public_literals_do_not() {
+        let domain = url::Url::parse("https://example.com/sub").unwrap();
+        assert!(check_fetch_url(&domain, &[], false).is_ok());
+        assert!(
+            check_fetch_url(&domain, &[], true)
+                .unwrap_err()
+                .to_string()
+                .contains("option.trusted_hosts")
+        );
+        assert!(check_fetch_url(&domain, &["example.com".into()], true).is_ok());
+        let public = url::Url::parse("http://8.8.8.8/sub").unwrap();
+        assert!(check_fetch_url(&public, &[], true).is_ok());
+    }
 
     #[test]
     fn test_loopback_blocked() {
