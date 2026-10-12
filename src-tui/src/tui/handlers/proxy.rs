@@ -410,6 +410,7 @@ pub(super) async fn apply_chain_config(
         Ok(config)
     })
     .await
+    .map_err(|error| error.to_string())
 }
 
 /// The (group_name, node_name) under the cursor, if it is on a node.

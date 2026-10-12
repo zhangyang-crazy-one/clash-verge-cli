@@ -24,6 +24,12 @@ mod settings;
 mod tun;
 mod unlock;
 
+#[cfg(test)]
+mod issue86_tests;
+
+#[cfg(test)]
+mod issue88_tests;
+
 use std::future::Future;
 use std::sync::Arc;
 
@@ -325,6 +331,15 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             ctx.cancel_background();
             lifecycle::note_error(app, msg);
         }
+        Action::OperationError(msg) => {
+            // A pending reload can retain the requested UID on disk. Mirror
+            // that desired profile without treating it as a confirmed apply
+            // or discarding the still-running core's runtime snapshots.
+            if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
+                app.load_profiles(&store);
+            }
+            app.status_msg = Some(format!("{}: {msg}", app.tr("status.error")));
+        }
         Action::ConfirmCoreUpdate => core_update::confirm(app, ctx),
         Action::RequestCoreUpdate { kind, intent } => core_update::begin(app, ctx, kind, intent),
         Action::CancelCoreUpdate => core_update::cancel(app),
@@ -339,7 +354,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
 
         // Profiles and subscriptions.
         Action::ConfirmImport(url) => profile::confirm_import(ctx, url),
-        Action::ImportNeedsTrust { url, host } => profile::begin_import_trust(app, url, host),
+        Action::ImportNeedsTrust(pending) => profile::begin_import_trust(app, *pending),
         Action::UpdateNeedsTrust { uid, host } => profile::begin_update_trust(app, uid, host),
         Action::ConfirmTrustImport => profile::handle_confirm_trust(app, &ctx.tx),
         Action::CancelTrustImport => profile::handle_cancel_trust(app),
@@ -464,7 +479,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::RulesEditSaveCancelled => rules::cancel_save_rules(app),
         Action::RuleFormAdd => rules::open_rule_form(app),
         Action::RulesEditSaved(message) => rules::note_rules_saved(app, ctx, message),
-        Action::RulesEditFailed(error) => rules::note_rules_failed(app, error),
+        Action::RulesEditFailed(error) => rules::note_rules_failed(app, ctx, error),
         Action::DnsEditToggle => rules::toggle_dns_edit(app),
         Action::DnsFocusToggle => rules::toggle_dns_focus(app),
         Action::DnsAddServer => rules::open_dns_server_input(app),
@@ -580,7 +595,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
     // sing-box apply shows what the conversion lost, grouped, with the
     // native-subscription hint — otherwise that knowledge only exists in
     // the log (#52).
-    crate::tui::singbox_degradation::maybe_surface(app).await;
+    crate::tui::singbox_degradation::maybe_surface(app, ctx.manager.core_kind()).await;
     Flow::Continue
 }
 
@@ -612,7 +627,7 @@ mod tests {
 
     use super::*;
 
-    fn ctx() -> (Ctx, tokio::sync::mpsc::Receiver<Action>) {
+    pub(super) fn ctx() -> (Ctx, tokio::sync::mpsc::Receiver<Action>) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let ctx = Ctx {
             manager: MihomoManager::new(std::env::temp_dir()),
@@ -629,6 +644,183 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn issue82_failed_rule_save_retains_dirty_buffer_and_busy_blocks_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.rules_edit_mode = true;
+        app.rules_edit_dirty = true;
+        app.rules_edit_buffer = vec![
+            crate::routing::from_clash_rule_str("DOMAIN,first.example,DIRECT"),
+            crate::routing::from_clash_rule_str("MATCH,DIRECT"),
+        ];
+        let edited = app.rules_edit_buffer.clone();
+        handle_intent(&mut app, &ctx, Action::RulesEditSave).await;
+        assert!(app.rules_save_busy);
+        assert_eq!(app.rules_edit_buffer, edited, "save clones rather than consumes edits");
+        for action in [
+            Action::RulesEditDelete,
+            Action::RulesEditMoveDown,
+            Action::RulesEditMoveUp,
+            Action::RulesEditAdd,
+            Action::RuleFormAdd,
+            Action::RulesEditToggle,
+            Action::RulesEditSave,
+        ] {
+            handle_intent(&mut app, &ctx, action).await;
+            assert_eq!(app.rules_edit_buffer, edited);
+            assert!(app.rules_edit_mode && app.rules_edit_dirty && app.rules_save_busy);
+            assert!(matches!(app.input_mode, InputMode::Normal));
+        }
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handle_event(&mut app, &ctx, failed).await;
+        assert_eq!(app.rules_edit_buffer, edited);
+        assert!(app.rules_edit_mode && app.rules_edit_dirty && !app.rules_save_busy);
+        assert_eq!(app.core_state, ctx.manager.state());
+        assert_eq!(app.core_pid, ctx.manager.pid());
+        assert!(app.status_msg.as_deref().unwrap().contains("no active profile"));
+        handle_intent(&mut app, &ctx, Action::RulesEditMoveDown).await;
+        assert_ne!(app.rules_edit_buffer, edited, "failed edits remain editable for retry");
+    }
+
+    #[tokio::test]
+    async fn issue82_empty_rule_save_and_confirmation_never_start_background_work() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.rules_edit_mode = true;
+        app.rules_edit_dirty = true;
+        handle_intent(&mut app, &ctx, Action::RulesEditSave).await;
+        assert!(app.status_msg.as_deref().unwrap().contains("empty rule list"));
+        assert!(!app.rules_save_busy && app.rules_edit_dirty && app.rules_edit_mode);
+        app.overlay = Some(Overlay::RulesRestartConfirmation);
+        handle_intent(&mut app, &ctx, Action::RulesEditSaveConfirmed).await;
+        assert!(app.overlay.is_none());
+        assert!(!app.rules_save_busy && app.rules_edit_dirty && app.rules_edit_mode);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !home.path().join("profiles.yaml").exists(),
+            "empty saves do not write profiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_errors_preserve_running_core_and_runtime_snapshots() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: desired\nitems:\n  - {uid: desired, type: local, file: desired.yaml}\n",
+        )
+        .unwrap();
+        let (ctx, _rx) = ctx();
+        let generation = ctx.tx.current_generation();
+        let pending = ctx.tx.spawn(std::future::pending::<()>());
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.core_version = Some("fixture-version".into());
+        app.current_profile_uid = Some("previous".into());
+        app.traffic = Some(TrafficData { up: 123, down: 456 });
+        app.traffic_totals = Some((1000, 2000));
+        app.logs.push(LogEntry {
+            level: "info".into(),
+            payload: "healthy core".into(),
+        });
+        app.delay_map.insert("node".into(), Some(30));
+        app.batch_delay = Some((1, 2));
+        app.runtime_loading.proxies = true;
+        app.log_stream = Some(pending.abort_handle());
+
+        for message in [
+            "profile reload rejected: invalid configuration",
+            "profile reload uncertain: response timeout; retry required",
+            "TUN setup failed: permission denied",
+        ] {
+            handle_event(&mut app, &ctx, Action::OperationError(message.into())).await;
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.core_version.as_deref(), Some("fixture-version"));
+            assert_eq!(
+                app.traffic.as_ref().map(|traffic| (traffic.up, traffic.down)),
+                Some((123, 456))
+            );
+            assert_eq!(app.traffic_totals, Some((1000, 2000)));
+            assert_eq!(app.logs.len(), 1);
+            assert_eq!(app.delay_map.get("node"), Some(&Some(30)));
+            assert_eq!(app.batch_delay, Some((1, 2)));
+            assert!(app.runtime_loading.proxies);
+            assert!(app.log_stream.is_some());
+            assert!(!pending.is_finished(), "an operation error must not abort live streams");
+            assert_eq!(ctx.tx.current_generation(), generation);
+            assert!(app.status_msg.as_deref().unwrap().contains(message));
+            assert_eq!(app.current_profile_uid.as_deref(), Some("desired"));
+        }
+        pending.abort();
+        let _ = pending.await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_error_still_clears_failed_core_and_runtime_snapshots() {
+        let (ctx, _rx) = ctx();
+        let generation = ctx.tx.current_generation();
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.traffic = Some(TrafficData { up: 1, down: 2 });
+        app.delay_map.insert("node".into(), Some(30));
+        handle_event(&mut app, &ctx, Action::CoreError("core process exited".into())).await;
+        assert_eq!(
+            app.core_state,
+            crate::app::CoreState::Error("core process exited".into())
+        );
+        assert!(app.core_pid.is_none());
+        assert!(app.traffic.is_none());
+        assert!(app.delay_map.is_empty());
+        assert_ne!(ctx.tx.current_generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn failed_profile_switch_and_import_emit_operation_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: previous\nitems:\n  - {uid: desired, type: local, file: missing-profile.yaml}\n",
+        )
+        .unwrap();
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.traffic_totals = Some((1000, 2000));
+        let store = crate::profile_store::store::ProfileStore::snapshot().await.unwrap();
+        app.load_profiles(&store);
+
+        for imported in [false, true] {
+            if imported {
+                profile::note_imported(&mut app, &ctx).await;
+            } else {
+                profile::switch_selected(&mut app, &ctx);
+            }
+            let action = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&action, Action::OperationError(message) if message.contains("missing-profile.yaml")));
+            handle_event(&mut app, &ctx, action).await;
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.traffic_totals, Some((1000, 2000)));
+        }
     }
 
     #[tokio::test]

@@ -138,6 +138,11 @@ pub struct IVerge {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_core: Option<String>,
 
+    /// Explicit browser origins allowed to access the CLI-owned controllers.
+    /// Missing/empty keeps local defaults; provider CORS is never authorization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_allowed_origins: Option<Vec<String>>,
+
     /// hotkey map
     /// format: {func},{key}
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -40,4 +40,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # paste is a frozen, widely-used proc-macro pulled in by boa_engine (the
 # profile script engine). "Unmaintained" is not a vulnerability; there is no
 # maintained drop-in that boa uses. Revisit if boa switches to pastey.
-ignore = ["RUSTSEC-2024-0436"]
+# unsafe-libyaml is an unmaintained transitive dependency of serde_yaml_ng;
+# RUSTSEC-2024-0449 has no patched version. Keep the current YAML parser for
+# GUI-compatible config/merge semantics; replacing it requires a separate
+# compatibility review. This exception is only for this maintenance notice,
+# not for future vulnerability advisories affecting the parser.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2024-0449"]

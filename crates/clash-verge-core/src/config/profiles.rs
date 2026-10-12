@@ -123,6 +123,13 @@ impl IProfiles {
 
     /// append new item
     pub async fn append_item(&mut self, item: &mut PrfItem) -> Result<()> {
+        self.append_item_with_selection(item, true).await
+    }
+
+    /// Store an item with caller-controlled first-profile selection. Callers
+    /// that do not apply the runtime must leave selection unchanged before
+    /// this method's first metadata write, including when saving fails.
+    pub async fn append_item_with_selection(&mut self, item: &mut PrfItem, select_first: bool) -> Result<()> {
         let uid = &item.uid;
         if uid.is_none() {
             bail!("the uid should not be null");
@@ -150,7 +157,10 @@ impl IProfiles {
                 .with_context(|| format!("failed to write to file \"{file}\""))?;
         }
 
-        if self.current.is_none() && (item.itype == Some("remote".into()) || item.itype == Some("local".into())) {
+        if select_first
+            && self.current.is_none()
+            && (item.itype == Some("remote".into()) || item.itype == Some("local".into()))
+        {
             self.current = uid.to_owned();
         }
 

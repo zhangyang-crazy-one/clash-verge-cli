@@ -130,12 +130,17 @@ pub enum Overlay {
 /// `uid` is `None` for the import flow and `Some(profile uid)` for a manual
 /// refresh of an existing profile: the update flow must carry the uid so that
 /// confirming persists the trusted host into that profile's stored option.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrustPending {
     pub url: String,
     pub host: String,
     /// Profile uid for the refresh flow (`None` = import flow).
     pub uid: Option<String>,
+    /// Preserve prior explicit grants and all import knobs across redirects.
+    pub option: Option<clash_verge_core::config::PrfOption>,
+    pub name: Option<String>,
+    /// Distinguish remote proxy DNS from a resolved private address.
+    pub proxy_dns: bool,
 }
 
 /// Why the core-start setup confirm was offered. Decides what `n`/Esc/q
@@ -292,6 +297,8 @@ pub struct App {
     pub selected_index: usize,
     pub input_mode: InputMode,
     pub status_msg: Option<String>,
+    /// Current hash-validated conversion report, also visible on attached Home.
+    pub singbox_degradation: Option<crate::runtime_config::SingboxDegradationRecord>,
     /// A problem with `tui.yaml`, kept on Home (status messages get replaced).
     pub config_warning: Option<String>,
     pub view: View,
@@ -364,6 +371,7 @@ pub struct App {
     pub rules_edit_mode: bool,
     pub rules_edit_buffer: Vec<crate::routing::IRouteRule>,
     pub rules_edit_dirty: bool,
+    pub rules_save_busy: bool,
     /// Task 7.4: rule-set definitions loaded with the edit buffer.
     pub rule_sets_edit: Vec<serde_json::Value>,
     /// Task 8.1: structured sing-box DNS editor state (spec mirrors disk;
@@ -423,6 +431,7 @@ impl App {
             selected_index: 0,
             input_mode: InputMode::Normal,
             status_msg: None,
+            singbox_degradation: None,
             config_warning: None,
             view: View::Home,
             focus: Focus::Menu,
@@ -473,6 +482,7 @@ impl App {
             rules_edit_mode: false,
             rules_edit_buffer: Vec::new(),
             rules_edit_dirty: false,
+            rules_save_busy: false,
             rule_sets_edit: Vec::new(),
             dns_edit_mode: false,
             dns_spec_edit: crate::singbox::dns::DnsConfigSpec::default(),

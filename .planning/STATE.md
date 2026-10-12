@@ -2,6 +2,23 @@
 
 ## Current work
 
+- 产品修复首次CI38195570594：hosted测试/release/审计通过，aarch64-musl因SCM ancillary长度字段ABI类型不同失败。已在接收函数显式转换，后续完整877回归+3pinned+11process、fmt/diff/clippy及release再次通过；最新artifact SHA256 `73797b0cb3e1393eff35c4b4b7ff4d590f6f7e229bdd7808811f4184c43f0a59`，来源清单 `/tmp/clash-pr74-products/source-after-musl.sha256` SHA256 `3d2707683fb13c2719377235ed3ab227742998d25cbe6f750b0ad1dc23e1b417`。推送ABI修正后等待新head完整hosted CI，不用旧snapshot绿项替代。
+- 2026-10-12 PR #74 产品复审（评论6116357639，基线a184adf5）：四项已修复。overlay 按原文保留源规则修饰符；直接 spawn 的不可dump子进程使用内核pidfd归属与认证回执，保留严格外部/readiness校验；备份恢复将缺席overlay纳入原子删除/回滚，v1和GUI/legacy策略明确；DNS区分实际代理/接口/特殊策略，不生成悬空detour。独立进程凭证复核通过。
+- 本轮最终默认并行 workspace：859 CLI +4 integration +14 core =877 passed/0 failed/6 ignored；三个 pinned-core 另行通过，剩余三项 ignored 未运行。真实不可dump夹具触发EACCES并验证归属/清理；真实DNS仅loopback lo，eth0/publicDoH仅check。fmt/diff/clippy、两份OpenSpec strict及locked release通过。尚未在用户环境执行真实setcap/TUN/service。
+- 新release SHA256 `2fbd2b10c6f26980f072461d51957eaf56862634d4dcfdbfc6bbf9111b33fb0f`；系统安装未覆盖。九文件冻结清单 `/tmp/clash-pr74-products/source.sha256` SHA256 `49f865774828613e37211564192764721cab5dba10d4bf46f877d3fd69358245`；日志 `/tmp/clash-pr74-products/logs/`。产品修复按问题分提交并更新PR，合并前核对新head hosted CI。Debug `.planning/debug/pr74-product-review.md`；逐项报告 `docs/REVIEW-ISSUES-70-73.md` 最新章节。
+- PR #74 CI follow-up：首次 hosted 测试有两个 adopted-core 夹具继承 runner 的 service cgroup，提前被保护拦截。仅新增 cfg(test) 每实例注入并给两项夹具设置 terminal.scope；生产逻辑不变。两项 RED 均复现、四项 focused GREEN 通过；默认并行 workspace 858 passed/0 failed/5 ignored，fmt/diff/clippy 通过。推送该修复后继续核对 Actions；记录 `.planning/debug/pr74-ci-cgroup.md` 与 `/tmp/clash-pr74-ci-fix/logs/`。
+- 2026-10-11：接续远端 #70–#73 的本人意见，分支 `fix/review-round5`，基线 `df0b7a73cfd4e9a537e3a908780198f22e040425`；核查时远端 main 为 `f0ecde3c`。用户随后授权提交、推送并创建面向 main 的 PR；不关闭仍有实机验收门禁的 issue。
+- 已保留并复验 A5/C7，补齐 native 引用/services 校验、systemd 外部替换预检、UUID/pidfd 启动清理及 exec 竞态、显式恢复模式、规则集 Go HTTP-client、节点 DNS/fake-IP 转换、持久规则覆盖及备份恢复、双核 CLI 文案/JSON。
+- C3 用户已选择“新增可配置外部白名单，默认仍仅本地”。`verge.yaml controller_allowed_origins` 与 `config get/set` 已实现，实际两核 CORS/PNA 及隔离 release set/get 验证通过；没有设置用户真实配置。
+- 最终冻结验证：840 CLI +4 integration +14 core =858 passed/0 failed/5 ignored；两项 pinned-core DNS/HTTP-client/CORS 单独通过，剩余三项 ignored 未运行。fmt/diff/clippy、两份 OpenSpec strict、locked release build 通过；本地 cargo-deny 未执行。
+- 新产物 `target/release/clash-verge-cli` SHA256 `82717d6ce46de059b439ce7ce038d5d5a1df82007422d84b7369a6e6882b7657`；版本仍0.2.7，系统 `/usr/local/bin/clash-verge-cli` 未覆盖。源码清单 `/tmp/clash-review-20261011/source.sha256`（27文件全匹配，清单 SHA256 `ff483bd3f14ea899a9f684d3d0c7f4225b53caf6753e3ce7531f793d77c377ac`）。
+- 持续证据与边界：[逐项报告](../docs/REVIEW-ISSUES-70-73.md)、[debug状态](debug/review-issues-70-73.md)，日志 `/tmp/clash-review-20261011/logs/`。align change 10.1–10.6 完成；add-singbox-dual-core 9.2–9.6 未勾选，不同步/归档未完成规格。
+- 待实际验收：完整 TUN start/restart/switch 授权、真实 system/user unit、完整切核/回滚/路由命中/GUI互斥、DoH/DoT握手、第三方浏览器及旧内核 pidfd。隔离证据不替代这些门禁。CLI后合成规则覆盖不会由GUI自动消费。
+
+Last activity: 2026-10-11 - Review #70–#73 continuation implemented and scoped verification passed; full user-environment acceptance pending
+
+## Earlier work (historical evidence)
+
 - debug `profile-script-core-switch` 已 resolved：GUI 兼容脚本引擎（有界 Boa）、双核心共享 composition、停止态选型仅提交 marker、owned-PID socket inode 端口归属证明、反向 selector 映射、FD 权限回退均已落地；OpenSpec 9.1–9.3 完成，累计 36/36。
 - 接管收尾（Pi 父代理）：发现并修复 `owns_listener` 的 /proc fd ENOENT 竞态（全套件并发下 1/3 概率失败），新增 churn 回归测试；连续 5 轮全套件 672 项测试 0 失败（仅 real-sing-box E2E 排除）；locked debug/release build、fmt、OpenSpec strict 通过。
 - 最终私有实际复验（产物 SHA256 `af80820f…f52522c`，含竞态修复）：sing-box 1.14.2 带脚本订阅启动成功（原报错路径），脚本改写进入 singbox.json 与 config.yaml；运行中双向切换 singbox↔mihomo 均成功；两核心 mixed 35123 HTTP 代理转发通过；GUI/服务/用户核心 4 个 PID+starttime 不变，46 个用户配置文件 hash 全同；私有端口已释放、tmux 夹具已拆除。证据 `/tmp/clash-script-live-n4g0e9jx/logs/pifix-*`。

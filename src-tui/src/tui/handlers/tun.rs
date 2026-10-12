@@ -79,7 +79,7 @@ pub(super) fn handle_password_submit(app: &mut App, action_tx: &crate::tui::back
                         let _ = tx.send(Action::TunSetupSucceeded { resume_start }).await;
                     }
                     Err(error) => {
-                        let _ = tx.send(Action::CoreError(error.to_string())).await;
+                        let _ = tx.send(Action::OperationError(error.to_string())).await;
                     }
                 }
             });

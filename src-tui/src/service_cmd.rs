@@ -52,14 +52,13 @@ pub(crate) fn systemd_escape(value: &str) -> String {
 pub fn unit_content(binary_path: &str, config_dir: &str) -> String {
     format!(
         r#"[Unit]
-Description=Clash Verge CLI - mihomo proxy daemon
+Description=Clash Verge CLI - proxy core daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart={} start --foreground --config-dir {}
-ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -606,21 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn unit_content_escapes_dollar_in_exec_start_but_keeps_mainpid_variable() {
-        // The binary/config paths must not be subject to `$VAR` expansion,
-        // while the template's own `$MAINPID` reference stays intact.
+    fn unit_content_escapes_dollar_and_uses_systemd_default_sigterm() {
         let unit = unit_content("/usr/bin/clash-verge-cli", "/tmp/$cfg");
         assert!(unit.contains("--config-dir /tmp/$$cfg"));
-        assert!(unit.contains("$MAINPID"));
+        assert!(unit.contains("Description=Clash Verge CLI - proxy core daemon"));
+        assert!(!unit.contains("ExecStop="));
+        assert!(!unit.contains("KillSignal="));
         assert!(!unit.contains("/tmp/$cfg"), "raw $cfg must not survive escaping");
     }
 
     #[test]
     fn unit_content_never_contains_a_raw_percent_in_exec_start() {
         // `%` starts a systemd specifier; the `%%` escape keeps the value
-        // literal and the $MAINPID variable intact.
+        // literal in the ExecStart path.
         let unit = unit_content("/usr/bin/clash-verge-cli", "/tmp/100%");
         assert!(unit.contains("--config-dir /tmp/100%%"));
-        assert!(unit.contains("$MAINPID"));
+        assert!(!unit.contains("ExecStop="));
     }
 }

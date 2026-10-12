@@ -80,9 +80,11 @@ pub(crate) fn system_singbox_candidates() -> Vec<PathBuf> {
 
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let path = dir.join("sing-box");
-            if seen.insert(path.clone()) && is_executable_file(&path) {
-                found.push(path);
+            for name in ["verge-sing-box", "sing-box"] {
+                let path = dir.join(name);
+                if seen.insert(path.clone()) && is_executable_file(&path) {
+                    found.push(path);
+                }
             }
         }
     }
@@ -289,7 +291,11 @@ pub(crate) async fn download_managed_singbox(
 /// The archive contains a top-level versioned directory holding the
 /// `sing-box` binary; we locate any entry whose file name is exactly
 /// `sing-box` regardless of directory depth.
-async fn extract_tar_gz_binary(compressed: &[u8], dest: &Path, expected_version: &str) -> anyhow::Result<String> {
+pub(crate) async fn extract_tar_gz_binary(
+    compressed: &[u8],
+    dest: &Path,
+    expected_version: &str,
+) -> anyhow::Result<String> {
     extract_tar_gz_binary_with_probe(compressed, dest, expected_version, |path| async move {
         read_singbox_version(&path).await
     })

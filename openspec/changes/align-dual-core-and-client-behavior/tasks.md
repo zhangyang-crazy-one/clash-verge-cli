@@ -70,3 +70,26 @@ TUN follow-up: 3/3 complete in the authorized implementation/isolated verificati
 - [x] 9.3 Run isolated regression tests and locked debug/release builds, then exercise the TUI and both real cores with private configuration/controllers/ports and TUN/system proxy off under the user's new authorization. Preserve the running GUI and record the distinction between fixtures, isolated live results and unverified user-network behavior.
 
 Follow-up complete: 9.1–9.3 verified (672 isolated tests, locked builds, private live bidirectional core switches with script transform; debug `profile-script-core-switch` resolved). The prior 33 completed tasks are historical. Isolated live results do not certify user-network behavior, real TUN authorization, or performance.
+
+## 10. Review issue continuation (#70–#73, 2026-10-11)
+
+- [x] 10.1 Close native `dns.final` and `services` validation gaps and validate resolver/HTTP-client references before formal configuration or lifecycle mutation.
+- [x] 10.2 Bind failed-launch cleanup to per-launch process identity, reject external systemd replacements before mutation, and replace ambient recovery mode with explicit CLI arguments; retain A5 candidate/rollback regressions.
+- [x] 10.3 Emit explicit rule-set HTTP clients, apply per-outbound DNS policy without resolver cycles, and map supported fake-IP filter modes with exact matching semantics and visible unsupported cases.
+- [x] 10.4 Persist per-profile rule overlays after the complete chain, preserve subscription refreshes and non-contiguous scripts, retain C7 ordering regressions, and verify durable backup/restore.
+- [x] 10.5 Remove unsupported GitHub-token advice, correct dual-core CLI/status/help output while preserving existing JSON fields, and implement the user-approved configurable external CORS allowlist with loopback-only defaults for both cores.
+- [x] 10.6 Run the fresh isolated suite, format/lint and locked builds; record version-bound isolated real-core DNS/HTTP-client evidence separately from privileged TUN and full end-to-end acceptance.
+
+Review continuation: 10.1–10.6 implementation and scoped verification complete; 858 serialized regression tests and two separately executed pinned-core tests passed. Format, clippy, strict OpenSpec validation and locked release build passed. Local cargo-deny and full user-environment acceptance remain unexecuted. Fresh artifact identities and evidence are in [the issue report](../../../docs/REVIEW-ISSUES-70-73.md).
+
+The external `add-singbox-dual-core` 9.2–9.6 acceptance gates remain independently tracked. See [review-follow-up.md](review-follow-up.md) for the overlay contract and evidence boundaries.
+
+## 11. Product review continuation (PR #74, 2026-10-12)
+
+- [x] 11.1 Separate overlay matching identities from raw source-rule replay; retain upstream no-resolve modifiers after refresh and repeated editing.
+- [x] 11.2 Bind direct spawned nondumpable children through actual Child/pidfd/starttime and authenticated per-launch transfer; retain strict external/readable identities, sender-generation and controller checks, and failed-launch cleanup after reparenting.
+- [x] 11.3 Restore absent CLI rule overlays as part of backup state, including pre-overlay v1 and explicitly defined GUI/legacy policy; atomically remove/replace with complete failure rollback while retaining unknown files.
+- [x] 11.4 Distinguish DNS proxy/group selectors, interfaces and special policies; emit bind_interface or explicit unsupported diagnostics without dangling or fabricated outbound tags.
+- [x] 11.5 Verify the integrated parallel suite, scoped real-core tests, lint/format and release build; record fresh source/artifact identities and require successful hosted CI before merging, without changing remaining privileged/user-environment gates.
+
+Product follow-up implementation and scoped verification complete: 877 parallel regression tests, three separately executed pinned-core tests, format/clippy, locked release build and strict OpenSpec checks passed. Hosted CI remains a merge prerequisite; actual setcap/TUN/systemd/full user-environment gates stay open. Evidence and compatibility policies: [product review report](../../../docs/REVIEW-ISSUES-70-73.md#2026-10-12-产品复审修复).

@@ -18,6 +18,7 @@ use tracing_subscriber::prelude::*;
 /// Kept separate from `mihomo` (download/resolve events) so the busy
 /// per-connection output can be filtered on its own.
 pub const MIHOMO_OUTPUT_TARGET: &str = "mihomo_core";
+pub const SINGBOX_OUTPUT_TARGET: &str = "singbox_core";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -30,7 +31,7 @@ impl Mode {
     pub fn for_command(command: Option<&crate::cli::Command>) -> Self {
         match command {
             None => Self::Tui,
-            Some(crate::cli::Command::Start { foreground: true }) => Self::Daemon,
+            Some(crate::cli::Command::Start { foreground: true, .. }) => Self::Daemon,
             Some(_) => Self::OneShot,
         }
     }
@@ -88,7 +89,9 @@ fn build_filter(mode: Mode, verbose: u8, rust_log: Option<&str>) -> Targets {
     // The TUI already shows mihomo's own output in the Logs view; keep the
     // file to the CLI's events unless the user asked for more.
     if mode == Mode::Tui && verbose == 0 {
-        filter = filter.with_target(MIHOMO_OUTPUT_TARGET, LevelFilter::WARN);
+        filter = filter
+            .with_target(MIHOMO_OUTPUT_TARGET, LevelFilter::WARN)
+            .with_target(SINGBOX_OUTPUT_TARGET, LevelFilter::WARN);
     }
     filter
 }

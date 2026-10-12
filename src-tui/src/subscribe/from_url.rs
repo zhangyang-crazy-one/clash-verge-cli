@@ -140,14 +140,28 @@ pub async fn import_with_fallback(
     ];
 
     let mut last_err = None;
+    let mut trust_err = None;
     for base in &attempts {
         let merged = merge_import_option(base, user);
         match from_url(url, name, None, Some(&merged)).await {
             Ok(bundle) => return Ok(bundle),
-            Err(err) => last_err = Some(err),
+            Err(err) => {
+                if matches!(
+                    err.downcast_ref::<super::ssrf::CheckError>(),
+                    Some(super::ssrf::CheckError::ProxyTrustRequired { .. })
+                ) {
+                    // Keep actionable authorization evidence, while still
+                    // allowing a later safe direct attempt to succeed.
+                    trust_err = Some(err);
+                } else {
+                    last_err = Some(err);
+                }
+            }
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("import failed")))
+    Err(trust_err
+        .or(last_err)
+        .unwrap_or_else(|| anyhow::anyhow!("import failed")))
 }
 
 /// GUI-style update retries: current options → self_proxy → with_proxy.

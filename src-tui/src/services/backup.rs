@@ -11,6 +11,12 @@
 //! profiles, so an archive is still private data; it is written mode 0600.
 //! Restoring keeps the local secrets an archive does not carry and first
 //! saves the current state as a `pre-restore-*` backup.
+//! CLI rule overlays are profile state: restoring removes recognized local
+//! overlays absent from the archive. This applies to full version-1 backups,
+//! including those predating overlays, and GUI/legacy archives without a
+//! manifest (which reset CLI edits to the restored profile's source rules).
+//! Missing legacy top-level sidecars remain untouched. Unknown overlay
+//! documents or symlinks that cannot safely be reset abort the restore.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -310,7 +316,8 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
             serde_yaml_ng::from_slice::<Value>(&data)
                 .with_context(|| format!("{name} in the archive is not valid YAML"))?;
         }
-        validate_json_file(&name, &data).with_context(|| format!("{name} in the archive is not valid JSON"))?;
+        validate_json_file(&name, &data)
+            .with_context(|| format!("{name} in the archive is not valid configuration"))?;
         files.push((name, data));
     }
     if !files.iter().any(|(name, _)| name == "profiles.yaml") {
@@ -322,6 +329,10 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
             bail!("{MANIFEST_FILE} file list does not match the archive contents");
         }
     }
+
+    // Overlay absence is authoritative even for pre-overlay v1 and GUI backups.
+    // Compute and validate removals before the pre-restore backup or any writes.
+    let removals = absent_rule_overlays(home, &seen)?;
 
     // Keep what the archive left out on purpose.
     for (name, data) in &mut files {
@@ -338,9 +349,14 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
         None
     };
 
-    let targets: Vec<(PathBuf, &[u8])> = files
-        .iter()
-        .map(|(name, data)| (home.join(name.as_str()), data.as_slice()))
+    let targets: Vec<(PathBuf, Option<&[u8]>)> = removals
+        .into_iter()
+        .map(|path| (path, None))
+        .chain(
+            files
+                .iter()
+                .map(|(name, data)| (home.join(name.as_str()), Some(data.as_slice()))),
+        )
         .collect();
     replace_all(&targets)?;
     Ok(Restored {
@@ -348,6 +364,50 @@ pub fn restore(home: &Path, archive: &Path, backup_dir: &Path) -> anyhow::Result
         skipped,
         previous,
     })
+}
+
+/// Only names produced by `rule_overlay::path` identify CLI-owned files.
+fn is_rule_overlay_name(name: &str) -> bool {
+    name.strip_prefix("cli-rule-overlay-")
+        .and_then(|name| name.strip_suffix(".yaml"))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn absent_rule_overlays(home: &Path, incoming: &std::collections::HashSet<String>) -> anyhow::Result<Vec<PathBuf>> {
+    let profiles = home.join(PROFILES_DIR);
+    let metadata = match std::fs::symlink_metadata(&profiles) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_dir() {
+        bail!("cannot restore through non-directory or symlink {}", profiles.display());
+    }
+    let mut removals = Vec::new();
+    for entry in std::fs::read_dir(&profiles)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !is_rule_overlay_name(&name) || incoming.contains(&format!("{PROFILES_DIR}/{name}")) {
+            continue;
+        }
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            bail!("cannot safely reset non-regular rule overlay {}", path.display());
+        }
+        crate::rule_overlay::validate_document(&std::fs::read(&path)?)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("cannot safely reset unknown rule overlay {}", path.display()))?;
+        removals.push(path);
+    }
+    removals.sort();
+    Ok(removals)
 }
 
 /// A top-level backup file or a plain file directly under `profiles/`.
@@ -361,6 +421,9 @@ fn is_restorable(name: &str) -> bool {
 }
 
 fn validate_json_file(name: &str, data: &[u8]) -> anyhow::Result<()> {
+    if name.starts_with("profiles/cli-rule-overlay-") && name.ends_with(".yaml") {
+        return crate::rule_overlay::validate_document(data).map_err(anyhow::Error::msg);
+    }
     if !JSON_FILES.contains(&name) {
         return Ok(());
     }
@@ -372,17 +435,7 @@ fn validate_json_file(name: &str, data: &[u8]) -> anyhow::Result<()> {
             spec.validate().map_err(anyhow::Error::msg)?;
         }
         "singbox-rules.json" => {
-            let rules = value
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("{name} must contain a JSON array"))?;
-            for (index, rule) in rules.iter().enumerate() {
-                if !matches!(
-                    crate::routing::from_singbox_json(rule),
-                    Some(crate::routing::IRouteRule::Logical { .. })
-                ) {
-                    bail!("{name} entry {index} is not a supported logical rule");
-                }
-            }
+            crate::singbox::parse_rule_order(&value).map_err(anyhow::Error::msg)?;
         }
         "singbox-rule-sets.json" => {
             let sets = value
@@ -422,15 +475,15 @@ fn keep_local_secrets(name: &str, data: &[u8], local: &Path) -> anyhow::Result<O
         .transpose()?)
 }
 
-/// Replace every file in `targets` or none: all new contents are staged
+/// Replace or remove every file in `targets` or none (`None` means removal): all new contents are staged
 /// first (mode 0600: they hold secrets and subscription URLs), then swapped
 /// in; a failure part-way puts the originals back.
-fn replace_all(targets: &[(PathBuf, &[u8])]) -> anyhow::Result<()> {
+fn replace_all(targets: &[(PathBuf, Option<&[u8]>)]) -> anyhow::Result<()> {
     replace_all_using(targets, |from, to| std::fs::rename(from, to))
 }
 
 fn replace_all_using(
-    targets: &[(PathBuf, &[u8])],
+    targets: &[(PathBuf, Option<&[u8]>)],
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -449,6 +502,9 @@ fn replace_all_using(
     };
 
     let staging = targets.iter().try_for_each(|(path, data)| {
+        let Some(data) = data else {
+            return Ok(());
+        };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -465,14 +521,21 @@ fn replace_all_using(
     // (path, preserved original path, whether an original existed)
     let mut swapped: Vec<(&Path, PathBuf, bool)> = Vec::new();
     let mut swap = || -> anyhow::Result<()> {
-        for (path, _) in targets {
-            let had_original = path.exists();
+        for (path, data) in targets {
+            let had_original = match std::fs::symlink_metadata(path) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
             let old = sibling(path, "orig");
             if had_original {
                 rename(path, &old).with_context(|| format!("cannot move {} aside", path.display()))?;
             }
             swapped.push((path, old, had_original));
-            rename(&sibling(path, "partial"), path).with_context(|| format!("cannot replace {}", path.display()))?;
+            if data.is_some() {
+                rename(&sibling(path, "partial"), path)
+                    .with_context(|| format!("cannot replace {}", path.display()))?;
+            }
         }
         Ok(())
     };
@@ -700,7 +763,10 @@ mod tests {
             ],
         );
         let error = restore(&home, &wrong_shape, &backups).unwrap_err();
-        assert!(format!("{error:#}").contains("must contain a JSON array"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("rule order requires an `entries` array"),
+            "{error:#}"
+        );
         assert!(read(&home.join("config.yaml")).contains("mixed-port: 7897"));
         assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
 
@@ -739,6 +805,92 @@ mod tests {
         assert_eq!(read(&home.join("singbox-rules.json")), "[]\n");
         assert_eq!(read(&home.join("singbox-rule-sets.json")), "[]\n");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pre_overlay_v1_and_gui_archives_reset_only_recognized_cli_overlays() {
+        for versioned in [true, false] {
+            let home = sample_home("old-overlay-backup");
+            let backups = home.join("backups");
+            std::fs::create_dir_all(&backups).unwrap();
+            let archive = backups.join("old.zip");
+            let mut entries = vec![("profiles.yaml".into(), b"current: A\nitems: []\n".to_vec())];
+            if versioned {
+                entries.push((
+                    MANIFEST_FILE.into(),
+                    br#"{"format_version":1,"files":["profiles.yaml"]}"#.to_vec(),
+                ));
+            }
+            write_zip(&archive, &entries).unwrap();
+            let overlay = crate::rule_overlay::path(
+                &home.join("profiles"),
+                &clash_verge_core::config::PrfItem {
+                    uid: Some("A".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            write(&overlay, "version: 1\nsource: []\nentries: []\n");
+            let unrelated = home.join("profiles/cli-rule-overlay-user.yaml");
+            write(&unrelated, "arbitrary: user content\n");
+
+            restore(&home, &archive, &backups).unwrap();
+
+            assert!(!overlay.exists(), "legacy mode versioned={versioned}");
+            assert_eq!(read(&unrelated), "arbitrary: user content\n");
+            assert_eq!(read(&home.join("profiles/A.yaml")), "proxies: []\n");
+            assert_eq!(read(&home.join("singbox-dns.json")), "{\"servers\": []}\n");
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn unknown_or_symlink_local_overlay_and_symlink_profiles_abort_before_writes() {
+        use std::os::unix::fs::symlink;
+        let home = sample_home("unsafe-overlay");
+        let backups = home.join("backups");
+        let archive = backups.join("b.zip");
+        create(&home, &archive, false).unwrap();
+        write(&home.join("config.yaml"), "mixed-port: 9999\n");
+        let overlay = crate::rule_overlay::path(
+            &home.join("profiles"),
+            &clash_verge_core::config::PrfItem {
+                uid: Some("A".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let unknown = "version: 77\nsource: []\nentries: []\n";
+        write(&overlay, unknown);
+        let error = restore(&home, &archive, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot safely reset unknown rule overlay"));
+        assert_eq!(read(&overlay), unknown);
+        assert_eq!(read(&home.join("config.yaml")), "mixed-port: 9999\n");
+        assert_eq!(
+            list(&backups).unwrap().len(),
+            1,
+            "validation precedes pre-restore backup"
+        );
+
+        std::fs::remove_file(&overlay).unwrap();
+        let outside = temp_dir("outside-profiles");
+        let external = outside.join("external.yaml");
+        write(&external, "version: 1\nsource: []\nentries: []\n");
+        symlink(&external, &overlay).unwrap();
+        let error = restore(&home, &archive, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("non-regular rule overlay"));
+        assert!(std::fs::symlink_metadata(&overlay).unwrap().file_type().is_symlink());
+        assert_eq!(read(&external), "version: 1\nsource: []\nentries: []\n");
+        std::fs::remove_file(&overlay).unwrap();
+        std::fs::remove_dir_all(home.join("profiles")).unwrap();
+        write(&outside.join("A.yaml"), "external: untouched\n");
+        symlink(&outside, home.join("profiles")).unwrap();
+        let error = restore(&home, &archive, &backups).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot restore through non-directory or symlink"));
+        assert_eq!(read(&outside.join("A.yaml")), "external: untouched\n");
+        assert_eq!(read(&home.join("config.yaml")), "mixed-port: 9999\n");
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -831,14 +983,20 @@ mod tests {
         let home = temp_dir("rollback");
         let first = home.join("config.yaml");
         let second = home.join("verge.yaml");
+        let removed = home.join("overlay.yaml");
+        let fresh = home.join("new.yaml");
         write(&first, "old-config: true\n");
         write(&second, "old-verge: true\n");
+        write(&removed, "old-overlay: true\n");
         let targets = vec![
-            (first.clone(), b"new-config: true\n".as_slice()),
-            (second.clone(), b"new-verge: true\n".as_slice()),
+            (removed.clone(), None),
+            (first.clone(), Some(b"new-config: true\n".as_slice())),
+            (fresh.clone(), Some(b"new-file: true\n".as_slice())),
+            (second.clone(), Some(b"new-verge: true\n".as_slice())),
         ];
         let error = replace_all_using(&targets, |from, to| {
             if to == second.as_path() && from.to_string_lossy().ends_with(".partial") {
+                assert!(!removed.exists(), "removal committed before the injected write failure");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "injected rename failure",
@@ -850,6 +1008,8 @@ mod tests {
         assert!(format!("{error:#}").contains("injected rename failure"));
         assert_eq!(read(&first), "old-config: true\n");
         assert_eq!(read(&second), "old-verge: true\n");
+        assert_eq!(read(&removed), "old-overlay: true\n");
+        assert!(!fresh.exists(), "newly created files are removed on rollback");
         assert!(
             std::fs::read_dir(&home)
                 .unwrap()
@@ -866,5 +1026,84 @@ mod tests {
         assert!(!is_backup_name("../x.zip"));
         assert!(!is_backup_name("x.tar"));
         assert!(list(Path::new("/nonexistent/backups")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_removes_rule_overlay_created_after_backup_and_restores_effective_rules() {
+        let home = sample_home("overlay-absence");
+        let item = clash_verge_core::config::PrfItem {
+            uid: Some("A".into()),
+            ..Default::default()
+        };
+        let profile = home.join("profiles/A.yaml");
+        write(&profile, "proxies: []\nrules: ['MATCH,DIRECT']\n");
+        let archive = home.join("backups/before-overlay.zip");
+        create(&home, &archive, false).unwrap();
+        let overlay = crate::rule_overlay::path(&home.join("profiles"), &item).unwrap();
+        write(
+            &overlay,
+            "version: 1\nsource: ['MATCH,DIRECT']\nentries: [{kind: added, value: 'MATCH,REJECT'}]\n",
+        );
+        let mut edited: Mapping = serde_yaml_ng::from_str(&read(&profile)).unwrap();
+        crate::rule_overlay::apply(&home.join("profiles"), &item, &mut edited).unwrap();
+        assert_eq!(edited["rules"][0], Value::from("MATCH,REJECT"));
+
+        let restored = restore(&home, &archive, &home.join("backups")).unwrap();
+
+        assert!(
+            !overlay.exists(),
+            "an absent overlay is part of the saved profile state"
+        );
+        let mut restored_profile: Mapping = serde_yaml_ng::from_str(&read(&profile)).unwrap();
+        crate::rule_overlay::apply(&home.join("profiles"), &item, &mut restored_profile).unwrap();
+        assert_eq!(restored_profile["rules"][0], Value::from("MATCH,DIRECT"));
+        let relative = overlay.strip_prefix(&home).unwrap().to_str().unwrap();
+        assert!(
+            archive_names(&restored.previous.unwrap())
+                .iter()
+                .any(|name| name == relative)
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn rule_overlays_round_trip_in_backup_and_invalid_versions_block_restore() {
+        let home = sample_home("rule-overlay");
+        let item = clash_verge_core::config::PrfItem {
+            uid: Some("A".into()),
+            ..Default::default()
+        };
+        let overlay = crate::rule_overlay::path(&home.join("profiles"), &item).unwrap();
+        let name = overlay.strip_prefix(&home).unwrap().to_str().unwrap();
+        let valid = "version: 1\nsource: ['MATCH,DIRECT']\nentries: [{kind: added, value: 'MATCH,REJECT'}]\n";
+        write(&home.join("profiles/A.yaml"), "proxies: []\nrules: ['MATCH,DIRECT']\n");
+        write(&overlay, valid);
+        let archive = home.join("backups/linux-backup-overlay.zip");
+        create(&home, &archive, false).unwrap();
+        let fresh = temp_dir("rule-overlay-restore");
+        restore(&fresh, &archive, &fresh.join("backups")).unwrap();
+        assert_eq!(read(&fresh.join(name)), valid);
+        let mut profile: Mapping = serde_yaml_ng::from_str(&read(&fresh.join("profiles/A.yaml"))).unwrap();
+        crate::rule_overlay::apply(&fresh.join("profiles"), &item, &mut profile).unwrap();
+        assert_eq!(profile["rules"][0], Value::from("MATCH,REJECT"));
+        write(&overlay, "version: 1\nsource: []\nentries: []\n");
+        restore(&home, &archive, &home.join("backups")).unwrap();
+        assert_eq!(read(&overlay), valid, "incoming overlay replaces the local edit");
+
+        let invalid = home.join("backups/linux-backup-invalid-overlay.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&invalid).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("profiles.yaml", options).unwrap();
+        zip.write_all(b"current: changed\nitems: []\n").unwrap();
+        zip.start_file(name, options).unwrap();
+        zip.write_all(b"version: 55\nsource: []\nentries: []\n").unwrap();
+        zip.finish().unwrap();
+        let before = read(&fresh.join("profiles.yaml"));
+        let error = restore(&fresh, &invalid, &fresh.join("backups")).unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported rule overlay version 55"));
+        assert_eq!(read(&fresh.join("profiles.yaml")), before);
+        assert_eq!(read(&fresh.join(name)), valid);
+        let _ = std::fs::remove_dir_all(fresh);
+        let _ = std::fs::remove_dir_all(home);
     }
 }

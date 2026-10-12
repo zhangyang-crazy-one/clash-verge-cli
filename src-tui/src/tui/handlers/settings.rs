@@ -257,9 +257,6 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
 
     app.status_msg = Some(app.tr(toggled).into());
     let owns_core = ctx.manager.pid().is_some();
-    if owns_core {
-        app.core_state = CoreState::Starting;
-    }
     let manager = ctx.manager.clone();
     ctx.spawn(|tx| async move {
         match apply_tun_runtime(&manager, owns_core, enabled).await {
@@ -268,10 +265,49 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
             }
             Ok(_) => {}
             Err(error) => {
-                let _ = tx.send(Action::CoreError(error)).await;
+                // An owned restart may fail before it touches the live core
+                // (runtime write, binary resolution or TUN preflight).
+                // Attached-core reload rejection/uncertainty is always an
+                // operation error. Only a failed owned lifecycle can clear
+                // the running state.
+                let action = super::lifecycle::apply_error(&manager, owns_core, error);
+                let _ = tx.send(action).await;
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tun_error_tests {
+    use super::*;
+
+    #[test]
+    fn attached_reload_and_untouched_owned_core_report_operation_error() {
+        for (owned, state) in [
+            (false, CoreState::Running),
+            (false, CoreState::Stopped),
+            (true, CoreState::Running),
+        ] {
+            let manager = crate::mihomo_manager::manager::MihomoManager::new(std::env::temp_dir());
+            *manager.inner().state.lock() = state;
+            assert!(matches!(
+                super::super::lifecycle::apply_error(&manager, owned, "reload uncertain".into()),
+                Action::OperationError(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn actual_owned_restart_failure_remains_lifecycle_error() {
+        for state in [CoreState::Stopped, CoreState::Error("failed to spawn".into())] {
+            let manager = crate::mihomo_manager::manager::MihomoManager::new(std::env::temp_dir());
+            *manager.inner().state.lock() = state;
+            assert!(matches!(
+                super::super::lifecycle::apply_error(&manager, true, "restart failed".into()),
+                Action::CoreGeneration { action, .. } if matches!(*action, Action::CoreError(_))
+            ));
+        }
+    }
 }
 
 /// Explicit setup targets the shared manager's selected kind and exact

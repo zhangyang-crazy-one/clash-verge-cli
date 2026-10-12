@@ -243,7 +243,7 @@ fn process_state(stat: &str) -> Option<char> {
 }
 
 /// Whether a NUL-separated command line passes `-ext-ctl-unix <socket_path>`.
-fn cmdline_serves_mihomo(cmdline: &[u8], socket_path: &Path) -> bool {
+pub(super) fn cmdline_serves_mihomo(cmdline: &[u8], socket_path: &Path) -> bool {
     let socket = socket_path.as_os_str().as_encoded_bytes();
     let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
     args.windows(2)
@@ -263,7 +263,7 @@ fn cmdline_serves_mihomo(cmdline: &[u8], socket_path: &Path) -> bool {
 /// 1. binary name starts with `sing-box`;
 /// 2. cmdline carries `-c <path>`;
 /// 3. the config parses and its clash_api listener matches.
-fn cmdline_serves_singbox(cmdline: &[u8], expected_endpoint: SocketAddr) -> bool {
+pub(super) fn cmdline_serves_singbox(cmdline: &[u8], expected_endpoint: SocketAddr) -> bool {
     let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
     let binary_name = args
         .first()

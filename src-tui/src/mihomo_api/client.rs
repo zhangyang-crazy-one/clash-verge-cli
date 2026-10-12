@@ -63,9 +63,85 @@ pub struct MihomoApi {
     base_url: String,
     singbox: bool,
     provider_timeout: Duration,
+    reload_timeout: Duration,
+}
+
+/// Only a complete accepted response and subsequent readiness establish a
+/// confirmed reload. A health probe alone cannot identify the applied config.
+#[derive(Debug)]
+pub enum ReloadOutcome {
+    Confirmed,
+    Rejected(String),
+    Uncertain(String),
 }
 
 impl MihomoApi {
+    /// Override the reload deadline for callers/tests requiring a shorter wait.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_reload_timeout(mut self, timeout: Duration) -> Result<Self, MihomoError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(120) {
+            return Err(MihomoError::InvalidUri("reload timeout must be in 1 ms..=120 s".into()));
+        }
+        self.reload_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Reload uses 120 seconds even though ordinary controller reads use five.
+    pub async fn reload_config(&self, path: &std::path::Path) -> ReloadOutcome {
+        let Some(path) = path.to_str() else {
+            return ReloadOutcome::Rejected("config path is not valid UTF-8".into());
+        };
+        let mut endpoint = match self.path_url(&["configs"]) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return ReloadOutcome::Rejected(error.to_string()),
+        };
+        endpoint.query_pairs_mut().append_pair("force", "true");
+        let response = self
+            .stream_client
+            .put(endpoint)
+            .timeout(self.reload_timeout)
+            .json(&serde_json::json!({ "path": path, "payload": "" }))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            // Connector errors occur before a request can reach the controller.
+            Err(error) if error.is_connect() => {
+                return ReloadOutcome::Rejected(format!("config reload could not connect before sending: {error}"));
+            }
+            Err(error) => {
+                return self
+                    .uncertain_reload(format!("no complete config reload response: {error}"))
+                    .await;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return ReloadOutcome::Rejected(format!("Mihomo rejected config reload ({status}): {body}"));
+        }
+        if let Err(error) = response.bytes().await {
+            return self
+                .uncertain_reload(format!("config reload accepted but response was lost: {error}"))
+                .await;
+        }
+        match self.version().await {
+            Ok(_) => ReloadOutcome::Confirmed,
+            Err(error) => ReloadOutcome::Uncertain(format!(
+                "config reload accepted but controller readiness failed: {error}; candidate retained; retry the same profile to confirm application"
+            )),
+        }
+    }
+
+    async fn uncertain_reload(&self, reason: String) -> ReloadOutcome {
+        let health = match self.version().await {
+            Ok(_) => "controller is reachable, but health does not prove the candidate was applied".into(),
+            Err(error) => format!("controller health unavailable: {error}"),
+        };
+        ReloadOutcome::Uncertain(format!(
+            "mihomo config reload outcome is uncertain: {reason}; {health}; candidate retained; GeoIP/GeoSite or rule-provider initialization may still be running; retry the same profile to confirm application"
+        ))
+    }
     pub fn for_core(mut self, kind: crate::mihomo_manager::CoreKind) -> Self {
         self.singbox = kind == crate::mihomo_manager::CoreKind::SingBox;
         self
@@ -154,6 +230,7 @@ impl MihomoApi {
             base_url,
             singbox: false,
             provider_timeout: DEFAULT_PROVIDER_TIMEOUT,
+            reload_timeout: Duration::from_secs(120),
         })
     }
 

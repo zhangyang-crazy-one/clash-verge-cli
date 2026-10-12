@@ -133,10 +133,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let mut spans = vec![
                 Span::styled(app.tr("input.views_focus"), Style::new().fg(theme::dim())),
                 Span::styled(" | ", Style::new().fg(theme::dim())),
-                Span::styled(
-                    input::context_hint(app.view, app.focus, app.language),
-                    Style::new().fg(theme::text()),
-                ),
+                Span::styled(input::app_context_hint(app), Style::new().fg(theme::text())),
             ];
             if matches!(app.view, View::Connections | View::Logs) {
                 spans.push(Span::styled(" | / filter", Style::new().fg(theme::dim())));

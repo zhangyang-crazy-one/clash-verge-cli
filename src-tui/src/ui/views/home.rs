@@ -302,16 +302,28 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         theme::dim()
     };
     let mut lines = Vec::new();
+    if let Some(record) = app.singbox_degradation.as_ref() {
+        lines.push(Line::from(Span::styled(
+            crate::tui::singbox_degradation::notice_text(app, &record.digest),
+            Style::new().fg(theme::warn()),
+        )));
+    }
     if let Some(warning) = app.config_warning.as_deref() {
         lines.push(Line::from(Span::styled(
             crate::ui::terminal_text::display(warning),
             Style::new().fg(theme::warn()),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        crate::ui::terminal_text::display(message),
-        Style::new().fg(color),
-    )));
+    if app
+        .singbox_degradation
+        .as_ref()
+        .is_none_or(|record| message != crate::tui::singbox_degradation::notice_text(app, &record.digest))
+    {
+        lines.push(Line::from(Span::styled(
+            crate::ui::terminal_text::display(message),
+            Style::new().fg(color),
+        )));
+    }
     let paragraph = Paragraph::new(lines)
         .wrap(ratatui::widgets::Wrap { trim: true })
         .block(theme::panel_block(app.tr("home.messages"), false).padding(Padding::horizontal(1)));

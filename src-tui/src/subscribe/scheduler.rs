@@ -24,6 +24,11 @@ use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::ProxyDelay;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
+use crate::runtime_config::ApplyError;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod reload_tests;
 
 /// Strategy the auto-update scheduler uses to push a freshly refreshed
 /// remote profile to the running core.
@@ -345,27 +350,11 @@ impl AutoUpdateScheduler {
         node: &str,
         enable_tun: bool,
     ) -> ProbeOutcome {
-        let items = match ProfileStore::snapshot().await {
-            Ok(store) => store.items(),
-            Err(error) => {
-                return ProbeOutcome {
-                    error: Some(error.to_string()),
-                    ..Default::default()
-                };
-            }
-        };
-        let Some((old_bytes, old_updated)) = profile_snapshot(&items, uid).await else {
-            return ProbeOutcome {
-                error: Some(format!("profile {uid} file unavailable for snapshot")),
-                ..Default::default()
-            };
-        };
-
-        match ProfileStore::update_remotes_locked(&[uid.to_string()]).await {
-            Ok((updated, _failed)) if !updated.is_empty() => {
+        match ProfileStore::force_refresh_locked(uid).await {
+            Ok((old_snapshot, refreshed_snapshot)) => {
                 if refreshed_config_has_node(uid, node).await {
                     match super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             let verdict =
                                 classify_delay(&lifecycle.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
                             ProbeOutcome {
@@ -374,13 +363,23 @@ impl AutoUpdateScheduler {
                                 ..Default::default()
                             }
                         }
+                        Err(error) if !error.allows_rollback() => ProbeOutcome {
+                            forced_refresh: true,
+                            error: Some(format!("reload after forced refresh: {error}")),
+                            ..Default::default()
+                        },
                         Err(error) => {
-                            let file = items
-                                .iter()
-                                .find(|item| item.uid.as_deref() == Some(uid))
-                                .and_then(|item| item.file.as_deref());
-                            if let Some(file) = file {
-                                restore_profile_snapshot(uid, file, &old_bytes, old_updated).await;
+                            if let Err(restore_error) =
+                                ProfileStore::restore_refresh_if_matches(&old_snapshot, &refreshed_snapshot).await
+                            {
+                                ProbeOutcome {
+                                    forced_refresh: true,
+                                    error: Some(format!(
+                                        "reload after forced refresh failed: {error}; rollback source failed: {restore_error}"
+                                    )),
+                                    ..Default::default()
+                                }
+                            } else {
                                 let rollback =
                                     super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun)
                                         .await;
@@ -394,22 +393,18 @@ impl AutoUpdateScheduler {
                                     error: Some(format!("reload after forced refresh failed: {error}{suffix}")),
                                     ..Default::default()
                                 }
-                            } else {
-                                ProbeOutcome {
-                                    forced_refresh: true,
-                                    error: Some(format!("reload after forced refresh: {error}")),
-                                    ..Default::default()
-                                }
                             }
                         }
                     }
                 } else {
-                    let file = items
-                        .iter()
-                        .find(|item| item.uid.as_deref() == Some(uid))
-                        .and_then(|item| item.file.clone());
-                    if let Some(file) = file {
-                        restore_profile_snapshot(uid, &file, &old_bytes, old_updated).await;
+                    if let Err(error) =
+                        ProfileStore::restore_refresh_if_matches(&old_snapshot, &refreshed_snapshot).await
+                    {
+                        return ProbeOutcome {
+                            forced_refresh: true,
+                            error: Some(format!("rollback source failed: {error}")),
+                            ..Default::default()
+                        };
                     }
                     let rollback =
                         super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await;
@@ -428,11 +423,6 @@ impl AutoUpdateScheduler {
                     }
                 }
             }
-            Ok(_) => ProbeOutcome {
-                forced_refresh: true,
-                error: Some(format!("forced refresh of {uid} produced no update")),
-                ..Default::default()
-            },
             Err(error) => ProbeOutcome {
                 error: Some(format!("forced refresh failed: {error}")),
                 ..Default::default()
@@ -449,26 +439,6 @@ fn unavailable_probe(kind: CoreKind) -> ProbeOutcome {
         )),
         ..Default::default()
     }
-}
-
-/// Snapshot a remote profile's file bytes and `updated` timestamp so a forced
-/// refresh can be rolled back.
-async fn profile_snapshot(items: &[PrfItem], uid: &str) -> Option<(Vec<u8>, usize)> {
-    let item = items.iter().find(|item| item.uid.as_deref() == Some(uid))?;
-    let file = item.file.as_ref()?;
-    let path = clash_verge_core::utils::dirs::app_profiles_dir()
-        .ok()?
-        .join(file.as_str());
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    Some((bytes, item.updated.unwrap_or(0)))
-}
-
-/// Restore a profile's file bytes and `updated` timestamp (rollback path).
-async fn restore_profile_snapshot(uid: &str, file: &str, bytes: &[u8], updated: usize) {
-    if let Ok(dir) = clash_verge_core::utils::dirs::app_profiles_dir() {
-        let _ = tokio::fs::write(dir.join(file), bytes).await;
-    }
-    let _ = ProfileStore::restore_updated_locked(uid, updated).await;
 }
 
 /// Whether the freshly refreshed profile config still contains `node`.
@@ -507,14 +477,14 @@ pub async fn reload_current_profile(
     uid: &str,
     enable_tun: bool,
     core_running: bool,
-) -> Result<(), String> {
+) -> Result<crate::runtime_config::ApplyOutcome, ApplyError> {
     let store = ProfileStore::snapshot().await.map_err(|error| error.to_string())?;
     let item = store
         .items()
         .into_iter()
         .find(|item| item.uid.as_deref() == Some(uid))
         .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
-    crate::runtime_config::reload_remote_profile(api, &item, enable_tun, core_running).await
+    crate::runtime_config::reload_remote_profile_with_outcome(api, &item, enable_tun, core_running).await
 }
 
 /// Reload the running core from a freshly refreshed current profile,
@@ -533,7 +503,10 @@ pub async fn reload_current_profile_for_core(
     enable_tun: bool,
     core_running: bool,
 ) -> Result<(), String> {
-    reload_current_profile_for_manager(manager, uid, enable_tun, core_running).await
+    reload_current_profile_for_manager(manager, uid, enable_tun, core_running)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn reload_current_profile_for_manager(
@@ -541,11 +514,11 @@ pub(crate) async fn reload_current_profile_for_manager(
     uid: &str,
     enable_tun: bool,
     core_running: bool,
-) -> Result<(), String> {
+) -> Result<crate::runtime_config::ApplyOutcome, ApplyError> {
     if !core_running {
         // A successful subscription update may be persisted while the core is
         // stopped, but applying it must not implicitly start that core.
-        return Ok(());
+        return Ok(crate::runtime_config::ApplyOutcome::Unchanged);
     }
     match decide_refresh_path(manager.core_kind()) {
         RefreshPath::HotReload => reload_current_profile(&manager.api(), uid, enable_tun, core_running).await,
@@ -560,14 +533,15 @@ pub(crate) async fn reload_current_profile_for_manager(
                 .find(|item| item.uid.as_deref() == Some(uid))
                 .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
             let yaml = read_profile_yaml(&item).await?;
-            crate::runtime_config::apply_singbox_restart_for_profile(
+            crate::runtime_config::apply_singbox_profile_with_outcome(
                 manager,
                 Some(yaml.as_str()),
                 enable_tun,
                 Some(uid),
             )
             .await
-            .map(|_report| ())
+            .map(|(outcome, _report)| outcome)
+            .map_err(ApplyError::from)
         }
     }
 }

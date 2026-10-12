@@ -8,14 +8,8 @@
 //! grouped [`crate::runtime_config::SingboxDegradationRecord`] into one
 //! localized status-bar line (the TUI's "recent message" surface).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use crate::app::App;
 use crate::runtime_config::{DegradationCategory, SingboxDegradationDigest};
-
-/// Seq of the record already shown. A newer apply supersedes it, so the
-/// same losses are never repeated on every subsequent event.
-static SHOWN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Localized category label with its count, e.g. "跳过 10 个节点".
 fn category_fragment(app: &App, category: DegradationCategory, count: usize) -> String {
@@ -48,18 +42,25 @@ pub(crate) fn notice_text(app: &App, digest: &SingboxDegradationDigest) -> Strin
 /// Called from the action handler after every event: the apply itself runs
 /// in a background task and reports through the action channel, so this is
 /// where its result becomes visible.
-pub(crate) async fn maybe_surface(app: &mut App) {
-    let Some(record) = crate::runtime_config::last_singbox_degradation().await else {
-        return;
+pub(crate) async fn maybe_surface(app: &mut App, kind: crate::mihomo_manager::CoreKind) {
+    let record = if kind == crate::mihomo_manager::CoreKind::SingBox {
+        crate::runtime_config::last_singbox_degradation().await
+    } else {
+        None
     };
-    if record.seq <= SHOWN_SEQ.load(Ordering::SeqCst) {
+    if record == app.singbox_degradation {
         return;
     }
-    // Claim the record before rendering: a notice is shown once per apply.
-    if SHOWN_SEQ.fetch_max(record.seq, Ordering::SeqCst) >= record.seq {
-        return;
+    // Clear an expired warning without erasing an unrelated recent message.
+    if let Some(old) = app.singbox_degradation.as_ref()
+        && app.status_msg.as_deref() == Some(notice_text(app, &old.digest).as_str())
+    {
+        app.status_msg = None;
     }
-    app.status_msg = Some(notice_text(app, &record.digest));
+    if let Some(record) = record.as_ref() {
+        app.status_msg = Some(notice_text(app, &record.digest));
+    }
+    app.singbox_degradation = record;
 }
 
 #[cfg(test)]
@@ -104,25 +105,38 @@ mod tests {
 
     #[tokio::test]
     async fn a_recorded_apply_is_surfaced_once_and_a_clean_apply_clears_it() {
-        SHOWN_SEQ.store(0, Ordering::SeqCst);
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(clash_verge_core::utils::dirs::singbox_config_path().unwrap(), "{}").unwrap();
         let mut app = App::new();
         // Nothing recorded yet: the status line is left alone.
         app.status_msg = Some("Profile switched".into());
-        maybe_surface(&mut app).await;
+        maybe_surface(&mut app, crate::mihomo_manager::CoreKind::SingBox).await;
         assert_eq!(app.status_msg.as_deref(), Some("Profile switched"));
 
         crate::runtime_config::record_singbox_degradation(&lossy_parts()).await;
-        maybe_surface(&mut app).await;
+        maybe_surface(&mut app, crate::mihomo_manager::CoreKind::SingBox).await;
         let shown = app.status_msg.clone().expect("the notice replaces the last message");
         assert!(shown.starts_with("sing-box conversion degraded"), "{shown}");
 
+        // A fresh App (an attached TUI) reads the durable record independently.
+        let mut attached = App::new();
+        maybe_surface(&mut attached, crate::mihomo_manager::CoreKind::SingBox).await;
+        assert_eq!(attached.status_msg, app.status_msg);
+        maybe_surface(&mut attached, crate::mihomo_manager::CoreKind::Mihomo).await;
+        assert!(attached.singbox_degradation.is_none());
+        assert!(
+            attached.status_msg.is_none(),
+            "switching to mihomo clears the old warning"
+        );
+
         // The same apply must not shout again on the next unrelated event.
         app.status_msg = Some("Proxies refreshed".into());
-        maybe_surface(&mut app).await;
+        maybe_surface(&mut app, crate::mihomo_manager::CoreKind::SingBox).await;
         assert_eq!(app.status_msg.as_deref(), Some("Proxies refreshed"));
 
         crate::runtime_config::record_singbox_degradation(&clean_parts()).await;
-        maybe_surface(&mut app).await;
+        maybe_surface(&mut app, crate::mihomo_manager::CoreKind::SingBox).await;
         assert_eq!(
             app.status_msg.as_deref(),
             Some("Proxies refreshed"),

@@ -21,8 +21,28 @@ use crate::mihomo_manager::pidfile;
 pub const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
+    run_with_ready_timeout(manager, READY_TIMEOUT).await
+}
+
+/// [`run`] with an explicit readiness budget — the production path uses
+/// [`READY_TIMEOUT`]; tests need a launch that is never ready without
+/// waiting it out.
+pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout: Duration) -> anyhow::Result<()> {
+    run_with_mode_and_timeout(manager, SupervisorLaunch::Regenerate, ready_timeout).await
+}
+
+pub(crate) async fn run_with_mode(manager: MihomoManager, mode: SupervisorLaunch) -> anyhow::Result<()> {
+    run_with_mode_and_timeout(manager, mode, READY_TIMEOUT).await
+}
+
+async fn run_with_mode_and_timeout(
+    manager: MihomoManager,
+    mode: SupervisorLaunch,
+    ready_timeout: Duration,
+) -> anyhow::Result<()> {
+    let kind = manager.core_kind().as_str();
     if let Some(pid) = manager.pid() {
-        anyhow::bail!("mihomo is already running (pid {pid}); use `restart` to replace it");
+        anyhow::bail!("{kind} is already running (pid {pid}); use `restart` to replace it");
     }
     // P1 (reviewer): complete the credential rotation in the PARENT before
     // anything is launched. The supervisor child resolves the secret again at
@@ -32,18 +52,32 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
     // transport ignores the bearer, but sing-box's clash_api is TCP and
     // really enforces it: a fresh install would report a 15s start timeout
     // while the core was healthy.
-    prepare_controller_credentials(&manager).await?;
     let api = manager.api();
     if super::core_running(&api).await {
         anyhow::bail!(
-            "a mihomo core already answers on {} without a clash-verge-cli pid record; stop it where it was started",
-            manager.socket_path().display()
+            "a proxy core already answers on {} without a clash-verge-cli pid record; stop it where it was started",
+            super::stop::controller_description(&manager)
         );
     }
 
+    let mode = manager.prepare_mihomo_launch(mode).await?;
+    prepare_controller_credentials(&manager).await?;
+
     let log = supervisor_log_path(manager.config_dir());
-    let mut supervisor = launch_supervisor_via(manager.config_dir(), &log, SupervisorLaunch::Regenerate)?;
-    wait_until_ready(&manager, &mut supervisor, &log).await?;
+    let (mut supervisor, ownership) = launch_owned_supervisor(&manager, &log, mode)?;
+    // A5 (reviewer): a readiness failure is a LAUNCH failure like any other,
+    // and it gets the same cleanup: bound to the supervisor handle captured
+    // here, stop the supervisor AND the core it already forked. Returning the
+    // error directly left that core holding the controller socket and the
+    // mixed port while the next `start`/`restart` competed with it.
+    let outcome = wait_until_ready_and_verify(&manager, &mut supervisor, &log, ready_timeout, || {
+        ownership.verify_core(&manager)
+    })
+    .await;
+    if let Err(error) = outcome {
+        manager.cleanup_failed_launch(&ownership, &mut supervisor).await;
+        return Err(error);
+    }
 
     let version = manager
         .api()
@@ -51,14 +85,15 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
         .await
         .map(|v| v.version)
         .unwrap_or_else(|_| "?".into());
-    let core = pidfile::read_live(&pidfile::path_for(manager.socket_path()), manager.socket_path());
-    println!("mihomo started");
+    let core = pidfile::read_record(&pidfile::path_for(manager.socket_path()));
+    println!("{kind} started");
     println!("  version:    {version}");
     if let Some(core) = core {
         println!("  pid:        {}", core.pid);
     }
     println!("  supervisor: pid {}", supervisor.id());
     println!("  log:        {}", log.display());
+    crate::runtime_config::print_singbox_degradation(manager.core_kind()).await;
     Ok(())
 }
 
@@ -78,21 +113,6 @@ pub enum SupervisorLaunch {
     UseExistingConfig,
 }
 
-/// Environment variable carrying [`SupervisorLaunch`] to the detached child.
-///
-/// The supervisor is launched as `start --foreground`, whose argument parser
-/// lives outside this module; an environment variable is what lets the
-/// recovery request travel to the child without a new CLI flag.
-pub const START_CONFIG_MODE_ENV: &str = "CLASH_VERGE_CLI_START_CONFIG";
-
-/// The launch mode this process was started with (default [`SupervisorLaunch::Regenerate`]).
-pub fn requested_launch() -> SupervisorLaunch {
-    match std::env::var(START_CONFIG_MODE_ENV).as_deref() {
-        Ok("existing") => SupervisorLaunch::UseExistingConfig,
-        _ => SupervisorLaunch::Regenerate,
-    }
-}
-
 /// Where the detached supervisor writes its own and the core's output.
 pub fn supervisor_log_path(config_dir: &Path) -> PathBuf {
     config_dir.join("logs").join("daemon.log")
@@ -106,9 +126,19 @@ pub fn supervisor_log_path(config_dir: &Path) -> PathBuf {
 /// Fail-closed: a malformed `config.yaml`, or a rotation that cannot be
 /// persisted, aborts the start here, before any process is launched.
 pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::Result<()> {
-    let secret = crate::enhance::resolve_controller_secret()
-        .await
-        .context("failed to prepare the controller secret in the clash config; no core was started")?;
+    let secret = if manager.core_kind() == crate::mihomo_manager::CoreKind::Mihomo {
+        crate::mihomo_manager::manager::controller_secret_from_config(Some(
+            &clash_verge_core::utils::dirs::clash_path()?,
+        ))?
+    } else if clash_verge_core::utils::dirs::singbox_config_path()?.exists() {
+        crate::mihomo_manager::manager::controller_secret_from_config(Some(
+            &clash_verge_core::utils::dirs::singbox_config_path()?,
+        ))?
+    } else {
+        crate::enhance::resolve_controller_secret()
+            .await
+            .context("failed to prepare the controller secret in the clash config; no core was started")?
+    };
     manager.set_secret_override(secret);
     Ok(())
 }
@@ -120,7 +150,13 @@ pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::
 ///
 /// Also used by [`crate::mihomo_manager::MihomoManager::restart_through_supervisor`]
 /// to hand a replacement core to a supervisor after stopping an adopted one.
-pub fn launch_supervisor(config_dir: &Path, log: &Path, mode: SupervisorLaunch) -> anyhow::Result<std::process::Child> {
+fn launch_supervisor_with_receipt(
+    config_dir: &Path,
+    log: &Path,
+    mode: SupervisorLaunch,
+    receipt: Option<&crate::mihomo_manager::process::ReceiptTarget>,
+    prepared: Option<&crate::mihomo_manager::binary::PreparedCore>,
+) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
 
     if let Some(dir) = log.parent() {
@@ -141,40 +177,81 @@ pub fn launch_supervisor(config_dir: &Path, log: &Path, mode: SupervisorLaunch) 
         .stdout(out)
         .stderr(err)
         .process_group(0);
-    if mode == SupervisorLaunch::UseExistingConfig {
-        command.env(START_CONFIG_MODE_ENV, "existing");
+    configure_launch(&mut command, mode, receipt);
+    if let Some(prepared) = prepared {
+        command
+            .arg("--start-core-kind")
+            .arg(prepared.kind.as_str())
+            .arg("--start-core-binary")
+            .arg(&prepared.path);
     }
     command.spawn().context("failed to launch the core supervisor")
 }
 
-/// Launch the detached supervisor, or the test-installed stand-in.
-///
-/// Every detached start goes through here (the plain `start`, the adopted
-/// core replacement and the apply transaction's rollback recovery), so a
-/// test can inject a *failing* supervisor launch at the real process
-/// boundary without spawning a core — and can observe the launch mode the
-/// production path would have put on the child's command line.
-pub(crate) fn launch_supervisor_via(
-    config_dir: &Path,
+fn configure_launch(
+    command: &mut std::process::Command,
+    mode: SupervisorLaunch,
+    receipt: Option<&crate::mihomo_manager::process::ReceiptTarget>,
+) {
+    use crate::mihomo_manager::process::{LAUNCH_ID_ENV, RECEIPT_PATH_ENV};
+    // Never inherit a prior launch's recovery mode or ownership receipt.
+    command
+        .env_remove("CLASH_VERGE_CLI_START_CONFIG")
+        .env_remove(RECEIPT_PATH_ENV)
+        .env_remove(LAUNCH_ID_ENV);
+    if mode == SupervisorLaunch::UseExistingConfig {
+        command.arg("--start-use-existing-config");
+    }
+    if let Some(receipt) = receipt {
+        command
+            .env(RECEIPT_PATH_ENV, &receipt.path)
+            .env(LAUNCH_ID_ENV, &receipt.launch_id);
+    }
+}
+
+pub(crate) fn launch_owned_supervisor(
+    manager: &MihomoManager,
     log: &Path,
     mode: SupervisorLaunch,
-) -> anyhow::Result<std::process::Child> {
+) -> anyhow::Result<(std::process::Child, crate::mihomo_manager::manager::LaunchOwnership)> {
+    launch_owned_supervisor_with_prepared(manager, log, mode, None)
+}
+
+pub(crate) fn launch_owned_supervisor_with_prepared(
+    manager: &MihomoManager,
+    log: &Path,
+    mode: SupervisorLaunch,
+    prepared: Option<&crate::mihomo_manager::binary::PreparedCore>,
+) -> anyhow::Result<(std::process::Child, crate::mihomo_manager::manager::LaunchOwnership)> {
+    let receipt = crate::mihomo_manager::process::ReceiptTarget::new(manager.config_dir(), manager.core_kind())?;
     #[cfg(test)]
     if let Some(launcher) = *SUPERVISOR_LAUNCHER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
     {
-        return launcher(config_dir, log, mode);
+        let child = launcher(manager.config_dir(), log, mode)?;
+        let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
+        return Ok((child, ownership));
     }
-    launch_supervisor(config_dir, log, mode)
+    let child = launch_supervisor_with_receipt(manager.config_dir(), log, mode, Some(&receipt), prepared)?;
+    let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
+    Ok((child, ownership))
 }
 
-/// Test seam: the launcher [`launch_supervisor_via`] prefers while armed.
+/// Test seam: the launcher [`launch_owned_supervisor`] prefers while armed.
 #[cfg(test)]
 pub(crate) type SupervisorLauncher = fn(&Path, &Path, SupervisorLaunch) -> anyhow::Result<std::process::Child>;
 
 #[cfg(test)]
 static SUPERVISOR_LAUNCHER: std::sync::Mutex<Option<SupervisorLauncher>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn supervisor_launcher_installed() -> bool {
+    SUPERVISOR_LAUNCHER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
 
 /// Arm the seam for one test and restore the real launcher afterwards.
 #[cfg(test)]
@@ -214,27 +291,75 @@ pub fn reap_supervisor(supervisor: &mut std::process::Child) {
     let _ = supervisor.wait();
 }
 
+/// Observe exit without releasing the Child's PID generation. Failed-launch
+/// cleanup must authenticate queued receipt senders before the final reap.
+pub(crate) fn supervisor_exit_status(
+    supervisor: &std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt as _;
+    // SAFETY: zeroed siginfo is writable, waitid targets our actual Child,
+    // and WNOWAIT retains its zombie/PID until Child::wait reaps it.
+    let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            supervisor.id(),
+            &mut info,
+            nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: waitid filled the SIGCHLD fields (or cleared si_pid for no exit).
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let code = unsafe { info.si_status() };
+    let raw = match info.si_code {
+        nix::libc::CLD_EXITED => code << 8,
+        nix::libc::CLD_DUMPED => code | 0x80,
+        _ => code,
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
 /// Wait until the supervised core answers. If the supervisor exits first
 /// (bad config, missing TUN capability, crash loop), report its log tail.
-pub async fn wait_until_ready(
+/// API readiness can precede receipt/shared-record publication. Wait for both
+/// within one budget; verification stays strict on every attempt.
+pub(crate) async fn wait_until_ready_and_verify(
     manager: &MihomoManager,
     supervisor: &mut std::process::Child,
     log: &Path,
+    ready_timeout: Duration,
+    verify: impl Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let api = manager.api();
-    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    let kind = manager.core_kind().as_str();
+    let deadline = tokio::time::Instant::now() + ready_timeout;
+    let mut last_identity_error = None;
     loop {
-        if super::core_running(&api).await {
-            return Ok(());
+        if let Some(status) = supervisor_exit_status(supervisor)? {
+            anyhow::bail!("{kind} failed to start ({status})\n{}", super::log_tail(log, 10));
         }
-        if let Some(status) = supervisor.try_wait()? {
-            anyhow::bail!("mihomo failed to start ({status})\n{}", super::log_tail(log, 10));
+        if tokio::time::timeout_at(deadline, super::core_running(&api))
+            .await
+            .unwrap_or(false)
+        {
+            match verify() {
+                Ok(()) => return Ok(()),
+                Err(error) => last_identity_error = Some(error),
+            }
         }
         if tokio::time::Instant::now() >= deadline {
+            if let Some(error) = last_identity_error {
+                anyhow::bail!("{kind} launch identity did not become ready within {ready_timeout:?}: {error}");
+            }
             anyhow::bail!(
-                "mihomo did not answer on {} within {}s\n{}",
-                manager.socket_path().display(),
-                READY_TIMEOUT.as_secs(),
+                "{kind} did not answer on {} within {}s\n{}",
+                super::stop::controller_description(manager),
+                ready_timeout.as_secs(),
                 super::log_tail(log, 10)
             );
         }
@@ -247,6 +372,56 @@ pub async fn wait_until_ready(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn supervisor_exit_observation_preserves_generation_until_cleanup_reaps() {
+        let mut supervisor = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .unwrap();
+        let pid = supervisor.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = supervisor_exit_status(&supervisor).unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(17));
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok(),
+            "queued sender credentials still have a kernel generation"
+        );
+        assert_eq!(supervisor.wait().unwrap().code(), Some(17));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "only the final wait releases the PID"
+        );
+    }
+
+    #[test]
+    fn launch_modes_are_explicit_and_clear_inherited_environment() {
+        use crate::mihomo_manager::process::{LAUNCH_ID_ENV, RECEIPT_PATH_ENV};
+        for mode in [SupervisorLaunch::Regenerate, SupervisorLaunch::UseExistingConfig] {
+            let mut command = std::process::Command::new("true");
+            command
+                .env("CLASH_VERGE_CLI_START_CONFIG", "existing")
+                .env(LAUNCH_ID_ENV, "previous-launch")
+                .env(RECEIPT_PATH_ENV, "/previous/receipt");
+            configure_launch(&mut command, mode, None);
+            for name in ["CLASH_VERGE_CLI_START_CONFIG", LAUNCH_ID_ENV, RECEIPT_PATH_ENV] {
+                assert!(
+                    command.get_envs().any(|(key, value)| key == name && value.is_none()),
+                    "{name} must not leak across launches"
+                );
+            }
+            assert_eq!(
+                command.get_args().any(|arg| arg == "--start-use-existing-config"),
+                mode == SupervisorLaunch::UseExistingConfig
+            );
+        }
+    }
 
     /// Armed by the stand-in supervisor: a fake core must not answer before
     /// one was launched, or `run`'s "a core already answers" guard would
@@ -262,6 +437,77 @@ mod tests {
     static CHILD_VIEW: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
     /// Pids of the stand-in supervisor processes, reaped at test end.
     static STANDIN_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+    #[tokio::test]
+    async fn issue82_ready_api_waits_for_identity_and_never_accepts_persistent_identity_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    if !matches!(stream.read(&mut request).await, Ok(1..)) {
+                        return;
+                    }
+                    let body = r#"{"version":"fixture"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let manager = MihomoManager::new(home.path().into())
+            .with_core_kind(crate::mihomo_manager::CoreKind::SingBox)
+            .with_singbox_controller(addr);
+        let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = wait_until_ready_and_verify(
+            &manager,
+            &mut child,
+            &home.path().join("log"),
+            Duration::from_secs(1),
+            || {
+                anyhow::ensure!(
+                    attempts.fetch_add(1, Ordering::SeqCst) >= 2,
+                    "identity record not published yet"
+                );
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let result = wait_until_ready_and_verify(
+            &manager,
+            &mut child,
+            &home.path().join("log"),
+            Duration::from_millis(120),
+            || anyhow::bail!("shared record does not name this launch's core"),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("identity did not become ready"), "{error}");
+        assert!(manager.pid().is_none(), "readiness alone never adopts a core");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "waiting does not signal a foreign process"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        server.abort();
+    }
 
     /// A fake sing-box clash_api: a real TCP listener on loopback that
     /// enforces the bearer secret exactly like the real controller, so the
@@ -461,5 +707,84 @@ mod tests {
 
     async fn prepare_controller_credentials_for_test() -> String {
         crate::enhance::resolve_controller_secret().await.expect("resolve")
+    }
+
+    /// A5 (reviewer): the readiness failure of the plain `start` is a LAUNCH
+    /// failure like any other and takes the same cleanup — the supervisor AND
+    /// the core it already forked are stopped, bound to the supervisor handle
+    /// this launch captured. Returning the error directly left that core
+    /// holding the controller socket and the mixed port while the next
+    /// start/restart competed with it.
+    #[tokio::test]
+    async fn a_readiness_failure_stops_the_supervisor_and_the_core_it_forked() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 39186\nsecret: start-cleanup-fixture\ntun: {enable: false}\n",
+        )
+        .expect("seed config");
+        std::fs::write(home.path().join("verge.yaml"), "proxy_core: mihomo\n").expect("verge");
+
+        // The seam is a plain fn pointer, so it cannot capture: the pid file
+        // travels through a thread-local set by the test.
+        static CORE_PID_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let core_pid_file = home.path().join("forked-core.pid");
+        CORE_PID_FILE.set(core_pid_file.clone()).expect("pid file once");
+        fn forking_supervisor(
+            _config_dir: &Path,
+            log: &Path,
+            _mode: SupervisorLaunch,
+        ) -> anyhow::Result<std::process::Child> {
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(log, b"stand-in supervisor\n")?;
+            // A supervisor that DOES spawn a core but never answers the
+            // controller: the readiness probe is what fails.
+            Ok(std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "sleep 300 & echo $! > {}; wait",
+                    CORE_PID_FILE
+                        .get()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                ))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?)
+        }
+        let _launcher = install_supervisor_launcher(forking_supervisor).expect("install seam");
+
+        let config_dir = home.path().join("run");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        // A short readiness budget: this core is never coming.
+        let manager = MihomoManager::new(config_dir)
+            .with_socket(home.path().join("controller.sock"))
+            .with_secret("start-cleanup-fixture".to_string());
+        *manager.inner().resolved_binary.lock() = Some("/bin/true".into());
+
+        let error = run_with_ready_timeout(manager, Duration::from_millis(300))
+            .await
+            .expect_err("the core never answers");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+
+        let mut core_pid = None;
+        for _ in 0..200 {
+            if let Ok(body) = std::fs::read_to_string(&core_pid_file)
+                && let Ok(pid) = body.trim().parse::<u32>()
+            {
+                core_pid = Some(pid);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let core_pid = core_pid.expect("the stand-in supervisor forked a core");
+        assert!(
+            !crate::mihomo_manager::pidfile::is_running(core_pid),
+            "the core this launch forked must be stopped, not left holding the ports (pid {core_pid})"
+        );
     }
 }

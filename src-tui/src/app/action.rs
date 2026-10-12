@@ -32,7 +32,10 @@ pub enum Action {
         binary_source: Option<String>,
     },
     CoreExited(i32),
+    /// A lifecycle or watcher failure: the core is no longer usable.
     CoreError(String),
+    /// A failed configuration/setup operation does not establish core failure.
+    OperationError(String),
     ConfirmCoreUpdate,
     RequestCoreUpdate {
         kind: crate::mihomo_manager::CoreKind,
@@ -68,12 +71,9 @@ pub enum Action {
     // Profile management
     StartImport,
     ConfirmImport(String),
-    /// The SSRF safety check found a blocked host during import; the user must
-    /// explicitly trust it before that URL may be imported.
-    ImportNeedsTrust {
-        url: String,
-        host: String,
-    },
+    /// Import found a blocked address or unverifiable remote proxy DNS.
+    /// Retry state retains the exact host and prior explicit grants.
+    ImportNeedsTrust(Box<super::TrustPending>),
     /// The SSRF safety check found a blocked host during a manual profile
     /// refresh; the user must explicitly trust it before the update retries.
     /// Carries the profile uid so confirming persists the trust into that
@@ -353,6 +353,7 @@ mod tests {
         let _ = Action::CoreExited(0);
         let _ = Action::CoreExited(137);
         let _ = Action::CoreError("boom".to_string());
+        let _ = Action::OperationError("reload uncertain".to_string());
         let _ = Action::Quit;
         let _ = Action::TunSetupSucceeded {
             resume_start: Some(true),

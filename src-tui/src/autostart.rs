@@ -45,14 +45,13 @@ pub fn unit_path() -> PathBuf {
 pub fn user_unit_content(binary_path: &str, config_dir: &str) -> String {
     format!(
         r#"[Unit]
-Description=Clash Verge CLI - mihomo proxy daemon
+Description=Clash Verge CLI - proxy core daemon
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart={} start --foreground --config-dir {}
-ExecStop=/bin/kill -TERM $MAINPID
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -143,7 +142,9 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(!unit.contains("multi-user.target"));
         assert!(unit.contains("Restart=on-failure"));
-        assert!(unit.contains("$MAINPID"));
+        assert!(unit.contains("Description=Clash Verge CLI - proxy core daemon"));
+        assert!(!unit.contains("ExecStop="));
+        assert!(!unit.contains("KillSignal="));
     }
 
     #[test]
@@ -158,7 +159,7 @@ mod tests {
             !unit.contains("/home/u/.config/100% $cfg"),
             "raw path must not survive escaping"
         );
-        assert!(unit.contains("$MAINPID"), "the template's own variable stays intact");
+        assert!(!unit.contains("ExecStop="));
     }
 
     #[test]

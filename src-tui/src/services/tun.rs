@@ -1,7 +1,7 @@
 //! Applying the TUN flag to the runtime config.
 
 use crate::mihomo_manager::manager::MihomoManager;
-use crate::runtime_config::{RUNTIME_CONFIG_IO, reload_config_file, write_runtime_config_unlocked};
+use crate::runtime_config::{RUNTIME_CONFIG_IO, commit_runtime_config_unlocked, write_runtime_config_unlocked};
 
 /// Write the TUN flag into the runtime config and apply it under one IO lock.
 ///
@@ -15,12 +15,17 @@ use crate::runtime_config::{RUNTIME_CONFIG_IO, reload_config_file, write_runtime
 /// prompts for a password.
 pub async fn apply_tun_runtime(manager: &MihomoManager, owns_core: bool, enable_tun: bool) -> Result<(), String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
-    let config = clash_verge_core::config::IClashTemp::new().await.0;
-    let path = write_runtime_config_unlocked(config, enable_tun).await?;
     if owns_core {
-        manager.restart().await.map(|_| ()).map_err(|error| error.to_string())
+        manager
+            .restart_tun_unlocked(&_guard, enable_tun)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     } else {
-        reload_config_file(&manager.api(), &path).await
+        commit_runtime_config_unlocked(&manager.api(), enable_tun, true, None, Ok)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 

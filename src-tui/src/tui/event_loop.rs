@@ -245,6 +245,8 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             }
 
             _ = runtime_refresh_tick.tick(), if app.core_state == CoreState::Running => {
+                crate::tui::singbox_degradation::maybe_surface(&mut app, ctx.manager.core_kind()).await;
+                dirty = true;
                 ctx.send(Action::TrafficRefresh);
                 match app.view {
                     View::Connections => {
@@ -415,7 +417,7 @@ fn handle_rule_input_prompt(app: &mut App, code: KeyCode, buffer: ModeBuffer) {
             // route rule (logical rules have no clash string form);
             // anything else goes through the clash string parser.
             let raw = buffer.text().trim().to_string();
-            if !raw.is_empty() && app.rules_edit_mode {
+            if !raw.is_empty() && app.rules_edit_mode && !app.rules_save_busy {
                 let parsed = if raw.starts_with('{') {
                     serde_json::from_str::<serde_json::Value>(&raw)
                         .ok()
@@ -457,7 +459,7 @@ fn handle_rule_set_prompt(app: &mut App, code: KeyCode, buffer: ModeBuffer) {
         KeyCode::Enter => {
             let spec = buffer.text().trim().to_string();
             let parts: Vec<&str> = spec.split('|').map(str::trim).collect();
-            if parts.len() == 3 && app.rules_edit_mode {
+            if parts.len() == 3 && app.rules_edit_mode && !app.rules_save_busy {
                 let (tag, rtype, loc) = (parts[0], parts[1], parts[2]);
                 let mut entry = serde_json::json!({
                     "type": rtype,
@@ -506,7 +508,7 @@ fn handle_rule_form_prompt(app: &mut App, code: KeyCode, buffer: ModeBuffer) {
         KeyCode::Esc => app.input_mode = InputMode::Normal,
         KeyCode::Enter => {
             let spec = buffer.text().trim().to_string();
-            if !spec.is_empty() && app.rules_edit_mode {
+            if !spec.is_empty() && app.rules_edit_mode && !app.rules_save_busy {
                 match crate::routing::build_simple_rule(&spec) {
                     Ok(rule) => {
                         let at = (app.rules_selected_index + 1).min(app.rules_edit_buffer.len());

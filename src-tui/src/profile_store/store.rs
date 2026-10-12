@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use anyhow::Context;
 use clash_verge_core::config::{IProfiles, PrfItem, PrfOption};
 use compact_str::CompactString;
+use serde_yaml_ng::{Mapping, Value};
 use tokio::sync::Mutex;
 
 use crate::subscribe::from_url::{self, RemoteProfileBundle};
@@ -15,6 +16,21 @@ static PROFILE_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 /// In-memory view of the profile list. Re-reads from disk on each load.
 pub struct ProfileStore {
     profiles: IProfiles,
+}
+
+/// Captured inside the same IO transaction as the forced-refresh write.
+pub(crate) struct RefreshSnapshot {
+    uid: String,
+    metadata: Vec<u8>,
+    body: Vec<u8>,
+    file: String,
+    fragments: Vec<RefreshFragment>,
+}
+
+struct RefreshFragment {
+    item: Value,
+    file: String,
+    body: Vec<u8>,
 }
 
 impl ProfileStore {
@@ -65,6 +81,19 @@ impl ProfileStore {
         store.import_url(url, name, option).await
     }
 
+    /// CLI import stores a profile without claiming it was applied. TUI
+    /// import retains its explicit first-profile application transaction.
+    pub async fn import_url_unselected_locked(
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let bundle = from_url::import_with_fallback(url, name, option).await?;
+        store.append_bundle_with_selection(bundle, false).await
+    }
+
     /// Update one remote profile under the shared IO lock.
     pub async fn update_remote_locked(uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
         let _guard = PROFILE_IO.lock().await;
@@ -103,20 +132,153 @@ impl ProfileStore {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
         let uid_key = CompactString::from(uid);
+        let item = store.profiles.get_item(&uid_key).context("profile not found")?.clone();
         let was_current = store.profiles.delete_item(&uid_key).await?;
         let _ = was_current;
+        let profiles = clash_verge_core::utils::dirs::app_profiles_dir()?;
+        let overlay = crate::rule_overlay::path(&profiles, &item).map_err(anyhow::Error::msg)?;
+        match tokio::fs::remove_file(&overlay).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to remove rule overlay {}", overlay.display()));
+            }
+        }
         Ok(())
     }
 
-    /// Restore a profile's `updated` timestamp (probe rollback path).
-    pub async fn restore_updated_locked(uid: &str, updated: usize) -> anyhow::Result<()> {
+    /// Identify the refresh's writes before any queued profile edit can run.
+    /// The lock is released before runtime reload/readiness begins.
+    pub(crate) async fn force_refresh_locked(uid: &str) -> anyhow::Result<(RefreshSnapshot, RefreshSnapshot)> {
         let _guard = PROFILE_IO.lock().await;
         let mut store = Self::load_unlocked().await?;
-        let patch = PrfItem {
-            updated: Some(updated),
-            ..Default::default()
-        };
-        store.profiles.patch_item(&uid.into(), &patch).await?;
+        let previous_uids: Vec<_> = store
+            .profiles
+            .get_items()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.uid.clone())
+            .collect();
+        let old = store.refresh_snapshot(uid).await?;
+        store.update_remote(uid, None).await?;
+        let mut expected = store.refresh_snapshot(uid).await?;
+        let expected_metadata: Value = serde_yaml_ng::from_slice(&expected.metadata)?;
+        for item in profile_items(&expected_metadata)? {
+            if previous_uids
+                .iter()
+                .any(|uid| item["uid"].as_str() == Some(uid.as_str()))
+            {
+                continue;
+            }
+            let file = item["file"]
+                .as_str()
+                .context("new refresh fragment has no file")?
+                .to_owned();
+            let body = tokio::fs::read(clash_verge_core::utils::dirs::app_profiles_dir()?.join(&file)).await?;
+            expected.fragments.push(RefreshFragment {
+                item: item.clone(),
+                file,
+                body,
+            });
+        }
+        Ok((old, expected))
+    }
+
+    async fn refresh_snapshot(&self, uid: &str) -> anyhow::Result<RefreshSnapshot> {
+        let item = self.profiles.get_item(CompactString::from(uid))?;
+        let file = item.file.as_deref().context("profile has no file")?.to_owned();
+        let metadata = tokio::fs::read(clash_verge_core::utils::dirs::profiles_path()?).await?;
+        let body = tokio::fs::read(clash_verge_core::utils::dirs::app_profiles_dir()?.join(&file)).await?;
+        Ok(RefreshSnapshot {
+            uid: uid.to_owned(),
+            metadata,
+            body,
+            file,
+            fragments: Vec::new(),
+        })
+    }
+
+    pub(crate) async fn restore_refresh_if_matches(
+        old: &RefreshSnapshot,
+        expected: &RefreshSnapshot,
+    ) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let metadata = clash_verge_core::utils::dirs::profiles_path()?;
+        let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()?;
+        let source = profiles_dir.join(&expected.file);
+        let current_bytes = tokio::fs::read(&metadata).await?;
+        let mut current: Value = serde_yaml_ng::from_slice(&current_bytes)?;
+        let old_metadata: Value = serde_yaml_ng::from_slice(&old.metadata)?;
+        let expected_metadata: Value = serde_yaml_ng::from_slice(&expected.metadata)?;
+        let old_item = profile_item(&old_metadata, &old.uid)?;
+        let expected_item = profile_item(&expected_metadata, &expected.uid)?;
+        let current_item = profile_items_mut(&mut current)?
+            .iter_mut()
+            .find(|item| item["uid"].as_str() == Some(old.uid.as_str()))
+            .context("refreshed profile was removed; refusing rollback")?;
+        let current_file_matches = current_item["file"].as_str() == Some(expected.file.as_str());
+        let mut conflict = !current_file_matches
+            || old.file != expected.file
+            || current_item["url"] != expected_item["url"]
+            || current_item["type"] != expected_item["type"];
+        // These are the only fields update_item owns. Desc/name/current,
+        // unknown fields and other profiles are never rollback targets.
+        let mapping = current_item.as_mapping_mut().context("profile item is not a mapping")?;
+        for field in ["updated", "extra", "home", "option", "file"] {
+            let key = Value::from(field);
+            conflict |= restore_field_delta(mapping, &key, old_item.get(field), expected_item.get(field));
+        }
+        let body_matches = tokio::fs::read(&source).await? == expected.body;
+        // Keep A's source and metadata as one transaction: a newer owned
+        // field or body rejects the entire rollback, including fragment cleanup.
+        anyhow::ensure!(
+            !conflict && body_matches,
+            "profile changed after forced refresh; refusing to overwrite newer source or metadata"
+        );
+
+        // Remove only this refresh's newly generated fragments. A later
+        // reference from any surviving profile makes the fragment shared.
+        let mut protected_fragment = false;
+        let mut removed_files = Vec::new();
+        for fragment in &expected.fragments {
+            let uid = fragment.item["uid"].as_str().context("fragment has no uid")?;
+            if profile_items(&current)?
+                .iter()
+                .any(|item| references_fragment(item, uid))
+            {
+                protected_fragment = true;
+                continue;
+            }
+            let items = profile_items_mut(&mut current)?;
+            let Some(index) = items.iter().position(|item| item["uid"].as_str() == Some(uid)) else {
+                continue;
+            };
+            let path = profiles_dir.join(&fragment.file);
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if items[index] != fragment.item || bytes.as_deref() != Some(fragment.body.as_slice()) {
+                protected_fragment = true;
+                continue;
+            }
+            items.remove(index);
+            removed_files.push(path);
+        }
+
+        tokio::fs::write(source, &old.body).await?;
+        // Preserve exact old bytes when the document has no other changes;
+        // otherwise serialize the merged current document, including unknowns.
+        if current_bytes == expected.metadata && !protected_fragment {
+            tokio::fs::write(metadata, &old.metadata).await?;
+        } else {
+            tokio::fs::write(metadata, serde_yaml_ng::to_string(&current)?).await?;
+        }
+        // Persist removal of chain references before deleting their files.
+        for path in removed_files {
+            tokio::fs::remove_file(path).await?;
+        }
         Ok(())
     }
 
@@ -229,17 +391,25 @@ impl ProfileStore {
 
     /// Append enhance fragments then the remote item, and persist.
     pub async fn append_bundle(&mut self, bundle: RemoteProfileBundle) -> anyhow::Result<PrfItem> {
+        self.append_bundle_with_selection(bundle, true).await
+    }
+
+    async fn append_bundle_with_selection(
+        &mut self,
+        bundle: RemoteProfileBundle,
+        select_first: bool,
+    ) -> anyhow::Result<PrfItem> {
         ensure_profile_storage().await?;
         for mut fragment in bundle.fragments {
             self.profiles
-                .append_item(&mut fragment)
+                .append_item_with_selection(&mut fragment, select_first)
                 .await
                 .context("failed to append profile fragment")?;
         }
         let mut item = bundle.item;
         let saved = item.clone();
         self.profiles
-            .append_item(&mut item)
+            .append_item_with_selection(&mut item, select_first)
             .await
             .context("failed to append remote profile")?;
         self.profiles
@@ -316,6 +486,92 @@ impl ProfileStore {
         }
         Ok(refreshed_current)
     }
+}
+
+fn profile_items(metadata: &Value) -> anyhow::Result<&Vec<Value>> {
+    metadata["items"]
+        .as_sequence()
+        .context("profile metadata has no item list")
+}
+
+fn profile_items_mut(metadata: &mut Value) -> anyhow::Result<&mut Vec<Value>> {
+    metadata["items"]
+        .as_sequence_mut()
+        .context("profile metadata has no item list")
+}
+
+fn profile_item<'a>(metadata: &'a Value, uid: &str) -> anyhow::Result<&'a Value> {
+    profile_items(metadata)?
+        .iter()
+        .find(|item| item["uid"].as_str() == Some(uid))
+        .context("profile missing from refresh snapshot")
+}
+
+fn references_fragment(item: &Value, uid: &str) -> bool {
+    ["merge", "script", "rules", "proxies", "groups"]
+        .iter()
+        .any(|key| item["option"][key].as_str() == Some(uid))
+}
+
+fn null_or_missing(value: Option<&Value>) -> bool {
+    value.is_none_or(Value::is_null)
+}
+
+/// Apply only the writer's leaf delta to a candidate document. The caller
+/// discards that document if any changed leaf no longer matches expected.
+fn restore_field_delta(current: &mut Mapping, key: &Value, old: Option<&Value>, expected: Option<&Value>) -> bool {
+    if old == expected || (null_or_missing(old) && null_or_missing(expected)) {
+        return false;
+    }
+    let old_map = old.and_then(Value::as_mapping);
+    let expected_map = expected.and_then(Value::as_mapping);
+    if (old_map.is_some() || expected_map.is_some())
+        && (old_map.is_some() || null_or_missing(old))
+        && (expected_map.is_some() || null_or_missing(expected))
+        && let Some(current_map) = current.get_mut(key).and_then(Value::as_mapping_mut)
+    {
+        let mut keys = Vec::new();
+        for map in [old_map, expected_map].into_iter().flatten() {
+            for key in map.keys() {
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
+        let mut conflict = false;
+        for nested in keys {
+            conflict |= restore_field_delta(
+                current_map,
+                &nested,
+                old_map.and_then(|map| map.get(&nested)),
+                expected_map.and_then(|map| map.get(&nested)),
+            );
+        }
+        if current_map.is_empty() && null_or_missing(old) {
+            match old {
+                Some(old) => {
+                    current.insert(key.clone(), old.clone());
+                }
+                None => {
+                    current.remove(key);
+                }
+            }
+        }
+        return conflict;
+    }
+    let actual = current.get(key);
+    if actual != expected && !(null_or_missing(actual) && null_or_missing(expected)) {
+        return true;
+    }
+    match old {
+        Some(old) => {
+            current.insert(key.clone(), old.clone());
+        }
+        None => {
+            current.remove(key);
+        }
+    }
+    false
 }
 
 async fn ensure_profile_storage() -> anyhow::Result<()> {
@@ -448,6 +704,57 @@ pub(crate) mod tests {
         };
         assert!(body.contains("proxies:"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn issue83_unselected_import_preserves_selection_and_unknown_fields_even_on_save_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = claim_test_app_home(home.path().to_path_buf()).await;
+        let bundle = |uid: &str| RemoteProfileBundle {
+            item: PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                file: Some(format!("{uid}.yaml").into()),
+                file_data: Some("proxies: []\n".into()),
+                ..Default::default()
+            },
+            fragments: vec![PrfItem::from_merge(None).unwrap()],
+        };
+        let mut store = ProfileStore {
+            profiles: serde_yaml_ng::from_str("future: {keep: true}\n").unwrap(),
+        };
+        store
+            .append_bundle_with_selection(bundle("first"), false)
+            .await
+            .unwrap();
+        assert!(store.current_uid().is_none());
+        assert!(ProfileStore::snapshot().await.unwrap().current_uid().is_none());
+        let saved: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&std::fs::read(home.path().join("profiles.yaml")).unwrap()).unwrap();
+        assert_eq!(saved["future"]["keep"], serde_yaml_ng::Value::Bool(true));
+        store.set_current("first").await.unwrap();
+        store
+            .append_bundle_with_selection(bundle("second"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            ProfileStore::snapshot().await.unwrap().current_uid().as_deref(),
+            Some("first")
+        );
+        std::fs::remove_file(home.path().join("profiles.yaml")).unwrap();
+        std::fs::create_dir(home.path().join("profiles.yaml")).unwrap();
+        for previous in [None, Some("first".into())] {
+            let mut profiles = IProfiles {
+                current: previous.clone(),
+                ..Default::default()
+            };
+            let mut item = bundle("failed").item;
+            assert!(profiles.append_item_with_selection(&mut item, false).await.is_err());
+            assert_eq!(
+                profiles.current, previous,
+                "no transient current mutation before failed metadata write"
+            );
+        }
     }
 
     #[tokio::test]

@@ -26,8 +26,10 @@ pub async fn run(manager: MihomoManager, json: bool, wait: Option<Duration>) -> 
         // The conversion losses of the last sing-box apply ride along with
         // the core status: `status --json` is what scripts read, and until
         // now a degraded run was only visible as a count in the apply log.
-        let mut value = serde_json::to_value(&status)?;
-        if let Some(record) = crate::runtime_config::last_singbox_degradation().await {
+        let mut value = status_json(&status, &manager)?;
+        if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox
+            && let Some(record) = crate::runtime_config::last_singbox_degradation().await
+        {
             value["singbox_conversion_degradations"] = serde_json::to_value(&record)?;
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -47,9 +49,12 @@ pub async fn run(manager: MihomoManager, json: bool, wait: Option<Duration>) -> 
         if let Some(version) = &status.version {
             println!("   Version: {version}");
         }
-        println!("   Socket: {}", status.socket_path.display());
+        println!("   Core: {}", manager.core_kind().as_str());
+        println!("   Controller: {}", super::stop::controller_description(&manager));
         println!("   Config: {}", status.config_dir.display());
-        if let Some(record) = crate::runtime_config::last_singbox_degradation().await {
+        if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox
+            && let Some(record) = crate::runtime_config::last_singbox_degradation().await
+        {
             println!(
                 "   sing-box: {} conversion categories, {} notes, {} nodes skipped, {} fields degraded",
                 record.digest.category_count(),
@@ -61,6 +66,15 @@ pub async fn run(manager: MihomoManager, json: bool, wait: Option<Duration>) -> 
     }
 
     Ok(exit_code(&status.state))
+}
+
+fn status_json(status: &CoreStatus, manager: &MihomoManager) -> anyhow::Result<serde_json::Value> {
+    let mut value = serde_json::to_value(status)?;
+    // Preserve existing fields for scripts while exposing the actual core
+    // transport (sing-box has no Unix controller socket).
+    value["core"] = manager.core_kind().as_str().into();
+    value["controller"] = super::stop::controller_description(manager).into();
+    Ok(value)
 }
 
 /// The core's status, as ready only once its controller answers: a live
@@ -97,11 +111,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_json_carries_the_last_apply_singbox_degradations() {
-        // The digest is only in memory (the last apply of *this* process),
-        // so `status --json` documents it under a dedicated key instead of
-        // pretending the core status owns the field.
+        // Keep the existing digest/seq shape while adding artifact identity.
         let record = crate::runtime_config::SingboxDegradationRecord {
             seq: 7,
+            config_sha256: "fixture-hash".into(),
+            generated_at: "2026-10-12T00:00:00Z".into(),
+            extra: Default::default(),
             digest: crate::runtime_config::SingboxDegradationDigest {
                 notes: 13,
                 nodes_skipped: 10,
@@ -140,5 +155,18 @@ mod tests {
         };
         assert_eq!(ready(status(None)).state, CoreState::Starting);
         assert_eq!(ready(status(Some("v1"))).state, CoreState::Running);
+    }
+
+    #[test]
+    fn status_json_identifies_singbox_tcp_without_removing_existing_fields() {
+        let manager = MihomoManager::new("/tmp/status-description".into())
+            .with_socket("/tmp/status-description/controller.sock".into())
+            .with_core_kind(crate::mihomo_manager::CoreKind::SingBox)
+            .with_singbox_controller("127.0.0.1:19999".parse().unwrap());
+        let json = status_json(&manager.local_status(), &manager).unwrap();
+        assert_eq!(json["core"], "singbox");
+        assert_eq!(json["controller"], "tcp 127.0.0.1:19999");
+        assert_eq!(json["socket_path"], "/tmp/status-description/controller.sock");
+        assert_eq!(json["config_dir"], "/tmp/status-description");
     }
 }

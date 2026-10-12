@@ -2,7 +2,11 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "clash-verge-cli", version, about = "Terminal-native proxy client for mihomo")]
+#[command(
+    name = "clash-verge-cli",
+    version,
+    about = "Terminal-native proxy client for mihomo and sing-box"
+)]
 pub struct Cli {
     /// Configuration directory (default: ~/.local/share/clash-verge-cli).
     /// Accepted before or after the subcommand; the systemd unit passes it
@@ -26,17 +30,25 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
-    /// Start the mihomo core (non-interactive)
+    /// Start the selected proxy core (non-interactive)
     Start {
         /// Run in foreground, blocking until SIGTERM (for systemd)
         #[arg(long)]
         foreground: bool,
+        /// Serve the existing runtime config without regenerating it
+        #[arg(long, requires = "foreground")]
+        start_use_existing_config: bool,
+        /// Internal transaction: run the already checked executable and kind.
+        #[arg(long, hide = true, requires_all = ["foreground", "start_use_existing_config", "start_core_kind"])]
+        start_core_binary: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "start_core_binary")]
+        start_core_kind: Option<crate::mihomo_manager::CoreKind>,
     },
-    /// Stop the mihomo core
+    /// Stop the proxy core
     Stop,
-    /// Restart the mihomo core
+    /// Restart the selected proxy core
     Restart,
-    /// Show mihomo status (exit 0 running, 3 not running, 1 error)
+    /// Show proxy core status (exit 0 running, 3 not running, 1 error)
     Status {
         /// Wait until the core is running (exit 3 on timeout)
         #[arg(long)]
@@ -49,6 +61,11 @@ pub enum Command {
     Core {
         #[command(subcommand)]
         action: Option<CoreCommand>,
+    },
+    /// Read or set controller browser-origin settings in verge.yaml
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
     },
     /// Manage subscription profiles
     Profile {
@@ -119,6 +136,14 @@ pub enum Command {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum ConfigCommand {
+    /// Show configured and effective values (controller_allowed_origins)
+    Get { key: String },
+    /// Set controller_allowed_origins using a YAML/JSON list of http(s) origins
+    Set { key: String, value: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum CoreCommand {
     /// Show the selected and the running core (default)
     Show,
@@ -126,6 +151,15 @@ pub enum CoreCommand {
     Use {
         /// Core to select: mihomo or singbox
         core: crate::mihomo_manager::CoreKind,
+    },
+    /// Install a pinned official release archive without network access
+    Install {
+        /// Official .gz (mihomo) or .tar.gz (sing-box) release archive
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Core to install (default: the selected core)
+        #[arg(long)]
+        core: Option<crate::mihomo_manager::CoreKind>,
     },
 }
 
@@ -301,10 +335,10 @@ pub enum TunCommand {
     On,
     /// Disable TUN mode (reloads the running core)
     Off,
-    /// Grant TUN capabilities to the mihomo binary (one-time sudo; the only
+    /// Grant TUN capabilities to the selected proxy core (one-time sudo; the only
     /// explicit privilege operation)
     Setup,
-    /// Show the TUN capability state of the resolved mihomo binary
+    /// Show the TUN capability state of the resolved proxy core binary
     Status,
 }
 
@@ -418,8 +452,69 @@ mod tests {
             .find_map(|line| line.strip_prefix("ExecStart="))
             .expect("unit has an ExecStart line");
         let cli = parse(&exec.split_whitespace().skip(1).collect::<Vec<_>>()).expect("ExecStart parses");
-        assert!(matches!(cli.command, Some(Command::Start { foreground: true })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: false,
+                ..
+            })
+        ));
         assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
+    }
+
+    #[test]
+    fn prepared_supervisor_requires_explicit_kind_binary_and_existing_foreground_config() {
+        for args in [
+            vec!["start", "--start-core-binary", "/tmp/core"],
+            vec!["start", "--foreground", "--start-core-kind", "singbox"],
+            vec![
+                "start",
+                "--foreground",
+                "--start-core-binary",
+                "/tmp/core",
+                "--start-core-kind",
+                "mihomo",
+            ],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+        let cli = parse(&[
+            "start",
+            "--foreground",
+            "--start-use-existing-config",
+            "--start-core-kind",
+            "singbox",
+            "--start-core-binary",
+            "/tmp/checked core",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Start { start_core_kind: Some(crate::mihomo_manager::CoreKind::SingBox), start_core_binary: Some(path), .. }) if path == std::path::Path::new("/tmp/checked core"))
+        );
+    }
+
+    #[test]
+    fn existing_config_start_requires_an_explicit_foreground_flag() {
+        assert!(parse(&["start", "--start-use-existing-config"]).is_err());
+        let cli = parse(&["start", "--foreground", "--start-use-existing-config"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: true,
+                ..
+            })
+        ));
+        let cli = parse(&["start", "--foreground"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Start {
+                foreground: true,
+                start_use_existing_config: false,
+                ..
+            })
+        ));
     }
 
     #[test]

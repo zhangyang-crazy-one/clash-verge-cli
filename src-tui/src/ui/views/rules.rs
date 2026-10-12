@@ -145,7 +145,7 @@ fn draw_edit_buffer(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool)
 
     if app.rules_edit_buffer.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
-            "No rules - W saves, E exits",
+            "No rules - a adds, E exits; empty save is blocked",
             Style::new().fg(theme::dim()),
         )))
         .block(block);

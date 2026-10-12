@@ -101,10 +101,17 @@ fn english(key: &'static str) -> &'static str {
         "hint.proxies" => "Enter select | t/T delay | o sort | H hide failed | / filter | c chain",
         "hint.profiles" => "i import | u update | Enter switch | / filter",
         "hint.connections" => "Enter/d close | / filter",
-        "hint.rules" => "j/k browse | Tab panel | Enter update provider | r refresh | / filter",
+        "hint.rules" => "j/k browse | Tab panel | Enter update provider | r refresh | / filter | E edit | O config",
+        "hint.rules_edit" => "a raw | f form | D delete | J/K move | R rule-set | x delete set | W save | E exit",
+        "hint.rules_saving" => "Saving rules... editing paused",
+        "hint.dns_edit" => "a server | r rule | R resolver | x delete | Shift-Tab list | w apply | d exit",
+        "help.rules_edit" => "E edit/exit | a raw rule | f rule form | D delete rule | J/K move | W save (y/n restart)",
+        "help.rules_sets" => "R add sing-box rule-set | x delete rule-set | O sing-box config | r refresh",
+        "help.dns_edit" => "d DNS edit/exit (sing-box) | a add server | r add split rule | R bootstrap resolver",
+        "help.dns_apply" => "x delete DNS entry | Shift-Tab servers/rules | j/k select | w apply DNS",
         "hint.logs" => "/ filter | L level | j/k browse",
         "hint.unlock" => "r check all",
-        "hint.settings" => "j/k select · Enter toggle",
+        "hint.settings" => "j/k select | Enter toggle | e config | d DNS edit",
         "hint.home" => "s start | r restart | m mode",
         "status.running" => "RUNNING",
         "status.starting" => "STARTING",
@@ -297,6 +304,10 @@ fn english(key: &'static str) -> &'static str {
         "dialog.password.hint" => "Enter = confirm | Esc = cancel",
         "dialog.trust" => "Trust Host",
         "dialog.trust_title" => "Import blocked by SSRF safety check",
+        "dialog.proxy_trust_title" => "Subscription host requires proxy DNS trust",
+        "dialog.proxy_trust_warning" => {
+            "The proxy resolves this host remotely; its destination addresses cannot be verified here. Trust only this exact host for this profile's import and future updates if you trust its operator and the proxy. Redirect hosts require separate confirmation."
+        }
         "dialog.trust_warning" => {
             "This subscription resolves to a private or loopback address. Confirming trusts only this host for this profile, so it can be imported and updated later."
         }
@@ -406,10 +417,17 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "hint.proxies" => "Enter 选择 | t/T 测速 | o 排序 | H 隐藏不可用 | / 过滤 | c 链式代理",
         "hint.profiles" => "i 导入 | u 更新 | Enter 切换 | / 过滤",
         "hint.connections" => "Enter/d 关闭 | / 过滤",
-        "hint.rules" => "j/k 浏览 | Tab 切换面板 | Enter 更新提供商 | r 刷新 | / 过滤",
+        "hint.rules" => "j/k 浏览 | Tab 面板 | Enter 更新提供商 | r 刷新 | / 过滤 | E 编辑 | O 配置",
+        "hint.rules_edit" => "a 原始规则 | f 表单 | D 删除 | J/K 移动 | R 规则集 | x 删除集 | W 保存 | E 退出",
+        "hint.rules_saving" => "正在保存规则…编辑已暂停",
+        "hint.dns_edit" => "a 服务器 | r 分流 | R 引导解析器 | x 删除 | Shift-Tab 列表 | w 应用 | d 退出",
+        "help.rules_edit" => "E 编辑/退出 | a 原始规则 | f 规则表单 | D 删除规则 | J/K 移动 | W 保存（y/n 重启）",
+        "help.rules_sets" => "R 添加 sing-box 规则集 | x 删除规则集 | O sing-box 配置 | r 刷新",
+        "help.dns_edit" => "d DNS 编辑/退出（sing-box）| a 添加服务器 | r 添加分流规则 | R 引导解析器",
+        "help.dns_apply" => "x 删除 DNS 条目 | Shift-Tab 切换服务器/规则 | j/k 选择 | w 应用 DNS",
         "hint.logs" => "/ 过滤 | L 级别 | j/k 浏览",
         "hint.unlock" => "r 全部检测",
-        "hint.settings" => "j/k 选择 · Enter 切换",
+        "hint.settings" => "j/k 选择 | Enter 切换 | e 配置 | d DNS 编辑",
         "status.running" => "运行中",
         "status.starting" => "启动中",
         "status.stopped" => "已停止",
@@ -595,6 +613,10 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "dialog.password.hint" => "Enter = 确认 | Esc = 取消",
         "dialog.trust" => "信任主机",
         "dialog.trust_title" => "导入被 SSRF 安全检查拦截",
+        "dialog.proxy_trust_title" => "订阅主机需要代理 DNS 信任",
+        "dialog.proxy_trust_warning" => {
+            "代理远端解析此主机，本客户端无法验证其目标地址。仅在信任主机运营者和代理时，才对此配置的导入及后续更新信任这一具体主机。重定向主机需要分别确认。"
+        }
         "dialog.trust_warning" => "该订阅解析到私有或回环地址。确认后仅对本配置文件信任此主机，以便后续导入与更新。",
         "dialog.trust_confirm" => "y = 信任并导入 | n/Esc = 取消（不保存信任）",
         "dialog.trust_update" => "信任并更新",

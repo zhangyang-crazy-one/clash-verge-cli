@@ -123,10 +123,11 @@ pub async fn import(
         trusted_hosts: (!trusted_hosts.is_empty()).then_some(trusted_hosts),
         ..Default::default()
     };
-    let item = ProfileStore::import_url_locked(url, name, Some(&option)).await?;
+    let item = ProfileStore::import_url_unselected_locked(url, name, Some(&option)).await?;
     let uid = item.uid.as_deref().unwrap_or("?");
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     println!("imported {uid} ({name})");
+    println!("activate with: clash-verge-cli profile use {uid}");
     Ok(())
 }
 
@@ -207,6 +208,7 @@ pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     if running {
         println!("switched to {uid} ({name})");
+        crate::runtime_config::print_singbox_degradation(manager.core_kind()).await;
     } else {
         println!("switched to {uid} ({name}); core not running, used on next start");
     }
@@ -272,10 +274,15 @@ async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -
         .await
         .enable_tun_mode
         .unwrap_or(false);
-    crate::subscribe::scheduler::reload_current_profile_for_core(manager, uid, enable_tun, true)
+    let outcome = crate::subscribe::scheduler::reload_current_profile_for_manager(manager, uid, enable_tun, true)
         .await
         .map_err(|error| anyhow::anyhow!("profile reload: {error}"))?;
-    println!("reloaded the running core with {uid}");
+    match outcome {
+        crate::runtime_config::ApplyOutcome::Applied => println!("reloaded the running core with {uid}"),
+        crate::runtime_config::ApplyOutcome::Unchanged => {
+            println!("current profile {uid} unchanged, not reloaded/restarted")
+        }
+    }
     Ok(())
 }
 

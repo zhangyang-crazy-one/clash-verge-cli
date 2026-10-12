@@ -20,22 +20,52 @@ use crate::commands;
 use crate::subscribe::lifecycle::{ManagerLifecycle, reload_with_lifecycle};
 use crate::subscribe::scheduler::AutoUpdateScheduler;
 
-pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
-    let launch = crate::commands::start::requested_launch();
-    let manager = commands::build_manager(config_dir).await?;
+pub async fn run(config_dir: PathBuf, launch: crate::commands::start::SupervisorLaunch) -> anyhow::Result<()> {
+    run_with_prepared(config_dir, launch, None).await
+}
+
+pub async fn run_prepared(
+    config_dir: PathBuf,
+    kind: crate::mihomo_manager::CoreKind,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    run_with_prepared(
+        config_dir,
+        crate::commands::start::SupervisorLaunch::UseExistingConfig,
+        Some((kind, path)),
+    )
+    .await
+}
+
+async fn run_with_prepared(
+    config_dir: PathBuf,
+    launch: crate::commands::start::SupervisorLaunch,
+    prepared: Option<(crate::mihomo_manager::CoreKind, PathBuf)>,
+) -> anyhow::Result<()> {
+    let manager = match prepared.as_ref() {
+        Some((kind, _)) => commands::build_manager_for_kind(config_dir, *kind).await?,
+        None => commands::build_manager(config_dir).await?,
+    };
+    let kind = manager.core_kind().as_str();
     // P1 (reviewer): a RECOVERY supervisor (launched by a failed apply's
     // rollback) must serve the runtime config already on disk — the
     // previous one just restored — and never regenerate it from the active
     // profile, which by then holds the newer config the apply failed on.
+    //
+    // A5 (reviewer): the mode is an explicit argument of this launch, not
+    // ambient manager state some later start could inherit.
     if launch == crate::commands::start::SupervisorLaunch::UseExistingConfig {
         tracing::info!(target: "daemon", "recovery start: serving the existing runtime config");
-        manager.set_use_existing_runtime_config(true);
     }
     let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::channel(64);
     manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
-    manager.start().await?;
+    if let Some((_, binary)) = prepared {
+        manager.start_prepared_binary(&binary).await?;
+    } else {
+        manager.start_with(launch).await?;
+    }
     let manager = Arc::new(manager);
 
     // Reload target state for current-profile refreshes (owned core → running).
@@ -61,7 +91,7 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                 };
                 match action {
                 crate::app::Action::CoreExited(_) if manager.state() == crate::app::CoreState::Stopped => {
-                    tracing::info!(target: "daemon", "mihomo was stopped, exiting");
+                    tracing::info!(target: "daemon", "{kind} was stopped, exiting");
                     if let Some(handle) = in_flight.take() {
                         handle.abort();
                         let _ = handle.await;
@@ -73,7 +103,7 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                         handle.abort();
                         let _ = handle.await;
                     }
-                    anyhow::bail!("mihomo stopped: {error}");
+                    anyhow::bail!("{kind} stopped: {error}");
                 }
                 _ => {}
                 }
@@ -113,8 +143,11 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
                         if is_current {
                             let lifecycle = ManagerLifecycle::new(&manager);
                             match reload_with_lifecycle(&lifecycle, &uid, enable_tun).await {
-                                Ok(()) => {
+                                Ok(crate::runtime_config::ApplyOutcome::Applied) => {
                                     tracing::info!(target: "auto_update", "reloaded current profile {uid}")
+                                }
+                                Ok(crate::runtime_config::ApplyOutcome::Unchanged) => {
+                                    tracing::info!(target: "auto_update", "current profile {uid} unchanged, not reloaded/restarted")
                                 }
                                 Err(error) => {
                                     tracing::error!(target: "auto_update", "reload {uid} failed: {error}")
@@ -152,6 +185,6 @@ pub async fn run(config_dir: PathBuf) -> anyhow::Result<()> {
         let _ = handle.await;
     }
     manager.stop().await?;
-    tracing::info!(target: "daemon", "mihomo stopped, exiting");
+    tracing::info!(target: "daemon", "{kind} stopped, exiting");
     Ok(())
 }

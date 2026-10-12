@@ -6,9 +6,7 @@ use crossterm::event::KeyCode;
 use tokio::sync::mpsc;
 
 use crate::app::{Action, App, CoreState, Focus, InputMode, Overlay, TrustPending};
-use crate::mihomo_manager::CoreKind;
 use crate::profile_store::store::ProfileStore;
-use crate::runtime_config::reload_remote_profile;
 
 use super::Ctx;
 
@@ -54,6 +52,7 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
         // Dispatch on the manager's core kind: `switch_profile` is the
@@ -67,7 +66,9 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
                 let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::CoreError(error)).await;
+                let _ = tx
+                    .send(super::lifecycle::apply_error(&manager, tracked_at_entry, error))
+                    .await;
             }
         }
     });
@@ -117,7 +118,13 @@ pub(super) fn confirm_import(ctx: &Ctx, url: String) {
     ctx.spawn(|tx| async move {
         match ssrf_blocked_host(&url) {
             Some(host) => {
-                let _ = tx.send(Action::ImportNeedsTrust { url, host }).await;
+                let _ = tx
+                    .send(Action::ImportNeedsTrust(Box::new(TrustPending {
+                        url,
+                        host,
+                        ..Default::default()
+                    })))
+                    .await;
             }
             None => spawn_import(&tx, url, None),
         }
@@ -125,17 +132,19 @@ pub(super) fn confirm_import(ctx: &Ctx, url: String) {
 }
 
 /// Open the SSRF trust prompt for an import blocked on `host`.
-pub(super) fn begin_import_trust(app: &mut App, url: String, host: String) {
-    app.pending_trust = Some(TrustPending {
-        url,
-        host: host.clone(),
-        uid: None,
-    });
+pub(super) fn begin_import_trust(app: &mut App, pending: TrustPending) {
+    let host = pending.host.clone();
+    let proxy_dns = pending.proxy_dns;
+    app.pending_trust = Some(pending);
     app.overlay = Some(Overlay::TrustConfirmation);
     app.focus = Focus::Content;
     app.status_msg = Some(format!(
         "{} — {}: {host}",
-        app.tr("dialog.trust_title"),
+        app.tr(if proxy_dns {
+            "dialog.proxy_trust_title"
+        } else {
+            "dialog.trust_title"
+        }),
         app.tr("dialog.target")
     ));
 }
@@ -156,59 +165,30 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     let Some(item) = app.profiles.get(last).cloned() else {
         return;
     };
-    let api = ctx.manager.api();
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
-        // Dispatch on the manager's core kind. The mihomo path keeps
-        // its PUT /configs hot reload; sing-box's controller would
-        // silently accept the request and drop the payload, so we route
-        // through `apply_singbox_restart`, which writes the JSON config,
-        // prevalidates with `sing-box check`, and restarts the process.
-        // For sing-box we read the imported YAML from disk — the import
-        // path (`append_bundle` → `append_item` → `fs::write`) already
-        // persisted it before this action fires.
-        let apply_result = match manager.core_kind() {
-            CoreKind::Mihomo => reload_remote_profile(&api, &item, enable_tun, core_running).await,
-            CoreKind::SingBox => apply_imported_profile_to_singbox(&manager, &item, enable_tun).await,
-        };
-        if let Err(error) = apply_result {
-            let _ = tx.send(Action::CoreError(error)).await;
-            return;
-        }
-        // The core now runs the imported profile: record it as current so
-        // profiles.yaml, Home, and the status bar agree with the core.
-        match ProfileStore::replace_current_locked(&uid).await {
-            // Refreshes the proxies when the core is running.
-            Ok(_) => {
+        // Use the same current-UID transaction as a manual switch: definite
+        // rejection restores the previous UID, while uncertain hot reloads
+        // retain the requested UID alongside their pending candidate.
+        match crate::services::profile::switch_profile_for_core(&manager, &item, enable_tun, core_running).await {
+            Ok(()) => {
                 let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::CoreError(format!("profile switch: {error}"))).await;
+                let _ = tx
+                    .send(super::lifecycle::apply_error(&manager, tracked_at_entry, error))
+                    .await;
+                return;
             }
         }
         if !core_running {
             let _ = manager.start().await;
         }
     });
-}
-
-/// Apply a freshly imported profile to a sing-box core: read the body
-/// the import just wrote and regenerate the JSON runtime config through
-/// [`crate::runtime_config::apply_singbox_restart`]. Extracted so the
-/// `note_imported` branch reads at a glance.
-async fn apply_imported_profile_to_singbox(
-    manager: &crate::mihomo_manager::MihomoManager,
-    item: &clash_verge_core::config::PrfItem,
-    enable_tun: bool,
-) -> Result<(), String> {
-    let yaml = crate::runtime_config::load_profile_yaml(item).await?;
-    crate::runtime_config::apply_singbox_restart(manager, Some(yaml.as_str()), enable_tun)
-        .await
-        .map(|_report| ())
-        .map_err(|error| format!("profile reload: {error}"))
 }
 
 /// A profile refresh finished: re-read the list and reload the core when the
@@ -228,6 +208,7 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     ctx.spawn(|tx| async move {
         // Use the dispatching wrapper so a sing-box subscription refresh
         // regenerates the JSON config and restarts the core instead of
@@ -240,7 +221,13 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
             }
             Ok(()) => {}
             Err(error) => {
-                let _ = tx.send(Action::CoreError(format!("profile reload: {error}"))).await;
+                let _ = tx
+                    .send(super::lifecycle::apply_error(
+                        &manager,
+                        tracked_at_entry,
+                        format!("profile reload: {error}"),
+                    ))
+                    .await;
             }
         }
     });
@@ -323,19 +310,42 @@ pub(super) fn ssrf_blocked_host(url: &str) -> Option<String> {
 
 /// Import a subscription URL in the background, preserving default SSRF
 /// protection (`option` is `None` for ordinary imports). Results arrive back
-/// as `ProfileImported` / `ProfileImportFailed`.
+/// as `ProfileImported` / `ProfileImportFailed` / `ImportNeedsTrust`.
 pub(super) fn spawn_import(
     action_tx: &crate::tui::background::EventSender,
     url: String,
     option: Option<clash_verge_core::config::PrfOption>,
 ) {
+    spawn_import_request(action_tx, url, None, option);
+}
+
+pub(super) fn spawn_import_request(
+    action_tx: &crate::tui::background::EventSender,
+    url: String,
+    name: Option<String>,
+    option: Option<clash_verge_core::config::PrfOption>,
+) {
     let tx = action_tx.clone();
     tx.clone().spawn(async move {
-        match crate::profile_store::store::ProfileStore::import_url_locked(&url, None, option.as_ref()).await {
+        match ProfileStore::import_url_locked(&url, name.as_deref(), option.as_ref()).await {
             Ok(_) => {
                 let _ = tx.send(Action::ProfileImported).await;
             }
             Err(error) => {
+                if let Some(crate::subscribe::ssrf::CheckError::ProxyTrustRequired { host }) =
+                    error.downcast_ref::<crate::subscribe::ssrf::CheckError>()
+                {
+                    let pending = TrustPending {
+                        url,
+                        host: host.clone(),
+                        option,
+                        name,
+                        proxy_dns: true,
+                        ..Default::default()
+                    };
+                    let _ = tx.send(Action::ImportNeedsTrust(Box::new(pending))).await;
+                    return;
+                }
                 let _ = tx.send(Action::ProfileImportFailed(error.to_string())).await;
             }
         }
@@ -384,11 +394,12 @@ pub(super) fn handle_confirm_trust(app: &mut App, action_tx: &crate::tui::backgr
         return;
     }
     app.status_msg = Some(format!("Importing {} (trusted host)...", pending.host));
-    let option = clash_verge_core::config::PrfOption {
-        trusted_hosts: Some(vec![pending.host.clone().into()]),
-        ..Default::default()
-    };
-    spawn_import(action_tx, pending.url, Some(option));
+    let mut option = pending.option.unwrap_or_default();
+    let hosts = option.trusted_hosts.get_or_insert_with(Vec::new);
+    if !hosts.iter().any(|host| host.as_str() == pending.host) {
+        hosts.push(pending.host.into());
+    }
+    spawn_import_request(action_tx, pending.url, pending.name, Some(option));
 }
 
 /// Cancel the trust prompt. Only in-memory state changes: no exception is
@@ -413,6 +424,7 @@ pub(super) fn begin_update_trust(app: &mut App, uid: String, host: String) {
         url: String::new(),
         host: host.clone(),
         uid: Some(uid),
+        ..Default::default()
     });
     app.overlay = Some(Overlay::TrustConfirmation);
     app.focus = Focus::Content;
@@ -491,6 +503,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: None,
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -511,6 +524,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: None,
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -616,6 +630,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: Some("R7iHvBBicAOz".to_string()),
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -676,6 +691,7 @@ mod tests {
             url,
             host: "127.0.0.1".to_string(),
             uid: Some(uid.to_string()),
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
         let (tx, mut rx) = mpsc::channel::<Action>(64);

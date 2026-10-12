@@ -3,6 +3,80 @@
 
 use serde_yaml_ng::{Mapping, Value};
 
+/// Validate a browser origin and return its canonical ASCII serialization.
+/// An origin has no credentials, path (even `/`), query or fragment.
+pub fn canonical_controller_origin(origin: &str) -> Result<String, String> {
+    let invalid = || {
+        "controller_allowed_origins requires http(s) origins containing only a host and optional port; wildcard, credentials, path, query and fragment are forbidden".to_string()
+    };
+    let (_, authority) = origin.split_once("://").ok_or_else(invalid)?;
+    if authority.is_empty()
+        || origin.chars().any(char::is_whitespace)
+        || authority.contains(['/', '\\', '@', '?', '#', '*'])
+    {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(origin).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || url.host_str().is_some_and(|host| host.contains('*'))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(invalid());
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+/// User-owned origins extend, and never replace, the local controller policy.
+pub fn controller_origins(additional: &[String]) -> Result<Vec<String>, String> {
+    let mut origins: Vec<String> = clash_verge_core::config::CONTROLLER_ALLOW_ORIGINS
+        .iter()
+        .map(|origin| (*origin).to_string())
+        .collect();
+    for origin in additional {
+        let origin = canonical_controller_origin(origin)?;
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    }
+    Ok(origins)
+}
+
+/// Fallible reload prevents malformed settings from silently losing a user's
+/// whitelist. Only verge.yaml authorizes origins, never a profile CORS block.
+pub async fn configured_controller_origins() -> anyhow::Result<Vec<String>> {
+    let verge = clash_verge_core::config::IVerge::try_new().await?;
+    let additional: Vec<String> = verge
+        .controller_allowed_origins
+        .unwrap_or_default()
+        .into_iter()
+        .map(|origin| origin.to_string())
+        .collect();
+    controller_origins(&additional).map_err(anyhow::Error::msg)
+}
+
+pub async fn apply_controller_cors(config: &mut Mapping) -> anyhow::Result<()> {
+    let origins = configured_controller_origins().await?;
+    let private_network = controller_allows_private_network(&origins);
+    let mut cors = Mapping::new();
+    cors.insert("allow-origins".into(), serde_yaml_ng::to_value(origins)?);
+    cors.insert("allow-private-network".into(), private_network.into());
+    config.insert("external-controller-cors".into(), cors.into());
+    Ok(())
+}
+
+/// External browser dashboards need PNA preflight permission to reach the
+/// loopback controller. Exact origins and controller authentication still apply.
+pub fn controller_allows_private_network(origins: &[String]) -> bool {
+    origins
+        .iter()
+        .any(|origin| !clash_verge_core::config::CONTROLLER_ALLOW_ORIGINS.contains(&origin.as_str()))
+}
+
 /// App-owned top-level keys that must survive manual merge overrides.
 const CONTROL_PLANE_KEYS: &[&str] = &[
     "external-controller",

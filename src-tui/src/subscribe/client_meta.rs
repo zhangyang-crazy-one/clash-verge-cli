@@ -103,7 +103,7 @@ fn metadata_network() -> MetadataNetwork {
 fn metadata_status_hint(status: u16) -> &'static str {
     match status {
         401 | 403 | 429 => {
-            "GitHub API rate limit or auth required (set GITHUB_TOKEN, or retry later; a shared proxy exit IP is rate limited)"
+            "GitHub API access denied or rate limit reached; retry later and check the configured proxy exit IP (metadata requests are anonymous)"
         }
         404 => "release or tag not found in the official repository",
         _ => "see the HTTP status above",
@@ -252,9 +252,7 @@ fn trusted_digest_metadata(
         })
         .collect();
     if manifests.len() != 1 {
-        anyhow::bail!(
-            "null asset digest and missing or ambiguous official checksum manifest for {asset_name}; existing binary preserved"
-        );
+        anyhow::bail!("null asset digest and missing or ambiguous official checksum manifest for {asset_name}");
     }
     let name = manifests[0]
         .get("name")
@@ -310,7 +308,7 @@ pub(crate) async fn fetch_trusted_release_digest(repo: &str, tag: &str, asset_na
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!(
-            "release metadata request to {url} failed ({}): status {} — {}; existing binary preserved",
+            "release metadata request to {url} failed ({}): status {} — {}",
             network.describe(),
             status.as_u16(),
             metadata_status_hint(status.as_u16())
@@ -364,7 +362,7 @@ pub async fn clash_verge_compat_version() -> &'static str {
                 tracing::info!(target: "subscribe", "subscription UA version from local package: {version}");
                 return version;
             }
-            tracing::warn!(
+            tracing::debug!(
                 target: "subscribe",
                 "subscription UA falling back to {FALLBACK_CLASH_VERGE_VERSION}"
             );
@@ -565,6 +563,9 @@ mod tests {
         for status in [401_u16, 403, 429] {
             let hint = metadata_status_hint(status);
             assert!(hint.contains("rate limit"), "status {status} hint: {hint}");
+            assert!(hint.contains("retry later"), "status {status} hint: {hint}");
+            assert!(hint.contains("anonymous"), "status {status} hint: {hint}");
+            assert!(!hint.contains("GITHUB_TOKEN"), "unsupported token advice: {hint}");
         }
         assert!(metadata_status_hint(404).contains("not found"));
         // The metadata client builder must stay proxy-env driven: building it
