@@ -110,6 +110,33 @@ pub(super) fn classify_exit(spawned_gen: u64, current_gen: u64, expected_exit_ge
     }
 }
 
+/// Bind the actual child before readiness, with no dependency on readable
+/// executable links. Receipt failure still tears down that same child.
+pub(crate) async fn bind_spawned_core(
+    child: &mut tokio::process::Child,
+    kind: CoreKind,
+    config: Option<&Path>,
+    executable: &Path,
+    cmdline: Vec<u8>,
+) -> anyhow::Result<super::process::OwnedProcess> {
+    let process = match super::process::OwnedProcess::spawned(child) {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(error.context("cannot bind the spawned core's process identity"));
+        }
+    };
+    if let Some(config) = config
+        && let Err(error) = super::process::record_launch(&process, kind, config, executable, cmdline)
+    {
+        let _ = process.stop().await;
+        let _ = child.wait().await;
+        return Err(error.context("cannot write this launch's core receipt"));
+    }
+    Ok(process)
+}
+
 /// Default sing-box skeleton payload (pure; unit-testable without touching
 /// the real data directory).
 pub(super) fn build_singbox_skeleton_json() -> anyhow::Result<String> {
@@ -483,6 +510,12 @@ impl ManagerInner {
         // NOTE: the `match inner.core_kind()` arm above already appends
         // `-ext-ctl-unix <socket_path>` for the mihomo case; sing-box binds
         // its controller via the generated JSON's `clash_api.listen`.
+        let launch_executable = std::fs::canonicalize(resolved_path)?;
+        let mut launch_cmdline = Vec::new();
+        for arg in std::iter::once(command.as_std().get_program()).chain(command.as_std().get_args()) {
+            launch_cmdline.extend_from_slice(arg.as_encoded_bytes());
+            launch_cmdline.push(0);
+        }
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -495,21 +528,14 @@ impl ManagerInner {
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
-        let identity = match super::process::ProcessIdentity::capture(pid) {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                return Err(error.context("cannot bind the spawned core's process identity"));
-            }
-        };
-        if let Some(config) = config_path.as_deref()
-            && let Err(error) = super::process::record_launch(pid, kind, config)
-        {
-            let _ = identity.stop().await;
-            let _ = child.wait().await;
-            return Err(error.context("cannot write this launch's core receipt"));
-        }
+        let identity = bind_spawned_core(
+            &mut child,
+            kind,
+            config_path.as_deref(),
+            &launch_executable,
+            launch_cmdline,
+        )
+        .await?;
 
         let started_at = Utc::now();
         let core_kind = kind;
@@ -564,6 +590,7 @@ impl ManagerInner {
                 // pidfile still names us at the time of the kill, so
                 // remove_if can confidently drop it.
                 let _ = identity.stop().await;
+                let _ = child.wait().await;
                 rollback_failed_spawn(&inner, socket_path, pid, error.to_string());
                 return Err(error);
             }
@@ -1038,7 +1065,8 @@ impl LaunchOwnership {
         }
     }
 
-    pub(crate) fn with_receipt(supervisor_pid: u32, receipt: super::process::ReceiptTarget) -> Self {
+    pub(crate) fn with_receipt(supervisor_pid: u32, mut receipt: super::process::ReceiptTarget) -> Self {
+        receipt.bind_supervisor(supervisor_pid);
         Self {
             supervisor_pid,
             supervisor_identity: super::process::OwnedProcess::capture(supervisor_pid).ok(),
@@ -1054,17 +1082,23 @@ impl LaunchOwnership {
         let identity = self
             .receipt
             .as_ref()
-            .and_then(|receipt| receipt.identity())
+            .and_then(|receipt| receipt.verified_identity())
             .ok_or_else(|| anyhow::anyhow!("core has no matching per-launch identity receipt"))?;
-        let record = pidfile::read_live_for_kind(
-            &pidfile::path_for(manager.socket_path()),
-            manager.socket_path(),
-            manager.core_kind(),
-            Some(manager.singbox_controller),
-        )
-        .ok_or_else(|| anyhow::anyhow!("core has no verified live shared pid record"))?;
+        let serves_controller = match manager.core_kind() {
+            CoreKind::Mihomo => pidfile::cmdline_serves_mihomo(&identity.cmdline, manager.socket_path()),
+            CoreKind::SingBox => pidfile::cmdline_serves_singbox(&identity.cmdline, manager.singbox_controller),
+        };
         anyhow::ensure!(
-            record.pid == identity.pid,
+            serves_controller,
+            "this launch's core does not serve the expected controller"
+        );
+        // The per-launch kernel handle proves this supervisor's child.
+        // Shared-record adoption still uses its independent strict checks.
+        let record = pidfile::read_record(&pidfile::path_for(manager.socket_path()))
+            .filter(|record| record.kind == manager.core_kind())
+            .ok_or_else(|| anyhow::anyhow!("core has no matching shared pid record"))?;
+        anyhow::ensure!(
+            record.pid == identity.pid && record.exe.as_deref() == identity.exe_string(),
             "shared record does not name this launch's core"
         );
         Ok(())
@@ -2340,10 +2374,11 @@ stop it where it was started",
         // Enumerate first: once the supervisor is gone its children are
         // reparented to init and can no longer be attributed to it.
         let mut owned = ownership.owned_descendants().await;
-        if let Some(identity) = ownership.receipt.as_ref().and_then(|receipt| receipt.identity())
+        if let Some(receipt) = ownership.receipt.as_ref()
+            && let Some(identity) = receipt.identity()
             && !owned.iter().any(|process| process.pid == identity.pid)
         {
-            match identity.bind() {
+            match receipt.bind() {
                 Ok(process) => owned.push(process),
                 Err(error) => {
                     tracing::warn!(target: "mihomo", "failed to bind per-launch core {}: {error}", identity.pid)

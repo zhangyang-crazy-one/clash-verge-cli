@@ -248,6 +248,39 @@ pub fn reap_supervisor(supervisor: &mut std::process::Child) {
     let _ = supervisor.wait();
 }
 
+/// Observe exit without releasing the Child's PID generation. Failed-launch
+/// cleanup must authenticate queued receipt senders before the final reap.
+pub(crate) fn supervisor_exit_status(
+    supervisor: &std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    use std::os::unix::process::ExitStatusExt as _;
+    // SAFETY: zeroed siginfo is writable, waitid targets our actual Child,
+    // and WNOWAIT retains its zombie/PID until Child::wait reaps it.
+    let mut info: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            supervisor.id(),
+            &mut info,
+            nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: waitid filled the SIGCHLD fields (or cleared si_pid for no exit).
+    if unsafe { info.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let code = unsafe { info.si_status() };
+    let raw = match info.si_code {
+        nix::libc::CLD_EXITED => code << 8,
+        nix::libc::CLD_DUMPED => code | 0x80,
+        _ => code,
+    };
+    Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
 /// Wait until the supervised core answers. If the supervisor exits first
 /// (bad config, missing TUN capability, crash loop), report its log tail.
 pub async fn wait_until_ready(
@@ -272,7 +305,7 @@ pub(crate) async fn wait_until_ready_with_timeout(
         if super::core_running(&api).await {
             return Ok(());
         }
-        if let Some(status) = supervisor.try_wait()? {
+        if let Some(status) = supervisor_exit_status(supervisor)? {
             anyhow::bail!("{kind} failed to start ({status})\n{}", super::log_tail(log, 10));
         }
         if tokio::time::Instant::now() >= deadline {
@@ -292,6 +325,33 @@ pub(crate) async fn wait_until_ready_with_timeout(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn supervisor_exit_observation_preserves_generation_until_cleanup_reaps() {
+        let mut supervisor = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .unwrap();
+        let pid = supervisor.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = supervisor_exit_status(&supervisor).unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(17));
+        assert!(
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok(),
+            "queued sender credentials still have a kernel generation"
+        );
+        assert_eq!(supervisor.wait().unwrap().code(), Some(17));
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "only the final wait releases the PID"
+        );
+    }
 
     #[test]
     fn launch_modes_are_explicit_and_clear_inherited_environment() {
