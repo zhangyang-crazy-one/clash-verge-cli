@@ -45,6 +45,9 @@ pub struct ManagerInner {
     pub started_at: Mutex<Option<DateTime<Utc>>>,
     pub restart_history: Mutex<VecDeque<DateTime<Utc>>>,
     pub pid: Mutex<Option<u32>>,
+    /// Kernel generation bound at spawn or validated adoption. This is only
+    /// resource-ownership evidence; it never authorizes a numeric PID signal.
+    listener_process: Mutex<Option<Arc<super::process::OwnedProcess>>>,
     /// Path of the resolved mihomo binary (set on start; None before first
     /// start). Used by TUN capability setup.
     pub resolved_binary: Mutex<Option<PathBuf>>,
@@ -82,6 +85,8 @@ pub struct ManagerInner {
     service_cgroup: Mutex<Option<String>>,
     #[cfg(test)]
     restart_stages: Mutex<Option<Arc<RestartStages>>>,
+    #[cfg(test)]
+    gui_running: Mutex<Option<bool>>,
 }
 
 /// Instance-local seams replace process effects, never restart preparation.
@@ -258,6 +263,13 @@ pub(super) async fn probe_readiness(
 }
 
 impl ManagerInner {
+    pub(super) fn forget_listener_process(&self, pid: u32) {
+        let mut process = self.listener_process.lock();
+        if process.as_ref().is_some_and(|process| process.pid == pid) {
+            *process = None;
+        }
+    }
+
     pub(crate) async fn send_action(&self, action: Action) {
         // The predecessor exiting during an explicit restart is not a final
         // stop notification; the replacement publishes ready or an error.
@@ -291,6 +303,7 @@ impl ManagerInner {
             started_at: Mutex::new(None),
             restart_history: Mutex::new(VecDeque::new()),
             pid: Mutex::new(None),
+            listener_process: Mutex::new(None),
             resolved_binary: Mutex::new(None),
             expected_exit: AtomicBool::new(false),
             restarting: AtomicBool::new(false),
@@ -304,6 +317,8 @@ impl ManagerInner {
             service_cgroup: Mutex::new(None),
             #[cfg(test)]
             restart_stages: Mutex::new(None),
+            #[cfg(test)]
+            gui_running: Mutex::new(None),
         }
     }
 
@@ -559,19 +574,22 @@ impl ManagerInner {
             ))?;
 
         let pid = child.id().expect("child must have PID after spawn");
-        let identity = bind_spawned_core(
-            &mut child,
-            kind,
-            config_path.as_deref(),
-            &launch_executable,
-            launch_cmdline,
-        )
-        .await?;
+        let identity = Arc::new(
+            bind_spawned_core(
+                &mut child,
+                kind,
+                config_path.as_deref(),
+                &launch_executable,
+                launch_cmdline,
+            )
+            .await?,
+        );
 
         let started_at = Utc::now();
         let core_kind = kind;
         *inner.state.lock() = CoreState::Running;
         *inner.pid.lock() = Some(pid);
+        *inner.listener_process.lock() = Some(Arc::clone(&identity));
         *inner.started_at.lock() = Some(started_at);
         // Owner main's pidfile/adopt/cross-process stop lifecycle: this
         // process now supervises the core it just spawned, the pidfile
@@ -736,7 +754,25 @@ impl ManagerInner {
     pub(crate) async fn write_singbox_full(config_dir: &Path, binary: &Path) -> anyhow::Result<PathBuf> {
         let enable_tun = runtime_tun_enabled().await?;
         preflight_tun_capability(binary, enable_tun)?;
-        Self::write_singbox_full_with_tun(config_dir, binary, enable_tun).await
+        Self::write_singbox_full_with_tun(config_dir, binary, enable_tun, None).await
+    }
+
+    async fn prepare_singbox_full(
+        &self,
+        config_dir: &Path,
+        binary: &Path,
+        enable_tun: bool,
+        socket: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        Self::write_singbox_full_with_tun(config_dir, binary, enable_tun, Some((self, socket))).await
+    }
+
+    fn gui_process_running(&self) -> bool {
+        #[cfg(test)]
+        if let Some(running) = *self.gui_running.lock() {
+            return running;
+        }
+        super::ownership::gui_process_running()
     }
 
     /// Full private candidate pipeline; the caller already checked capability.
@@ -744,7 +780,75 @@ impl ManagerInner {
         config_dir: &Path,
         binary: &Path,
         enable_tun: bool,
+        manager: Option<(&ManagerInner, &Path)>,
     ) -> anyhow::Result<PathBuf> {
+        let gui_running = manager.map_or_else(super::ownership::gui_process_running, |(inner, _)| {
+            inner.gui_process_running()
+        });
+        let socket = manager.map_or_else(clash_verge_core::utils::dirs::standalone_socket_path, |(_, socket)| {
+            socket.to_path_buf()
+        });
+        let generation = manager.map(|(inner, _)| inner.generation.load(Ordering::SeqCst));
+        let owned_child = manager.is_some_and(|(inner, _)| inner.owns_child.load(Ordering::SeqCst));
+        let predecessor = if gui_running {
+            manager
+                .and_then(|(inner, _)| inner.pid.lock().map(|pid| (inner, pid)))
+                .map(|(inner, pid)| {
+                    let process = inner
+                        .listener_process
+                        .lock()
+                        .clone()
+                        .filter(|process| process.pid == pid && process.matches_process())
+                        .context("CLI predecessor has no matching validated process generation")?;
+                    let endpoint = (inner.core_kind() == CoreKind::SingBox).then_some(inner.singbox_controller());
+                    // A spawn-bound child may hide exe/cmdline after gaining
+                    // capabilities. Its kernel handle proves the generation;
+                    // only adopted cores require the external live-record path.
+                    let record = if owned_child {
+                        pidfile::read_record(&pidfile::path_for(&socket))
+                    } else {
+                        pidfile::read_live_for_kind(&pidfile::path_for(&socket), &socket, inner.core_kind(), endpoint)
+                    }
+                    .filter(|record| record.pid == pid && record.kind == inner.core_kind())
+                    .context("CLI predecessor no longer has its validated ownership record")?;
+                    Ok::<_, anyhow::Error>((process, record))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let owner = || {
+            let Some((inner, _)) = manager else { return Ok(None) };
+            anyhow::ensure!(
+                Some(inner.generation.load(Ordering::SeqCst)) == generation,
+                "CLI ownership/generation changed during candidate preparation"
+            );
+            let Some((process, record)) = &predecessor else {
+                anyhow::ensure!(
+                    inner.pid.lock().is_none(),
+                    "CLI predecessor changed during candidate preparation"
+                );
+                return Ok(None);
+            };
+            let endpoint = (record.kind == CoreKind::SingBox).then_some(inner.singbox_controller());
+            let current = if owned_child {
+                pidfile::read_record(&pidfile::path_for(&socket))
+            } else {
+                pidfile::read_live_for_kind(&pidfile::path_for(&socket), &socket, record.kind, endpoint)
+            };
+            anyhow::ensure!(
+                *inner.pid.lock() == Some(process.pid)
+                    && inner.core_kind() == record.kind
+                    && inner.owns_child.load(Ordering::SeqCst) == owned_child
+                    && process.matches_process()
+                    && current.as_ref() == Some(record),
+                "CLI predecessor identity/ownership changed during candidate preparation"
+            );
+            Ok(Some(process.pid))
+        };
+        if gui_running {
+            owner()?;
+        }
         let yaml = Self::active_profile_yaml().await?;
         let path = clash_verge_core::utils::dirs::singbox_config_path()?;
         let parent = path.parent().context("runtime config has no parent")?;
@@ -767,18 +871,23 @@ impl ManagerInner {
         crate::runtime_config::prevalidate_singbox_config(binary, &candidate)
             .await
             .map_err(anyhow::Error::msg)?;
-        if super::ownership::gui_process_running() {
-            super::gui_isolation::check(
-                config_dir,
-                &clash_verge_core::utils::dirs::standalone_socket_path(),
-                None,
-                Some((&candidate, CoreKind::SingBox)),
-            )?;
+        // A GUI may have appeared during asynchronous composition/checking.
+        // If a live predecessor was not captured, the owner closure refuses
+        // rather than discovering a new identity after candidate validation.
+        let gui_running = gui_running
+            || manager.map_or_else(super::ownership::gui_process_running, |(inner, _)| {
+                inner.gui_process_running()
+            });
+        if gui_running {
+            super::gui_isolation::check_with_owner(config_dir, &socket, owner, Some((&candidate, CoreKind::SingBox)))?;
         }
         // Independent commands obtain the TCP credential from config.yaml.
         // Persist a rotated credential only after the private candidate has
         // passed all read-only checks, preserving every unknown config field.
         let shared = clash_verge_core::utils::dirs::clash_path()?;
+        if gui_running {
+            owner()?;
+        }
         if controller_secret_from_config(Some(&shared))? != secret {
             let mut mapping = match std::fs::read(&shared) {
                 Ok(bytes) => serde_yaml_ng::from_slice::<serde_yaml_ng::Mapping>(&bytes)?,
@@ -830,6 +939,20 @@ impl ManagerInner {
         config_dir: &Path,
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<PathBuf> {
+        self.runtime_config_for_start_with_socket(
+            config_dir,
+            mode,
+            &clash_verge_core::utils::dirs::standalone_socket_path(),
+        )
+        .await
+    }
+
+    async fn runtime_config_for_start_with_socket(
+        &self,
+        config_dir: &Path,
+        mode: crate::commands::start::SupervisorLaunch,
+        socket: &Path,
+    ) -> anyhow::Result<PathBuf> {
         if self.core_kind() == CoreKind::Mihomo {
             if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
                 return Self::existing_mihomo_config().await;
@@ -847,7 +970,9 @@ impl ManagerInner {
                 Some(path) => path,
                 None => super::singbox_binary::resolve_or_install().await?.path,
             };
-            return Self::write_singbox_full(config_dir, &binary).await;
+            let enable_tun = runtime_tun_enabled().await?;
+            preflight_tun_capability(&binary, enable_tun)?;
+            return self.prepare_singbox_full(config_dir, &binary, enable_tun, socket).await;
         }
         let path = Self::existing_singbox_config().await?;
         tracing::info!(
@@ -1272,6 +1397,8 @@ impl LaunchOwnership {
                 "test core executable changed"
             );
             *manager.inner.pid.lock() = Some(record.pid);
+            *manager.inner.listener_process.lock() =
+                super::process::OwnedProcess::capture(record.pid).ok().map(Arc::new);
             *manager.inner.started_at.lock() = record.started_at();
             *manager.inner.state.lock() = CoreState::Running;
             return Ok(());
@@ -1294,6 +1421,11 @@ impl LaunchOwnership {
             );
         }
         *manager.inner.pid.lock() = Some(record.pid);
+        *manager.inner.listener_process.lock() = self
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.bind().ok())
+            .map(Arc::new);
         *manager.inner.started_at.lock() = record.started_at();
         *manager.inner.state.lock() = CoreState::Running;
         Ok(())
@@ -1462,6 +1594,20 @@ impl MihomoManager {
             kind,
             singbox_endpoint,
         ) {
+            let process = super::process::OwnedProcess::capture(record.pid)
+                .ok()
+                .filter(|process| {
+                    process.matches_process()
+                        && pidfile::read_live_for_kind(
+                            &pidfile::path_for(&self.socket_path),
+                            &self.socket_path,
+                            kind,
+                            singbox_endpoint,
+                        )
+                        .as_ref()
+                            == Some(&record)
+                });
+            *self.inner.listener_process.lock() = process.map(Arc::new);
             *self.inner.pid.lock() = Some(record.pid);
             *self.inner.started_at.lock() = record.started_at();
             *self.inner.state.lock() = CoreState::Running;
@@ -2276,6 +2422,7 @@ stop it where it was started",
         // No PID — already stopped or never started (idempotent).
 
         *self.inner.pid.lock() = None;
+        *self.inner.listener_process.lock() = None;
         {
             let mut state = self.inner.state.lock();
             *state = CoreState::Stopped;
@@ -2511,7 +2658,9 @@ stop it where it was started",
                     // A5 (reviewer): the launch mode travels with the
                     // launch — a supervisor told to serve the config on
                     // disk must not regenerate it from the active profile.
-                    let config_path = ManagerInner::runtime_config_for_start(&inner, &config_dir, mode).await?;
+                    let config_path = inner
+                        .runtime_config_for_start_with_socket(&config_dir, mode, &socket_path)
+                        .await?;
                     ManagerInner::spawn_core(
                         &path,
                         &version,
@@ -2586,9 +2735,13 @@ stop it where it was started",
         // full disk) leaves the running service untouched instead of
         // dropping it and then failing to start a replacement.
         if let Some(enabled) = tun_override {
-            ManagerInner::write_singbox_full_with_tun(&self.config_dir, &resolved.path, enabled).await?;
+            self.inner
+                .prepare_singbox_full(&self.config_dir, &resolved.path, enabled, &self.socket_path)
+                .await?;
         }
-        let config_path = ManagerInner::runtime_config_for_start(&self.inner, &self.config_dir, mode)
+        let config_path = self
+            .inner
+            .runtime_config_for_start_with_socket(&self.config_dir, mode, &self.socket_path)
             .await
             .context("failed to prepare the sing-box runtime config; the running core was left untouched")?;
         self.stop().await.context("failed to stop running sing-box")?;
@@ -2950,7 +3103,11 @@ stop it where it was started",
                 Some(path) => path,
                 None => Self::resolve_and_preflight_singbox().await?.path,
             };
-            ManagerInner::write_singbox_full(&self.config_dir, &binary).await?;
+            let enable_tun = runtime_tun_enabled().await?;
+            preflight_tun_capability(&binary, enable_tun)?;
+            self.inner
+                .prepare_singbox_full(&self.config_dir, &binary, enable_tun, &self.socket_path)
+                .await?;
             return Ok(crate::commands::start::SupervisorLaunch::UseExistingConfig);
         }
         if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
@@ -3252,6 +3409,7 @@ fn preflight_tun_capability(path: &Path, tun_enabled: bool) -> anyhow::Result<()
 /// `spawn_core`'s readiness-failure path and unit-testable in isolation.
 pub(crate) fn rollback_failed_spawn(inner: &ManagerInner, socket_path: &Path, pid: u32, error_message: String) {
     pidfile::remove_if(&pidfile::path_for(socket_path), pid);
+    inner.forget_listener_process(pid);
     inner.owns_child.store(false, std::sync::atomic::Ordering::SeqCst);
     *inner.pid.lock() = None;
     *inner.started_at.lock() = None;
@@ -6281,6 +6439,9 @@ secret: f4-fixture-secret\ntun: {{enable: false}}\n",
         // set, and a fresh pidfile the rollback should drop.
         let pid = std::process::id();
         *inner.pid.lock() = Some(pid);
+        let process = Arc::new(super::super::process::OwnedProcess::capture(pid).unwrap());
+        let released = Arc::downgrade(&process);
+        *inner.listener_process.lock() = Some(process);
         *inner.started_at.lock() = Some(Utc::now());
         inner.owns_child.store(true, std::sync::atomic::Ordering::SeqCst);
         let now = Utc::now();
@@ -6294,6 +6455,10 @@ secret: f4-fixture-secret\ntun: {{enable: false}}\n",
         rollback_failed_spawn(&inner, &socket, pid, "probe timed out".into());
 
         assert!(inner.pid.lock().is_none(), "pid must be cleared");
+        assert!(
+            released.upgrade().is_none(),
+            "failed spawn must release the listener generation handle"
+        );
         assert!(inner.started_at.lock().is_none(), "started_at must be cleared");
         assert!(
             !inner.owns_child.load(std::sync::atomic::Ordering::SeqCst),
@@ -8042,3 +8207,7 @@ mod mihomo_regeneration {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 #[path = "tun_restart_tests.rs"]
 mod tun_restart_tests;
+
+#[cfg(test)]
+#[path = "gui_restart_tests.rs"]
+mod gui_restart_tests;

@@ -14,6 +14,18 @@ pub(super) fn check(
     owned_pid: Option<u32>,
     candidate: Option<(&Path, CoreKind)>,
 ) -> anyhow::Result<()> {
+    check_with_owner(config_dir, socket, || Ok(owned_pid), candidate)
+}
+
+/// Candidate preparation supplies a generation-bound revalidation closure.
+/// Recheck on both sides of each kernel socket probe, and even for free ports.
+pub(super) fn check_with_owner(
+    config_dir: &Path,
+    socket: &Path,
+    owner: impl Fn() -> anyhow::Result<Option<u32>>,
+    candidate: Option<(&Path, CoreKind)>,
+) -> anyhow::Result<()> {
+    owner()?;
     let home = clash_verge_core::utils::dirs::app_home_dir()?;
     let canonical = config_dir
         .canonicalize()
@@ -58,23 +70,32 @@ pub(super) fn check(
             bail!("GUI coexistence requires explicit loopback listener ports");
         }
         if let Err(error) = std::net::TcpListener::bind(address)
-            && !owned_pid
-                .map(|pid| owns_listener(pid, address, "tcp"))
-                .transpose()?
-                .unwrap_or(false)
+            && !verified_listener_owner(&owner, address, "tcp")?
         {
             return Err(error).context("isolated CLI TCP listener belongs to another process");
         }
         if let Err(error) = std::net::UdpSocket::bind(address)
-            && !owned_pid
-                .map(|pid| owns_listener(pid, address, "udp"))
-                .transpose()?
-                .unwrap_or(false)
+            && !verified_listener_owner(&owner, address, "udp")?
         {
             return Err(error).context("isolated CLI UDP listener belongs to another process");
         }
     }
+    owner()?;
     Ok(())
+}
+
+fn verified_listener_owner(
+    owner: &impl Fn() -> anyhow::Result<Option<u32>>,
+    address: std::net::SocketAddr,
+    protocol: &str,
+) -> anyhow::Result<bool> {
+    let Some(pid) = owner()? else { return Ok(false) };
+    let owned = owns_listener(pid, address, protocol)?;
+    anyhow::ensure!(
+        owner()? == Some(pid),
+        "CLI listener ownership changed during verification"
+    );
+    Ok(owned)
 }
 
 fn is_gui_directory(path: &Path) -> bool {

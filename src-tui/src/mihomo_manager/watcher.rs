@@ -65,6 +65,7 @@ pub fn spawn_watcher(
         // this pid before signalling it.
         let mut expected = inner.expected_exit.swap(false, Ordering::SeqCst);
         if let Some(pid) = exited_pid {
+            inner.forget_listener_process(pid);
             use crate::mihomo_manager::pidfile;
             expected |= pidfile::take_stop_intent(&pidfile::stop_intent_path_for(&socket_path), pid);
             pidfile::remove_if(&pidfile::path_for(&socket_path), pid);
