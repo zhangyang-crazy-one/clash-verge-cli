@@ -1,6 +1,7 @@
 //! Per-profile edits applied after the GUI-compatible enhancement chain.
-//! Source rules use exact text plus occurrence identity; refreshes keep new
-//! source rules rather than freezing the subscription at the time of editing.
+//! Source rules match canonical text plus occurrence identity, while replay
+//! retains their raw text. Refreshes keep new source rules rather than
+//! freezing the subscription at the time of editing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -103,13 +104,17 @@ impl RuleOverlay {
 
     fn apply(&self, actual: &[String]) -> Result<Vec<String>, String> {
         self.validate()?;
+        // Identities are normalized for matching the editor's typed model;
+        // output must remain the upstream string, including Clash modifiers.
+        let source_identities = identities(&self.source)?;
+        let actual_identities = identities(actual)?;
         let mut source_slots: HashMap<&str, VecDeque<usize>> = HashMap::new();
-        for (index, rule) in self.source.iter().enumerate() {
+        for (index, rule) in source_identities.iter().enumerate() {
             source_slots.entry(rule).or_default().push_back(index);
         }
         let mut source_to_actual = HashMap::new();
         let mut new_rules = Vec::new();
-        for (index, rule) in actual.iter().enumerate() {
+        for (index, rule) in actual_identities.iter().enumerate() {
             match source_slots.get_mut(rule.as_str()).and_then(VecDeque::pop_front) {
                 Some(source) => {
                     source_to_actual.insert(source, index);
@@ -166,6 +171,14 @@ impl RuleOverlay {
     }
 }
 
+fn identities(raw: &[String]) -> Result<Vec<String>, String> {
+    strings(
+        &raw.iter()
+            .map(|rule| crate::routing::from_clash_rule_str(rule))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn is_catch_all(rule: &str) -> bool {
     rule.split(',')
         .next()
@@ -206,14 +219,8 @@ pub(crate) fn apply(
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err("rule overlay source rules must be an array".into()),
     };
-    let canonical = strings(
-        &actual
-            .iter()
-            .map(|rule| crate::routing::from_clash_rule_str(rule))
-            .collect::<Vec<_>>(),
-    )?;
     let rules = overlay
-        .apply(&canonical)
+        .apply(&actual)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     profile.insert(
         "rules".into(),
@@ -318,5 +325,85 @@ mod tests {
         };
         let error = RuleOverlay::from_edit(&[], &[rule]).unwrap_err();
         assert!(error.contains("without losing match conditions"));
+    }
+
+    #[test]
+    fn replay_preserves_raw_source_modifiers_after_refresh_and_repeated_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let item = clash_verge_core::config::PrfItem {
+            uid: Some("A".into()),
+            ..Default::default()
+        };
+        let initial = ["IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "MATCH,DIRECT"];
+        // The editor represents source rules as typed models. Its identity
+        // normalization intentionally omits no-resolve; replay must not.
+        let source: Vec<_> = initial
+            .iter()
+            .map(|raw| crate::routing::from_clash_rule_str(raw))
+            .collect();
+        let mut edited = source.clone();
+        edited.insert(0, crate::routing::from_clash_rule_str("DOMAIN,local.example,REJECT"));
+        let overlay_path = path(home.path(), &item).unwrap();
+        std::fs::write(
+            &overlay_path,
+            RuleOverlay::from_edit(&source, &edited).unwrap().serialize().unwrap(),
+        )
+        .unwrap();
+        let refreshed = [
+            " IP-CIDR,10.0.0.0/8,DIRECT,no-resolve ",
+            "IP-CIDR,0.0.0.0/0,DIRECT,no-resolve",
+            "IP-CIDR6,::/0,no-resolve,DIRECT",
+            "RULE-SET,private,DIRECT,no-resolve",
+            "MATCH,DIRECT",
+        ];
+        let mut profile = serde_yaml_ng::Mapping::new();
+        let source_value = serde_yaml_ng::Value::Sequence(
+            refreshed
+                .iter()
+                .map(|raw| serde_yaml_ng::Value::String((*raw).into()))
+                .collect(),
+        );
+        profile.insert("rules".into(), source_value.clone());
+        apply(home.path(), &item, &mut profile).unwrap();
+        let expected: Vec<_> = std::iter::once("DOMAIN,local.example,REJECT")
+            .chain(refreshed)
+            .collect();
+        let output = profile.get("rules").unwrap().as_sequence().unwrap();
+        assert_eq!(
+            output.iter().map(|rule| rule.as_str().unwrap()).collect::<Vec<_>>(),
+            expected
+        );
+
+        // Reopen/save the typed editor and replay against the raw subscription
+        // again: neither old references nor new source rules lose modifiers.
+        let refreshed_typed = refreshed
+            .iter()
+            .map(|raw| crate::routing::from_clash_rule_str(raw))
+            .collect::<Vec<_>>();
+        let edited_typed = output
+            .iter()
+            .map(|raw| crate::routing::from_clash_rule_str(raw.as_str().unwrap()))
+            .collect::<Vec<_>>();
+        std::fs::write(
+            &overlay_path,
+            RuleOverlay::from_edit(&refreshed_typed, &edited_typed)
+                .unwrap()
+                .serialize()
+                .unwrap(),
+        )
+        .unwrap();
+        profile.insert("rules".into(), source_value);
+        apply(home.path(), &item, &mut profile).unwrap();
+        assert_eq!(
+            profile
+                .get("rules")
+                .unwrap()
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|rule| rule.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }
