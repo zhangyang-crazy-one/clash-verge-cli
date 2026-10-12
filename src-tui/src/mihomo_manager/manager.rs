@@ -651,7 +651,7 @@ impl ManagerInner {
                     .await
                     .context("auto-restart: failed to resolve sing-box binary")?;
                 tracing::info!(target: "singbox", "auto-restarting sing-box {}", resolved.version);
-                let config_path = Self::write_singbox_full(config_dir).await?;
+                let config_path = Self::write_singbox_full(config_dir, &resolved.path).await?;
                 Self::spawn_core(
                     &resolved.path,
                     &resolved.version,
@@ -695,15 +695,58 @@ impl ManagerInner {
     /// Generate and persist the sing-box runtime config from whatever the
     /// active profile currently holds (task 7.5): converted outbounds/groups,
     /// route rules, stored logical rules, rule-sets and structured DNS.
-    pub(crate) async fn write_singbox_full(config_dir: &Path) -> anyhow::Result<PathBuf> {
+    pub(crate) async fn write_singbox_full(config_dir: &Path, binary: &Path) -> anyhow::Result<PathBuf> {
         let yaml = Self::active_profile_yaml().await?;
-        let enable_tun = runtime_tun_enabled().await.unwrap_or(false);
-        let (path, parts) = Self::write_singbox_assembled(config_dir, yaml.as_deref(), enable_tun).await?;
-        // Start, restart and crash auto-restart all funnel through here, so
-        // this is where the losses of the config the core is about to run
-        // become known: the TUI notice and `status --json` read the record.
-        // A native sing-box subscription passes through untouched and
-        // records nothing.
+        let enable_tun = runtime_tun_enabled().await?;
+        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
+        let parent = path.parent().context("runtime config has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let candidate = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+        let secret = controller_secret_from_config(Some(&clash_verge_core::utils::dirs::clash_path()?))?;
+        let secret = if crate::enhance::is_placeholder_secret(&secret) {
+            crate::enhance::generate_controller_secret()
+        } else {
+            secret
+        };
+        let (_, parts) = Self::write_singbox_assembled_with_secret(
+            config_dir,
+            yaml.as_deref(),
+            enable_tun,
+            &candidate,
+            Some(secret.clone()),
+        )
+        .await?;
+        preflight_tun_capability(binary, enable_tun)?;
+        crate::runtime_config::prevalidate_singbox_config(binary, &candidate)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        if super::ownership::gui_process_running() {
+            super::gui_isolation::check(
+                config_dir,
+                &clash_verge_core::utils::dirs::standalone_socket_path(),
+                None,
+                Some((&candidate, CoreKind::SingBox)),
+            )?;
+        }
+        // Independent commands obtain the TCP credential from config.yaml.
+        // Persist a rotated credential only after the private candidate has
+        // passed all read-only checks, preserving every unknown config field.
+        let shared = clash_verge_core::utils::dirs::clash_path()?;
+        if controller_secret_from_config(Some(&shared))? != secret {
+            let mut mapping = match std::fs::read(&shared) {
+                Ok(bytes) => serde_yaml_ng::from_slice::<serde_yaml_ng::Mapping>(&bytes)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    clash_verge_core::config::IClashTemp::new().await.0
+                }
+                Err(error) => return Err(error.into()),
+            };
+            mapping.insert("secret".into(), secret.into());
+            let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+            std::io::Write::write_all(&mut staged, serde_yaml_ng::to_string(&mapping)?.as_bytes())?;
+            staged.as_file().sync_all()?;
+            staged.persist(shared).map_err(|error| error.error)?;
+        }
+        std::fs::rename(&candidate, &path).context("failed to install validated sing-box config")?;
         crate::runtime_config::record_singbox_degradation(&parts).await;
         Ok(path)
     }
@@ -752,7 +795,12 @@ impl ManagerInner {
             return Self::runtime_config_for_mihomo_start(config_dir, &binary, mode).await;
         }
         if mode == crate::commands::start::SupervisorLaunch::Regenerate {
-            return Self::write_singbox_full(config_dir).await;
+            let cached = self.resolved_binary.lock().clone();
+            let binary = match cached {
+                Some(path) => path,
+                None => super::singbox_binary::resolve_or_install().await?.path,
+            };
+            return Self::write_singbox_full(config_dir, &binary).await;
         }
         let path = Self::existing_singbox_config().await?;
         tracing::info!(
@@ -815,15 +863,6 @@ the previous configuration could not be recovered",
     /// Persist a sing-box runtime config assembled from the given profile
     /// YAML (None → bare skeleton). Returns the written path plus the parts
     /// so callers can build a degradation report without re-converting.
-    pub(crate) async fn write_singbox_assembled(
-        config_dir: &Path,
-        yaml: Option<&str>,
-        enable_tun: bool,
-    ) -> anyhow::Result<(PathBuf, SingboxParts)> {
-        let path = clash_verge_core::utils::dirs::singbox_config_path()?;
-        Self::write_singbox_assembled_to(config_dir, yaml, enable_tun, &path).await
-    }
-
     /// Assemble and atomically write to an explicit destination. Runtime
     /// applies use a candidate path, validate it, and only then replace the
     /// formal config consumed by the core.
@@ -1699,6 +1738,7 @@ impl MihomoManager {
         let files = GuidedFileSnapshot::capture([
             clash_verge_core::utils::dirs::clash_path()?,
             clash_verge_core::utils::dirs::singbox_config_path()?,
+            crate::runtime_config::singbox_conversion_path()?,
             clash_verge_core::utils::dirs::verge_path()?,
             home.join(super::ownership::OWNERSHIP_MARKER),
         ])?;
@@ -2717,7 +2757,16 @@ stop it where it was started",
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<crate::commands::start::SupervisorLaunch> {
         if self.core_kind() != CoreKind::Mihomo {
-            return Ok(mode);
+            if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+                ManagerInner::existing_singbox_config().await?;
+                return Ok(mode);
+            }
+            let binary = match self.binary_path() {
+                Some(path) => path,
+                None => Self::resolve_and_preflight_singbox().await?.path,
+            };
+            ManagerInner::write_singbox_full(&self.config_dir, &binary).await?;
+            return Ok(crate::commands::start::SupervisorLaunch::UseExistingConfig);
         }
         if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
             ManagerInner::existing_mihomo_config().await?;
@@ -4825,6 +4874,7 @@ mod tests {
             .with_socket(socket.clone())
             .with_singbox_controller("127.0.0.1:19992".parse().unwrap())
             .with_core_kind(CoreKind::SingBox);
+        *normal.inner.resolved_binary.lock() = Some("/bin/true".into());
         let path = normal
             .inner
             .runtime_config_for_start(&config_dir, crate::commands::start::SupervisorLaunch::Regenerate)
@@ -7082,6 +7132,119 @@ mod replacement_identity {
         );
 
         cleanup(&live);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod issue81_conversion_report_tests {
+    use super::*;
+    use crate::runtime_config::{self, ApplyOutcome};
+    const CLEAN: &str = "proxies: []\nrules:\n  - MATCH,DIRECT\n";
+    const LOSSY: &str = "proxies: []\nrules:\n  - DOMAIN-REGEX,ads.*,REJECT\n  - MATCH,DIRECT\n";
+
+    fn seed(home: &Path) -> MihomoManager {
+        std::fs::write(
+            home.join("verge.yaml"),
+            "proxy_core: singbox\nverge_mixed_port: 35123\nenable_tun_mode: false\nenable_system_proxy: false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("profiles.yaml"),
+            "current: base\nitems:\n  - {uid: base, type: local, name: fixture, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("profiles/base.yaml"), LOSSY).unwrap();
+        let manager = MihomoManager::new(home.to_path_buf())
+            .with_socket(home.join("controller.sock"))
+            .with_core_kind(CoreKind::SingBox)
+            .with_singbox_controller("127.0.0.1:49715".parse().unwrap());
+        *manager.inner.resolved_binary.lock() = Some("/bin/true".into());
+        manager
+    }
+
+    #[tokio::test]
+    async fn issue81_normal_start_rejection_and_use_existing_preserve_old_report_and_snapshot_restores_it() {
+        let (home, _guard) = super::conversion_fixture().await;
+        let manager = seed(home.path());
+        // A generated credential must be visible to fresh command processes.
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nexternal-controller: 127.0.0.1:49715\nsecret: set-your-secret\nfuture: {keep: true}\n",
+        )
+        .unwrap();
+        ManagerInner::write_singbox_full(home.path(), Path::new("/bin/true"))
+            .await
+            .unwrap();
+        let formal = home.path().join("singbox.json");
+        let report = runtime_config::singbox_conversion_path().unwrap();
+        let old = std::fs::read(&formal).unwrap();
+        let old_report = std::fs::read(&report).unwrap();
+        let secret = controller_secret_from_config(Some(&formal)).unwrap();
+        assert!(!crate::enhance::is_placeholder_secret(&secret));
+        assert_eq!(
+            controller_secret_from_config(Some(&home.path().join("config.yaml"))).unwrap(),
+            secret
+        );
+        let shared: serde_yaml_ng::Mapping =
+            serde_yaml_ng::from_slice(&std::fs::read(home.path().join("config.yaml")).unwrap()).unwrap();
+        assert_eq!(shared["future"]["keep"].as_bool(), Some(true));
+        std::fs::write(home.path().join("profiles/base.yaml"), CLEAN).unwrap();
+        assert!(
+            ManagerInner::write_singbox_full(home.path(), Path::new("/bin/false"))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&formal).unwrap(), old);
+        assert_eq!(std::fs::read(&report).unwrap(), old_report);
+        // Recovery never reads the changed/invalid source or emits its digest.
+        std::fs::write(home.path().join("profiles/base.yaml"), "[invalid YAML").unwrap();
+        manager
+            .inner
+            .runtime_config_for_start(home.path(), crate::commands::start::SupervisorLaunch::UseExistingConfig)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&formal).unwrap(), old);
+        assert_eq!(std::fs::read(&report).unwrap(), old_report);
+        let snapshot = GuidedFileSnapshot::capture([formal.clone(), report.clone()]).unwrap();
+        std::fs::write(&formal, "{}").unwrap();
+        std::fs::write(&report, "{bad JSON").unwrap();
+        snapshot.restore().unwrap();
+        assert_eq!(std::fs::read(&formal).unwrap(), old);
+        assert_eq!(std::fs::read(&report).unwrap(), old_report);
+        assert!(runtime_config::last_singbox_degradation().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn issue81_unchanged_refreshes_current_raw_hash_and_changed_losses_and_clean_success_clears_report() {
+        let (home, _guard) = super::conversion_fixture().await;
+        let manager = seed(home.path());
+        let first = runtime_config::apply_singbox_profile_with_outcome(&manager, Some(LOSSY), false, None)
+            .await
+            .unwrap();
+        assert_eq!(first.0, ApplyOutcome::Applied);
+        let first_record = runtime_config::last_singbox_degradation().await.unwrap();
+        let formal = home.path().join("singbox.json");
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&formal).unwrap()).unwrap();
+        std::fs::write(&formal, serde_json::to_vec(&config).unwrap()).unwrap();
+        let exact = std::fs::read(&formal).unwrap();
+        let more_loss =
+            "proxies: []\nrules:\n  - DOMAIN-REGEX,ads.*,REJECT\n  - DOMAIN-REGEX,more.*,REJECT\n  - MATCH,DIRECT\n";
+        let result = runtime_config::apply_singbox_profile_with_outcome(&manager, Some(more_loss), false, None)
+            .await
+            .unwrap();
+        assert_eq!(result.0, ApplyOutcome::Unchanged);
+        assert_eq!(std::fs::read(&formal).unwrap(), exact);
+        let refreshed = runtime_config::last_singbox_degradation().await.unwrap();
+        assert!(refreshed.digest.notes > first_record.digest.notes);
+        runtime_config::apply_singbox_profile_with_outcome(&manager, Some(more_loss), false, None)
+            .await
+            .unwrap();
+        assert_eq!(runtime_config::last_singbox_degradation().await.unwrap(), refreshed);
+        runtime_config::apply_singbox_profile_with_outcome(&manager, Some(CLEAN), false, None)
+            .await
+            .unwrap();
+        assert!(!runtime_config::singbox_conversion_path().unwrap().exists());
     }
 }
 

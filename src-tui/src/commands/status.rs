@@ -27,7 +27,9 @@ pub async fn run(manager: MihomoManager, json: bool, wait: Option<Duration>) -> 
         // the core status: `status --json` is what scripts read, and until
         // now a degraded run was only visible as a count in the apply log.
         let mut value = status_json(&status, &manager)?;
-        if let Some(record) = crate::runtime_config::last_singbox_degradation().await {
+        if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox
+            && let Some(record) = crate::runtime_config::last_singbox_degradation().await
+        {
             value["singbox_conversion_degradations"] = serde_json::to_value(&record)?;
         }
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -50,7 +52,9 @@ pub async fn run(manager: MihomoManager, json: bool, wait: Option<Duration>) -> 
         println!("   Core: {}", manager.core_kind().as_str());
         println!("   Controller: {}", super::stop::controller_description(&manager));
         println!("   Config: {}", status.config_dir.display());
-        if let Some(record) = crate::runtime_config::last_singbox_degradation().await {
+        if manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox
+            && let Some(record) = crate::runtime_config::last_singbox_degradation().await
+        {
             println!(
                 "   sing-box: {} conversion categories, {} notes, {} nodes skipped, {} fields degraded",
                 record.digest.category_count(),
@@ -107,11 +111,12 @@ mod tests {
 
     #[tokio::test]
     async fn status_json_carries_the_last_apply_singbox_degradations() {
-        // The digest is only in memory (the last apply of *this* process),
-        // so `status --json` documents it under a dedicated key instead of
-        // pretending the core status owns the field.
+        // Keep the existing digest/seq shape while adding artifact identity.
         let record = crate::runtime_config::SingboxDegradationRecord {
             seq: 7,
+            config_sha256: "fixture-hash".into(),
+            generated_at: "2026-10-12T00:00:00Z".into(),
+            extra: Default::default(),
             digest: crate::runtime_config::SingboxDegradationDigest {
                 notes: 13,
                 nodes_skipped: 10,

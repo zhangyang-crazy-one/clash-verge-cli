@@ -99,6 +99,7 @@ where
     if was_running {
         if running_kind == target {
             println!("{} is already the running core", target.as_str());
+            crate::runtime_config::print_singbox_degradation(target).await;
             return Ok(());
         }
         // Authorize before downloads, without weakening the TUI's attached
@@ -111,6 +112,7 @@ where
             "selected core: {} (running under a detached supervisor)",
             target.as_str()
         );
+        crate::runtime_config::print_singbox_degradation(target).await;
         return Ok(());
     }
     // Commits `proxy_core` (and the sing-box ownership marker) after the

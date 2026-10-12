@@ -44,7 +44,6 @@ async fn run_with_mode_and_timeout(
     if let Some(pid) = manager.pid() {
         anyhow::bail!("{kind} is already running (pid {pid}); use `restart` to replace it");
     }
-    let mode = manager.prepare_mihomo_launch(mode).await?;
     // P1 (reviewer): complete the credential rotation in the PARENT before
     // anything is launched. The supervisor child resolves the secret again at
     // spawn time (a no-op once it is strong), so doing it here is safe — but
@@ -53,7 +52,6 @@ async fn run_with_mode_and_timeout(
     // transport ignores the bearer, but sing-box's clash_api is TCP and
     // really enforces it: a fresh install would report a 15s start timeout
     // while the core was healthy.
-    prepare_controller_credentials(&manager).await?;
     let api = manager.api();
     if super::core_running(&api).await {
         anyhow::bail!(
@@ -61,6 +59,9 @@ async fn run_with_mode_and_timeout(
             super::stop::controller_description(&manager)
         );
     }
+
+    let mode = manager.prepare_mihomo_launch(mode).await?;
+    prepare_controller_credentials(&manager).await?;
 
     let log = supervisor_log_path(manager.config_dir());
     let (mut supervisor, ownership) = launch_owned_supervisor(&manager, &log, mode)?;
@@ -91,6 +92,7 @@ async fn run_with_mode_and_timeout(
     }
     println!("  supervisor: pid {}", supervisor.id());
     println!("  log:        {}", log.display());
+    crate::runtime_config::print_singbox_degradation(manager.core_kind()).await;
     Ok(())
 }
 
@@ -126,6 +128,10 @@ pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::
     let secret = if manager.core_kind() == crate::mihomo_manager::CoreKind::Mihomo {
         crate::mihomo_manager::manager::controller_secret_from_config(Some(
             &clash_verge_core::utils::dirs::clash_path()?,
+        ))?
+    } else if clash_verge_core::utils::dirs::singbox_config_path()?.exists() {
+        crate::mihomo_manager::manager::controller_secret_from_config(Some(
+            &clash_verge_core::utils::dirs::singbox_config_path()?,
         ))?
     } else {
         crate::enhance::resolve_controller_secret()

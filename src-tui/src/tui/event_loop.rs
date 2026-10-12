@@ -245,6 +245,8 @@ pub async fn run(config_dir: std::path::PathBuf) -> anyhow::Result<()> {
             }
 
             _ = runtime_refresh_tick.tick(), if app.core_state == CoreState::Running => {
+                crate::tui::singbox_degradation::maybe_surface(&mut app, ctx.manager.core_kind()).await;
+                dirty = true;
                 ctx.send(Action::TrafficRefresh);
                 match app.view {
                     View::Connections => {

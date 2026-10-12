@@ -207,6 +207,7 @@ pub async fn use_profile(manager: &MihomoManager, query: &str) -> anyhow::Result
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     if running {
         println!("switched to {uid} ({name})");
+        crate::runtime_config::print_singbox_degradation(manager.core_kind()).await;
     } else {
         println!("switched to {uid} ({name}); core not running, used on next start");
     }

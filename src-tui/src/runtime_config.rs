@@ -329,6 +329,7 @@ pub(crate) async fn apply_singbox_profile_with_outcome(
         transaction.previous.as_deref(),
         &candidate_bytes,
     )? {
+        record_singbox_degradation(&parts).await;
         persist_dns_override_state(dns_state.as_ref()).await;
         tracing::info!(target: "config", "sing-box effective configuration unchanged, not restarted");
         return Ok((ApplyOutcome::Unchanged, "sing-box: unchanged, not restarted".into()));
@@ -433,7 +434,7 @@ pub(crate) async fn apply_singbox_profile_with_outcome(
 /// One bucket of what a Clash → sing-box conversion lost. The TUI notice
 /// and `status --json` speak in buckets because the raw notes are one line
 /// per lost item and nobody reads forty of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DegradationCategory {
     /// Nodes/groups the conversion could not express at all.
@@ -447,7 +448,7 @@ pub enum DegradationCategory {
 }
 
 /// Grouped digest of one conversion run's losses.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SingboxDegradationDigest {
     /// Total note lines behind the buckets (the raw conversion report size).
     pub notes: usize,
@@ -461,12 +462,16 @@ pub struct SingboxDegradationDigest {
 
 /// A digest plus the apply generation it belongs to, so a consumer shows it
 /// once instead of on every later event.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SingboxDegradationRecord {
-    /// Monotonic id: a newer apply supersedes an older record even when the
-    /// new apply produced fewer notes.
+    /// Timestamp-based generation retained for existing status consumers.
     pub seq: u64,
+    /// SHA256 of the exact committed singbox.json bytes, including formatting.
+    pub config_sha256: String,
+    pub generated_at: String,
     pub digest: SingboxDegradationDigest,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl SingboxDegradationDigest {
@@ -521,27 +526,102 @@ pub fn should_surface_singbox_degradation(
     profile_used && core == crate::mihomo_manager::CoreKind::SingBox && total > 0 && digest.category_count() > 0
 }
 
-static LAST_SINGBOX_DEGRADATION: LazyLock<Mutex<Option<SingboxDegradationRecord>>> = LazyLock::new(|| Mutex::new(None));
-static SINGBOX_DEGRADATION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Remember what the last successful sing-box apply lost. Records the
-/// *absence* of losses too (as `None`) so a clean apply clears a stale
-/// warning instead of leaving it on screen forever.
-pub async fn record_singbox_degradation(parts: &crate::mihomo_manager::manager::SingboxParts) {
-    let digest = singbox_degradation_digest(parts);
-    let record =
-        should_surface_singbox_degradation(parts.profile_used, crate::mihomo_manager::CoreKind::SingBox, &digest).then(
-            || {
-                let seq = SINGBOX_DEGRADATION_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                SingboxDegradationRecord { seq, digest }
-            },
-        );
-    *LAST_SINGBOX_DEGRADATION.lock().await = record;
+pub(crate) fn singbox_conversion_path() -> anyhow::Result<std::path::PathBuf> {
+    Ok(clash_verge_core::utils::dirs::singbox_config_path()?.with_file_name("singbox-conversion.json"))
 }
 
-/// The last apply's degradation record, for `status --json` and the TUI.
+fn config_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Called only after committing the formal config. A rejected candidate or
+/// UseExistingConfig recovery must never publish a new conversion report.
+pub async fn record_singbox_degradation(parts: &crate::mihomo_manager::manager::SingboxParts) {
+    if let Err(error) = persist_singbox_degradation(parts) {
+        tracing::warn!(target: "config", "cannot persist sing-box conversion report: {error}");
+    }
+}
+
+fn persist_singbox_degradation(parts: &crate::mihomo_manager::manager::SingboxParts) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let config = std::fs::read(clash_verge_core::utils::dirs::singbox_config_path()?)?;
+    let _: serde_json::Value = serde_json::from_slice(&config)?;
+    let path = singbox_conversion_path()?;
+    let digest = singbox_degradation_digest(parts);
+    if !should_surface_singbox_degradation(parts.profile_used, crate::mihomo_manager::CoreKind::SingBox, &digest) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(());
+    }
+    let hash = config_sha256(&config);
+    let old = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<SingboxDegradationRecord>(&bytes).ok());
+    // An unchanged conversion should not produce a fresh TUI warning on each
+    // interval refresh. Different losses on the same effective config do.
+    let record = match old {
+        Some(record) if record.config_sha256 == hash && record.digest == digest => record,
+        old => {
+            let now = chrono::Utc::now();
+            SingboxDegradationRecord {
+                seq: u64::try_from(now.timestamp_nanos_opt().unwrap_or_default()).unwrap_or_default(),
+                config_sha256: hash,
+                generated_at: now.to_rfc3339(),
+                digest,
+                extra: old.map(|record| record.extra).unwrap_or_default(),
+            }
+        }
+    };
+    let mut candidate =
+        tempfile::NamedTempFile::new_in(path.parent().ok_or_else(|| anyhow::anyhow!("report has no parent"))?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        candidate
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    candidate.write_all(&serde_json::to_vec_pretty(&record)?)?;
+    candidate.as_file().sync_all()?;
+    candidate.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Read from disk on every call so independent status and attached TUI
+/// processes observe current truth. Malformed, missing or stale reports fail
+/// closed, including a config replacement while the two files are read.
 pub async fn last_singbox_degradation() -> Option<SingboxDegradationRecord> {
-    LAST_SINGBOX_DEGRADATION.lock().await.clone()
+    let path = clash_verge_core::utils::dirs::singbox_config_path().ok()?;
+    let config = std::fs::read(&path).ok()?;
+    let _: serde_json::Value = serde_json::from_slice(&config).ok()?;
+    let report = std::fs::read(singbox_conversion_path().ok()?).ok()?;
+    let record: SingboxDegradationRecord = serde_json::from_slice(&report).ok()?;
+    if record.config_sha256 != config_sha256(&config)
+        || chrono::DateTime::parse_from_rfc3339(&record.generated_at).is_err()
+        || !should_surface_singbox_degradation(true, crate::mihomo_manager::CoreKind::SingBox, &record.digest)
+        || std::fs::read(path).ok()? != config
+    {
+        return None;
+    }
+    Some(record)
+}
+
+pub(crate) async fn print_singbox_degradation(kind: crate::mihomo_manager::CoreKind) {
+    if kind == crate::mihomo_manager::CoreKind::SingBox
+        && let Some(record) = last_singbox_degradation().await
+    {
+        println!(
+            "sing-box: {} conversion categories, {} notes, {} nodes skipped, {} fields degraded — see `status`",
+            record.digest.category_count(),
+            record.digest.notes,
+            record.digest.nodes_skipped,
+            record.digest.fields_degraded
+        );
+    }
 }
 
 async fn persist_dns_override_state(state: Option<&clash_verge_core::config::DnsOverrideState>) {
@@ -1677,7 +1757,46 @@ entries:
     }
 
     #[tokio::test]
+    async fn issue81_report_is_private_hash_bound_preserves_unknown_fields_and_rejects_malformed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let formal = clash_verge_core::utils::dirs::singbox_config_path().unwrap();
+        let report = singbox_conversion_path().unwrap();
+        let parts = parts_with(true, &["unsupported node"], &[], &["rule dropped"]);
+        std::fs::write(&formal, "{\"unknown\":true}\n").unwrap();
+        persist_singbox_degradation(&parts).unwrap();
+        let first = last_singbox_degradation().await.unwrap();
+        assert_eq!(first.config_sha256, config_sha256(&std::fs::read(&formal).unwrap()));
+        assert_eq!(std::fs::metadata(&report).unwrap().permissions().mode() & 0o777, 0o600);
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+        json["future_metadata"] = serde_json::json!({"keep": true});
+        std::fs::write(&report, serde_json::to_vec(&json).unwrap()).unwrap();
+        persist_singbox_degradation(&parts).unwrap();
+        let same = last_singbox_degradation().await.unwrap();
+        assert_eq!(same.seq, first.seq, "same bytes and digest do not repeat a notice");
+        assert_eq!(same.extra["future_metadata"]["keep"], true);
+        std::fs::write(&formal, "{ \"unknown\": true }\n").unwrap();
+        assert!(
+            last_singbox_degradation().await.is_none(),
+            "semantic equality is not raw-byte identity"
+        );
+        persist_singbox_degradation(&parts).unwrap();
+        assert!(last_singbox_degradation().await.is_some());
+        std::fs::write(&report, b"{bad JSON").unwrap();
+        assert!(last_singbox_degradation().await.is_none());
+        persist_singbox_degradation(&parts_with(true, &[], &[], &[])).unwrap();
+        assert!(
+            !report.exists(),
+            "successful lossless conversion clears even malformed stale reports"
+        );
+    }
+
+    #[tokio::test]
     async fn a_recorded_apply_replaces_the_previous_record_and_clears_on_a_clean_one() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(clash_verge_core::utils::dirs::singbox_config_path().unwrap(), "{}").unwrap();
         let lossy = parts_with(
             true,
             &["edge: unsupported protocol mieru"],

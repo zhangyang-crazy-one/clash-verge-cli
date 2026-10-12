@@ -589,7 +589,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
     // sing-box apply shows what the conversion lost, grouped, with the
     // native-subscription hint — otherwise that knowledge only exists in
     // the log (#52).
-    crate::tui::singbox_degradation::maybe_surface(app).await;
+    crate::tui::singbox_degradation::maybe_surface(app, ctx.manager.core_kind()).await;
     Flow::Continue
 }
 

@@ -292,6 +292,8 @@ pub struct App {
     pub selected_index: usize,
     pub input_mode: InputMode,
     pub status_msg: Option<String>,
+    /// Current hash-validated conversion report, also visible on attached Home.
+    pub singbox_degradation: Option<crate::runtime_config::SingboxDegradationRecord>,
     /// A problem with `tui.yaml`, kept on Home (status messages get replaced).
     pub config_warning: Option<String>,
     pub view: View,
@@ -423,6 +425,7 @@ impl App {
             selected_index: 0,
             input_mode: InputMode::Normal,
             status_msg: None,
+            singbox_degradation: None,
             config_warning: None,
             view: View::Home,
             focus: Focus::Menu,

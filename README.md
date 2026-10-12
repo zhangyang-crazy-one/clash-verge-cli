@@ -37,6 +37,17 @@ with reference validation before launch. Nonempty `services` are rejected:
 the CLI manages its mixed/TUN inbounds and controller, and cannot manage
 additional provider service listeners.
 
+Clash profiles converted to sing-box can lose rules, node fields or group
+semantics. After a validated runtime config is committed, its loss digest is
+stored in `<config-dir>/singbox-conversion.json` with mode `0600`, a generation
+timestamp and the SHA256 of the exact `singbox.json` bytes. Independent
+`status --json` commands expose it as `singbox_conversion_degradations`, human
+`status` and attached TUI Home show a summary, and successful `start`,
+`restart`, running `core use singbox` and running `profile use` print one
+summary when losses exist. Stale or malformed reports are ignored; a
+successful lossless conversion removes the report. This describes the
+committed runtime artifact; core readiness is reported separately by status.
+
 Browser dashboards are limited to local origins by default. To authorize
 specific external origins for both cores, set the user-owned whitelist in
 `verge.yaml` through the CLI:
