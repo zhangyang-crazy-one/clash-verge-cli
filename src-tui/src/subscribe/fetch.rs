@@ -16,7 +16,7 @@ const MAX_REDIRECTS: usize = 10;
 
 #[cfg(test)]
 #[path = "fetch_tests.rs"]
-mod security_tests;
+pub(crate) mod security_tests;
 
 /// How the HTTP client should reach the subscription host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +49,15 @@ pub async fn fetch_subscription(
 
     let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
     let accept_invalid = option.and_then(|o| o.danger_accept_invalid_certs).unwrap_or(false);
-    let user_agent = match option.and_then(|o| o.user_agent.as_ref()) {
-        Some(custom) if !custom.trim().is_empty() => custom.to_string(),
+    let custom_user_agent = option
+        .and_then(|o| o.user_agent.as_ref())
+        .filter(|agent| !agent.trim().is_empty());
+    #[cfg(test)]
+    let fixture_user_agent = super::test_transport::for_url(&request_url).map(|_| "issue86-fixture".into());
+    #[cfg(test)]
+    let custom_user_agent = custom_user_agent.or(fixture_user_agent.as_ref());
+    let user_agent = match custom_user_agent {
+        Some(custom) => custom.to_string(),
         _ => super::client_meta::default_subscription_user_agent().await,
     };
 
@@ -70,6 +77,11 @@ pub async fn fetch_subscription(
                 reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).context("invalid localhost proxy URL")?;
             builder = builder.proxy(proxy);
         }
+    }
+
+    #[cfg(test)]
+    if let Some(fixture) = super::test_transport::for_url(&request_url) {
+        builder = fixture.configure(builder, &request_url, mode)?;
     }
 
     let client = builder.build().context("failed to build reqwest client")?;

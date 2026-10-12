@@ -24,6 +24,9 @@ mod settings;
 mod tun;
 mod unlock;
 
+#[cfg(test)]
+mod issue86_tests;
+
 use std::future::Future;
 use std::sync::Arc;
 
@@ -348,7 +351,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
 
         // Profiles and subscriptions.
         Action::ConfirmImport(url) => profile::confirm_import(ctx, url),
-        Action::ImportNeedsTrust { url, host } => profile::begin_import_trust(app, url, host),
+        Action::ImportNeedsTrust(pending) => profile::begin_import_trust(app, *pending),
         Action::UpdateNeedsTrust { uid, host } => profile::begin_update_trust(app, uid, host),
         Action::ConfirmTrustImport => profile::handle_confirm_trust(app, &ctx.tx),
         Action::CancelTrustImport => profile::handle_cancel_trust(app),
@@ -621,7 +624,7 @@ mod tests {
 
     use super::*;
 
-    fn ctx() -> (Ctx, tokio::sync::mpsc::Receiver<Action>) {
+    pub(super) fn ctx() -> (Ctx, tokio::sync::mpsc::Receiver<Action>) {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let ctx = Ctx {
             manager: MihomoManager::new(std::env::temp_dir()),

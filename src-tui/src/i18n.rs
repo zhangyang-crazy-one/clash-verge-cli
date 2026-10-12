@@ -304,6 +304,10 @@ fn english(key: &'static str) -> &'static str {
         "dialog.password.hint" => "Enter = confirm | Esc = cancel",
         "dialog.trust" => "Trust Host",
         "dialog.trust_title" => "Import blocked by SSRF safety check",
+        "dialog.proxy_trust_title" => "Subscription host requires proxy DNS trust",
+        "dialog.proxy_trust_warning" => {
+            "The proxy resolves this host remotely; its destination addresses cannot be verified here. Trust only this exact host for this profile's import and future updates if you trust its operator and the proxy. Redirect hosts require separate confirmation."
+        }
         "dialog.trust_warning" => {
             "This subscription resolves to a private or loopback address. Confirming trusts only this host for this profile, so it can be imported and updated later."
         }
@@ -609,6 +613,10 @@ fn chinese(key: &'static str) -> Option<&'static str> {
         "dialog.password.hint" => "Enter = 确认 | Esc = 取消",
         "dialog.trust" => "信任主机",
         "dialog.trust_title" => "导入被 SSRF 安全检查拦截",
+        "dialog.proxy_trust_title" => "订阅主机需要代理 DNS 信任",
+        "dialog.proxy_trust_warning" => {
+            "代理远端解析此主机，本客户端无法验证其目标地址。仅在信任主机运营者和代理时，才对此配置的导入及后续更新信任这一具体主机。重定向主机需要分别确认。"
+        }
         "dialog.trust_warning" => "该订阅解析到私有或回环地址。确认后仅对本配置文件信任此主机，以便后续导入与更新。",
         "dialog.trust_confirm" => "y = 信任并导入 | n/Esc = 取消（不保存信任）",
         "dialog.trust_update" => "信任并更新",

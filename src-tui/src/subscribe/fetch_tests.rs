@@ -10,15 +10,15 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-struct Server {
-    address: SocketAddr,
-    requests: Arc<Mutex<Vec<String>>>,
-    hits: Arc<AtomicUsize>,
+pub(crate) struct Server {
+    pub(crate) address: SocketAddr,
+    pub(crate) requests: Arc<Mutex<Vec<String>>>,
+    pub(crate) hits: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Server {
-    async fn start(ip: &str, handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
+    pub(crate) async fn start(ip: &str, handler: impl Fn(&str) -> Vec<u8> + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind((ip, 0)).await.expect("bind local fixture");
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));

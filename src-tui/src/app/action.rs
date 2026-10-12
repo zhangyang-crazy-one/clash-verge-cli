@@ -71,12 +71,9 @@ pub enum Action {
     // Profile management
     StartImport,
     ConfirmImport(String),
-    /// The SSRF safety check found a blocked host during import; the user must
-    /// explicitly trust it before that URL may be imported.
-    ImportNeedsTrust {
-        url: String,
-        host: String,
-    },
+    /// Import found a blocked address or unverifiable remote proxy DNS.
+    /// Retry state retains the exact host and prior explicit grants.
+    ImportNeedsTrust(Box<super::TrustPending>),
     /// The SSRF safety check found a blocked host during a manual profile
     /// refresh; the user must explicitly trust it before the update retries.
     /// Carries the profile uid so confirming persists the trust into that

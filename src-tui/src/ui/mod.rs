@@ -209,6 +209,7 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
         Overlay::Filter => {}
         Overlay::TrustConfirmation => {
             let is_update = app.pending_trust.as_ref().is_some_and(|pending| pending.uid.is_some());
+            let proxy_dns = app.pending_trust.as_ref().is_some_and(|pending| pending.proxy_dns);
             let host = app
                 .pending_trust
                 .as_ref()
@@ -216,11 +217,15 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .unwrap_or(app.tr("common.unknown"));
             let title = app.tr(if is_update {
                 "dialog.trust_update_title"
+            } else if proxy_dns {
+                "dialog.proxy_trust_title"
             } else {
                 "dialog.trust_title"
             });
             let warning = app.tr(if is_update {
                 "dialog.trust_update_warning"
+            } else if proxy_dns {
+                "dialog.proxy_trust_warning"
             } else {
                 "dialog.trust_warning"
             });
@@ -922,6 +927,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: None,
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -934,6 +940,53 @@ mod tests {
     }
 
     #[test]
+    fn issue86_proxy_trust_dialog_explains_remote_dns_and_exact_host_in_both_languages() {
+        let mut app = representative_app();
+        app.pending_trust = Some(crate::app::TrustPending {
+            host: "initial.issue86.test".into(),
+            proxy_dns: true,
+            ..Default::default()
+        });
+        app.overlay = Some(Overlay::TrustConfirmation);
+        let (rendered, _) = render(&app, 140, 40);
+        assert!(rendered.contains("initial.issue86.test"));
+        assert!(rendered.contains("resolves this host remotely"));
+        assert!(rendered.contains("cannot be verified here"));
+        assert!(rendered.contains("exact host"));
+        assert!(rendered.contains("separate confirmation"));
+        assert!(!rendered.contains("private or loopback"));
+        app.language = crate::i18n::Language::SimplifiedChinese;
+        let (rendered, _) = render(&app, 140, 40);
+        let rendered: String = rendered.chars().filter(|c| !c.is_whitespace() && *c != '\0').collect();
+        assert!(rendered.contains("代理远端解析"));
+        assert!(rendered.contains("无法验证"));
+        assert!(rendered.contains("分别确认"));
+        for language in [crate::i18n::Language::English, crate::i18n::Language::SimplifiedChinese] {
+            app.language = language;
+            let (rendered, _) = render(&app, 80, 24);
+            let compact: String = rendered.chars().filter(|c| !c.is_whitespace() && *c != '\0').collect();
+            assert!(compact.contains("initial.issue86.test"));
+            assert!(
+                compact.contains("n/Esc="),
+                "cancel key must remain visible at 80x24: {compact}"
+            );
+            match language {
+                crate::i18n::Language::English => {
+                    assert!(compact.contains("cannotbeverifiedhere"));
+                    assert!(compact.contains("y=trust&import"));
+                    assert!(compact.contains("notrustsaved"));
+                }
+                _ => {
+                    assert!(compact.contains("代理远端解析"));
+                    assert!(compact.contains("无法验证"));
+                    assert!(compact.contains("y=信任并导入"));
+                    assert!(compact.contains("不保存信任"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn trust_update_confirmation_renders_update_wording() {
         // The refresh trust prompt (pending.uid set) must use the update wording
         // instead of the import wording while sharing the same overlay.
@@ -943,6 +996,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: Some("R7iHvBBicAOz".to_string()),
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 

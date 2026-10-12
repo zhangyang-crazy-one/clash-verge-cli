@@ -47,9 +47,9 @@ fn is_ula_v6(ip: &std::net::Ipv6Addr) -> bool {
 ///
 /// `Blocked` is the only variant that means a private/loopback/link-local
 /// address was actually resolved. The DNS variants mean no address could be
-/// established at all. Callers that offer "trust this host" (e.g. the TUI
-/// import flow) must match on `Blocked` so a transient DNS failure is never
-/// presented as, or persisted as, a trusted host.
+/// established at all. `ProxyTrustRequired` separately describes unverifiable
+/// remote proxy DNS. Trust prompts must match these explicit variants, never
+/// arbitrary DNS/transport failures.
 #[derive(Debug)]
 pub enum CheckError {
     /// URL could not be parsed, or has no host.
@@ -58,6 +58,8 @@ pub enum CheckError {
     DnsFailed { host: String, source: std::io::Error },
     /// Host resolved but to zero addresses.
     NoAddress { host: String },
+    /// Remote proxy DNS cannot be checked; exemption must be per host.
+    ProxyTrustRequired { host: String },
     /// Host resolved to an address in a blocked range.
     Blocked {
         host: String,
@@ -74,6 +76,10 @@ impl fmt::Display for CheckError {
                 write!(f, "DNS resolution failed for '{host}': {source}")
             }
             CheckError::NoAddress { host } => write!(f, "host '{host}' resolved to no addresses"),
+            CheckError::ProxyTrustRequired { host } => write!(
+                f,
+                "SSRF protection cannot verify remote proxy DNS for host '{host}'; add this specific host to option.trusted_hosts only if you trust it, or explicitly choose direct fetching"
+            ),
             CheckError::Blocked { host, label, ip } => {
                 write!(f, "SSRF blocked: host '{host}' resolves to {label} address {ip}")
             }
@@ -102,6 +108,11 @@ pub fn check_url_host(url: &str, allowlist: &[String]) -> Result<(), CheckError>
     // Allowlist check (before DNS resolution)
     if allowlist.iter().any(|a| a == &host) {
         return Ok(());
+    }
+
+    #[cfg(test)]
+    if super::test_transport::is_fixture_host(&host) {
+        return check_addresses(&host, &["8.8.8.8:0".parse().unwrap()], allowlist);
     }
 
     // Resolve host to IPs
@@ -171,9 +182,7 @@ pub fn check_fetch_url(url: &url::Url, allowlist: &[String], proxy_mode: bool) -
         Some(url::Host::Ipv4(ip)) => check_ip(host, IpAddr::V4(ip))?,
         Some(url::Host::Ipv6(ip)) => check_ip(host, IpAddr::V6(ip))?,
         Some(url::Host::Domain(_)) if proxy_mode => {
-            anyhow::bail!(
-                "SSRF protection cannot verify remote proxy DNS for host '{host}'; add this specific host to option.trusted_hosts only if you trust it, or explicitly choose direct fetching"
-            );
+            return Err(CheckError::ProxyTrustRequired { host: host.into() }.into());
         }
         _ => {}
     }
@@ -300,10 +309,8 @@ mod tests {
         let domain = url::Url::parse("https://example.com/sub").unwrap();
         assert!(check_fetch_url(&domain, &[], false).is_ok());
         assert!(
-            check_fetch_url(&domain, &[], true)
-                .unwrap_err()
-                .to_string()
-                .contains("option.trusted_hosts")
+            matches!(check_fetch_url(&domain, &[], true).unwrap_err().downcast_ref::<CheckError>(),
+                Some(CheckError::ProxyTrustRequired { host }) if host == "example.com")
         );
         assert!(check_fetch_url(&domain, &["example.com".into()], true).is_ok());
         let public = url::Url::parse("http://8.8.8.8/sub").unwrap();

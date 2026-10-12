@@ -130,12 +130,17 @@ pub enum Overlay {
 /// `uid` is `None` for the import flow and `Some(profile uid)` for a manual
 /// refresh of an existing profile: the update flow must carry the uid so that
 /// confirming persists the trusted host into that profile's stored option.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TrustPending {
     pub url: String,
     pub host: String,
     /// Profile uid for the refresh flow (`None` = import flow).
     pub uid: Option<String>,
+    /// Preserve prior explicit grants and all import knobs across redirects.
+    pub option: Option<clash_verge_core::config::PrfOption>,
+    pub name: Option<String>,
+    /// Distinguish remote proxy DNS from a resolved private address.
+    pub proxy_dns: bool,
 }
 
 /// Why the core-start setup confirm was offered. Decides what `n`/Esc/q

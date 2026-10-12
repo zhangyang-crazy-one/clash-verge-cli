@@ -115,7 +115,13 @@ pub(super) fn confirm_import(ctx: &Ctx, url: String) {
     ctx.spawn(|tx| async move {
         match ssrf_blocked_host(&url) {
             Some(host) => {
-                let _ = tx.send(Action::ImportNeedsTrust { url, host }).await;
+                let _ = tx
+                    .send(Action::ImportNeedsTrust(Box::new(TrustPending {
+                        url,
+                        host,
+                        ..Default::default()
+                    })))
+                    .await;
             }
             None => spawn_import(&tx, url, None),
         }
@@ -123,17 +129,19 @@ pub(super) fn confirm_import(ctx: &Ctx, url: String) {
 }
 
 /// Open the SSRF trust prompt for an import blocked on `host`.
-pub(super) fn begin_import_trust(app: &mut App, url: String, host: String) {
-    app.pending_trust = Some(TrustPending {
-        url,
-        host: host.clone(),
-        uid: None,
-    });
+pub(super) fn begin_import_trust(app: &mut App, pending: TrustPending) {
+    let host = pending.host.clone();
+    let proxy_dns = pending.proxy_dns;
+    app.pending_trust = Some(pending);
     app.overlay = Some(Overlay::TrustConfirmation);
     app.focus = Focus::Content;
     app.status_msg = Some(format!(
         "{} — {}: {host}",
-        app.tr("dialog.trust_title"),
+        app.tr(if proxy_dns {
+            "dialog.proxy_trust_title"
+        } else {
+            "dialog.trust_title"
+        }),
         app.tr("dialog.target")
     ));
 }
@@ -291,19 +299,42 @@ pub(super) fn ssrf_blocked_host(url: &str) -> Option<String> {
 
 /// Import a subscription URL in the background, preserving default SSRF
 /// protection (`option` is `None` for ordinary imports). Results arrive back
-/// as `ProfileImported` / `ProfileImportFailed`.
+/// as `ProfileImported` / `ProfileImportFailed` / `ImportNeedsTrust`.
 pub(super) fn spawn_import(
     action_tx: &crate::tui::background::EventSender,
     url: String,
     option: Option<clash_verge_core::config::PrfOption>,
 ) {
+    spawn_import_request(action_tx, url, None, option);
+}
+
+pub(super) fn spawn_import_request(
+    action_tx: &crate::tui::background::EventSender,
+    url: String,
+    name: Option<String>,
+    option: Option<clash_verge_core::config::PrfOption>,
+) {
     let tx = action_tx.clone();
     tx.clone().spawn(async move {
-        match crate::profile_store::store::ProfileStore::import_url_locked(&url, None, option.as_ref()).await {
+        match ProfileStore::import_url_locked(&url, name.as_deref(), option.as_ref()).await {
             Ok(_) => {
                 let _ = tx.send(Action::ProfileImported).await;
             }
             Err(error) => {
+                if let Some(crate::subscribe::ssrf::CheckError::ProxyTrustRequired { host }) =
+                    error.downcast_ref::<crate::subscribe::ssrf::CheckError>()
+                {
+                    let pending = TrustPending {
+                        url,
+                        host: host.clone(),
+                        option,
+                        name,
+                        proxy_dns: true,
+                        ..Default::default()
+                    };
+                    let _ = tx.send(Action::ImportNeedsTrust(Box::new(pending))).await;
+                    return;
+                }
                 let _ = tx.send(Action::ProfileImportFailed(error.to_string())).await;
             }
         }
@@ -352,11 +383,12 @@ pub(super) fn handle_confirm_trust(app: &mut App, action_tx: &crate::tui::backgr
         return;
     }
     app.status_msg = Some(format!("Importing {} (trusted host)...", pending.host));
-    let option = clash_verge_core::config::PrfOption {
-        trusted_hosts: Some(vec![pending.host.clone().into()]),
-        ..Default::default()
-    };
-    spawn_import(action_tx, pending.url, Some(option));
+    let mut option = pending.option.unwrap_or_default();
+    let hosts = option.trusted_hosts.get_or_insert_with(Vec::new);
+    if !hosts.iter().any(|host| host.as_str() == pending.host) {
+        hosts.push(pending.host.into());
+    }
+    spawn_import_request(action_tx, pending.url, pending.name, Some(option));
 }
 
 /// Cancel the trust prompt. Only in-memory state changes: no exception is
@@ -381,6 +413,7 @@ pub(super) fn begin_update_trust(app: &mut App, uid: String, host: String) {
         url: String::new(),
         host: host.clone(),
         uid: Some(uid),
+        ..Default::default()
     });
     app.overlay = Some(Overlay::TrustConfirmation);
     app.focus = Focus::Content;
@@ -459,6 +492,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: None,
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -479,6 +513,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: None,
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -584,6 +619,7 @@ mod tests {
             url: "http://192.168.1.1/sub".to_string(),
             host: "192.168.1.1".to_string(),
             uid: Some("R7iHvBBicAOz".to_string()),
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
 
@@ -644,6 +680,7 @@ mod tests {
             url,
             host: "127.0.0.1".to_string(),
             uid: Some(uid.to_string()),
+            ..Default::default()
         });
         app.overlay = Some(Overlay::TrustConfirmation);
         let (tx, mut rx) = mpsc::channel::<Action>(64);
