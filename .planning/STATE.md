@@ -2,6 +2,9 @@
 
 ## Current work
 
+- 2026-10-12 PR #74 产品复审（评论6116357639，基线a184adf5）：四项已修复。overlay 按原文保留源规则修饰符；直接 spawn 的不可dump子进程使用内核pidfd归属与认证回执，保留严格外部/readiness校验；备份恢复将缺席overlay纳入原子删除/回滚，v1和GUI/legacy策略明确；DNS区分实际代理/接口/特殊策略，不生成悬空detour。独立进程凭证复核通过。
+- 本轮最终默认并行 workspace：859 CLI +4 integration +14 core =877 passed/0 failed/6 ignored；三个 pinned-core 另行通过，剩余三项 ignored 未运行。真实不可dump夹具触发EACCES并验证归属/清理；真实DNS仅loopback lo，eth0/publicDoH仅check。fmt/diff/clippy、两份OpenSpec strict及locked release通过。尚未在用户环境执行真实setcap/TUN/service。
+- 新release SHA256 `2fbd2b10c6f26980f072461d51957eaf56862634d4dcfdbfc6bbf9111b33fb0f`；系统安装未覆盖。九文件冻结清单 `/tmp/clash-pr74-products/source.sha256` SHA256 `49f865774828613e37211564192764721cab5dba10d4bf46f877d3fd69358245`；日志 `/tmp/clash-pr74-products/logs/`。产品修复按问题分提交并更新PR，合并前核对新head hosted CI。Debug `.planning/debug/pr74-product-review.md`；逐项报告 `docs/REVIEW-ISSUES-70-73.md` 最新章节。
 - PR #74 CI follow-up：首次 hosted 测试有两个 adopted-core 夹具继承 runner 的 service cgroup，提前被保护拦截。仅新增 cfg(test) 每实例注入并给两项夹具设置 terminal.scope；生产逻辑不变。两项 RED 均复现、四项 focused GREEN 通过；默认并行 workspace 858 passed/0 failed/5 ignored，fmt/diff/clippy 通过。推送该修复后继续核对 Actions；记录 `.planning/debug/pr74-ci-cgroup.md` 与 `/tmp/clash-pr74-ci-fix/logs/`。
 - 2026-10-11：接续远端 #70–#73 的本人意见，分支 `fix/review-round5`，基线 `df0b7a73cfd4e9a537e3a908780198f22e040425`；核查时远端 main 为 `f0ecde3c`。用户随后授权提交、推送并创建面向 main 的 PR；不关闭仍有实机验收门禁的 issue。
 - 已保留并复验 A5/C7，补齐 native 引用/services 校验、systemd 外部替换预检、UUID/pidfd 启动清理及 exec 竞态、显式恢复模式、规则集 Go HTTP-client、节点 DNS/fake-IP 转换、持久规则覆盖及备份恢复、双核 CLI 文案/JSON。

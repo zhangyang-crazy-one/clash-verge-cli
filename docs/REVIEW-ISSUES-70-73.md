@@ -99,3 +99,36 @@ Rust 单元测试及 opt-in 实核夹具随源码保留：
 修复仅增加 `#[cfg(test)]` 的每实例 cgroup setter，并在两项夹具中明确提供非服务 `terminal.scope`；默认值仍为 `None`，生产 `/proc` 读取和拒绝逻辑不变。既有 system/user service 拒绝测试复用同一入口，没有跳过测试或禁用保护。
 
 将 runner service cgroup 临时注入两项测试后，均以退出码 101 复现原错误；修复后两项启动/回滚测试、system/user service 拒绝测试及纯策略矩阵单独通过。随后在隔离 XDG 目录运行与 CI 一致的默认并行 `cargo test --workspace --all-targets --locked`：**858 passed、0 failed、5 ignored**；fmt、diff 和 workspace Clippy 通过。日志保存在 `/tmp/clash-pr74-ci-fix/logs/`。这次仅改变测试代码，前述 release 和实核验证属于首次修复产物的历史证据。
+
+## 2026-10-12 产品复审修复
+
+复审来源：[PR #74 评论](https://github.com/zhangyang-crazy-one/clash-verge-cli/pull/74#issuecomment-6116357639)，核对基线 `a184adf59c1c2fd3a7bc70ae04af260541764a80`。该基线 CI 已通过，但以下四项产品路径仍存在缺陷，本轮分别修复。
+
+| 意见 | 修复契约 | 回归依据 |
+|---|---|---|
+| P1 overlay 丢失 no-resolve | 编辑器规范化身份与实际输出分离；按规范化字符串和出现次序匹配，保留引用及新增上游规则原文，不从 sing-box 简化模型生成 Mihomo 源规则 | 文件级重放覆盖已有/刷新新增 IPv4、IPv6、RULE-SET 修饰符；重开、重复保存后原文保持，既有规则顺序回归保留 |
+| P1 capability 子进程 exe 不可读 | 实际直接 spawn 的 `Child` 用 ancestry、pidfd 和 starttime 建立归属；per-launch 通过内核凭证传递 pidfd，匹配已绑定 supervisor 代次、launch/kind/config、FD 的 PID 和已知启动入口 | uid=1000 的真实 `PR_SET_DUMPABLE=0` 子进程触发 exe 的 EACCES，仍可绑定并仅清理本次 child；同 exe 的其他进程、伪造文件/发送者/代次/FD 均拒绝；回执错误清理/reap、reparent 后清理覆盖 |
+| P2 旧备份恢复留下 overlay | 归档内 overlay 的缺席也是恢复状态：v1（含早期 v1）及无 manifest 的 GUI/legacy 备份重置缺席的标准 CLI overlay；旧顶层 sidecar 缺席行为保留 | 同目录“无 overlay 备份→新增 overlay→恢复”后有效规则恢复；有 overlay 的备份恢复；删除与多文件写入中途失败回滚，暂存/新文件清理 |
+| P2 DNS fragment 悬空 detour | 已声明且实际可生成的节点/组优先使用 detour；合法接口使用 bind_interface；DIRECT 直接拨号；RULES 等无法表达的策略逐条明确报告，不伪造出站 | eth0、RULES、DIRECT、已定义/未转换代理、转义组名、参数及同名接口/代理；内部 direct/block 标签不当作声明代理；完整配置校验与实际 lo DNS 查询 |
+
+进程的外部/adopted 身份校验不放宽。readiness 对可读 exe/argv 仍要求精确一致，只有本次通过内核凭证认证的 child 才可容忍 exe 的 EACCES，且 live argv 仍须匹配。`WNOWAIT` 在接收回执前保留 supervisor 代次；接收方核对实际 sender starttime，不能只信 JSON。已消费的畸形消息继续有界读取，拒绝消息的 FD 自动关闭。独立只读复核确认这些归属约束与 controller/config 校验保持。
+
+备份仅清除标准 SHA256 文件名、已知结构的普通 overlay；不相关文件保留，未知结构及不安全 symlink 在恢复写入前拒绝。删除与写入在同一恢复事务中暂存原件并回滚。无 manifest 的 GUI/legacy 备份会清除后来产生的 CLI overlay，使规则回到所恢复的源配置；该策略不会把未知文档静默删除。
+
+DNS `#RULES` 当前明确不支持，不能等价于指定代理；对应条目报告并丢弃，全部上游均不支持时明确提示该来源 DNS 未应用、沿用存储/默认解析器。接口名只验证语法，可用性与权限由运行主机上的核心判断。依据：[Mihomo DNS](https://wiki.metacubex.one/config/dns/#dns-指定-代理接口-进行连接)、[Mihomo DNS selector 实现](https://raw.githubusercontent.com/MetaCubeX/mihomo/Meta/tunnel/dns_dialer.go)、[sing-box dial fields](https://sing-box.sagernet.org/configuration/shared/dial/)。
+
+最终默认并行套件 **877 passed，0 failed，6 ignored**（859 CLI +4 integration +14 core）；其中三个 pinned-core 测试另行执行，**3 passed**，剩余三项 ignored 未运行。新版实核夹具包含 sing-box 1.14.2 的 DNS fragment 配置校验及真实 loopback `#lo` 查询，并重新执行已有 34 次 DNS/SRS 冷热缓存和双核 CORS 验证；公网 DoH/eth0 仅 check，没有实际连接。fmt、diff 和 workspace Clippy 通过。
+
+本轮日志位于 `/tmp/clash-pr74-products/logs/`，Rust 来源清单 `/tmp/clash-pr74-products/source.sha256` 覆盖九个修改文件。永久夹具保留在源码中；旧产物和旧日志不作为新版代码的构建证明。
+
+| 证据 | SHA-256 |
+|---|---|
+| source.sha256 | `49f865774828613e37211564192764721cab5dba10d4bf46f877d3fd69358245` |
+| suite-parallel.log | `497f79230da316180966ec86f97eef7b67941a7b970301caa374c9d4ff50be84` |
+| pinned-cores.log | `0c881c93b7af48102f8318bd9b459b53e1b1658855e26eccf28b43493d33f26b` |
+| clippy.log | `0248de18639da1ce453258ee46167fb134c98b432c3409434c77439273cec2e3` |
+| build-release.log | `a1e9332bb4afb584ab9e59eb83e834432f9abc230f82a65a4ec8ab1d1e2b9f12` |
+
+locked release 构建及两份 OpenSpec strict 校验通过。新版 `target/release/clash-verge-cli` 的 SHA-256 为 `2fbd2b10c6f26980f072461d51957eaf56862634d4dcfdbfc6bbf9111b33fb0f`（版本仍 0.2.7）；构建源码是 `a184adf5` 加本轮九个 Rust 文件修改，清单逐项重新核对一致。没有覆盖系统入口。合并前要求新 head 的 hosted CI 通过，以 PR Checks 和对应运行链接为准。
+
+实际 setcap/TUN 核心、systemd unit、完整切核/GUI 与非 loopback 网络验收仍保持未完成，不用不可 dump 夹具替代用户环境的授权验收。

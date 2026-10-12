@@ -83,3 +83,13 @@ Follow-up complete: 9.1–9.3 verified (672 isolated tests, locked builds, priva
 Review continuation: 10.1–10.6 implementation and scoped verification complete; 858 serialized regression tests and two separately executed pinned-core tests passed. Format, clippy, strict OpenSpec validation and locked release build passed. Local cargo-deny and full user-environment acceptance remain unexecuted. Fresh artifact identities and evidence are in [the issue report](../../../docs/REVIEW-ISSUES-70-73.md).
 
 The external `add-singbox-dual-core` 9.2–9.6 acceptance gates remain independently tracked. See [review-follow-up.md](review-follow-up.md) for the overlay contract and evidence boundaries.
+
+## 11. Product review continuation (PR #74, 2026-10-12)
+
+- [x] 11.1 Separate overlay matching identities from raw source-rule replay; retain upstream no-resolve modifiers after refresh and repeated editing.
+- [x] 11.2 Bind direct spawned nondumpable children through actual Child/pidfd/starttime and authenticated per-launch transfer; retain strict external/readable identities, sender-generation and controller checks, and failed-launch cleanup after reparenting.
+- [x] 11.3 Restore absent CLI rule overlays as part of backup state, including pre-overlay v1 and explicitly defined GUI/legacy policy; atomically remove/replace with complete failure rollback while retaining unknown files.
+- [x] 11.4 Distinguish DNS proxy/group selectors, interfaces and special policies; emit bind_interface or explicit unsupported diagnostics without dangling or fabricated outbound tags.
+- [x] 11.5 Verify the integrated parallel suite, scoped real-core tests, lint/format and release build; record fresh source/artifact identities and require successful hosted CI before merging, without changing remaining privileged/user-environment gates.
+
+Product follow-up implementation and scoped verification complete: 877 parallel regression tests, three separately executed pinned-core tests, format/clippy, locked release build and strict OpenSpec checks passed. Hosted CI remains a merge prerequisite; actual setcap/TUN/systemd/full user-environment gates stay open. Evidence and compatibility policies: [product review report](../../../docs/REVIEW-ISSUES-70-73.md#2026-10-12-产品复审修复).
