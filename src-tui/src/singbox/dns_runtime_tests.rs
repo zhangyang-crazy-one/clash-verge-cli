@@ -210,6 +210,84 @@ impl Drop for Threads {
 }
 
 #[test]
+#[ignore = "requires CLASH_TEST_SINGBOX_BIN; config checks and loopback interface DNS only"]
+fn pinned_core_dns_fragment_validation_and_loopback_binding() {
+    let binary = std::env::var_os("CLASH_TEST_SINGBOX_BIN").expect("set CLASH_TEST_SINGBOX_BIN");
+    let root = tempfile::tempdir().unwrap();
+    let core = root.path().join("sing-box");
+    std::fs::copy(binary, &core).unwrap();
+    let version = Command::new(&core).arg("version").output().unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("1.14.2"));
+    for fragment in [
+        "eth0",
+        "direct",
+        "block",
+        "reject",
+        "GLOBAL",
+        "RULES",
+        "DIRECT",
+        "Proxy%20%E4%B8%AD",
+        "eth0=true&RULES=true",
+    ] {
+        let yaml = format!(
+            "proxies:\n  - {{name: node, type: http, server: 127.0.0.1, port: 8080}}\nproxy-groups:\n  - {{name: 'Proxy 中', type: select, proxies: [node, DIRECT]}}\ndns:\n  nameserver: ['https://1.1.1.1/dns-query#{fragment}']\n"
+        );
+        let (report, config) = super::tests::generated_profile_dns(&yaml);
+        if fragment == "RULES" {
+            assert!(report.spec.is_none());
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("RULES") && note.contains("unsupported"))
+            );
+        }
+        let path = root.path().join("fragment-check.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        let checked = Command::new(&core)
+            .args(["check", "-c"])
+            .arg(&path)
+            .current_dir(root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("xdg-config"))
+            .env("XDG_DATA_HOME", root.path().join("xdg-data"))
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{fragment}: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+    // Only the loopback interface is used for live traffic. The eth0/public
+    // DoH configurations above are checked, never started or queried.
+    let upstream = DnsFixture::new();
+    let report = dns_conversion_from_clash_yaml(&format!(
+        "dns:\n  nameserver: ['udp://127.0.0.1:{}#lo']\n",
+        upstream.port
+    ))
+    .unwrap();
+    let spec = report.spec.unwrap();
+    let dns_port = free_udp_port();
+    let ready_port = free_tcp_port();
+    let config = json!({
+        "inbounds": [
+            {"type":"mixed", "listen":"127.0.0.1", "listen_port":ready_port},
+            {"type":"direct", "tag":"dns-in", "network":"udp", "listen":"127.0.0.1", "listen_port":dns_port}
+        ],
+        "outbounds":[{"type":"direct", "tag":"direct"}],
+        "dns":build_dns_section(&spec).unwrap().unwrap(),
+        "route":{"rules":[{"inbound":["dns-in"], "action":"hijack-dns"}], "final":"direct"}
+    });
+    assert_eq!(config["dns"]["servers"][0]["bind_interface"], "lo");
+    let mut process = start(&core, root.path(), &config);
+    wait_ready(&mut process, ready_port, root.path());
+    assert_eq!(query(dns_port, "bound-interface.example", 1), vec![127, 0, 0, 1]);
+    assert!(upstream.saw("bound-interface.example"));
+    drop(process);
+}
+
+#[test]
 #[ignore = "requires CLASH_TEST_SINGBOX_BIN; uses only private files and loopback servers"]
 fn pinned_core_dns_semantics_loopback() {
     let binary = std::env::var_os("CLASH_TEST_SINGBOX_BIN").expect("set CLASH_TEST_SINGBOX_BIN");

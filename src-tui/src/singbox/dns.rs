@@ -90,6 +90,10 @@ pub struct DnsServerSpec {
     /// Outbound tag the DNS queries leave through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detour: Option<String>,
+    /// Interface used by a direct DNS dialer (Clash `#eth0` when no proxy
+    /// with that name exists). Kept optional for stored DNS compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_interface: Option<String>,
     /// Disable TLS certificate verification (Clash `#skip-cert-verify=true`),
     /// rendered as `tls: {"enabled": true, "insecure": true}`. Only the
     /// TLS-capable remote kinds (`tls`/`https`/`quic`/`h3`) accept it.
@@ -199,6 +203,19 @@ impl DnsConfigSpec {
                     "dns server {:?}: tls_insecure is only supported for TLS DNS servers ({})",
                     server.tag,
                     server.kind.as_str()
+                ));
+            }
+            if let Some(interface) = &server.bind_interface
+                && (!server.kind.is_remote()
+                    || !valid_interface_name(interface)
+                    || server
+                        .detour
+                        .as_deref()
+                        .is_some_and(|tag| !tag.is_empty() && tag != "direct"))
+            {
+                return Err(format!(
+                    "dns server {:?}: bind_interface requires a valid interface and a direct remote dialer",
+                    server.tag
                 ));
             }
         }
@@ -380,6 +397,7 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
     }
 
     let mut spec = DnsConfigSpec::default();
+    let dial_targets = DnsDialTargets::from_profile(root, yaml)?;
     let mut tags = std::collections::HashMap::<String, String>::new();
     // Tags registered from `default-nameserver`. They exist only to resolve
     // the *hostnames* of the encrypted upstreams, so they must never become
@@ -411,8 +429,15 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
     }
 
     if let Some(nameservers) = get("nameserver").filter(|value| !value.is_null()) {
-        for endpoint in as_string_list(nameservers, "nameserver")? {
-            if let Some(tag) = add_clash_dns_endpoint(&endpoint, &mut spec, &mut tags, &mut report) {
+        for (index, endpoint) in as_string_list(nameservers, "nameserver")?.iter().enumerate() {
+            if let Some(tag) = add_clash_dns_endpoint(
+                endpoint,
+                &format!("nameserver[{index}]"),
+                &dial_targets,
+                &mut spec,
+                &mut tags,
+                &mut report,
+            ) {
                 upstream_tags.push(tag);
             }
         }
@@ -458,10 +483,17 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                     ),
                 );
             }
-            let Some(tag) = add_clash_dns_endpoint(first, &mut spec, &mut tags, &mut report) else {
+            let Some(tag) = add_clash_dns_endpoint(
+                first,
+                &format!("nameserver-policy.{pattern}[0]"),
+                &dial_targets,
+                &mut spec,
+                &mut tags,
+                &mut report,
+            ) else {
                 report.note(
                     format!("nameserver-policy.{pattern}"),
-                    "every listed server was dropped, so the policy is not applied",
+                    "the first server was dropped and the remaining servers are not used, so the policy is not applied",
                 );
                 continue;
             };
@@ -519,6 +551,7 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
                 server_port: None,
                 path: None,
                 detour: None,
+                bind_interface: None,
                 tls_insecure: None,
                 inet4_range,
                 inet6_range,
@@ -591,7 +624,7 @@ pub fn dns_conversion_from_clash_yaml(yaml: &str) -> Result<DnsConversionReport,
             // here), which is exactly the plaintext downgrade we refuse.
             // Emitting nothing keeps the caller's sidecar/default resolver,
             // so the profile's DNS block is dropped with a note instead.
-            if requested_servers > 0 || !spec.rules.is_empty() {
+            if requested_servers > 0 || !spec.rules.is_empty() || get("nameserver").is_some() {
                 let described = spec
                     .servers
                     .iter()
@@ -684,6 +717,7 @@ fn add_bootstrap_server(
             server_port: port,
             path: None,
             detour: None,
+            bind_interface: None,
             tls_insecure: None,
             inet4_range: None,
             inet6_range: None,
@@ -723,6 +757,7 @@ fn add_system_server(spec: &mut DnsConfigSpec) {
             server_port: None,
             path: None,
             detour: None,
+            bind_interface: None,
             tls_insecure: None,
             inet4_range: None,
             inet6_range: None,
@@ -734,12 +769,13 @@ fn add_system_server(spec: &mut DnsConfigSpec) {
 /// or `None` when the endpoint was dropped with a note.
 fn add_clash_dns_endpoint(
     endpoint: &str,
+    key: &str,
+    dial_targets: &DnsDialTargets,
     spec: &mut DnsConfigSpec,
     tags: &mut std::collections::HashMap<String, String>,
     report: &mut DnsConversionReport,
 ) -> Option<String> {
     let endpoint = endpoint.trim();
-    let key = "nameserver";
     if endpoint.is_empty() {
         report.note(key, "an empty nameserver entry is dropped");
         return None;
@@ -757,8 +793,38 @@ fn add_clash_dns_endpoint(
     let mut force_h3 = false;
     let mut insecure = false;
     let mut detour = None;
-    for option in fragment.split(['&', ',']).filter(|part| !part.trim().is_empty()) {
-        let (name, value) = option.split_once('=').unwrap_or((option, ""));
+    let mut bind_interface = None;
+    // Go's url.Parse decodes the fragment before Mihomo splits it on '&'.
+    // Do the same; '+' remains literal and commas are part of a name.
+    if fragment.match_indices('%').any(|(index, _)| {
+        fragment
+            .as_bytes()
+            .get(index + 1..index + 3)
+            .is_none_or(|digits| !digits.iter().all(u8::is_ascii_hexdigit))
+    }) {
+        report.note(
+            key,
+            format!("{host}: invalid percent-encoded fragment; the entry is dropped"),
+        );
+        return None;
+    }
+    let Ok(fragment) = percent_encoding::percent_decode_str(fragment).decode_utf8() else {
+        report.note(key, format!("{host}: invalid UTF-8 fragment; the entry is dropped"));
+        return None;
+    };
+    let mut selector = None;
+    for option in fragment.split('&').filter(|part| !part.trim().is_empty()) {
+        let Some((name, value)) = option.split_once('=') else {
+            if selector.is_some_and(|previous| previous != option) {
+                report.note(
+                    key,
+                    format!("{host}: multiple proxy/interface selectors are unsupported; the entry is dropped"),
+                );
+                return None;
+            }
+            selector = Some(option);
+            continue;
+        };
         match name.trim().to_ascii_lowercase().as_str() {
             "h3" => {
                 force_h3 = matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes");
@@ -776,16 +842,31 @@ fn add_clash_dns_endpoint(
                 }
             }
             other => {
-                if !option.contains('=') && !other.is_empty() {
-                    detour = if option.trim().eq_ignore_ascii_case("DIRECT") {
-                        None
-                    } else {
-                        Some(option.trim().to_string())
-                    };
-                } else {
-                    report.note(key, format!("{host}: unsupported '#{other}' option is dropped"));
-                }
+                report.note(
+                    key,
+                    format!(
+                        "{host}: unsupported '#{other}' parameter is dropped; it is not a proxy/interface selector"
+                    ),
+                );
             }
+        }
+    }
+    if let Some(selector) = selector {
+        if selector == "RULES" {
+            report.note(key, format!("{host}: '#RULES' routing semantics are unsupported; the entry is dropped instead of choosing an outbound"));
+            return None;
+        } else if selector == "DIRECT" {
+            // New-format DNS servers use a direct dialer without detour.
+        } else if dial_targets.converted.contains(selector) {
+            detour = Some(selector.to_string());
+        } else if dial_targets.proxy_names.contains(selector) {
+            report.note(key, format!("{host}: selected proxy/group cannot be emitted (unsupported or reserved tag); the entry is dropped instead of binding an interface"));
+            return None;
+        } else if valid_interface_name(selector) {
+            bind_interface = Some(selector.to_string());
+        } else {
+            report.note(key, format!("{host}: selector is neither a converted proxy/group nor a valid Linux interface name; the entry is dropped"));
+            return None;
         }
     }
 
@@ -801,6 +882,7 @@ fn add_clash_dns_endpoint(
                 server_port: None,
                 path: None,
                 detour: detour.clone(),
+                bind_interface,
                 tls_insecure: None,
                 inet4_range: None,
                 inet6_range: None,
@@ -890,11 +972,65 @@ fn add_clash_dns_endpoint(
             server_port: url.port(),
             path,
             detour,
+            bind_interface,
             tls_insecure: insecure.then_some(true),
             inet4_range: None,
             inet6_range: None,
         },
     ))
+}
+
+struct DnsDialTargets {
+    proxy_names: std::collections::HashSet<String>,
+    converted: std::collections::HashSet<String>,
+}
+
+impl DnsDialTargets {
+    fn from_profile(root: &serde_yaml_ng::Mapping, yaml: &str) -> Result<Self, String> {
+        let mut proxy_names: std::collections::HashSet<String> = ["proxies", "proxy-groups"]
+            .into_iter()
+            .flat_map(|key| {
+                root.get(Yaml::String(key.into()))
+                    .and_then(Yaml::as_sequence)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter_map(|entry| {
+                entry
+                    .get(Yaml::String("name".into()))
+                    .and_then(Yaml::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let profile = super::convert::convert_profile(yaml)?;
+        // outbound_tags() includes internal route aliases such as `direct`
+        // and `block`; only actual declared/emittable proxies are DNS detours.
+        let converted = profile
+            .outbounds
+            .iter()
+            .filter_map(|outbound| outbound.get("tag").and_then(Value::as_str))
+            .chain(profile.groups.iter().map(|group| group.name.as_str()))
+            .filter(|tag| proxy_names.contains(*tag))
+            .filter(|tag| !matches!(tag.to_ascii_uppercase().as_str(), "DIRECT" | "REJECT" | "BLOCK"))
+            .map(str::to_string)
+            .collect();
+        // Mihomo synthesizes these case-sensitive proxy names. If no group
+        // was emitted for one, report the unsupported policy, never bind it
+        // as an interface. An explicitly declared GLOBAL group can survive.
+        proxy_names.extend(["GLOBAL", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS", "PASS-RULE"].map(str::to_string));
+        Ok(Self { proxy_names, converted })
+    }
+}
+
+fn valid_interface_name(name: &str) -> bool {
+    // Linux IFNAMSIZ includes the terminating NUL. Availability is checked
+    // by the core on the target host, never by conversion on another host.
+    !name.is_empty()
+        && name.len() < 16
+        && !matches!(name, "." | "..")
+        && !name
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | ':' | '\0'))
 }
 
 /// Endpoint without its scheme, path or credentials — safe to quote in a note.
@@ -931,13 +1067,14 @@ fn register_server(
     mut server: DnsServerSpec,
 ) -> String {
     let key = format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}",
         server.kind.as_str(),
         server.server.clone().unwrap_or_default(),
         server.server_port.unwrap_or_default(),
         server.path.clone().unwrap_or_default(),
         server.tls_insecure.unwrap_or_default(),
-        server.detour.as_deref().unwrap_or_default()
+        server.detour.as_deref().unwrap_or_default(),
+        server.bind_interface.as_deref().unwrap_or_default()
     );
     if let Some(tag) = tags.get(&key) {
         return tag.clone();
@@ -1179,6 +1316,9 @@ pub fn build_dns_section(spec: &DnsConfigSpec) -> Result<Option<Value>, String> 
                 }
                 if let Some(detour) = s.detour.as_deref().filter(|tag| !tag.is_empty() && *tag != "direct") {
                     entry["detour"] = json!(detour);
+                }
+                if let Some(interface) = &s.bind_interface {
+                    entry["bind_interface"] = json!(interface);
                 }
                 // Clash's `#skip-cert-verify=true`. Verified accepted by
                 // sing-box 1.14.2 (`tls: {"enabled": true, "insecure": true}`
@@ -1448,6 +1588,7 @@ pub fn parse_server_spec(spec: &str) -> Result<DnsServerSpec, String> {
         server_port: None,
         path: None,
         detour: None,
+        bind_interface: None,
         tls_insecure: None,
         inet4_range: None,
         inet6_range: None,
@@ -1514,6 +1655,239 @@ mod runtime_tests;
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    pub(super) fn generated_profile_dns(yaml: &str) -> (DnsConversionReport, Value) {
+        let report = dns_conversion_from_clash_yaml(yaml).unwrap();
+        let mut converted = super::super::convert::convert_profile(yaml).unwrap();
+        let dns = report.spec.as_ref().and_then(|spec| {
+            apply_outbound_domain_resolvers(spec, &mut converted.outbounds, &converted.groups).unwrap();
+            build_dns_section(spec).unwrap()
+        });
+        let config = super::super::generate_config(&super::super::ConfigInput {
+            outbounds: converted.outbounds,
+            groups: converted.groups,
+            mixed_port: 17890,
+            enable_tun: false,
+            tun: super::super::TunSettings {
+                stack: "mixed".into(),
+                mtu: 1500,
+            },
+            clash_api: super::super::ClashApiSettings {
+                listen: "127.0.0.1:19090".parse().unwrap(),
+                secret: "fixture-secret".into(),
+            },
+            rule_sets: Vec::new(),
+            route_rules: Vec::new(),
+            dns,
+        })
+        .unwrap();
+        super::super::config_gen::validate_native_config(&config).unwrap();
+        (report, config)
+    }
+
+    #[test]
+    fn dns_fragment_interface_is_not_a_dangling_detour() {
+        let (_, config) = generated_profile_dns("dns:\n  nameserver: ['https://1.1.1.1/dns-query#eth0']\n");
+        assert_eq!(config["dns"]["servers"][0]["bind_interface"], "eth0");
+        assert!(config["dns"]["servers"][0].get("detour").is_none());
+    }
+
+    #[test]
+    fn dns_fragment_rules_is_reported_without_fabricating_an_outbound() {
+        let (report, config) = generated_profile_dns("dns:\n  nameserver: ['https://1.1.1.1/dns-query#RULES']\n");
+        assert!(report.spec.is_none());
+        assert!(config.get("dns").is_none());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("nameserver[0]") && note.contains("RULES") && note.contains("unsupported")),
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            report.notes.iter().any(|note| note.contains("stored/default resolver")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn dns_fragment_prefers_defined_proxies_and_groups_over_interfaces() {
+        let (report, config) = generated_profile_dns(
+            r#"
+proxies:
+  - {name: eth0, type: http, server: 127.0.0.1, port: 8080}
+proxy-groups:
+  - {name: 'Proxy 中', type: select, proxies: [eth0, DIRECT]}
+  - {name: 'Proxy,Comma', type: select, proxies: [DIRECT]}
+dns:
+  nameserver:
+    - https://1.1.1.1/dns-query#eth0
+    - https://1.1.1.1/dns-query#Proxy%20%E4%B8%AD
+    - https://1.1.1.1/dns-query#Proxy,Comma
+    - https://1.1.1.1/dns-query#DIRECT
+"#,
+        );
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 4);
+        for (server, expected) in servers
+            .iter()
+            .zip([Some("eth0"), Some("Proxy 中"), Some("Proxy,Comma"), None])
+        {
+            assert_eq!(server.get("detour").and_then(Value::as_str), expected);
+            assert!(server.get("bind_interface").is_none());
+        }
+        assert!(report.notes.is_empty(), "{:?}", report.notes);
+    }
+
+    #[test]
+    fn dns_fragment_parameters_do_not_become_selectors() {
+        let (_, config) = generated_profile_dns(
+            r#"
+dns:
+  nameserver:
+    - https://1.1.1.1/dns-query#eth0&skip-cert-verify=true&h3=true
+    - https://1.1.1.1/dns-query#eth0=true&RULES=true&ecs=1.1.1.1/24
+    - https://1.1.1.1/dns-query#h3
+"#,
+        );
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["type"], "h3");
+        assert_eq!(servers[0]["bind_interface"], "eth0");
+        assert_eq!(servers[0]["tls"]["insecure"], true);
+        assert!(servers[1].get("detour").is_none());
+        assert!(servers[1].get("bind_interface").is_none());
+        assert_eq!(servers[2]["type"], "https");
+        assert_eq!(servers[2]["bind_interface"], "h3");
+        assert!(servers.iter().all(|s| s.get("detour").is_none()));
+    }
+
+    #[test]
+    fn dns_fragment_drops_unsupported_entries_with_their_own_notes() {
+        let (report, config) = generated_profile_dns(
+            r#"
+proxies:
+  - {name: eth0, type: unknown, server: 127.0.0.1, port: 8080}
+  - {name: RULES, type: http, server: 127.0.0.1, port: 8080}
+dns:
+  nameserver:
+    - https://1.1.1.1/dns-query#eth0
+    - https://1.1.1.1/dns-query#RULES
+    - https://1.1.1.1/dns-query#eth0&lo
+    - https://1.1.1.1/dns-query#eth0%26lo
+    - https://1.1.1.1/dns-query#missing%20proxy
+    - https://1.1.1.1/dns-query#DIRECT
+  nameserver-policy:
+    exact.example: https://9.9.9.9/dns-query#RULES
+"#,
+        );
+        assert_eq!(config["dns"]["servers"].as_array().unwrap().len(), 1);
+        assert!(report.spec.unwrap().rules.is_empty());
+        for key in [
+            "nameserver[0]",
+            "nameserver[1]",
+            "nameserver[2]",
+            "nameserver[3]",
+            "nameserver[4]",
+            "nameserver-policy.exact.example[0]",
+        ] {
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.starts_with(&format!("dns.{key}:")) && note.contains("dropped")),
+                "{key}: {:?}",
+                report.notes
+            );
+        }
+        assert!(!report.notes.iter().any(|note| note.contains("nameserver[5]")));
+    }
+
+    #[test]
+    fn dns_fragment_interfaces_are_distinct_and_stored_specs_remain_compatible() {
+        let (report, _) = generated_profile_dns(
+            "dns:\n  nameserver: ['1.1.1.1#eth0', '1.1.1.1#lo', '1.1.1.1#eth0', '1.1.1.1#DIRECT']\n",
+        );
+        let spec = report.spec.unwrap();
+        assert_eq!(spec.servers.len(), 3, "interface must be part of server identity");
+        let old: DnsServerSpec =
+            serde_json::from_value(json!({"tag":"old", "kind":"udp", "server":"1.1.1.1"})).unwrap();
+        assert!(old.bind_interface.is_none());
+        assert!(serde_json::to_value(old).unwrap().get("bind_interface").is_none());
+        let mut invalid = spec;
+        invalid.servers[0].detour = Some("proxy".into());
+        assert!(invalid.validate().unwrap_err().contains("direct remote dialer"));
+    }
+
+    #[test]
+    fn dns_fragment_invalid_escapes_are_reported_instead_of_bound() {
+        for fragment in ["eth%ZZ", "eth%", "%FF"] {
+            let (report, config) = generated_profile_dns(&format!(
+                "dns:\n  nameserver: ['https://1.1.1.1/dns-query#{fragment}']\n"
+            ));
+            assert!(report.spec.is_none());
+            assert!(config.get("dns").is_none());
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("nameserver[0]") && note.contains("invalid")),
+                "{:?}",
+                report.notes
+            );
+        }
+    }
+
+    #[test]
+    fn dns_fragment_internal_tags_do_not_invent_profile_proxies() {
+        for selector in ["direct", "block", "reject"] {
+            let (_, config) = generated_profile_dns(&format!(
+                "dns:\n  nameserver: ['https://1.1.1.1/dns-query#{selector}']\n"
+            ));
+            assert_eq!(config["dns"]["servers"][0]["bind_interface"], selector);
+            assert!(config["dns"]["servers"][0].get("detour").is_none());
+        }
+        let report = dns_conversion_from_clash_yaml("proxies:\n  - {name: direct, type: http, server: 127.0.0.1, port: 8080}\ndns:\n  nameserver: ['https://1.1.1.1/dns-query#direct']\n").unwrap();
+        assert!(
+            report.spec.is_none(),
+            "reserved-name proxy must not silently become the built-in direct dialer"
+        );
+        assert!(
+            report.notes.iter().any(|note| note.contains("nameserver[0]")
+                && note.contains("selected proxy/group")
+                && note.contains("dropped")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn dns_fragment_implicit_mihomo_policies_are_not_network_interfaces() {
+        for selector in ["GLOBAL", "REJECT", "REJECT-DROP", "COMPATIBLE", "PASS", "PASS-RULE"] {
+            let (report, config) = generated_profile_dns(&format!(
+                "dns:\n  nameserver: ['https://1.1.1.1/dns-query#{selector}']\n"
+            ));
+            assert!(
+                report.spec.is_none(),
+                "{selector} requires an explicit supported policy mapping"
+            );
+            assert!(config.get("dns").is_none());
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("selected proxy/group") && note.contains("dropped")),
+                "{selector}: {:?}",
+                report.notes
+            );
+        }
+        let (_, config) = generated_profile_dns(
+            "proxy-groups:\n  - {name: GLOBAL, type: select, proxies: [DIRECT]}\ndns:\n  nameserver: ['https://1.1.1.1/dns-query#GLOBAL']\n",
+        );
+        assert_eq!(config["dns"]["servers"][0]["detour"], "GLOBAL");
+        assert!(config["dns"]["servers"][0].get("bind_interface").is_none());
+    }
 
     fn real_server<'a>(spec: &'a DnsConfigSpec, address: &str) -> &'a str {
         &spec
@@ -1704,7 +2078,7 @@ dns:
     fn resolver_detour_cycles_through_nodes_groups_and_dependencies_are_rejected() {
         for detour in ["node", "group", "chain"] {
             let spec = spec_from_clash_yaml(&format!(
-                "dns:\n  default-nameserver: [1.1.1.1]\n  nameserver: ['udp://9.9.9.9#{detour}']\n"
+                "proxies:\n  - {{name: node, type: http, server: node.example, port: 8080}}\n  - {{name: chain, type: http, server: 127.0.0.1, port: 8080}}\nproxy-groups:\n  - {{name: group, type: select, proxies: [DIRECT, node]}}\ndns:\n  default-nameserver: [1.1.1.1]\n  nameserver: ['udp://9.9.9.9#{detour}']\n"
             ))
             .unwrap()
             .unwrap();
@@ -1720,7 +2094,7 @@ dns:
             let error = apply_outbound_domain_resolvers(&spec, &mut nodes, &groups).unwrap_err();
             assert!(error.contains("dependency cycle"), "{detour}: {error}");
         }
-        let spec = spec_from_clash_yaml("dns:\n  nameserver: ['udp://9.9.9.9#node']\n")
+        let spec = spec_from_clash_yaml("proxies:\n  - {name: node, type: http, server: 127.0.0.1, port: 8080}\ndns:\n  nameserver: ['udp://9.9.9.9#node']\n")
             .unwrap()
             .unwrap();
         let mut nodes = vec![json!({"type":"http", "tag":"node", "server":"127.0.0.1"})];
@@ -1783,6 +2157,7 @@ dns:
                     server_port: Some(443),
                     path: None,
                     detour: Some("PROXY".into()),
+                    bind_interface: None,
                     tls_insecure: None,
                     inet4_range: None,
                     inet6_range: None,
@@ -1794,6 +2169,7 @@ dns:
                     server_port: None,
                     path: None,
                     detour: None,
+                    bind_interface: None,
                     tls_insecure: None,
                     inet4_range: None,
                     inet6_range: None,
@@ -1805,6 +2181,7 @@ dns:
                     server_port: None,
                     path: None,
                     detour: None,
+                    bind_interface: None,
                     tls_insecure: None,
                     inet4_range: None,
                     inet6_range: None,
@@ -1871,6 +2248,7 @@ dns:
                 server_port: None,
                 path: None,
                 detour: None,
+                bind_interface: None,
                 tls_insecure: None,
                 inet4_range: None,
                 inet6_range: None,
@@ -2623,6 +3001,7 @@ mod form_tests {
                 server_port: Some(443),
                 path: None,
                 detour: Some("PROXY".into()),
+                bind_interface: None,
                 tls_insecure: None,
                 inet4_range: None,
                 inet6_range: None,

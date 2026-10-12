@@ -926,6 +926,7 @@ mod storage_tests {
                 server: None,
                 server_port: None,
                 detour: None,
+                bind_interface: None,
                 tls_insecure: None,
                 path: None,
                 inet4_range: None,
