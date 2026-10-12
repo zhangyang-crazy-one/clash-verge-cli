@@ -2,6 +2,7 @@
 
 ## Current work
 
+- 产品修复首次CI38195570594：hosted测试/release/审计通过，aarch64-musl因SCM ancillary长度字段ABI类型不同失败。已在接收函数显式转换，后续完整877回归+3pinned+11process、fmt/diff/clippy及release再次通过；最新artifact SHA256 `73797b0cb3e1393eff35c4b4b7ff4d590f6f7e229bdd7808811f4184c43f0a59`，来源清单 `/tmp/clash-pr74-products/source-after-musl.sha256` SHA256 `3d2707683fb13c2719377235ed3ab227742998d25cbe6f750b0ad1dc23e1b417`。推送ABI修正后等待新head完整hosted CI，不用旧snapshot绿项替代。
 - 2026-10-12 PR #74 产品复审（评论6116357639，基线a184adf5）：四项已修复。overlay 按原文保留源规则修饰符；直接 spawn 的不可dump子进程使用内核pidfd归属与认证回执，保留严格外部/readiness校验；备份恢复将缺席overlay纳入原子删除/回滚，v1和GUI/legacy策略明确；DNS区分实际代理/接口/特殊策略，不生成悬空detour。独立进程凭证复核通过。
 - 本轮最终默认并行 workspace：859 CLI +4 integration +14 core =877 passed/0 failed/6 ignored；三个 pinned-core 另行通过，剩余三项 ignored 未运行。真实不可dump夹具触发EACCES并验证归属/清理；真实DNS仅loopback lo，eth0/publicDoH仅check。fmt/diff/clippy、两份OpenSpec strict及locked release通过。尚未在用户环境执行真实setcap/TUN/service。
 - 新release SHA256 `2fbd2b10c6f26980f072461d51957eaf56862634d4dcfdbfc6bbf9111b33fb0f`；系统安装未覆盖。九文件冻结清单 `/tmp/clash-pr74-products/source.sha256` SHA256 `49f865774828613e37211564192764721cab5dba10d4bf46f877d3fd69358245`；日志 `/tmp/clash-pr74-products/logs/`。产品修复按问题分提交并更新PR，合并前核对新head hosted CI。Debug `.planning/debug/pr74-product-review.md`；逐项报告 `docs/REVIEW-ISSUES-70-73.md` 最新章节。

@@ -484,6 +484,9 @@ fn send_receipt(socket: &UnixDatagram, body: &[u8], pidfd: &OwnedFd) -> std::io:
 
 type ReceivedReceipt = (Vec<u8>, nix::libc::ucred, Vec<OwnedFd>);
 
+// GNU uses usize for these lengths; musl uses socklen_t. The bounded
+// control buffer fits both ABIs, and parsing indexes must use usize.
+#[allow(clippy::unnecessary_cast)]
 fn receive_receipt(socket: &UnixDatagram) -> std::io::Result<Option<ReceivedReceipt>> {
     let mut body = vec![0u8; 65536];
     let mut control = [0usize; 32];
@@ -496,7 +499,7 @@ fn receive_receipt(socket: &UnixDatagram) -> std::io::Result<Option<ReceivedRece
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&control);
+    message.msg_controllen = std::mem::size_of_val(&control) as _;
     // SAFETY: message contains valid writable buffers; received fds are
     // marked CLOEXEC before another thread can exec.
     let count = unsafe {
@@ -522,7 +525,7 @@ fn receive_receipt(socket: &UnixDatagram) -> std::io::Result<Option<ReceivedRece
         let mut header = nix::libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
             if (*header).cmsg_level == nix::libc::SOL_SOCKET {
-                let size = (*header).cmsg_len.saturating_sub(nix::libc::CMSG_LEN(0) as usize);
+                let size = ((*header).cmsg_len as usize).saturating_sub(nix::libc::CMSG_LEN(0) as usize);
                 if (*header).cmsg_type == nix::libc::SCM_RIGHTS {
                     for index in 0..size / std::mem::size_of::<i32>() {
                         let fd = std::ptr::read_unaligned(nix::libc::CMSG_DATA(header).cast::<i32>().add(index));

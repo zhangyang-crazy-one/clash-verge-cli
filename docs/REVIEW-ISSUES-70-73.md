@@ -132,3 +132,19 @@ DNS `#RULES` 当前明确不支持，不能等价于指定代理；对应条目�
 locked release 构建及两份 OpenSpec strict 校验通过。新版 `target/release/clash-verge-cli` 的 SHA-256 为 `2fbd2b10c6f26980f072461d51957eaf56862634d4dcfdbfc6bbf9111b33fb0f`（版本仍 0.2.7）；构建源码是 `a184adf5` 加本轮九个 Rust 文件修改，清单逐项重新核对一致。没有覆盖系统入口。合并前要求新 head 的 hosted CI 通过，以 PR Checks 和对应运行链接为准。
 
 实际 setcap/TUN 核心、systemd unit、完整切核/GUI 与非 loopback 网络验收仍保持未完成，不用不可 dump 夹具替代用户环境的授权验收。
+
+### musl ABI 构建补充
+
+首次产品修复 head `abe7bfdd` 的 [CI38195570594](https://github.com/zhangyang-crazy-one/clash-verge-cli/actions/runs/38195570594) 已通过 hosted 格式/Clippy/测试/release 和依赖审计，但 aarch64-musl 编译失败：`msghdr.msg_controllen` 与 `cmsghdr.cmsg_len` 在 GNU/musl 下的整数类型不同。Unix 凭证接收函数现在对有界缓冲区长度与解析索引做显式 ABI 转换，仅在该函数注明必要的同类型 cast lint 例外。
+
+修正后再次运行完整并行套件 **877 passed/0 failed/6 ignored**、三个 pinned-core 测试 **3 passed**、进程专项 **11 passed**；fmt/diff/clippy 及 locked release 构建通过。最新九文件来源清单为 `/tmp/clash-pr74-products/source-after-musl.sha256`，新产物 `target/release/clash-verge-cli` SHA-256 `73797b0cb3e1393eff35c4b4b7ff4d590f6f7e229bdd7808811f4184c43f0a59`。前表的来源/日志/产物对应首次产品修复快照，不能混用。
+
+| 最新证据（`/tmp/clash-pr74-products/`） | SHA-256 |
+|---|---|
+| source-after-musl.sha256 | `3d2707683fb13c2719377235ed3ab227742998d25cbe6f750b0ad1dc23e1b417` |
+| logs/suite-after-musl.log | `920d71f2efb5890437056d7c438cec5698e5f0e104f9befedce913d80aa2917c` |
+| logs/pinned-after-musl.log | `f5e5b12374e702c82d536c764169266c5710fae7d59a62312446d8f108dff70d` |
+| logs/clippy-after-musl.log | `a4be99b273fbc0c276b7a7d729f1ef57d169eb6649beeea62512e97a03d9bfd1` |
+| logs/build-after-musl.log | `e8066296ec28b26d10f59a097f58d0759fa9254a0a1d533f83887f9dc74c1b6c` |
+
+本地没有安装 aarch64-musl/zig 工具链，完整交叉构建由新 head 的 hosted CI 复验，以最终 Checks 结果为准。
