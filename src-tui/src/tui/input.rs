@@ -43,6 +43,28 @@ pub fn context_hint(view: View, focus: Focus, language: Language) -> &'static st
     }
 }
 
+pub fn app_context_hint(app: &crate::app::App) -> &'static str {
+    let key = match (app.view, app.focus) {
+        (View::Rules, Focus::Content) if app.rules_save_busy => Some("hint.rules_saving"),
+        (View::Rules, Focus::Content) if app.rules_edit_mode => Some("hint.rules_edit"),
+        (View::Settings, Focus::Content) if app.dns_edit_mode => Some("hint.dns_edit"),
+        _ => None,
+    };
+    key.map_or_else(
+        || context_hint(app.view, app.focus, app.language),
+        |key| crate::i18n::tr(app.language, key),
+    )
+}
+
+pub fn editor_help(view: View, language: Language) -> Vec<&'static str> {
+    let keys: &[&str] = match view {
+        View::Rules => &["help.rules_edit", "help.rules_sets"],
+        View::Settings => &["help.dns_edit", "help.dns_apply"],
+        _ => &[],
+    };
+    keys.iter().map(|key| crate::i18n::tr(language, key)).collect()
+}
+
 /// Map a crossterm KeyEvent to an optional action using the current shell state.
 /// Input mode character editing is handled directly in the event loop.
 pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
@@ -177,7 +199,7 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
         KeyCode::Char('E') if context.view == View::Rules => Some(Action::RulesEditToggle),
         KeyCode::Char('a') if context.view == View::Rules => Some(Action::RulesEditAdd),
         KeyCode::Char('O') if context.view == View::Rules => Some(Action::OpenEditor(EditorTarget::Singbox)),
-        KeyCode::Char('r') if context.view == View::Rules => Some(Action::RulesEditAddRuleSet),
+        KeyCode::Char('R') if context.view == View::Rules => Some(Action::RulesEditAddRuleSet),
         KeyCode::Char('x') if context.view == View::Rules => Some(Action::RulesEditDeleteRuleSet),
         KeyCode::Char('D') if context.view == View::Rules && context.focus == Focus::Content => {
             Some(Action::RulesEditDelete)
@@ -214,6 +236,55 @@ pub fn map_key(event: KeyEvent, context: KeyContext<'_>) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rules_refresh_and_rule_set_have_distinct_keys() {
+        let context = base(View::Rules);
+        assert!(matches!(
+            map_key(event(KeyCode::Char('r')), context),
+            Some(Action::RulesRefresh)
+        ));
+        assert!(matches!(
+            map_key(event(KeyCode::Char('R')), context),
+            Some(Action::RulesEditAddRuleSet)
+        ));
+        assert!(!matches!(
+            map_key(event(KeyCode::Char('R')), base(View::Home)),
+            Some(Action::RulesEditAddRuleSet)
+        ));
+    }
+
+    #[test]
+    fn rules_and_dns_hints_and_help_describe_actual_edit_keys() {
+        let mut app = crate::app::App::new();
+        app.view = View::Rules;
+        app.focus = Focus::Content;
+        for language in [Language::English, Language::SimplifiedChinese] {
+            app.language = language;
+            assert!(app_context_hint(&app).contains("E "));
+            app.rules_edit_mode = true;
+            for key in ["a ", "f ", "D ", "J/K ", "R ", "x ", "W ", "E "] {
+                assert!(app_context_hint(&app).contains(key), "{key}");
+            }
+            app.rules_save_busy = true;
+            assert_eq!(app_context_hint(&app), crate::i18n::tr(language, "hint.rules_saving"));
+            app.rules_save_busy = false;
+            app.rules_edit_mode = false;
+            let help = editor_help(View::Rules, language).join(" ");
+            for key in ["E ", "a ", "f ", "D ", "J/K ", "W ", "R ", "x ", "O ", "r "] {
+                assert!(help.contains(key), "{key}");
+            }
+            app.view = View::Settings;
+            assert!(app_context_hint(&app).contains("d "));
+            app.dns_edit_mode = true;
+            let hint = app_context_hint(&app);
+            let help = editor_help(View::Settings, language).join(" ");
+            for key in ["d ", "a ", "r ", "R ", "x ", "w ", "Shift-Tab "] {
+                assert!(hint.contains(key) && help.contains(key), "{key}");
+            }
+            app.dns_edit_mode = false;
+            app.view = View::Rules;
+        }
+    }
     #[test]
     fn guided_core_overlay_requires_explicit_confirmation_and_cancel_keys() {
         let context = KeyContext {

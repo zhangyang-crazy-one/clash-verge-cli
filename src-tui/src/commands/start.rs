@@ -70,9 +70,10 @@ async fn run_with_mode_and_timeout(
     // here, stop the supervisor AND the core it already forked. Returning the
     // error directly left that core holding the controller socket and the
     // mixed port while the next `start`/`restart` competed with it.
-    let outcome = wait_until_ready_with_timeout(&manager, &mut supervisor, &log, ready_timeout)
-        .await
-        .and_then(|()| ownership.verify_core(&manager));
+    let outcome = wait_until_ready_and_verify(&manager, &mut supervisor, &log, ready_timeout, || {
+        ownership.verify_core(&manager)
+    })
+    .await;
     if let Err(error) = outcome {
         manager.cleanup_failed_launch(&ownership, &mut supervisor).await;
         return Err(error);
@@ -325,32 +326,36 @@ pub(crate) fn supervisor_exit_status(
 
 /// Wait until the supervised core answers. If the supervisor exits first
 /// (bad config, missing TUN capability, crash loop), report its log tail.
-pub async fn wait_until_ready(
-    manager: &MihomoManager,
-    supervisor: &mut std::process::Child,
-    log: &Path,
-) -> anyhow::Result<()> {
-    wait_until_ready_with_timeout(manager, supervisor, log, READY_TIMEOUT).await
-}
-
-/// [`wait_until_ready`] with an explicit readiness budget.
-pub(crate) async fn wait_until_ready_with_timeout(
+/// API readiness can precede receipt/shared-record publication. Wait for both
+/// within one budget; verification stays strict on every attempt.
+pub(crate) async fn wait_until_ready_and_verify(
     manager: &MihomoManager,
     supervisor: &mut std::process::Child,
     log: &Path,
     ready_timeout: Duration,
+    verify: impl Fn() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let api = manager.api();
     let kind = manager.core_kind().as_str();
     let deadline = tokio::time::Instant::now() + ready_timeout;
+    let mut last_identity_error = None;
     loop {
-        if super::core_running(&api).await {
-            return Ok(());
-        }
         if let Some(status) = supervisor_exit_status(supervisor)? {
             anyhow::bail!("{kind} failed to start ({status})\n{}", super::log_tail(log, 10));
         }
+        if tokio::time::timeout_at(deadline, super::core_running(&api))
+            .await
+            .unwrap_or(false)
+        {
+            match verify() {
+                Ok(()) => return Ok(()),
+                Err(error) => last_identity_error = Some(error),
+            }
+        }
         if tokio::time::Instant::now() >= deadline {
+            if let Some(error) = last_identity_error {
+                anyhow::bail!("{kind} launch identity did not become ready within {ready_timeout:?}: {error}");
+            }
             anyhow::bail!(
                 "{kind} did not answer on {} within {}s\n{}",
                 super::stop::controller_description(manager),
@@ -432,6 +437,77 @@ mod tests {
     static CHILD_VIEW: std::sync::OnceLock<(PathBuf, String)> = std::sync::OnceLock::new();
     /// Pids of the stand-in supervisor processes, reaped at test end.
     static STANDIN_PIDS: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+    #[tokio::test]
+    async fn issue82_ready_api_waits_for_identity_and_never_accepts_persistent_identity_failure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    if !matches!(stream.read(&mut request).await, Ok(1..)) {
+                        return;
+                    }
+                    let body = r#"{"version":"fixture"}"#;
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        let manager = MihomoManager::new(home.path().into())
+            .with_core_kind(crate::mihomo_manager::CoreKind::SingBox)
+            .with_singbox_controller(addr);
+        let mut child = std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap();
+        let attempts = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result = wait_until_ready_and_verify(
+            &manager,
+            &mut child,
+            &home.path().join("log"),
+            Duration::from_secs(1),
+            || {
+                anyhow::ensure!(
+                    attempts.fetch_add(1, Ordering::SeqCst) >= 2,
+                    "identity record not published yet"
+                );
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        let result = wait_until_ready_and_verify(
+            &manager,
+            &mut child,
+            &home.path().join("log"),
+            Duration::from_millis(120),
+            || anyhow::bail!("shared record does not name this launch's core"),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("identity did not become ready"), "{error}");
+        assert!(manager.pid().is_none(), "readiness alone never adopts a core");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "waiting does not signal a foreign process"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        server.abort();
+    }
 
     /// A fake sing-box clash_api: a real TCP listener on loopback that
     /// enforces the bearer secret exactly like the real controller, so the

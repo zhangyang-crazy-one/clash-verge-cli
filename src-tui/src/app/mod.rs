@@ -366,6 +366,7 @@ pub struct App {
     pub rules_edit_mode: bool,
     pub rules_edit_buffer: Vec<crate::routing::IRouteRule>,
     pub rules_edit_dirty: bool,
+    pub rules_save_busy: bool,
     /// Task 7.4: rule-set definitions loaded with the edit buffer.
     pub rule_sets_edit: Vec<serde_json::Value>,
     /// Task 8.1: structured sing-box DNS editor state (spec mirrors disk;
@@ -476,6 +477,7 @@ impl App {
             rules_edit_mode: false,
             rules_edit_buffer: Vec::new(),
             rules_edit_dirty: false,
+            rules_save_busy: false,
             rule_sets_edit: Vec::new(),
             dns_edit_mode: false,
             dns_spec_edit: crate::singbox::dns::DnsConfigSpec::default(),

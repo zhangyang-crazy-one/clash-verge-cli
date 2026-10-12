@@ -473,7 +473,7 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
         Action::RulesEditSaveCancelled => rules::cancel_save_rules(app),
         Action::RuleFormAdd => rules::open_rule_form(app),
         Action::RulesEditSaved(message) => rules::note_rules_saved(app, ctx, message),
-        Action::RulesEditFailed(error) => rules::note_rules_failed(app, error),
+        Action::RulesEditFailed(error) => rules::note_rules_failed(app, ctx, error),
         Action::DnsEditToggle => rules::toggle_dns_edit(app),
         Action::DnsFocusToggle => rules::toggle_dns_focus(app),
         Action::DnsAddServer => rules::open_dns_server_input(app),
@@ -638,6 +638,72 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn issue82_failed_rule_save_retains_dirty_buffer_and_busy_blocks_edits() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.rules_edit_mode = true;
+        app.rules_edit_dirty = true;
+        app.rules_edit_buffer = vec![
+            crate::routing::from_clash_rule_str("DOMAIN,first.example,DIRECT"),
+            crate::routing::from_clash_rule_str("MATCH,DIRECT"),
+        ];
+        let edited = app.rules_edit_buffer.clone();
+        handle_intent(&mut app, &ctx, Action::RulesEditSave).await;
+        assert!(app.rules_save_busy);
+        assert_eq!(app.rules_edit_buffer, edited, "save clones rather than consumes edits");
+        for action in [
+            Action::RulesEditDelete,
+            Action::RulesEditMoveDown,
+            Action::RulesEditMoveUp,
+            Action::RulesEditAdd,
+            Action::RuleFormAdd,
+            Action::RulesEditToggle,
+            Action::RulesEditSave,
+        ] {
+            handle_intent(&mut app, &ctx, action).await;
+            assert_eq!(app.rules_edit_buffer, edited);
+            assert!(app.rules_edit_mode && app.rules_edit_dirty && app.rules_save_busy);
+            assert!(matches!(app.input_mode, InputMode::Normal));
+        }
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        handle_event(&mut app, &ctx, failed).await;
+        assert_eq!(app.rules_edit_buffer, edited);
+        assert!(app.rules_edit_mode && app.rules_edit_dirty && !app.rules_save_busy);
+        assert_eq!(app.core_state, ctx.manager.state());
+        assert_eq!(app.core_pid, ctx.manager.pid());
+        assert!(app.status_msg.as_deref().unwrap().contains("no active profile"));
+        handle_intent(&mut app, &ctx, Action::RulesEditMoveDown).await;
+        assert_ne!(app.rules_edit_buffer, edited, "failed edits remain editable for retry");
+    }
+
+    #[tokio::test]
+    async fn issue82_empty_rule_save_and_confirmation_never_start_background_work() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = crate::profile_store::store::tests::claim_test_app_home(home.path().into()).await;
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.rules_edit_mode = true;
+        app.rules_edit_dirty = true;
+        handle_intent(&mut app, &ctx, Action::RulesEditSave).await;
+        assert!(app.status_msg.as_deref().unwrap().contains("empty rule list"));
+        assert!(!app.rules_save_busy && app.rules_edit_dirty && app.rules_edit_mode);
+        app.overlay = Some(Overlay::RulesRestartConfirmation);
+        handle_intent(&mut app, &ctx, Action::RulesEditSaveConfirmed).await;
+        assert!(app.overlay.is_none());
+        assert!(!app.rules_save_busy && app.rules_edit_dirty && app.rules_edit_mode);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            !home.path().join("profiles.yaml").exists(),
+            "empty saves do not write profiles"
+        );
     }
 
     #[tokio::test]

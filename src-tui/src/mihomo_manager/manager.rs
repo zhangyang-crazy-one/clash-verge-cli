@@ -1201,6 +1201,52 @@ impl LaunchOwnership {
         Ok(())
     }
 
+    /// Adopt a validated snapshot, never an unconstrained second read after
+    /// this launch's receipt was checked.
+    fn adopt_core(&self, manager: &MihomoManager) -> anyhow::Result<()> {
+        self.verify_core(manager)?;
+        // Injected launchers use a stand-in Child and controller, without the
+        // production receipt protocol. Keep their config-transaction seam,
+        // binding the recorded PID to its real executable before adoption.
+        #[cfg(test)]
+        if crate::commands::start::supervisor_launcher_installed() {
+            let record = pidfile::read_record(&pidfile::path_for(manager.socket_path()))
+                .filter(|record| record.kind == manager.core_kind())
+                .context("test launcher left no matching core record")?;
+            let identity = super::process::ProcessIdentity::capture(record.pid)?;
+            let executable = std::fs::canonicalize(record.exe.as_deref().context("test record has no executable")?)?;
+            anyhow::ensure!(
+                executable.to_str() == identity.exe_string(),
+                "test core executable changed"
+            );
+            *manager.inner.pid.lock() = Some(record.pid);
+            *manager.inner.started_at.lock() = record.started_at();
+            *manager.inner.state.lock() = CoreState::Running;
+            return Ok(());
+        }
+        let endpoint = (manager.core_kind() == CoreKind::SingBox).then_some(manager.singbox_controller);
+        let record = pidfile::read_live_for_kind(
+            &pidfile::path_for(manager.socket_path()),
+            manager.socket_path(),
+            manager.core_kind(),
+            endpoint,
+        )
+        .context("replacement left no adoptable core record")?;
+        if let Some(receipt) = &self.receipt {
+            let identity = receipt
+                .verified_identity()
+                .context("launch identity changed before adoption")?;
+            anyhow::ensure!(
+                record.pid == identity.pid && record.exe.as_deref() == identity.exe_string(),
+                "adoptable record does not name this launch's core"
+            );
+        }
+        *manager.inner.pid.lock() = Some(record.pid);
+        *manager.inner.started_at.lock() = record.started_at();
+        *manager.inner.state.lock() = CoreState::Running;
+        Ok(())
+    }
+
     /// Every descendant of the supervisor, breadth-first.
     ///
     /// Must be read BEFORE the supervisor is killed: once it exits, its
@@ -2590,11 +2636,25 @@ stop it where it was started",
         authorization: &RestartAuthorization,
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<()> {
+        self.apply_restart_authorization_with_timeout(authorization, mode, crate::commands::start::READY_TIMEOUT)
+            .await
+    }
+
+    async fn apply_restart_authorization_with_timeout(
+        &self,
+        authorization: &RestartAuthorization,
+        mode: crate::commands::start::SupervisorLaunch,
+        ready_timeout: std::time::Duration,
+    ) -> anyhow::Result<()> {
         if self.owns_child() {
             return self.restart_with(mode).await.map(|_| ());
         }
         self.ensure_external_replacement_allowed()?;
         self.authorize_still_ours(authorization)?;
+        if self.inner.restarting.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("a core restart is already in progress");
+        }
+        let _busy = LifecycleBusy(&self.inner.restarting);
         let mode = self.prepare_mihomo_launch(mode).await?;
         // A partially started previous attempt (supervisor alive, core not
         // yet answering) must be cleared first, or the recovery would leave
@@ -2609,19 +2669,25 @@ stop it where it was started",
         // restart — must take the supervisor and the core it spawned back
         // down. Leaving the new core alive would hold the controller socket
         // and the mixed port while the caller rolls the config back to A.
-        let outcome = match crate::commands::start::wait_until_ready(self, &mut supervisor, &log).await {
-            Ok(()) => self
-                .verify_replacement_core(authorization, launched_at)
-                .and_then(|()| ownership.verify_core(self)),
-            Err(error) => Err(error),
-        };
+        let outcome =
+            crate::commands::start::wait_until_ready_and_verify(self, &mut supervisor, &log, ready_timeout, || {
+                self.verify_replacement_core(authorization, launched_at)?;
+                ownership.adopt_core(self)
+            })
+            .await;
         if let Err(error) = outcome {
             self.cleanup_failed_launch(&ownership, &mut supervisor).await;
             return Err(error);
         }
         // The replacement belongs to the new supervisor; adopt its pid
         // record so the rest of this process sees the running core.
-        self.adopt_running_core();
+        self.inner
+            .send_action(Action::CoreStarted {
+                version: None,
+                binary_path: None,
+                binary_source: None,
+            })
+            .await;
         Ok(())
     }
 
@@ -2678,17 +2744,14 @@ stop it where it was started",
             crate::commands::start::SupervisorLaunch::UseExistingConfig,
             Some(prepared),
         )?;
-        let outcome = crate::commands::start::wait_until_ready(self, &mut supervisor, &log)
-            .await
-            .and_then(|()| ownership.verify_core(self))
-            .and_then(|()| {
-                self.adopt_running_core();
-                anyhow::ensure!(
-                    self.pid().is_some(),
-                    "prepared supervisor left no adoptable core record"
-                );
-                Ok(())
-            });
+        let outcome = crate::commands::start::wait_until_ready_and_verify(
+            self,
+            &mut supervisor,
+            &log,
+            crate::commands::start::READY_TIMEOUT,
+            || ownership.adopt_core(self),
+        )
+        .await;
         if let Err(error) = outcome {
             self.cleanup_failed_launch(&ownership, &mut supervisor).await;
             return Err(error);
@@ -4721,9 +4784,10 @@ mod tests {
                 .with_core_kind(CoreKind::SingBox)
                 .with_secret("ownership-fixture".to_string());
             let error = manager
-                .apply_restart_authorization_with(
+                .apply_restart_authorization_with_timeout(
                     &stopped_predecessor_receipt(),
                     crate::commands::start::SupervisorLaunch::Regenerate,
+                    std::time::Duration::from_millis(250),
                 )
                 .await
                 .expect_err("no pid record means the replacement cannot be attributed");
@@ -4810,7 +4874,11 @@ mod tests {
         }
         let _launcher = crate::commands::start::install_supervisor_launcher(idle_supervisor).expect("install seam");
         let error = manager
-            .apply_restart_authorization_with(&receipt, crate::commands::start::SupervisorLaunch::Regenerate)
+            .apply_restart_authorization_with_timeout(
+                &receipt,
+                crate::commands::start::SupervisorLaunch::Regenerate,
+                std::time::Duration::from_millis(250),
+            )
             .await
             .expect_err("the answering core is not the replacement this launch forked");
         assert!(error.to_string().contains("never started"), "{error}");

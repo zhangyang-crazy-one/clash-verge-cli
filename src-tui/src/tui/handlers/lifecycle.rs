@@ -26,6 +26,7 @@ pub(super) fn stop(app: &mut App, ctx: &Ctx) {
     let pending = app.core_operation_task.take();
     app.clear_runtime_caches();
     app.core_state = CoreState::Stopped;
+    app.rules_save_busy = false;
     ctx.cancel_background();
     let manager = ctx.manager.clone();
     ctx.spawn(|tx| async move {
@@ -172,12 +173,14 @@ pub(super) fn note_started(
 }
 
 pub(super) fn note_stopped(app: &mut App) {
+    app.rules_save_busy = false;
     app.core_state = CoreState::Stopped;
     app.core_pid = None;
     app.clear_runtime_caches();
 }
 
 pub(super) fn note_error(app: &mut App, msg: String) {
+    app.rules_save_busy = false;
     app.status_msg = Some(format!("{}: {msg}", app.tr("status.error")));
     app.core_state = CoreState::Error(msg);
     app.core_pid = None;

@@ -481,6 +481,9 @@ pub(super) fn update_selected_provider(app: &mut App, ctx: &Ctx) {
 /// from the current profile's YAML (plus the stored logical rules under
 /// sing-box) on entry.
 pub(super) async fn toggle_edit_mode(app: &mut App, ctx: &Ctx) {
+    if app.rules_save_busy {
+        return;
+    }
     if app.rules_edit_mode {
         app.rules_edit_mode = false;
         app.rules_edit_buffer.clear();
@@ -491,7 +494,8 @@ pub(super) async fn toggle_edit_mode(app: &mut App, ctx: &Ctx) {
     let singbox = ctx.manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox;
     match load_edit_buffer_from_active_profile(app, singbox).await {
         Ok(()) => {
-            app.status_msg = Some("rule editing ON - D del, J/K move, A raw, F form, W save, E exit".into());
+            app.status_msg =
+                Some("rule editing ON - D del, J/K move, a raw, f form, R rule-set, W save, E exit".into());
         }
         Err(message) => app.status_msg = Some(message),
     }
@@ -499,22 +503,22 @@ pub(super) async fn toggle_edit_mode(app: &mut App, ctx: &Ctx) {
 
 /// `A` on Rules: open the raw clash rule-string input.
 pub(super) fn open_rule_input(app: &mut App) {
-    if app.rules_edit_mode {
+    if app.rules_edit_mode && !app.rules_save_busy {
         app.input_mode = InputMode::RuleInput(String::new());
         app.status_msg = Some("rule: TYPE,PAYLOAD,PROXY (or sing-box JSON)".into());
     }
 }
 
-/// `r` on Rules (uppercase): open the rule-set definition input.
+/// `R` on Rules: open the rule-set definition input.
 pub(super) fn open_rule_set_input(app: &mut App) {
-    if app.rules_edit_mode {
+    if app.rules_edit_mode && !app.rules_save_busy {
         app.input_mode = InputMode::RuleSetInput(String::new());
     }
 }
 
 /// `x` on Rules: delete the selected rule-set.
 pub(super) fn delete_rule_set(app: &mut App) {
-    if !app.rules_edit_mode {
+    if !app.rules_edit_mode || app.rules_save_busy {
         return;
     }
     if let Ok(home) = clash_verge_core::utils::dirs::app_home_dir() {
@@ -542,7 +546,7 @@ pub(super) fn delete_rule_set(app: &mut App) {
 
 /// `D` on Rules: delete the selected rule from the edit buffer.
 pub(super) fn delete_selected_rule(app: &mut App) {
-    if !app.rules_edit_mode {
+    if !app.rules_edit_mode || app.rules_save_busy {
         return;
     }
     if app.rules_selected_index < app.rules_edit_buffer.len() {
@@ -556,7 +560,7 @@ pub(super) fn delete_selected_rule(app: &mut App) {
 
 /// `J` on Rules: move the selected rule one step down.
 pub(super) fn move_rule_down(app: &mut App) {
-    if !app.rules_edit_mode {
+    if !app.rules_edit_mode || app.rules_save_busy {
         return;
     }
     let i = app.rules_selected_index;
@@ -569,7 +573,7 @@ pub(super) fn move_rule_down(app: &mut App) {
 
 /// `K` on Rules: move the selected rule one step up.
 pub(super) fn move_rule_up(app: &mut App) {
-    if !app.rules_edit_mode {
+    if !app.rules_edit_mode || app.rules_save_busy {
         return;
     }
     let i = app.rules_selected_index;
@@ -583,7 +587,7 @@ pub(super) fn move_rule_up(app: &mut App) {
 /// `W` on Rules: persist the buffer. Under sing-box the user must confirm
 /// the core restart first.
 pub(super) fn save_rules(app: &mut App, ctx: &Ctx) {
-    if !app.rules_edit_mode || !app.rules_edit_dirty {
+    if !can_save_rules(app) {
         return;
     }
     if ctx.manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox {
@@ -593,7 +597,8 @@ pub(super) fn save_rules(app: &mut App, ctx: &Ctx) {
         let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
         let m = ctx.manager.clone();
         let tx = ctx.tx.for_current();
-        let buffer = std::mem::take(&mut app.rules_edit_buffer);
+        let buffer = app.rules_edit_buffer.clone();
+        app.rules_save_busy = true;
         spawn_rules_save(m, enable_tun, buffer, tx);
     }
 }
@@ -604,10 +609,14 @@ pub(super) fn confirm_save_rules(app: &mut App, ctx: &Ctx) {
         return;
     }
     app.overlay = None;
+    if !can_save_rules(app) {
+        return;
+    }
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let m = ctx.manager.clone();
     let tx = ctx.tx.for_current();
-    let buffer = std::mem::take(&mut app.rules_edit_buffer);
+    let buffer = app.rules_edit_buffer.clone();
+    app.rules_save_busy = true;
     spawn_rules_save(m, enable_tun, buffer, tx);
 }
 
@@ -619,9 +628,20 @@ pub(super) fn cancel_save_rules(app: &mut App) {
     }
 }
 
+fn can_save_rules(app: &mut App) -> bool {
+    if !app.rules_edit_mode || !app.rules_edit_dirty || app.rules_save_busy {
+        return false;
+    }
+    if app.rules_edit_buffer.is_empty() {
+        app.status_msg = Some("cannot save an empty rule list - add a rule or exit editing".into());
+        return false;
+    }
+    true
+}
+
 /// `F` on Rules: open the structured rule form input.
 pub(super) fn open_rule_form(app: &mut App) {
-    if app.rules_edit_mode {
+    if app.rules_edit_mode && !app.rules_save_busy {
         app.input_mode = InputMode::RuleFormInput(String::new());
         app.status_msg = Some("rule form: kind=value>target".into());
     }
@@ -629,6 +649,7 @@ pub(super) fn open_rule_form(app: &mut App) {
 
 /// Channel-receive side: a save completed; report status and exit edit mode.
 pub(super) fn note_rules_saved(app: &mut App, ctx: &Ctx, message: String) {
+    app.rules_save_busy = false;
     app.rules_edit_dirty = false;
     app.rules_edit_buffer.clear();
     app.rules_edit_mode = false;
@@ -636,12 +657,12 @@ pub(super) fn note_rules_saved(app: &mut App, ctx: &Ctx, message: String) {
     ctx.send(Action::RulesRefresh);
 }
 
-/// Channel-receive side: a save failed; the buffer is cleared so the user
-/// can re-enter edit mode, retry the import, or back out without stranding
-/// the in-memory state.
-pub(super) fn note_rules_failed(app: &mut App, error: String) {
-    app.rules_edit_buffer.clear();
-    app.rules_edit_mode = false;
+/// A failed save keeps the user's edits and reconciles the actual core state
+/// after a failed replacement/recovery. The desired source may be persisted.
+pub(super) fn note_rules_failed(app: &mut App, ctx: &Ctx, error: String) {
+    app.rules_save_busy = false;
+    app.core_state = ctx.manager.state();
+    app.core_pid = ctx.manager.pid();
     app.status_msg = Some(format!("rule save failed: {error}"));
 }
 
@@ -657,6 +678,9 @@ fn spawn_rules_save(
     tx.clone().spawn(async move {
         let is_singbox = manager.core_kind() == crate::mihomo_manager::CoreKind::SingBox;
         let outcome = async {
+            if buffer.is_empty() {
+                return Err("cannot save an empty rule list".into());
+            }
             let store = crate::profile_store::store::ProfileStore::snapshot()
                 .await
                 .map_err(|e| e.to_string())?;
@@ -747,8 +771,9 @@ pub(super) fn toggle_dns_edit(app: &mut App) {
     app.dns_cursor = 0;
     app.dns_focus_rules = false;
     app.dns_edit_mode = true;
-    app.status_msg =
-        Some("sing-box DNS editor ON - a server | r rule | R resolver | x del | Tab lists | w apply | d exit".into());
+    app.status_msg = Some(
+        "sing-box DNS editor ON - a server | r rule | R resolver | x del | Shift-Tab lists | w apply | d exit".into(),
+    );
 }
 
 /// `Tab` (BackTab) on Settings: switch DNS focus between servers and split rules.

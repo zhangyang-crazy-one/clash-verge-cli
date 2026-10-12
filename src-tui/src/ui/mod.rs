@@ -162,16 +162,23 @@ fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
             }
         }
         Overlay::Help => {
-            let content = vec![
+            let mut content = vec![
                 Line::from(Span::styled(app.tr("help.global"), theme::bold(theme::accent()))),
                 Line::from(app.tr("help.global_commands")),
                 Line::from(app.tr("help.global_commands_more")),
                 Line::from(""),
                 Line::from(Span::styled(app.tr("help.current_view"), theme::bold(theme::accent()))),
-                Line::from(crate::tui::input::context_hint(app.view, app.focus, app.language)),
+                Line::from(crate::tui::input::app_context_hint(app)),
                 Line::from(""),
                 Line::from(Span::styled(app.tr("help.close"), Style::new().fg(theme::dim()))),
             ];
+            let at = content.len() - 2;
+            content.splice(
+                at..at,
+                crate::tui::input::editor_help(app.view, app.language)
+                    .into_iter()
+                    .map(Line::from),
+            );
             dialog::draw_dialog(frame, frame.area(), dialog::DialogKind::Info, app.tr("help"), content);
         }
         Overlay::CloseConfirmation => {
