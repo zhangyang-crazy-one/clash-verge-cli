@@ -270,19 +270,11 @@ async fn toggle_tun(app: &mut App, ctx: &Ctx) {
                 // Attached-core reload rejection/uncertainty is always an
                 // operation error. Only a failed owned lifecycle can clear
                 // the running state.
-                let action = tun_apply_error(owns_core, manager.state(), error);
+                let action = super::lifecycle::apply_error(&manager, owns_core, error);
                 let _ = tx.send(action).await;
             }
         }
     });
-}
-
-fn tun_apply_error(owns_core: bool, state: CoreState, error: String) -> Action {
-    if owns_core && matches!(state, CoreState::Stopped | CoreState::Error(_)) {
-        Action::CoreError(error)
-    } else {
-        Action::OperationError(error)
-    }
 }
 
 #[cfg(test)]
@@ -296,8 +288,10 @@ mod tun_error_tests {
             (false, CoreState::Stopped),
             (true, CoreState::Running),
         ] {
+            let manager = crate::mihomo_manager::manager::MihomoManager::new(std::env::temp_dir());
+            *manager.inner().state.lock() = state;
             assert!(matches!(
-                tun_apply_error(owned, state, "reload uncertain".into()),
+                super::super::lifecycle::apply_error(&manager, owned, "reload uncertain".into()),
                 Action::OperationError(_)
             ));
         }
@@ -306,9 +300,11 @@ mod tun_error_tests {
     #[test]
     fn actual_owned_restart_failure_remains_lifecycle_error() {
         for state in [CoreState::Stopped, CoreState::Error("failed to spawn".into())] {
+            let manager = crate::mihomo_manager::manager::MihomoManager::new(std::env::temp_dir());
+            *manager.inner().state.lock() = state;
             assert!(matches!(
-                tun_apply_error(true, state, "restart failed".into()),
-                Action::CoreError(_)
+                super::super::lifecycle::apply_error(&manager, true, "restart failed".into()),
+                Action::CoreGeneration { action, .. } if matches!(*action, Action::CoreError(_))
             ));
         }
     }

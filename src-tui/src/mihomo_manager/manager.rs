@@ -90,11 +90,11 @@ type RestartPreflight = dyn Fn(&Path, bool) -> anyhow::Result<()> + Send + Sync;
 #[cfg(test)]
 type RestartSpawn = dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync;
 #[cfg(test)]
-struct RestartStages {
-    resolve: Box<dyn Fn() -> anyhow::Result<binary::ResolvedMihomo> + Send + Sync>,
-    preflight: Box<RestartPreflight>,
-    stop: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
-    spawn: Box<RestartSpawn>,
+pub(crate) struct RestartStages {
+    pub(crate) resolve: Box<dyn Fn() -> anyhow::Result<binary::ResolvedMihomo> + Send + Sync>,
+    pub(crate) preflight: Box<RestartPreflight>,
+    pub(crate) stop: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    pub(crate) spawn: Box<RestartSpawn>,
 }
 
 /// What a watcher should do when its child exits (task 3.1).
@@ -275,6 +275,15 @@ impl ManagerInner {
                 .await;
         }
     }
+
+    async fn publish_started(&self, version: String, path: &Path, source: &str) {
+        self.send_action(Action::CoreStarted {
+            version: Some(version),
+            binary_path: Some(path.display().to_string()),
+            binary_source: Some(source.to_string()),
+        })
+        .await;
+    }
     pub fn new() -> Self {
         Self {
             state: Mutex::new(CoreState::Stopped),
@@ -302,6 +311,11 @@ impl ManagerInner {
     #[cfg(test)]
     pub(crate) fn set_service_cgroup_for_test(&self, cgroup: &str) {
         *self.service_cgroup.lock() = Some(cgroup.to_string());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_restart_stages_for_test(&self, stages: RestartStages) {
+        *self.restart_stages.lock() = Some(Arc::new(stages));
     }
 
     /// Publish the secret that was just resolved/persisted for this spawn.
@@ -393,12 +407,17 @@ impl ManagerInner {
         inner: Arc<ManagerInner>,
     ) -> anyhow::Result<()> {
         #[cfg(test)]
-        if let Some(stages) = inner.restart_stages.lock().clone() {
-            return (stages.spawn)(
-                config_path
-                    .as_deref()
-                    .context("restart fixture requires a prepared file")?,
-            );
+        {
+            let stages = inner.restart_stages.lock().clone();
+            if let Some(stages) = stages {
+                (stages.spawn)(
+                    config_path
+                        .as_deref()
+                        .context("restart fixture requires a prepared file")?,
+                )?;
+                inner.publish_started(_version.to_string(), resolved_path, source).await;
+                return Ok(());
+            }
         }
         let kind = inner.core_kind();
         Self::spawn_core_as(
@@ -610,13 +629,7 @@ impl ManagerInner {
 
         if publish {
             inner.set_core_kind(kind);
-            inner
-                .send_action(Action::CoreStarted {
-                    version: Some(probed_version),
-                    binary_path: Some(resolved_path.display().to_string()),
-                    binary_source: Some(source.to_string()),
-                })
-                .await;
+            inner.publish_started(probed_version, resolved_path, source).await;
         }
 
         // The desktop proxy follows the core (no-op unless

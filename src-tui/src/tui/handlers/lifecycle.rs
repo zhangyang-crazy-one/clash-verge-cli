@@ -55,6 +55,31 @@ pub(super) fn resume_start(ctx: &Ctx, enable_tun: bool) {
     });
 }
 
+/// Configuration rejection does not itself establish a dead core. Capture
+/// whether this request tracked a core before applying: failed readiness can
+/// clear ownership, while an untracked attachment can have a Stopped manager
+/// despite a healthy external controller.
+pub(super) fn apply_error(
+    manager: &crate::mihomo_manager::manager::MihomoManager,
+    tracked_at_entry: bool,
+    error: String,
+) -> Action {
+    let generation = manager.current_generation();
+    if tracked_at_entry
+        && manager.pid().is_none()
+        && matches!(manager.state(), CoreState::Stopped | CoreState::Error(_))
+    {
+        // Replacement attempts advance generation. Bind the final result to
+        // that generation so a subsequently recovered core rejects it.
+        Action::CoreGeneration {
+            generation,
+            action: Box::new(Action::CoreError(error)),
+        }
+    } else {
+        Action::OperationError(error)
+    }
+}
+
 /// The core is running: either spawned by us (version and binary known) or
 /// an already running controller we attached to.
 pub(super) fn note_started(
@@ -176,7 +201,7 @@ pub(super) fn note_stopped(app: &mut App) {
     app.rules_save_busy = false;
     app.core_state = CoreState::Stopped;
     app.core_pid = None;
-    app.clear_runtime_caches();
+    clear_terminal_snapshots(app);
 }
 
 pub(super) fn note_error(app: &mut App, msg: String) {
@@ -184,7 +209,21 @@ pub(super) fn note_error(app: &mut App, msg: String) {
     app.status_msg = Some(format!("{}: {msg}", app.tr("status.error")));
     app.core_state = CoreState::Error(msg);
     app.core_pid = None;
+    clear_terminal_snapshots(app);
+}
+
+fn clear_terminal_snapshots(app: &mut App) {
     app.clear_runtime_caches();
+    app.proxy_groups.clear();
+    app.expanded_proxy_group = None;
+    app.node_selected_index = 0;
+    app.rules.clear();
+    app.rule_providers.clear();
+    app.rules_loading = false;
+    app.rules_error = None;
+    app.rule_providers_loading = false;
+    app.rule_providers_error = None;
+    // Unsaved rule edits are source drafts, independent of these snapshots.
 }
 
 /// Write the runtime config (with TUN flag) and start the core. Shared by

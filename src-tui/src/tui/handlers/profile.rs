@@ -52,6 +52,7 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
         // Dispatch on the manager's core kind: `switch_profile` is the
@@ -65,7 +66,9 @@ pub(super) fn switch_selected(app: &mut App, ctx: &Ctx) {
                 let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::OperationError(error)).await;
+                let _ = tx
+                    .send(super::lifecycle::apply_error(&manager, tracked_at_entry, error))
+                    .await;
             }
         }
     });
@@ -165,6 +168,7 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     let uid = item.uid.as_deref().unwrap_or_default().to_string();
     ctx.spawn(|tx| async move {
         // Use the same current-UID transaction as a manual switch: definite
@@ -175,7 +179,9 @@ pub(super) async fn note_imported(app: &mut App, ctx: &Ctx) {
                 let _ = tx.send(Action::ProfileSwitched(uid)).await;
             }
             Err(error) => {
-                let _ = tx.send(Action::OperationError(error)).await;
+                let _ = tx
+                    .send(super::lifecycle::apply_error(&manager, tracked_at_entry, error))
+                    .await;
                 return;
             }
         }
@@ -202,6 +208,7 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
     let manager = ctx.manager.clone();
     let enable_tun = app.gui_config.enable_tun_mode.unwrap_or(false);
     let core_running = app.core_state == CoreState::Running;
+    let tracked_at_entry = manager.pid().is_some();
     ctx.spawn(|tx| async move {
         // Use the dispatching wrapper so a sing-box subscription refresh
         // regenerates the JSON config and restarts the core instead of
@@ -215,7 +222,11 @@ pub(super) async fn note_updated(app: &mut App, ctx: &Ctx, uid: String, is_curre
             Ok(()) => {}
             Err(error) => {
                 let _ = tx
-                    .send(Action::OperationError(format!("profile reload: {error}")))
+                    .send(super::lifecycle::apply_error(
+                        &manager,
+                        tracked_at_entry,
+                        format!("profile reload: {error}"),
+                    ))
                     .await;
             }
         }

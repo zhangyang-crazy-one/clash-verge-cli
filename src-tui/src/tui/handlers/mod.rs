@@ -27,6 +27,9 @@ mod unlock;
 #[cfg(test)]
 mod issue86_tests;
 
+#[cfg(test)]
+mod issue88_tests;
+
 use std::future::Future;
 use std::sync::Arc;
 
