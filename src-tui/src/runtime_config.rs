@@ -10,6 +10,39 @@ use tokio::sync::Mutex;
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Result of applying a complete effective configuration. Refresh callers use
+/// this to avoid recovery/selection writes when the running config is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyOutcome {
+    Applied,
+    Unchanged,
+}
+
+/// Compare parsed configuration, preserving array order and every unknown
+/// field while ignoring formatting and mapping key order. An unreadable old
+/// document is never evidence that the candidate is already running.
+fn effective_config_unchanged(
+    kind: crate::mihomo_manager::CoreKind,
+    previous: Option<&[u8]>,
+    candidate: &[u8],
+) -> Result<bool, String> {
+    match kind {
+        crate::mihomo_manager::CoreKind::SingBox => {
+            let new: serde_json::Value = serde_json::from_slice(candidate).map_err(|error| error.to_string())?;
+            Ok(previous
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                .is_some_and(|old| old == new))
+        }
+        crate::mihomo_manager::CoreKind::Mihomo => {
+            let new: serde_yaml_ng::Mapping =
+                serde_yaml_ng::from_slice(candidate).map_err(|error| error.to_string())?;
+            Ok(previous
+                .and_then(|bytes| serde_yaml_ng::from_slice::<serde_yaml_ng::Mapping>(bytes).ok())
+                .is_some_and(|old| old == new))
+        }
+    }
+}
+
 /// How a committed config reaches the running core (task 3.4): reload the
 /// running mihomo core from a config file via `PUT /configs`, or restart
 /// the process for a core where hot reload is a no-op. Consumed as call
@@ -159,6 +192,17 @@ pub async fn apply_singbox_restart_for_profile(
     enable_tun: bool,
     profile_uid: Option<&str>,
 ) -> Result<String, String> {
+    apply_singbox_profile_with_outcome(manager, config_yaml, enable_tun, profile_uid)
+        .await
+        .map(|(_, report)| report)
+}
+
+pub(crate) async fn apply_singbox_profile_with_outcome(
+    manager: &crate::mihomo_manager::MihomoManager,
+    config_yaml: Option<&str>,
+    enable_tun: bool,
+    profile_uid: Option<&str>,
+) -> Result<(ApplyOutcome, String), String> {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     // Captured at entry and used for the whole transaction: a failed restart
     // clears the manager's pid, so conditioning the rollback restart on the
@@ -247,6 +291,17 @@ pub async fn apply_singbox_restart_for_profile(
         }
     };
 
+    let candidate_bytes = tokio::fs::read(&candidate).await.map_err(|error| error.to_string())?;
+    if effective_config_unchanged(
+        crate::mihomo_manager::CoreKind::SingBox,
+        transaction.previous.as_deref(),
+        &candidate_bytes,
+    )? {
+        persist_dns_override_state(dns_state.as_ref()).await;
+        tracing::info!(target: "config", "sing-box effective configuration unchanged, not restarted");
+        return Ok((ApplyOutcome::Unchanged, "sing-box: unchanged, not restarted".into()));
+    }
+
     let binary = match manager.binary_path() {
         Some(binary) => binary,
         None => {
@@ -273,17 +328,20 @@ pub async fn apply_singbox_restart_for_profile(
         transaction.commit();
         persist_dns_override_state(dns_state.as_ref()).await;
         record_singbox_degradation(&parts).await;
-        return Ok(if parts.profile_used {
-            format!(
-                "sing-box: {} nodes, {} skipped, {} fields degraded, {} notes (saved; core stopped)",
-                parts.conversion.outbounds.len(),
-                parts.conversion.skipped.len(),
-                parts.conversion.degraded.len(),
-                parts.conversion.notes.len()
-            )
-        } else {
-            "sing-box: skeleton config saved (core stopped)".into()
-        });
+        return Ok((
+            ApplyOutcome::Applied,
+            if parts.profile_used {
+                format!(
+                    "sing-box: {} nodes, {} skipped, {} fields degraded, {} notes (saved; core stopped)",
+                    parts.conversion.outbounds.len(),
+                    parts.conversion.skipped.len(),
+                    parts.conversion.degraded.len(),
+                    parts.conversion.notes.len()
+                )
+            } else {
+                "sing-box: skeleton config saved (core stopped)".into()
+            },
+        ));
     }
 
     if let Err(restart_error) = restart(SupervisorLaunch::UseExistingConfig).await {
@@ -337,7 +395,7 @@ pub async fn apply_singbox_restart_for_profile(
     for note in parts.conversion.notes.iter().chain(parts.conversion.skipped.iter()) {
         tracing::info!(target: "config", "sing-box conversion: {note}");
     }
-    Ok(report)
+    Ok((ApplyOutcome::Applied, report))
 }
 
 /// One bucket of what a Clash → sing-box conversion lost. The TUI notice
@@ -489,7 +547,7 @@ impl RuntimeCandidate {
     }
     fn install(&mut self) -> Result<(), String> {
         std::fs::rename(&self.candidate, &self.formal)
-            .map_err(|error| format!("failed to atomically install validated sing-box config: {error}"))?;
+            .map_err(|error| format!("failed to atomically install runtime config: {error}"))?;
         self.installed = true;
         Ok(())
     }
@@ -867,15 +925,26 @@ pub async fn reload_remote_profile(
     enable_tun: bool,
     core_running: bool,
 ) -> Result<(), String> {
+    reload_remote_profile_with_outcome(api, item, enable_tun, core_running)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn reload_remote_profile_with_outcome(
+    api: &crate::mihomo_api::MihomoApi,
+    item: &clash_verge_core::config::PrfItem,
+    enable_tun: bool,
+    core_running: bool,
+) -> Result<ApplyOutcome, String> {
     let profile = load_remote_profile_with_rules(item).await?;
 
     // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
-    commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
+    commit_runtime_config_with_outcome(api, enable_tun, core_running, Some(item), |app_config| {
         let control_plane = crate::enhance::snapshot_control_plane(&app_config);
         Ok(crate::enhance::enforce_control_plane(profile, control_plane))
     })
-    .await?;
-    Ok(())
+    .await
+    .map(|(_, outcome)| outcome)
 }
 
 /// Restore the user's saved node selection into the running core after a reload.
@@ -919,6 +988,21 @@ pub async fn commit_runtime_config<F>(
 where
     F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
 {
+    commit_runtime_config_with_outcome(api, enable_tun, core_running, restore_item, build)
+        .await
+        .map(|(path, _)| path)
+}
+
+async fn commit_runtime_config_with_outcome<F>(
+    api: &crate::mihomo_api::MihomoApi,
+    enable_tun: bool,
+    core_running: bool,
+    restore_item: Option<&clash_verge_core::config::PrfItem>,
+    build: F,
+) -> Result<(std::path::PathBuf, ApplyOutcome), String>
+where
+    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
+{
     let _guard = RUNTIME_CONFIG_IO.lock().await;
     let app_config = clash_verge_core::config::IClashTemp::new().await.0;
     let config = build(app_config)?;
@@ -936,14 +1020,24 @@ where
     };
     let mut transaction = RuntimeCandidate::new(path.clone(), private_candidate_path(&path), previous);
 
-    write_runtime_config_unlocked(config, enable_tun).await?;
-    transaction.installed = true;
+    let yaml = prepare_mihomo_runtime_yaml(config, enable_tun).await?;
+    if effective_config_unchanged(
+        crate::mihomo_manager::CoreKind::Mihomo,
+        transaction.previous.as_deref(),
+        yaml.as_bytes(),
+    )? {
+        persist_dns_override_state(dns_state.as_ref()).await;
+        tracing::info!(target: "config", "mihomo effective configuration unchanged, not reloaded");
+        return Ok((path, ApplyOutcome::Unchanged));
+    }
+    write_private_runtime_yaml(&transaction.candidate, &yaml)?;
+    transaction.install()?;
     if !core_running {
         // Keep the newly selected runtime config for the next Start; do not API-reload
         // (or roll it back) while no controller is available.
         transaction.commit();
         persist_dns_override_state(dns_state.as_ref()).await;
-        return Ok(path);
+        return Ok((path, ApplyOutcome::Applied));
     }
     if let Err(error) = reload_config_file(api, &path).await {
         transaction
@@ -960,13 +1054,10 @@ where
     }
     transaction.commit();
     persist_dns_override_state(dns_state.as_ref()).await;
-    Ok(path)
+    Ok((path, ApplyOutcome::Applied))
 }
 
-pub async fn write_runtime_config_unlocked(
-    mut config: serde_yaml_ng::Mapping,
-    enable_tun: bool,
-) -> Result<std::path::PathBuf, String> {
+async fn prepare_mihomo_runtime_yaml(mut config: serde_yaml_ng::Mapping, enable_tun: bool) -> Result<String, String> {
     // Honour the CLI's own verge.yaml port settings before the control plane
     // is snapshotted, so a port chosen to avoid the Clash Verge GUI sticks.
     crate::enhance::apply_verge_ports(&mut config).await;
@@ -974,8 +1065,10 @@ pub async fn write_runtime_config_unlocked(
         .await
         .map_err(|error| error.to_string())?;
     config = crate::enhance::prepare_runtime_config(config, enable_tun);
-    let yaml = serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())?;
-    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    serde_yaml_ng::to_string(&config).map_err(|error| error.to_string())
+}
+
+fn write_private_runtime_yaml(path: &std::path::Path, yaml: &str) -> Result<(), String> {
     use std::io::Write as _;
     let parent = path.parent().ok_or("runtime config has no parent")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -983,8 +1076,18 @@ pub async fn write_runtime_config_unlocked(
     staged.write_all(yaml.as_bytes()).map_err(|error| error.to_string())?;
     staged.as_file().sync_all().map_err(|error| error.to_string())?;
     staged
-        .persist(&path)
+        .persist(path)
         .map_err(|error| format!("failed to replace {}: {error}", path.display()))?;
+    Ok(())
+}
+
+pub async fn write_runtime_config_unlocked(
+    config: serde_yaml_ng::Mapping,
+    enable_tun: bool,
+) -> Result<std::path::PathBuf, String> {
+    let yaml = prepare_mihomo_runtime_yaml(config, enable_tun).await?;
+    let path = clash_verge_core::utils::dirs::clash_path().map_err(|error| error.to_string())?;
+    write_private_runtime_yaml(&path, &yaml)?;
     Ok(path)
 }
 
@@ -1000,6 +1103,323 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn effective_equality_ignores_json_yaml_format_and_key_order_but_keeps_unknown_fields_and_array_order() {
+        use crate::mihomo_manager::CoreKind;
+        for (kind, previous, same, changed) in [
+            (
+                CoreKind::SingBox,
+                r#"{"dns":{"servers":[1,2]},"future":{"x":true}}"#,
+                "{\n\"future\": {\"x\":true}, \"dns\":{\"servers\":[1,2]}}",
+                r#"{"future":{"x":true},"dns":{"servers":[2,1]}}"#,
+            ),
+            (
+                CoreKind::Mihomo,
+                "dns: {servers: [1, 2]}\nfuture: {x: true}\n",
+                "# reordered\nfuture:\n  x: true\ndns:\n  servers: [1, 2]\n",
+                "dns: {servers: [2, 1]}\nfuture: {x: true}\n",
+            ),
+        ] {
+            assert!(effective_config_unchanged(kind, Some(previous.as_bytes()), same.as_bytes()).unwrap());
+            assert!(!effective_config_unchanged(kind, Some(previous.as_bytes()), changed.as_bytes()).unwrap());
+            assert!(!effective_config_unchanged(kind, None, same.as_bytes()).unwrap());
+            assert!(!effective_config_unchanged(kind, Some(b"invalid["), same.as_bytes()).unwrap());
+            assert!(!effective_config_unchanged(kind, Some(previous.as_bytes()), b"{}").unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn same_subscription_applies_chain_overlay_dns_and_app_control_changes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        async fn singbox_effective(item: &PrfItem, home: &std::path::Path) -> Vec<u8> {
+            let profile = load_remote_profile_with_rules(item).await.unwrap();
+            let (profile, _) = crate::services::profile::prepare_profile_dns_from_settings("base", profile)
+                .await
+                .unwrap();
+            let yaml = serde_yaml_ng::to_string(&profile).unwrap();
+            let destination = home.join("assembled.json");
+            crate::mihomo_manager::ManagerInner::write_singbox_assembled_to(home, Some(&yaml), false, &destination)
+                .await
+                .unwrap();
+            std::fs::read(destination).unwrap()
+        }
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let profiles = home.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nsecret: fixture\ntun: {enable: false}\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+        std::fs::write(home.path().join("profiles.yaml"), "current: base\nitems:\n  - {uid: base, type: remote, file: base.yaml, option: {merge: custom}}\n  - {uid: custom, type: merge, file: custom.yaml}\n").unwrap();
+        let subscription = "proxies: []\ndns: {enable: true, nameserver: [1.1.1.1], proxy-server-nameserver: [1.1.1.1]}\nrules:\n  - DOMAIN,first.example,DIRECT\n  - MATCH,DIRECT\n";
+        std::fs::write(profiles.join("base.yaml"), subscription).unwrap();
+        std::fs::write(profiles.join("custom.yaml"), "{}").unwrap();
+        let item = PrfItem {
+            uid: Some("base".into()),
+            itype: Some("remote".into()),
+            file: Some("base.yaml".into()),
+            option: Some(PrfOption {
+                merge: Some("custom".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = crate::mihomo_api::MihomoApi::with_transport(
+            crate::mihomo_api::Transport::Tcp(listener.local_addr().unwrap()),
+            "fixture",
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                let count = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..count]);
+                let (status, body) = if request.starts_with("PUT /configs?") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    ("204 No Content", "")
+                } else {
+                    ("200 OK", r#"{"version":"v1.19.32"}"#)
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, false)
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Unchanged
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        let mut previous_json = singbox_effective(&item, home.path()).await;
+        assert!(
+            effective_config_unchanged(
+                crate::mihomo_manager::CoreKind::SingBox,
+                Some(&previous_json),
+                &singbox_effective(&item, home.path()).await
+            )
+            .unwrap()
+        );
+
+        std::fs::write(
+            profiles.join("custom.yaml"),
+            "rules:\n  - DOMAIN,first.example,DIRECT\n  - DOMAIN,chain.example,DIRECT\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+        let changed_json = singbox_effective(&item, home.path()).await;
+        assert!(
+            !effective_config_unchanged(
+                crate::mihomo_manager::CoreKind::SingBox,
+                Some(&previous_json),
+                &changed_json
+            )
+            .unwrap()
+        );
+        previous_json = changed_json;
+
+        std::fs::write(
+            crate::rule_overlay::path(&profiles, &item).unwrap(),
+            r#"version: 1
+source: ["DOMAIN,first.example,DIRECT", "MATCH,DIRECT"]
+entries:
+  - {kind: source, value: 0}
+  - {kind: added, value: "DOMAIN,overlay.example,REJECT"}
+  - {kind: source, value: 1}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let changed_json = singbox_effective(&item, home.path()).await;
+        assert!(
+            !effective_config_unchanged(
+                crate::mihomo_manager::CoreKind::SingBox,
+                Some(&previous_json),
+                &changed_json
+            )
+            .unwrap()
+        );
+        previous_json = changed_json;
+
+        let composed = load_remote_profile_with_rules(&item).await.unwrap();
+        let source = clash_verge_core::config::dns_override_source("base", &composed)
+            .unwrap()
+            .unwrap();
+        let mut verge = clash_verge_core::config::IVerge::new().await;
+        verge.profile_dns_settings.entry("base".into()).or_default().enabled = true;
+        verge.profile_dns_settings.get_mut("base").unwrap().confirmation = Some(source);
+        verge.save_file().await.unwrap();
+        std::fs::write(
+            home.path().join("dns_config.yaml"),
+            "enable: true\nnameserver: [9.9.9.9]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+
+        let changed_json = singbox_effective(&item, home.path()).await;
+        assert!(
+            !effective_config_unchanged(
+                crate::mihomo_manager::CoreKind::SingBox,
+                Some(&previous_json),
+                &changed_json
+            )
+            .unwrap()
+        );
+        previous_json = changed_json;
+
+        verge.verge_mixed_port = Some(35124);
+        verge.save_file().await.unwrap();
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Applied
+        );
+        let changed_json = singbox_effective(&item, home.path()).await;
+        assert!(
+            !effective_config_unchanged(
+                crate::mihomo_manager::CoreKind::SingBox,
+                Some(&previous_json),
+                &changed_json
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            reload_remote_profile_with_outcome(&api, &item, false, true)
+                .await
+                .unwrap(),
+            ApplyOutcome::Unchanged
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            std::fs::read_to_string(profiles.join("base.yaml")).unwrap(),
+            subscription
+        );
+        assert!(
+            !std::fs::read_dir(home.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("candidate"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unchanged_singbox_native_json_preserves_formal_and_removes_candidate_without_validation() {
+        use crate::mihomo_manager::{CoreKind, MihomoManager};
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "mixed-port: 35123\nsecret: fixture\nexternal-controller: 127.0.0.1:39997\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+        let formal = home.path().join("singbox.json");
+        let native =
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"},"log":{"level":"warn"}}"#;
+        crate::mihomo_manager::ManagerInner::write_singbox_assembled_to(home.path(), Some(native), false, &formal)
+            .await
+            .unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&std::fs::read(&formal).unwrap()).unwrap();
+        let original = serde_json::to_string_pretty(&json).unwrap();
+        std::fs::write(&formal, &original).unwrap();
+        // A nonexistent validator proves the no-change branch returns before
+        // resolving/spawning any process; the stopped-core policy is unchanged.
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_core_kind(CoreKind::SingBox);
+        *manager.inner().resolved_binary.lock() = Some(home.path().join("nonexistent-validator"));
+        let reformatted =
+            serde_json::to_string_pretty(&serde_json::from_str::<serde_json::Value>(native).unwrap()).unwrap();
+        let (outcome, report) = apply_singbox_profile_with_outcome(&manager, Some(&reformatted), false, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Unchanged);
+        assert!(report.contains("unchanged, not restarted"));
+        assert_eq!(std::fs::read_to_string(&formal).unwrap(), original);
+        assert!(
+            !std::fs::read_dir(home.path()).unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("candidate"))
+        );
+        json["route"]["auto_detect_interface"] = serde_json::json!(true);
+        let changed = serde_json::to_string(&json).unwrap();
+        assert!(
+            apply_singbox_profile_with_outcome(&manager, Some(&changed), false, None)
+                .await
+                .unwrap_err()
+                .contains("failed to run")
+        );
+        assert_eq!(std::fs::read_to_string(&formal).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn unchanged_mihomo_refresh_preserves_file_and_sends_no_controller_request() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(home.path().join("verge.yaml"), "verge_mixed_port: 35123\n").unwrap();
+        let mut config = clash_verge_core::config::IClashTemp::template().0;
+        config.insert("mixed-port".into(), 35123.into());
+        config.insert("secret".into(), "fixture".into());
+        let path = write_runtime_config(config, false).await.unwrap();
+        // Comments and mapping order have no effect on the effective config.
+        let previous = format!("# keep these exact bytes\n{}", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &previous).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = crate::mihomo_api::MihomoApi::with_transport(
+            crate::mihomo_api::Transport::Tcp(listener.local_addr().unwrap()),
+            "fixture",
+        )
+        .unwrap();
+        let apply = tokio::spawn(async move { commit_runtime_config(&api, false, true, None, Ok).await });
+        let request = tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept()).await;
+        if request.is_ok() {
+            apply.abort();
+            panic!("unchanged refresh sent a controller request");
+        }
+        apply.await.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), previous);
+    }
 
     #[tokio::test]
     async fn mihomo_validation_timeout_does_not_hang_a_restart() {

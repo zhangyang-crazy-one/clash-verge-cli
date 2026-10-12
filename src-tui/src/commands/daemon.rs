@@ -143,8 +143,11 @@ async fn run_with_prepared(
                         if is_current {
                             let lifecycle = ManagerLifecycle::new(&manager);
                             match reload_with_lifecycle(&lifecycle, &uid, enable_tun).await {
-                                Ok(()) => {
+                                Ok(crate::runtime_config::ApplyOutcome::Applied) => {
                                     tracing::info!(target: "auto_update", "reloaded current profile {uid}")
+                                }
+                                Ok(crate::runtime_config::ApplyOutcome::Unchanged) => {
+                                    tracing::info!(target: "auto_update", "current profile {uid} unchanged, not reloaded/restarted")
                                 }
                                 Err(error) => {
                                     tracing::error!(target: "auto_update", "reload {uid} failed: {error}")

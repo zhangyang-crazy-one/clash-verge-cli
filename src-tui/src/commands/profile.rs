@@ -272,10 +272,15 @@ async fn reload_if_requested(manager: &MihomoManager, uid: &str, reload: bool) -
         .await
         .enable_tun_mode
         .unwrap_or(false);
-    crate::subscribe::scheduler::reload_current_profile_for_core(manager, uid, enable_tun, true)
+    let outcome = crate::subscribe::scheduler::reload_current_profile_for_manager(manager, uid, enable_tun, true)
         .await
         .map_err(|error| anyhow::anyhow!("profile reload: {error}"))?;
-    println!("reloaded the running core with {uid}");
+    match outcome {
+        crate::runtime_config::ApplyOutcome::Applied => println!("reloaded the running core with {uid}"),
+        crate::runtime_config::ApplyOutcome::Unchanged => {
+            println!("current profile {uid} unchanged, not reloaded/restarted")
+        }
+    }
     Ok(())
 }
 

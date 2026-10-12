@@ -365,7 +365,7 @@ impl AutoUpdateScheduler {
             Ok((updated, _failed)) if !updated.is_empty() => {
                 if refreshed_config_has_node(uid, node).await {
                     match super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await {
-                        Ok(()) => {
+                        Ok(_) => {
                             let verdict =
                                 classify_delay(&lifecycle.delay_test(node, PROBE_TEST_URL, PROBE_TIMEOUT_MS).await);
                             ProbeOutcome {
@@ -507,14 +507,14 @@ pub async fn reload_current_profile(
     uid: &str,
     enable_tun: bool,
     core_running: bool,
-) -> Result<(), String> {
+) -> Result<crate::runtime_config::ApplyOutcome, String> {
     let store = ProfileStore::snapshot().await.map_err(|error| error.to_string())?;
     let item = store
         .items()
         .into_iter()
         .find(|item| item.uid.as_deref() == Some(uid))
         .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
-    crate::runtime_config::reload_remote_profile(api, &item, enable_tun, core_running).await
+    crate::runtime_config::reload_remote_profile_with_outcome(api, &item, enable_tun, core_running).await
 }
 
 /// Reload the running core from a freshly refreshed current profile,
@@ -533,7 +533,9 @@ pub async fn reload_current_profile_for_core(
     enable_tun: bool,
     core_running: bool,
 ) -> Result<(), String> {
-    reload_current_profile_for_manager(manager, uid, enable_tun, core_running).await
+    reload_current_profile_for_manager(manager, uid, enable_tun, core_running)
+        .await
+        .map(|_| ())
 }
 
 pub(crate) async fn reload_current_profile_for_manager(
@@ -541,11 +543,11 @@ pub(crate) async fn reload_current_profile_for_manager(
     uid: &str,
     enable_tun: bool,
     core_running: bool,
-) -> Result<(), String> {
+) -> Result<crate::runtime_config::ApplyOutcome, String> {
     if !core_running {
         // A successful subscription update may be persisted while the core is
         // stopped, but applying it must not implicitly start that core.
-        return Ok(());
+        return Ok(crate::runtime_config::ApplyOutcome::Unchanged);
     }
     match decide_refresh_path(manager.core_kind()) {
         RefreshPath::HotReload => reload_current_profile(&manager.api(), uid, enable_tun, core_running).await,
@@ -560,14 +562,14 @@ pub(crate) async fn reload_current_profile_for_manager(
                 .find(|item| item.uid.as_deref() == Some(uid))
                 .ok_or_else(|| format!("profile {uid} not found after refresh"))?;
             let yaml = read_profile_yaml(&item).await?;
-            crate::runtime_config::apply_singbox_restart_for_profile(
+            crate::runtime_config::apply_singbox_profile_with_outcome(
                 manager,
                 Some(yaml.as_str()),
                 enable_tun,
                 Some(uid),
             )
             .await
-            .map(|_report| ())
+            .map(|(outcome, _report)| outcome)
         }
     }
 }

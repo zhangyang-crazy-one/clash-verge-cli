@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::ProxyDelay;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
+use crate::runtime_config::ApplyOutcome;
 
 #[async_trait]
 pub(crate) trait CoreLifecycle: Send + Sync {
@@ -16,7 +17,7 @@ pub(crate) trait CoreLifecycle: Send + Sync {
     fn owns_core(&self) -> bool;
     async fn current_exit_node(&self, items: &[clash_verge_core::config::PrfItem], uid: &str) -> Option<String>;
     async fn delay_test(&self, node: &str, url: &str, timeout_ms: u64) -> Result<ProxyDelay, MihomoError>;
-    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<(), String>;
+    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, String>;
     async fn reapply_selected(&self, node: &str) -> Result<(), String>;
 }
 
@@ -47,10 +48,10 @@ pub(crate) async fn reload_with_lifecycle<C: CoreLifecycle>(
     lifecycle: &C,
     uid: &str,
     enable_tun: bool,
-) -> Result<(), String> {
+) -> Result<ApplyOutcome, String> {
     validate_apply_target(lifecycle.core_kind(), lifecycle.is_running(), lifecycle.owns_core())?;
     if !lifecycle.is_running() {
-        return Ok(());
+        return Ok(ApplyOutcome::Unchanged);
     }
     lifecycle.reload_profile(uid, enable_tun).await
 }
@@ -61,12 +62,12 @@ pub(crate) async fn reload_selected_with_lifecycle<C: CoreLifecycle>(
     uid: &str,
     node: &str,
     tun: bool,
-) -> Result<(), String> {
-    reload_with_lifecycle(lifecycle, uid, tun).await?;
-    if lifecycle.is_running() {
+) -> Result<ApplyOutcome, String> {
+    let outcome = reload_with_lifecycle(lifecycle, uid, tun).await?;
+    if outcome == ApplyOutcome::Applied && lifecycle.is_running() {
         lifecycle.reapply_selected(node).await?;
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Follow real selectors; sing-box's synthetic GLOBAL fallback is never written.
@@ -164,7 +165,7 @@ impl CoreLifecycle for ManagerLifecycle<'_> {
         Some(node)
     }
 
-    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<(), String> {
+    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, String> {
         super::scheduler::reload_current_profile_for_manager(self.manager, uid, enable_tun, true).await
     }
 
@@ -223,6 +224,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         fail_reload: bool,
         fail_reapply: bool,
+        unchanged: bool,
     }
 
     #[async_trait]
@@ -242,13 +244,17 @@ mod tests {
         async fn delay_test(&self, _node: &str, _url: &str, _timeout_ms: u64) -> Result<ProxyDelay, MihomoError> {
             Ok(ProxyDelay { delay: 1 })
         }
-        async fn reload_profile(&self, uid: &str, _enable_tun: bool) -> Result<(), String> {
+        async fn reload_profile(&self, uid: &str, _enable_tun: bool) -> Result<ApplyOutcome, String> {
             self.events.lock().unwrap().push("reload");
             if self.fail_reload {
                 return Err("readiness failed".into());
             }
             self.reloads.lock().unwrap().push(uid.into());
-            Ok(())
+            Ok(if self.unchanged {
+                ApplyOutcome::Unchanged
+            } else {
+                ApplyOutcome::Applied
+            })
         }
         async fn reapply_selected(&self, _node: &str) -> Result<(), String> {
             self.events.lock().unwrap().push("reapply");
@@ -291,6 +297,7 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_reload: false,
                 fail_reapply: false,
+                unchanged: false,
             };
             reload_with_lifecycle(&fake, "profile-a", false)
                 .await
@@ -305,6 +312,7 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_reload: false,
                 fail_reapply: false,
+                unchanged: false,
             };
             reload_with_lifecycle(&stopped, "profile-b", false)
                 .await
@@ -324,6 +332,7 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             fail_reload: false,
             fail_reapply: false,
+            unchanged: false,
         };
         let error = reload_with_lifecycle(&fake, "profile-a", false)
             .await
@@ -343,6 +352,7 @@ mod tests {
             events: events.clone(),
             fail_reload: false,
             fail_reapply: false,
+            unchanged: false,
         };
         reload_selected_with_lifecycle(&fake, "profile-a", "JP-1", false)
             .await
@@ -357,6 +367,7 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             fail_reload: true,
             fail_reapply: false,
+            unchanged: false,
         };
         assert!(
             reload_selected_with_lifecycle(&failed_reload, "profile-a", "JP-1", false)
@@ -373,6 +384,7 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             fail_reload: false,
             fail_reapply: true,
+            unchanged: false,
         };
         assert!(
             reload_selected_with_lifecycle(&failed_selection, "profile-a", "JP-1", false)
@@ -380,6 +392,30 @@ mod tests {
                 .is_err()
         );
         assert_eq!(*failed_selection.events.lock().unwrap(), vec!["reload", "reapply"]);
+    }
+
+    #[tokio::test]
+    async fn unchanged_forced_refresh_skips_selector_writes_for_both_cores() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let fake = FakeLifecycle {
+                kind,
+                running: true,
+                owns: true,
+                reloads: Arc::new(Mutex::new(Vec::new())),
+                events: events.clone(),
+                fail_reload: false,
+                fail_reapply: true,
+                unchanged: true,
+            };
+            assert_eq!(
+                reload_selected_with_lifecycle(&fake, "profile-a", "JP-1", false)
+                    .await
+                    .unwrap(),
+                ApplyOutcome::Unchanged,
+            );
+            assert_eq!(*events.lock().unwrap(), vec!["reload"]);
+        }
     }
 
     #[tokio::test]
@@ -394,6 +430,7 @@ mod tests {
                 events: events.clone(),
                 fail_reload: true,
                 fail_reapply: true,
+                unchanged: false,
             };
             reload_selected_with_lifecycle(&fake, "profile-a", "JP-1", false)
                 .await
@@ -409,6 +446,7 @@ mod tests {
             events: events.clone(),
             fail_reload: false,
             fail_reapply: false,
+            unchanged: false,
         };
         assert!(
             reload_selected_with_lifecycle(&fake, "profile-a", "JP-1", false)
