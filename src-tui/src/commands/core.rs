@@ -4,8 +4,9 @@
 //! it while a core was running left `stop`/`restart` unable to find the
 //! running core. This command performs the switch as a transaction:
 //!
-//! - while a core is running: it is stopped through its pid record first,
-//!   then the selection is committed and the selected core is started;
+//! - while a core is running: resolve/check the replacement first, launch it
+//!   under a detached supervisor, migrate selectors and commit; failure rolls
+//!   back the runtime files, selection and predecessor service;
 //! - while stopped: the selection is committed through the same
 //!   stopped-state transaction the TUI's guided switch uses (verge.yaml
 //!   `proxy_core` plus the sing-box ownership marker), with a last-moment
@@ -70,38 +71,54 @@ pub async fn show(config_dir: PathBuf, json: bool) -> anyhow::Result<()> {
 
 /// `clash-verge-cli core use <mihomo|singbox>`.
 pub async fn use_core(config_dir: PathBuf, target: CoreKind) -> anyhow::Result<()> {
-    let manager = super::build_manager(config_dir.clone()).await?;
+    let manager = super::build_manager(config_dir).await?;
+    use_core_with_preparation(&manager, target, || async {
+        use crate::mihomo_manager::binary::{self, CoreInspection, DownloadAuthorization};
+        match binary::inspect(target).await {
+            CoreInspection::Ready(prepared) => Ok(prepared),
+            CoreInspection::NeedsUpdate(_) => {
+                binary::acquire(target, DownloadAuthorization::confirmed(target, 0), None).await
+            }
+            CoreInspection::Review(diagnostic) => anyhow::bail!("{diagnostic}"),
+        }
+    })
+    .await
+}
+
+/// Production resolution and injected failures use this exact command order.
+async fn use_core_with_preparation<F>(
+    manager: &crate::mihomo_manager::MihomoManager,
+    target: CoreKind,
+    prepare: impl FnOnce() -> F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = anyhow::Result<crate::mihomo_manager::binary::PreparedCore>>,
+{
     let running_kind = manager.core_kind();
     let was_running = manager.pid().is_some();
-    let mut prepared_start = None;
-
     if was_running {
         if running_kind == target {
             println!("{} is already the running core", target.as_str());
             return Ok(());
         }
-        let fresh = super::build_manager_for_kind(config_dir.clone(), target).await?;
-        let mode = fresh
-            .prepare_mihomo_launch(super::start::SupervisorLaunch::Regenerate)
-            .await?;
-        prepared_start = Some((fresh, mode));
+        // Authorize before downloads, without weakening the TUI's attached
+        // core policy or taking a systemd/GUI-owned core away from its owner.
+        manager.capture_core_switch_authorization()?;
+        let prepared = prepare().await?;
+        let enable_tun = crate::mihomo_manager::manager::runtime_tun_enabled().await?;
+        manager.apply_prepared_cli_core(&prepared, enable_tun).await?;
         println!(
-            "stopping {} before switching to {}",
-            running_kind.as_str(),
+            "selected core: {} (running under a detached supervisor)",
             target.as_str()
         );
-        manager.stop().await?;
+        return Ok(());
     }
     // Commits `proxy_core` (and the sing-box ownership marker) after the
     // read-only stopped-state preflight, rolling back on failure.
     manager.select_core_while_stopped(target)?;
     println!("selected core: {}", target.as_str());
-    if !was_running {
-        println!("core is not running; the new core starts with `clash-verge-cli start`");
-        return Ok(());
-    }
-    let (fresh, mode) = prepared_start.ok_or_else(|| anyhow::anyhow!("core switch has no prepared replacement"))?;
-    super::start::run_with_mode(fresh, mode).await
+    println!("core is not running; the new core starts with `clash-verge-cli start`");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -109,6 +126,48 @@ pub async fn use_core(config_dir: PathBuf, target: CoreKind) -> anyhow::Result<(
 mod tests {
     use super::*;
     use crate::mihomo_manager::manager::MihomoManager;
+
+    #[tokio::test]
+    async fn cli_core_missing_target_and_acquire_failure_preserve_the_running_predecessor() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (home, manager) = manager(CoreKind::SingBox);
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let original = [
+            ("verge.yaml", b"proxy_core: singbox\nfuture: unchanged\n".as_slice()),
+            ("config.yaml", b"secret: private-fixture\n".as_slice()),
+            ("singbox.json", b"{\"previous\":true}".as_slice()),
+            (
+                "core-owner.json",
+                b"{\"owner\":\"tui\",\"core\":\"singbox\",\"pid\":1}".as_slice(),
+            ),
+        ];
+        for (name, bytes) in &original {
+            std::fs::write(home.path().join(name), bytes).unwrap();
+        }
+        let mut predecessor = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        *manager.inner().pid.lock() = Some(predecessor.id());
+        *manager.inner().state.lock() = crate::app::CoreState::Running;
+        manager.inner().owns_child.store(true, Ordering::SeqCst);
+        let preparations = AtomicUsize::new(0);
+        let error = use_core_with_preparation(&manager, CoreKind::Mihomo, || async {
+            preparations.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("target binary missing; injected acquisition failed: HTTP 403");
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("HTTP 403"));
+        assert_eq!(preparations.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.pid(), Some(predecessor.id()));
+        assert_eq!(manager.core_kind(), CoreKind::SingBox);
+        assert_eq!(manager.state(), crate::app::CoreState::Running);
+        assert!(predecessor.try_wait().unwrap().is_none());
+        for (name, bytes) in &original {
+            assert_eq!(std::fs::read(home.path().join(name)).unwrap(), *bytes);
+        }
+        assert!(!home.path().join("logs/daemon.log").exists());
+        predecessor.kill().unwrap();
+        predecessor.wait().unwrap();
+    }
 
     fn manager(kind: CoreKind) -> (tempfile::TempDir, MihomoManager) {
         let home = tempfile::tempdir().expect("tempdir");

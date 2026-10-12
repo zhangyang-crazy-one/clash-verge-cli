@@ -412,7 +412,7 @@ impl ManagerInner {
         // config.yaml does not exist yet; composing it here is what makes
         // `start` work out of the box instead of failing with a bare
         // ENOENT from `controller_secret_from_config`.
-        let secret = if kind == CoreKind::Mihomo && prepared_config {
+        let secret = if prepared_config {
             // A prepared/recovery launch must consume exactly the artifact
             // its caller installed, including its original credentials.
             controller_secret_from_config(config_path.as_deref())?
@@ -833,6 +833,16 @@ the previous configuration could not be recovered",
         enable_tun: bool,
         destination: &Path,
     ) -> anyhow::Result<(PathBuf, SingboxParts)> {
+        Self::write_singbox_assembled_with_secret(config_dir, yaml, enable_tun, destination, None).await
+    }
+
+    async fn write_singbox_assembled_with_secret(
+        config_dir: &Path,
+        yaml: Option<&str>,
+        enable_tun: bool,
+        destination: &Path,
+        candidate_secret: Option<String>,
+    ) -> anyhow::Result<(PathBuf, SingboxParts)> {
         let _ = config_dir;
         crate::singbox::capabilities::for_version(crate::mihomo_manager::core_policy::SINGBOX_POLICY_VERSION)
             .ok_or_else(|| anyhow::anyhow!("missing pinned sing-box configuration capability matrix"))?;
@@ -847,9 +857,12 @@ the previous configuration could not be recovered",
             // #48: never write the template's public `set-your-secret` (or an
             // empty secret) into singbox.json. Rotate + persist into the shared
             // config.yaml first, so the CLI and the generated clash_api agree.
-            secret: crate::enhance::resolve_controller_secret()
-                .await
-                .context("cannot generate the sing-box clash_api controller secret")?,
+            secret: match candidate_secret {
+                Some(secret) => secret,
+                None => crate::enhance::resolve_controller_secret()
+                    .await
+                    .context("cannot generate the sing-box clash_api controller secret")?,
+            },
         };
 
         // Native sing-box JSON profile passthrough: preserve the provider's own
@@ -1596,15 +1609,79 @@ impl MihomoManager {
         cancelled: &AtomicBool,
         stages: Option<mpsc::Sender<()>>,
     ) -> anyhow::Result<()> {
+        self.apply_prepared_core_with_launch(
+            prepared,
+            expected_generation,
+            start_if_stopped,
+            enable_tun,
+            cancelled,
+            stages,
+            false,
+        )
+        .await
+    }
+
+    /// CLI switching shares the guided transaction, but keeps its validated
+    /// adopted-core policy and hands both replacement and recovery to a daemon.
+    pub(crate) async fn apply_prepared_cli_core(
+        &self,
+        prepared: &binary::PreparedCore,
+        enable_tun: bool,
+    ) -> anyhow::Result<()> {
+        self.apply_prepared_core_with_launch(
+            prepared,
+            self.current_generation(),
+            false,
+            enable_tun,
+            &AtomicBool::new(false),
+            None,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_prepared_core_with_launch(
+        &self,
+        prepared: &binary::PreparedCore,
+        expected_generation: u64,
+        start_if_stopped: bool,
+        enable_tun: bool,
+        cancelled: &AtomicBool,
+        stages: Option<mpsc::Sender<()>>,
+        detached: bool,
+    ) -> anyhow::Result<()> {
         let old_kind = self.core_kind();
         let _config_lock = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
         if !start_if_stopped && self.state() != CoreState::Running {
             return self.commit_stopped_selection(expected_generation, old_kind, prepared.kind, cancelled);
         }
-        self.guided_preflight(expected_generation, prepared.kind)?;
+        let authorization = if detached {
+            self.capture_core_switch_authorization()?
+        } else {
+            None
+        };
+        let recheck_owner = || -> anyhow::Result<()> {
+            if detached {
+                self.cli_switch_preflight(prepared.kind, authorization.as_ref())
+            } else {
+                self.guided_owner_check(super::ownership::gui_process_running())?;
+                self.guided_record_check(prepared.kind)
+            }
+        };
+        recheck_owner()?;
+        if expected_generation != self.current_generation() || self.inner.restarting.load(Ordering::SeqCst) {
+            anyhow::bail!("Core ownership/generation changed since checking; retry the operation");
+        }
         let generation = expected_generation;
         let was_running = self.state() == CoreState::Running;
-        let old_binary = self.binary_path();
+        let old_binary = self.binary_path().or_else(|| {
+            authorization
+                .as_ref()
+                .and_then(|auth| auth.exe.as_ref())
+                .map(PathBuf::from)
+        });
+        let old_secret = self.effective_secret();
         if was_running && old_binary.is_none() {
             anyhow::bail!("Cannot switch: the owned core executable is unknown; no process was stopped.");
         }
@@ -1616,7 +1693,8 @@ impl MihomoManager {
         std::fs::create_dir_all(&home)?;
         let candidate = tempfile::NamedTempFile::new_in(&home)?.into_temp_path();
         let files = GuidedFileSnapshot::capture([
-            target_config.clone(),
+            clash_verge_core::utils::dirs::clash_path()?,
+            clash_verge_core::utils::dirs::singbox_config_path()?,
             clash_verge_core::utils::dirs::verge_path()?,
             home.join(super::ownership::OWNERSHIP_MARKER),
         ])?;
@@ -1639,9 +1717,20 @@ impl MihomoManager {
         match prepared.kind {
             CoreKind::SingBox => {
                 let yaml = ManagerInner::active_profile_yaml().await?;
-                let (_, parts) =
-                    ManagerInner::write_singbox_assembled_to(&self.config_dir, yaml.as_deref(), enable_tun, &candidate)
-                        .await?;
+                let secret = controller_secret_from_config(Some(&clash_verge_core::utils::dirs::clash_path()?))?;
+                let secret = if crate::enhance::is_placeholder_secret(&secret) {
+                    crate::enhance::generate_controller_secret()
+                } else {
+                    secret
+                };
+                let (_, parts) = ManagerInner::write_singbox_assembled_with_secret(
+                    &self.config_dir,
+                    yaml.as_deref(),
+                    enable_tun,
+                    &candidate,
+                    Some(secret),
+                )
+                .await?;
                 validate_guided_conversion(&parts.conversion)?;
                 converted_parts = Some(parts);
                 crate::runtime_config::prevalidate_singbox_config(&prepared.path, &candidate)
@@ -1658,7 +1747,7 @@ impl MihomoManager {
             super::gui_isolation::check(
                 &self.config_dir,
                 &self.socket_path,
-                if was_running && self.owns_child() {
+                if was_running && (self.owns_child() || detached) {
                     self.pid()
                 } else {
                     None
@@ -1673,7 +1762,7 @@ impl MihomoManager {
             controller_secret_from_config(Some(&candidate))?,
         )?;
         check_guided_cancel(cancelled)?;
-        self.guided_owner_check(super::ownership::gui_process_running())?;
+        recheck_owner()?;
         if generation != self.current_generation() {
             anyhow::bail!("Core ownership/generation changed during preparation; retry. No process was stopped.");
         }
@@ -1687,11 +1776,16 @@ impl MihomoManager {
         let launch = was_running || start_if_stopped;
         let stopped = AtomicBool::new(false);
         let target_started = AtomicBool::new(false);
+        let target_manager = MihomoManager::new(self.config_dir.clone())
+            .with_socket(self.socket_path.clone())
+            .with_singbox_controller(self.singbox_controller)
+            .with_core_kind(prepared.kind)
+            .with_secret(controller_secret_from_config(Some(&candidate))?);
+        let detached_launch = parking_lot::Mutex::new(None);
         let outcome = orchestrate_guided_switch(
             || async {
                 check_guided_cancel(cancelled)?;
-                self.guided_owner_check(super::ownership::gui_process_running())?;
-                self.guided_record_check(prepared.kind)?;
+                recheck_owner()?;
                 if generation != self.current_generation() {
                     anyhow::bail!("Core ownership/generation changed before switching; retry");
                 }
@@ -1719,84 +1813,163 @@ impl MihomoManager {
                     crate::enhance::ensure_mixed_port_available()
                         .await
                         .map_err(anyhow::Error::msg)?;
-                    ManagerInner::spawn_core_as(
-                        prepared.kind,
-                        &prepared.path,
-                        &prepared.version,
-                        &prepared.source,
-                        &self.config_dir,
-                        &self.socket_path,
-                        Some(target_config.clone()),
-                        self.inner(),
-                        false,
-                    )
-                    .await?;
-                    target_started.store(true, Ordering::SeqCst);
-                    for (group, node) in &target_selections {
-                        target_api.select_proxy(group, node).await?;
+                    if detached {
+                        let launched = target_manager.launch_prepared_supervisor(prepared).await?;
+                        *detached_launch.lock() = Some(launched);
+                    } else {
+                        ManagerInner::spawn_core_as(
+                            prepared.kind,
+                            &prepared.path,
+                            &prepared.version,
+                            &prepared.source,
+                            &self.config_dir,
+                            &self.socket_path,
+                            Some(target_config.clone()),
+                            self.inner(),
+                            false,
+                        )
+                        .await?;
                     }
+                    target_started.store(true, Ordering::SeqCst);
+                    let selection_generation = self.current_generation();
+                    restore_guided_selections(&target_api, &target_selections, || {
+                        if detached {
+                            let launched = detached_launch.lock();
+                            launched
+                                .as_ref()
+                                .context("prepared supervisor identity is missing")?
+                                .1
+                                .verify_core(&target_manager)?;
+                            target_manager.verify_selector_record(prepared.kind)
+                        } else {
+                            anyhow::ensure!(
+                                self.current_generation() == selection_generation,
+                                "core generation changed while waiting for selectors"
+                            );
+                            self.verify_selector_record(prepared.kind)
+                        }
+                    })
+                    .await?;
                 }
                 Ok(())
             },
             || async {
                 check_guided_cancel(cancelled)?;
-                self.guided_owner_check(super::ownership::gui_process_running())?;
-                if launch && (self.pid().is_none() || self.state() != CoreState::Running) {
+                let live_manager = if detached { &target_manager } else { self };
+                if detached {
+                    let launched = detached_launch.lock();
+                    let (_, ownership) = launched.as_ref().context("prepared supervisor identity is missing")?;
+                    ownership.verify_core(live_manager)?;
+                    anyhow::ensure!(
+                        live_manager.pid().is_some_and(pidfile::is_running),
+                        "prepared target exited before commit"
+                    );
+                } else {
+                    self.guided_owner_check(super::ownership::gui_process_running())?;
+                }
+                if launch && (live_manager.pid().is_none() || live_manager.state() != CoreState::Running) {
                     anyhow::bail!("Prepared target exited before the selection could be committed");
                 }
-                // Fresh read retains all unknown YAML fields and unrelated edits.
-                let mut config = clash_verge_core::config::IVerge::new().await;
-                config.proxy_core = Some(
-                    match prepared.kind {
-                        CoreKind::Mihomo => "mihomo",
-                        CoreKind::SingBox => "singbox",
+                // The raw selection transaction preserves unknown settings.
+                persist_stopped_selection(&home, prepared.kind, || {
+                    check_guided_cancel(cancelled)?;
+                    if detached {
+                        let launched = detached_launch.lock();
+                        launched
+                            .as_ref()
+                            .context("prepared supervisor identity is missing")?
+                            .1
+                            .verify_core(&target_manager)?;
+                        target_manager.verify_selector_record(prepared.kind)
+                    } else {
+                        self.guided_owner_check(super::ownership::gui_process_running())?;
+                        self.verify_selector_record(prepared.kind)
                     }
-                    .into(),
-                );
-                config.save_file().await?;
-                check_guided_cancel(cancelled)?;
+                })?;
                 if prepared.kind == CoreKind::SingBox {
-                    super::ownership::write_ownership_marker_at(&home, "singbox")?;
-                } else {
-                    let marker = home.join(super::ownership::OWNERSHIP_MARKER);
-                    match std::fs::remove_file(marker) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    // Later CLI invocations obtain TCP credentials from the
+                    // shared Clash config; publish the candidate's secret only
+                    // after readiness, as part of the snapshotted transaction.
+                    let path = clash_verge_core::utils::dirs::clash_path()?;
+                    let mut config: serde_yaml_ng::Mapping = match std::fs::read(&path) {
+                        Ok(bytes) => serde_yaml_ng::from_slice(&bytes)?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            clash_verge_core::config::IClashTemp::new().await.0
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    config.insert("secret".into(), target_manager.effective_secret().into());
+                    let mut file = tempfile::NamedTempFile::new_in(&home)?;
+                    std::io::Write::write_all(&mut file, serde_yaml_ng::to_string(&config)?.as_bytes())?;
+                    file.as_file().sync_all()?;
+                    file.persist(path)?;
                 }
                 check_guided_cancel(cancelled)?;
                 self.inner.set_core_kind(prepared.kind);
                 *self.inner.resolved_binary.lock() = Some(prepared.path.clone());
+                if detached {
+                    *self.inner.pid.lock() = target_manager.pid();
+                    *self.inner.started_at.lock() = *target_manager.inner.started_at.lock();
+                    *self.inner.state.lock() = target_manager.state();
+                    self.inner.set_secret_override(target_manager.effective_secret());
+                    self.inner.generation.fetch_add(1, Ordering::SeqCst);
+                }
                 if !launch {
                     *self.inner.state.lock() = CoreState::Stopped;
                 }
                 Ok(())
             },
             || async {
-                if target_started.load(Ordering::SeqCst) {
+                let launched = detached_launch.lock().take();
+                if let Some((mut supervisor, ownership)) = launched {
+                    target_manager.cleanup_failed_launch(&ownership, &mut supervisor).await;
+                } else if target_started.load(Ordering::SeqCst) {
                     self.stop().await?;
                 }
                 files.restore()?;
                 self.inner.set_core_kind(old_kind);
                 *self.inner.resolved_binary.lock() = old_binary.clone();
+                self.inner.set_secret_override(old_secret.clone());
                 if stopped.load(Ordering::SeqCst) && was_running {
                     let old_binary = old_binary.as_ref().context("Old executable missing for rollback")?;
-                    ManagerInner::spawn_core_as(
-                        old_kind,
-                        old_binary,
-                        "",
-                        "rollback",
-                        &self.config_dir,
-                        &self.socket_path,
-                        None,
-                        self.inner(),
-                        false,
-                    )
+                    let recovery_launch = if detached {
+                        let recovery = binary::PreparedCore {
+                            kind: old_kind,
+                            path: old_binary.clone(),
+                            version: String::new(),
+                            source: "rollback".into(),
+                        };
+                        Some(self.launch_prepared_supervisor(&recovery).await?)
+                    } else {
+                        ManagerInner::spawn_core_as(
+                            old_kind,
+                            old_binary,
+                            "",
+                            "rollback",
+                            &self.config_dir,
+                            &self.socket_path,
+                            Some(match old_kind {
+                                CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path()?,
+                                CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path()?,
+                            }),
+                            self.inner(),
+                            false,
+                        )
+                        .await?;
+                        None
+                    };
+                    let recovery_generation = self.current_generation();
+                    restore_guided_selections(&self.api(), &selections, || {
+                        if let Some((_, ownership)) = recovery_launch.as_ref() {
+                            ownership.verify_core(self)?;
+                        }
+                        anyhow::ensure!(
+                            self.current_generation() == recovery_generation,
+                            "recovery generation changed while waiting for selectors"
+                        );
+                        self.verify_selector_record(old_kind)
+                    })
                     .await?;
-                    for (group, node) in &selections {
-                        self.api().select_proxy(group, node).await?;
-                    }
                 }
                 Ok(())
             },
@@ -2314,6 +2487,33 @@ stop it where it was started",
         }))
     }
 
+    /// An explicit core switch reconciles a stale persisted selection with
+    /// the validated running record. Unlike a same-kind restart it does not
+    /// ask the supervisor to infer the replacement kind from verge.yaml.
+    pub(crate) fn capture_core_switch_authorization(&self) -> anyhow::Result<Option<RestartAuthorization>> {
+        if self.owns_child() {
+            return Ok(None);
+        }
+        self.ensure_external_replacement_allowed()?;
+        let endpoint = (self.core_kind() == CoreKind::SingBox).then_some(self.singbox_controller);
+        let record = pidfile::read_live_for_kind(
+            &pidfile::path_for(&self.socket_path),
+            &self.socket_path,
+            self.core_kind(),
+            endpoint,
+        )
+        .filter(|record| Some(record.pid) == self.pid())
+        .context("cannot switch a core without its validated CLI ownership record; stop it through its owner")?;
+        if super::ownership::gui_process_running() {
+            super::gui_isolation::check(&self.config_dir, &self.socket_path, self.pid(), None)?;
+        }
+        Ok(Some(RestartAuthorization {
+            kind: record.kind,
+            pid: record.pid,
+            exe: record.exe,
+        }))
+    }
+
     /// Replace the authorized core with a fresh supervisor-launched one.
     ///
     /// P1 (reviewer): this is the recovery half of a transaction. The first
@@ -2378,6 +2578,131 @@ stop it where it was started",
         // The replacement belongs to the new supervisor; adopt its pid
         // record so the rest of this process sees the running core.
         self.adopt_running_core();
+        Ok(())
+    }
+
+    /// Start exactly the checked binary on the already installed config. Used
+    /// only inside the foreground supervisor for a switch or its recovery.
+    pub(crate) async fn start_prepared_binary(&self, binary: &Path) -> anyhow::Result<()> {
+        check_cross_kind_record(&self.socket_path, self.core_kind())?;
+        if self.pid().is_some() || self.api().version().await.is_ok() {
+            anyhow::bail!("a core already owns this controller; no prepared core was started");
+        }
+        let config = match self.core_kind() {
+            CoreKind::Mihomo => ManagerInner::existing_mihomo_config().await?,
+            CoreKind::SingBox => ManagerInner::existing_singbox_config().await?,
+        };
+        if super::ownership::gui_process_running() {
+            super::gui_isolation::check(
+                &self.config_dir,
+                &self.socket_path,
+                None,
+                Some((&config, self.core_kind())),
+            )?;
+        }
+        ensure_guided_controller_released(self.core_kind(), self.singbox_controller)?;
+        crate::enhance::ensure_mixed_port_available()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        ManagerInner::spawn_core_as(
+            self.core_kind(),
+            binary,
+            "",
+            "prepared",
+            &self.config_dir,
+            &self.socket_path,
+            Some(config),
+            self.inner(),
+            true,
+        )
+        .await
+    }
+
+    async fn launch_prepared_supervisor(
+        &self,
+        prepared: &binary::PreparedCore,
+    ) -> anyhow::Result<(std::process::Child, LaunchOwnership)> {
+        let config = match prepared.kind {
+            CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path()?,
+            CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path()?,
+        };
+        self.set_secret_override(controller_secret_from_config(Some(&config))?);
+        let log = crate::commands::start::supervisor_log_path(&self.config_dir);
+        let (mut supervisor, ownership) = crate::commands::start::launch_owned_supervisor_with_prepared(
+            self,
+            &log,
+            crate::commands::start::SupervisorLaunch::UseExistingConfig,
+            Some(prepared),
+        )?;
+        let outcome = crate::commands::start::wait_until_ready(self, &mut supervisor, &log)
+            .await
+            .and_then(|()| ownership.verify_core(self))
+            .and_then(|()| {
+                self.adopt_running_core();
+                anyhow::ensure!(
+                    self.pid().is_some(),
+                    "prepared supervisor left no adoptable core record"
+                );
+                Ok(())
+            });
+        if let Err(error) = outcome {
+            self.cleanup_failed_launch(&ownership, &mut supervisor).await;
+            return Err(error);
+        }
+        Ok((supervisor, ownership))
+    }
+
+    fn cli_switch_preflight(
+        &self,
+        target: CoreKind,
+        authorization: Option<&RestartAuthorization>,
+    ) -> anyhow::Result<()> {
+        self.ensure_external_replacement_allowed()?;
+        if let Some(authorization) = authorization {
+            self.authorize_still_ours(authorization)?;
+            let endpoint = (authorization.kind == CoreKind::SingBox).then_some(self.singbox_controller);
+            let record = pidfile::read_live_for_kind(
+                &pidfile::path_for(&self.socket_path),
+                &self.socket_path,
+                authorization.kind,
+                endpoint,
+            );
+            anyhow::ensure!(
+                record
+                    .as_ref()
+                    .is_some_and(|record| record.pid == authorization.pid && record.exe == authorization.exe),
+                "Core ownership changed during switch preparation; no process was stopped"
+            );
+        } else {
+            self.guided_record_check(target)?;
+        }
+        if super::ownership::gui_process_running() {
+            super::gui_isolation::check(&self.config_dir, &self.socket_path, self.pid(), None)?;
+        }
+        if target == CoreKind::SingBox
+            && self.core_kind() != CoreKind::SingBox
+            && let Err(error) = std::net::TcpListener::bind(self.singbox_controller)
+        {
+            let owned = self
+                .pid()
+                .map(|pid| super::gui_isolation::owns_listener(pid, self.singbox_controller, "tcp"))
+                .transpose()?
+                .unwrap_or(false);
+            if !owned {
+                return Err(error).context("sing-box controller belongs to another process; no core was stopped");
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_selector_record(&self, kind: CoreKind) -> anyhow::Result<()> {
+        let record = pidfile::read_record(&pidfile::path_for(&self.socket_path));
+        anyhow::ensure!(
+            record.is_some_and(|record| record.kind == kind
+                && Some(record.pid) == self.pid()
+                && pidfile::is_running(record.pid)),
+            "core ownership changed while waiting for selectors"
+        );
         Ok(())
     }
 
@@ -3001,6 +3326,65 @@ fn guided_target_selections(
     Ok(mapped)
 }
 
+/// The version endpoint can answer before the runtime's groups are published.
+/// Keep one bounded budget for all selections and verify the launch identity
+/// before every controller request, including rollback's recovery controller.
+async fn restore_guided_selections(
+    api: &MihomoApi,
+    selections: &[(String, String)],
+    verify: impl Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    restore_guided_selections_with_timeout(api, selections, verify, crate::commands::start::READY_TIMEOUT).await
+}
+
+async fn restore_guided_selections_with_timeout(
+    api: &MihomoApi,
+    selections: &[(String, String)],
+    verify: impl Fn() -> anyhow::Result<()>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    if selections.is_empty() {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    for (group, node) in selections {
+        loop {
+            verify()?;
+            let proxies = tokio::time::timeout_at(deadline, api.get_proxies())
+                .await
+                .context("selector readiness budget expired")??;
+            let published = proxies
+                .proxies
+                .get(group)
+                .is_some_and(|proxy| proxy.all.as_ref().is_some_and(|members| members.contains(node)));
+            if !published {
+                tracing::debug!(target: "core_switch", group, node, "controller is answering but prepared selector is not published yet");
+            }
+            if published {
+                verify()?;
+                match tokio::time::timeout_at(deadline, api.select_proxy(group, node))
+                    .await
+                    .context("selector readiness budget expired")?
+                {
+                    Ok(()) => break,
+                    Err(crate::mihomo_api::error::MihomoError::HttpStatus { status: 404, .. }) => {
+                        tracing::debug!(target: "core_switch", group, node, "prepared selector temporarily returned 404; waiting within readiness budget");
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("failed to migrate selector {group:?} to {node:?}"));
+                    }
+                }
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "prepared selector {group:?} with member {node:?} did not become ready; selection was not committed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    Ok(())
+}
+
 fn validate_guided_conversion(conversion: &crate::singbox::convert::ProfileConversion) -> anyhow::Result<()> {
     if !conversion.skipped.is_empty() || !conversion.degraded.is_empty() {
         anyhow::bail!(
@@ -3152,7 +3536,7 @@ where
     if let Err(error) = outcome {
         return match rollback().await {
             Ok(()) => Err(error.context("Previous core selection restored")),
-            Err(restore) => Err(error.context(format!("Rollback also failed: {restore}"))),
+            Err(restore) => Err(error.context(format!("Rollback also failed: {restore:#}"))),
         };
     }
     Ok(())
@@ -3246,6 +3630,221 @@ pub struct CoreStatus {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    #[tokio::test]
+    async fn cli_core_selector_readiness_waits_for_groups_and_transient_404_before_commit() {
+        use super::*;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = MihomoApi::with_transport(
+            crate::mihomo_api::Transport::Tcp(listener.local_addr().unwrap()),
+            "fixture",
+        )
+        .unwrap();
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut gets = 0;
+            let mut puts = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 4096];
+                let count = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                let line = request.lines().next().unwrap().to_string();
+                recorded.lock().push(line.clone());
+                let (status, body) = if line.starts_with("GET /version ") {
+                    ("200 OK", r#"{"version":"fixture"}"#)
+                } else if line.starts_with("GET /proxies ") {
+                    gets += 1;
+                    if gets == 1 {
+                        ("200 OK", r#"{"proxies":{}}"#)
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"proxies":{"Proxy":{"type":"Selector","all":["egress1","egress2"],"now":"egress1"}}}"#,
+                        )
+                    }
+                } else {
+                    assert!(line.starts_with("PUT /proxies/Proxy "), "{line}");
+                    assert!(
+                        gets >= 2,
+                        "version health must not publish selection before groups exist"
+                    );
+                    puts += 1;
+                    if puts == 1 {
+                        ("404 Not Found", r#"{"message":"Resource not found"}"#)
+                    } else {
+                        ("204 No Content", "")
+                    }
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        assert!(api.version().await.is_ok());
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        restore_guided_selections_with_timeout(
+            &api,
+            &[("Proxy".into(), "egress2".into())],
+            || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *requests.lock(),
+            [
+                "GET /version HTTP/1.1",
+                "GET /proxies HTTP/1.1",
+                "GET /proxies HTTP/1.1",
+                "PUT /proxies/Proxy HTTP/1.1",
+                "GET /proxies HTTP/1.1",
+                "PUT /proxies/Proxy HTTP/1.1"
+            ]
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 5);
+        let error = restore_guided_selections_with_timeout(
+            &api,
+            &[("NeverPublished".into(), "egress2".into())],
+            || Ok(()),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("budget") || error.contains("did not become ready"),
+            "{error}"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .iter()
+                .filter(|request| request.starts_with("PUT "))
+                .count(),
+            2,
+            "a missing selector is never dropped or written"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cli_core_selector_readiness_rejects_changed_ownership_before_contacting_controller() {
+        use super::*;
+        let api = MihomoApi::with_transport(
+            crate::mihomo_api::Transport::Tcp("127.0.0.1:1".parse().unwrap()),
+            "fixture",
+        )
+        .unwrap();
+        let error = restore_guided_selections(&api, &[("Proxy".into(), "egress2".into())], || {
+            anyhow::bail!("changed ownership")
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "changed ownership");
+    }
+
+    #[tokio::test]
+    async fn cli_core_stopped_selection_never_resolves_or_launches_the_prepared_binary() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "proxy_core: mihomo\nfuture_setting: {keep: true}\n",
+        )
+        .unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_socket(home.path().join("controller.sock"));
+        let prepared = binary::PreparedCore {
+            kind: CoreKind::SingBox,
+            path: home.path().join("missing-binary"),
+            version: "fixture".into(),
+            source: "fixture".into(),
+        };
+        manager.apply_prepared_cli_core(&prepared, false).await.unwrap();
+        assert_eq!(manager.pid(), None);
+        assert_eq!(manager.state(), CoreState::Stopped);
+        assert_eq!(manager.core_kind(), CoreKind::SingBox);
+        let settings: serde_yaml_ng::Mapping =
+            serde_yaml_ng::from_slice(&std::fs::read(home.path().join("verge.yaml")).unwrap()).unwrap();
+        assert_eq!(settings["future_setting"]["keep"].as_bool(), Some(true));
+        assert!(!home.path().join("singbox.json").exists());
+    }
+
+    #[tokio::test]
+    async fn cli_core_systemd_authorization_fails_before_config_or_stop() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let settings = b"proxy_core: mihomo\nfuture_setting: preserved\n";
+        std::fs::write(home.path().join("verge.yaml"), settings).unwrap();
+        let mut core = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_socket(home.path().join("controller.sock"));
+        *manager.inner.pid.lock() = Some(core.id());
+        *manager.inner.state.lock() = CoreState::Running;
+        *manager.inner.service_cgroup.lock() = Some("0::/system.slice/clash-verge-cli.service\n".into());
+        let prepared = binary::PreparedCore {
+            kind: CoreKind::SingBox,
+            path: home.path().join("missing-binary"),
+            version: "fixture".into(),
+            source: "fixture".into(),
+        };
+        let error = manager
+            .apply_prepared_cli_core(&prepared, false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("systemctl"), "{error}");
+        assert!(core.try_wait().unwrap().is_none());
+        assert_eq!(manager.pid(), Some(core.id()));
+        assert_eq!(std::fs::read(home.path().join("verge.yaml")).unwrap(), settings);
+        core.kill().unwrap();
+        core.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cli_core_singbox_candidate_does_not_rotate_live_credentials_before_check() {
+        use super::*;
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        let original = b"secret: set-your-secret\nfuture: preserved\nmixed-port: 18977\n";
+        let formal = home.path().join("config.yaml");
+        std::fs::write(&formal, original).unwrap();
+        let candidate = home.path().join("candidate.json");
+        ManagerInner::write_singbox_assembled_with_secret(
+            home.path(),
+            None,
+            false,
+            &candidate,
+            Some("candidate-secret".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            controller_secret_from_config(Some(&candidate)).unwrap(),
+            "candidate-secret"
+        );
+        assert_eq!(std::fs::read(&formal).unwrap(), original);
+        assert!(
+            crate::runtime_config::prevalidate_singbox_config(Path::new("/bin/false"), &candidate)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&formal).unwrap(), original);
+    }
+
     #[tokio::test]
     async fn systemd_external_apply_refuses_before_writing_or_stopping_the_core() {
         use super::*;

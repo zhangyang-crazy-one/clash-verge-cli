@@ -148,6 +148,7 @@ fn launch_supervisor_with_receipt(
     log: &Path,
     mode: SupervisorLaunch,
     receipt: Option<&crate::mihomo_manager::process::ReceiptTarget>,
+    prepared: Option<&crate::mihomo_manager::binary::PreparedCore>,
 ) -> anyhow::Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
 
@@ -170,6 +171,13 @@ fn launch_supervisor_with_receipt(
         .stderr(err)
         .process_group(0);
     configure_launch(&mut command, mode, receipt);
+    if let Some(prepared) = prepared {
+        command
+            .arg("--start-core-kind")
+            .arg(prepared.kind.as_str())
+            .arg("--start-core-binary")
+            .arg(&prepared.path);
+    }
     command.spawn().context("failed to launch the core supervisor")
 }
 
@@ -199,6 +207,15 @@ pub(crate) fn launch_owned_supervisor(
     log: &Path,
     mode: SupervisorLaunch,
 ) -> anyhow::Result<(std::process::Child, crate::mihomo_manager::manager::LaunchOwnership)> {
+    launch_owned_supervisor_with_prepared(manager, log, mode, None)
+}
+
+pub(crate) fn launch_owned_supervisor_with_prepared(
+    manager: &MihomoManager,
+    log: &Path,
+    mode: SupervisorLaunch,
+    prepared: Option<&crate::mihomo_manager::binary::PreparedCore>,
+) -> anyhow::Result<(std::process::Child, crate::mihomo_manager::manager::LaunchOwnership)> {
     let receipt = crate::mihomo_manager::process::ReceiptTarget::new(manager.config_dir(), manager.core_kind())?;
     #[cfg(test)]
     if let Some(launcher) = *SUPERVISOR_LAUNCHER
@@ -209,7 +226,7 @@ pub(crate) fn launch_owned_supervisor(
         let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
         return Ok((child, ownership));
     }
-    let child = launch_supervisor_with_receipt(manager.config_dir(), log, mode, Some(&receipt))?;
+    let child = launch_supervisor_with_receipt(manager.config_dir(), log, mode, Some(&receipt), prepared)?;
     let ownership = crate::mihomo_manager::manager::LaunchOwnership::with_receipt(child.id(), receipt);
     Ok((child, ownership))
 }

@@ -21,7 +21,31 @@ use crate::subscribe::lifecycle::{ManagerLifecycle, reload_with_lifecycle};
 use crate::subscribe::scheduler::AutoUpdateScheduler;
 
 pub async fn run(config_dir: PathBuf, launch: crate::commands::start::SupervisorLaunch) -> anyhow::Result<()> {
-    let manager = commands::build_manager(config_dir).await?;
+    run_with_prepared(config_dir, launch, None).await
+}
+
+pub async fn run_prepared(
+    config_dir: PathBuf,
+    kind: crate::mihomo_manager::CoreKind,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    run_with_prepared(
+        config_dir,
+        crate::commands::start::SupervisorLaunch::UseExistingConfig,
+        Some((kind, path)),
+    )
+    .await
+}
+
+async fn run_with_prepared(
+    config_dir: PathBuf,
+    launch: crate::commands::start::SupervisorLaunch,
+    prepared: Option<(crate::mihomo_manager::CoreKind, PathBuf)>,
+) -> anyhow::Result<()> {
+    let manager = match prepared.as_ref() {
+        Some((kind, _)) => commands::build_manager_for_kind(config_dir, *kind).await?,
+        None => commands::build_manager(config_dir).await?,
+    };
     let kind = manager.core_kind().as_str();
     // P1 (reviewer): a RECOVERY supervisor (launched by a failed apply's
     // rollback) must serve the runtime config already on disk — the
@@ -37,7 +61,11 @@ pub async fn run(config_dir: PathBuf, launch: crate::commands::start::Supervisor
     manager.set_action_tx(lifecycle_tx);
     // TUN capability preflight happens inside the manager, after binary
     // resolution and before spawn — never sudo/setcap/askpass on this path.
-    manager.start_with(launch).await?;
+    if let Some((_, binary)) = prepared {
+        manager.start_prepared_binary(&binary).await?;
+    } else {
+        manager.start_with(launch).await?;
+    }
     let manager = Arc::new(manager);
 
     // Reload target state for current-profile refreshes (owned core → running).

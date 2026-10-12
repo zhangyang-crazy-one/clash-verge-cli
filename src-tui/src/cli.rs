@@ -38,6 +38,11 @@ pub enum Command {
         /// Serve the existing runtime config without regenerating it
         #[arg(long, requires = "foreground")]
         start_use_existing_config: bool,
+        /// Internal transaction: run the already checked executable and kind.
+        #[arg(long, hide = true, requires_all = ["foreground", "start_use_existing_config", "start_core_kind"])]
+        start_core_binary: Option<PathBuf>,
+        #[arg(long, hide = true, requires = "start_core_binary")]
+        start_core_kind: Option<crate::mihomo_manager::CoreKind>,
     },
     /// Stop the proxy core
     Stop,
@@ -442,10 +447,42 @@ mod tests {
             cli.command,
             Some(Command::Start {
                 foreground: true,
-                start_use_existing_config: false
+                start_use_existing_config: false,
+                ..
             })
         ));
         assert_eq!(cli.config_dir.as_deref(), Some(std::path::Path::new("/home/u/cfg")));
+    }
+
+    #[test]
+    fn prepared_supervisor_requires_explicit_kind_binary_and_existing_foreground_config() {
+        for args in [
+            vec!["start", "--start-core-binary", "/tmp/core"],
+            vec!["start", "--foreground", "--start-core-kind", "singbox"],
+            vec![
+                "start",
+                "--foreground",
+                "--start-core-binary",
+                "/tmp/core",
+                "--start-core-kind",
+                "mihomo",
+            ],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+        let cli = parse(&[
+            "start",
+            "--foreground",
+            "--start-use-existing-config",
+            "--start-core-kind",
+            "singbox",
+            "--start-core-binary",
+            "/tmp/checked core",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Some(Command::Start { start_core_kind: Some(crate::mihomo_manager::CoreKind::SingBox), start_core_binary: Some(path), .. }) if path == std::path::Path::new("/tmp/checked core"))
+        );
     }
 
     #[test]
@@ -456,7 +493,8 @@ mod tests {
             cli.command,
             Some(Command::Start {
                 foreground: true,
-                start_use_existing_config: true
+                start_use_existing_config: true,
+                ..
             })
         ));
         let cli = parse(&["start", "--foreground"]).unwrap();
@@ -464,7 +502,8 @@ mod tests {
             cli.command,
             Some(Command::Start {
                 foreground: true,
-                start_use_existing_config: false
+                start_use_existing_config: false,
+                ..
             })
         ));
     }

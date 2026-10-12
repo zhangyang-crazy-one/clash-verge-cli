@@ -95,6 +95,8 @@ async fn run() -> anyhow::Result<i32> {
         Some(cli::Command::Start {
             foreground,
             start_use_existing_config,
+            start_core_binary,
+            start_core_kind,
         }) => {
             if foreground {
                 let launch = if start_use_existing_config {
@@ -102,7 +104,10 @@ async fn run() -> anyhow::Result<i32> {
                 } else {
                     commands::start::SupervisorLaunch::Regenerate
                 };
-                commands::daemon::run(config_dir, launch).await?;
+                match (start_core_kind, start_core_binary) {
+                    (Some(kind), Some(path)) => commands::daemon::run_prepared(config_dir, kind, path).await?,
+                    _ => commands::daemon::run(config_dir, launch).await?,
+                }
             } else {
                 let manager = commands::build_manager(config_dir).await?;
                 commands::start::run(manager).await?;
