@@ -73,12 +73,18 @@ pub async fn use_core(config_dir: PathBuf, target: CoreKind) -> anyhow::Result<(
     let manager = super::build_manager(config_dir.clone()).await?;
     let running_kind = manager.core_kind();
     let was_running = manager.pid().is_some();
+    let mut prepared_start = None;
 
     if was_running {
         if running_kind == target {
             println!("{} is already the running core", target.as_str());
             return Ok(());
         }
+        let fresh = super::build_manager_for_kind(config_dir.clone(), target).await?;
+        let mode = fresh
+            .prepare_mihomo_launch(super::start::SupervisorLaunch::Regenerate)
+            .await?;
+        prepared_start = Some((fresh, mode));
         println!(
             "stopping {} before switching to {}",
             running_kind.as_str(),
@@ -94,8 +100,8 @@ pub async fn use_core(config_dir: PathBuf, target: CoreKind) -> anyhow::Result<(
         println!("core is not running; the new core starts with `clash-verge-cli start`");
         return Ok(());
     }
-    let fresh = super::build_manager_for_kind(config_dir, target).await?;
-    super::start::run(fresh).await
+    let (fresh, mode) = prepared_start.ok_or_else(|| anyhow::anyhow!("core switch has no prepared replacement"))?;
+    super::start::run_with_mode(fresh, mode).await
 }
 
 #[cfg(test)]

@@ -28,10 +28,23 @@ pub async fn run(manager: MihomoManager) -> anyhow::Result<()> {
 /// [`READY_TIMEOUT`]; tests need a launch that is never ready without
 /// waiting it out.
 pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout: Duration) -> anyhow::Result<()> {
+    run_with_mode_and_timeout(manager, SupervisorLaunch::Regenerate, ready_timeout).await
+}
+
+pub(crate) async fn run_with_mode(manager: MihomoManager, mode: SupervisorLaunch) -> anyhow::Result<()> {
+    run_with_mode_and_timeout(manager, mode, READY_TIMEOUT).await
+}
+
+async fn run_with_mode_and_timeout(
+    manager: MihomoManager,
+    mode: SupervisorLaunch,
+    ready_timeout: Duration,
+) -> anyhow::Result<()> {
     let kind = manager.core_kind().as_str();
     if let Some(pid) = manager.pid() {
         anyhow::bail!("{kind} is already running (pid {pid}); use `restart` to replace it");
     }
+    let mode = manager.prepare_mihomo_launch(mode).await?;
     // P1 (reviewer): complete the credential rotation in the PARENT before
     // anything is launched. The supervisor child resolves the secret again at
     // spawn time (a no-op once it is strong), so doing it here is safe — but
@@ -50,7 +63,7 @@ pub(crate) async fn run_with_ready_timeout(manager: MihomoManager, ready_timeout
     }
 
     let log = supervisor_log_path(manager.config_dir());
-    let (mut supervisor, ownership) = launch_owned_supervisor(&manager, &log, SupervisorLaunch::Regenerate)?;
+    let (mut supervisor, ownership) = launch_owned_supervisor(&manager, &log, mode)?;
     // A5 (reviewer): a readiness failure is a LAUNCH failure like any other,
     // and it gets the same cleanup: bound to the supervisor handle captured
     // here, stop the supervisor AND the core it already forked. Returning the
@@ -110,9 +123,15 @@ pub fn supervisor_log_path(config_dir: &Path) -> PathBuf {
 /// Fail-closed: a malformed `config.yaml`, or a rotation that cannot be
 /// persisted, aborts the start here, before any process is launched.
 pub async fn prepare_controller_credentials(manager: &MihomoManager) -> anyhow::Result<()> {
-    let secret = crate::enhance::resolve_controller_secret()
-        .await
-        .context("failed to prepare the controller secret in the clash config; no core was started")?;
+    let secret = if manager.core_kind() == crate::mihomo_manager::CoreKind::Mihomo {
+        crate::mihomo_manager::manager::controller_secret_from_config(Some(
+            &clash_verge_core::utils::dirs::clash_path()?,
+        ))?
+    } else {
+        crate::enhance::resolve_controller_secret()
+            .await
+            .context("failed to prepare the controller secret in the clash config; no core was started")?
+    };
     manager.set_secret_override(secret);
     Ok(())
 }
@@ -646,6 +665,7 @@ mod tests {
         let manager = MihomoManager::new(config_dir)
             .with_socket(home.path().join("controller.sock"))
             .with_secret("start-cleanup-fixture".to_string());
+        *manager.inner().resolved_binary.lock() = Some("/bin/true".into());
 
         let error = run_with_ready_timeout(manager, Duration::from_millis(300))
             .await

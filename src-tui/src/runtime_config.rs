@@ -59,6 +59,80 @@ pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::
     }
 }
 
+/// Check a private Mihomo candidate without binding listeners or starting TUN.
+/// A wedged validator must not hold the live core's restart indefinitely.
+pub(crate) async fn prevalidate_mihomo_config(
+    binary: &std::path::Path,
+    config_dir: &std::path::Path,
+    candidate: &std::path::Path,
+) -> anyhow::Result<()> {
+    prevalidate_mihomo_config_with_timeout(binary, config_dir, candidate, std::time::Duration::from_secs(120)).await
+}
+
+async fn prevalidate_mihomo_config_with_timeout(
+    binary: &std::path::Path,
+    config_dir: &std::path::Path,
+    candidate: &std::path::Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let output = tokio::time::timeout(
+        timeout,
+        tokio::process::Command::new(binary)
+            .arg("-t")
+            .arg("-d")
+            .arg(config_dir)
+            .arg("-f")
+            .arg(candidate)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("mihomo config validation timed out; the running core was left untouched"))?
+    .map_err(|error| anyhow::anyhow!("failed to run {} -t: {error}", binary.display()))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "mihomo -t rejected {}: {}{}",
+        candidate.display(),
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    Ok(())
+}
+
+/// Assemble the current profile with the same chain, overlay, DNS and app
+/// controls as profile application. This only writes the private destination;
+/// the live config (including its secret) remains untouched until validation.
+pub(crate) async fn write_mihomo_candidate(enable_tun: bool, destination: &std::path::Path) -> anyhow::Result<()> {
+    let formal = clash_verge_core::utils::dirs::clash_path()?;
+    if tokio::fs::try_exists(&formal).await? {
+        clash_verge_core::utils::help::read_mapping(&formal)
+            .await
+            .map_err(|error| anyhow::anyhow!("cannot read {}: {error}; config was left untouched", formal.display()))?;
+    }
+    let mut config = match crate::mihomo_manager::ManagerInner::active_profile_yaml().await? {
+        Some(yaml) if crate::subscribe::from_url::is_singbox_json_profile(&yaml) => {
+            anyhow::bail!(
+                "Selected native sing-box JSON has no lossless Clash conversion; select a Clash subscription before switching to mihomo"
+            );
+        }
+        Some(yaml) => serde_yaml_ng::from_str::<serde_yaml_ng::Mapping>(&yaml)?,
+        None => clash_verge_core::config::IClashTemp::new().await.0,
+    };
+    crate::enhance::apply_verge_ports(&mut config).await;
+    crate::enhance::apply_controller_cors(&mut config).await?;
+    config = crate::enhance::prepare_runtime_config(config, enable_tun);
+    let secret = config
+        .get("secret")
+        .and_then(serde_yaml_ng::Value::as_str)
+        .unwrap_or_default();
+    if crate::enhance::is_placeholder_secret(secret) {
+        config.insert("secret".into(), crate::enhance::generate_controller_secret().into());
+    }
+    tokio::fs::write(destination, serde_yaml_ng::to_string(&config)?).await?;
+    std::fs::File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
 /// Sing-box ReloadStrategy application (task 3.4): regenerate the runtime
 /// config, prevalidate it while the old core is still serving, then restart
 /// through the manager (barrier + readiness probe inside). On a failed
@@ -926,6 +1000,28 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn mihomo_validation_timeout_does_not_hang_a_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::tempdir().unwrap();
+        let validator = home.path().join("validator");
+        std::fs::write(&validator, "#!/bin/sh\nexec sleep 5\n").unwrap();
+        std::fs::set_permissions(&validator, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let candidate = home.path().join("candidate.yaml");
+        std::fs::write(&candidate, "secret: fixture\n").unwrap();
+        let start = std::time::Instant::now();
+        let error = prevalidate_mihomo_config_with_timeout(
+            &validator,
+            home.path(),
+            &candidate,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     fn parts_with(
         profile_used: bool,

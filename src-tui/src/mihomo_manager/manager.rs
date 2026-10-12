@@ -362,26 +362,6 @@ impl ManagerInner {
         self.core_kind.store(v, Ordering::SeqCst);
     }
 
-    /// Spawn a mihomo child from a resolved binary, wire up the watcher,
-    /// and update the inner state.  Used by both `start` (initial launch)
-    /// and `try_auto_restart` (crash recovery).
-    ///
-    /// Single-point TUN preflight (D2): after the binary has been resolved
-    /// and before every TUN-enabled spawn we check the file capability.
-    /// The check is read-only — no sudo/setcap/askpass here — and root
-    /// processes bypass it. This covers CLI start/restart, TUI Start/Restart,
-    /// the TUN toggle, watcher auto-restart, and post-upgrade replacement.
-    async fn spawn_and_watch(
-        resolved_path: &Path,
-        version: &str,
-        source: &str,
-        config_dir: &Path,
-        socket_path: &Path,
-        inner: Arc<ManagerInner>,
-    ) -> anyhow::Result<()> {
-        Self::spawn_core(resolved_path, version, source, config_dir, socket_path, None, inner).await
-    }
-
     /// Spawn a core child from a resolved binary, wire up the watcher, and
     /// update the inner state. `config_path` overrides the default mihomo
     /// `-f` argument (used by sing-box, which always passes its generated
@@ -422,6 +402,7 @@ impl ManagerInner {
         inner: Arc<ManagerInner>,
         publish: bool,
     ) -> anyhow::Result<()> {
+        let prepared_config = config_path.is_some();
         let config_path = config_path.or_else(|| match kind {
             CoreKind::Mihomo => clash_verge_core::utils::dirs::clash_path().ok(),
             CoreKind::SingBox => clash_verge_core::utils::dirs::singbox_config_path().ok(),
@@ -431,9 +412,15 @@ impl ManagerInner {
         // config.yaml does not exist yet; composing it here is what makes
         // `start` work out of the box instead of failing with a bare
         // ENOENT from `controller_secret_from_config`.
-        let secret = crate::enhance::resolve_controller_secret()
-            .await
-            .context("failed to prepare the controller secret in the clash config; no core was started")?;
+        let secret = if kind == CoreKind::Mihomo && prepared_config {
+            // A prepared/recovery launch must consume exactly the artifact
+            // its caller installed, including its original credentials.
+            controller_secret_from_config(config_path.as_deref())?
+        } else {
+            crate::enhance::resolve_controller_secret()
+                .await
+                .context("failed to prepare the controller secret in the clash config; no core was started")?
+        };
         // Publish it to the live manager: it was built from the pre-rotation
         // config.yaml, so its snapshot still carries the template secret and
         // every controller call would be rejected (401) on sing-box.
@@ -623,7 +610,7 @@ impl ManagerInner {
     /// Attempt to restart mihomo from the watcher after a crash.
     ///
     /// Resolves the binary (reusing cached managed or system path) and
-    /// delegates to [`spawn_and_watch`] so the spawn pipeline is shared
+    /// delegates to [`Self::spawn_core`] so the spawn pipeline is shared
     /// with [`MihomoManager::start`].
     ///
     /// `config_dir` and `socket_path` are passed in by the caller (the
@@ -641,12 +628,19 @@ impl ManagerInner {
                     .await
                     .context("auto-restart: failed to resolve mihomo binary")?;
                 tracing::info!(target: "mihomo", "auto-restarting mihomo {}", resolved.version);
-                Self::spawn_and_watch(
+                let config_path = Self::runtime_config_for_mihomo_start(
+                    config_dir,
+                    &resolved.path,
+                    crate::commands::start::SupervisorLaunch::Regenerate,
+                )
+                .await?;
+                Self::spawn_core(
                     &resolved.path,
                     &resolved.version,
                     resolved.source.as_str(),
                     config_dir,
                     socket_path,
+                    Some(config_path),
                     Arc::clone(&inner),
                 )
                 .await
@@ -746,6 +740,17 @@ impl ManagerInner {
         config_dir: &Path,
         mode: crate::commands::start::SupervisorLaunch,
     ) -> anyhow::Result<PathBuf> {
+        if self.core_kind() == CoreKind::Mihomo {
+            if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+                return Self::existing_mihomo_config().await;
+            }
+            let cached = self.resolved_binary.lock().clone();
+            let binary = match cached {
+                Some(path) => path,
+                None => binary::resolve_or_install().await?.path,
+            };
+            return Self::runtime_config_for_mihomo_start(config_dir, &binary, mode).await;
+        }
         if mode == crate::commands::start::SupervisorLaunch::Regenerate {
             return Self::write_singbox_full(config_dir).await;
         }
@@ -755,6 +760,42 @@ impl ManagerInner {
             "launch mode UseExistingConfig: serving the runtime config {} as-is (no regeneration)",
             path.display()
         );
+        Ok(path)
+    }
+
+    async fn existing_mihomo_config() -> anyhow::Result<PathBuf> {
+        let path = clash_verge_core::utils::dirs::clash_path()?;
+        anyhow::ensure!(
+            tokio::fs::try_exists(&path).await?,
+            "launch mode UseExistingConfig: no restored {} to serve",
+            path.display()
+        );
+        Ok(path)
+    }
+
+    /// Prepare and check before installation and before any live-core stop.
+    /// TempPath also removes the private candidate if validation is cancelled.
+    async fn runtime_config_for_mihomo_start(
+        config_dir: &Path,
+        binary: &Path,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<PathBuf> {
+        if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+            return Self::existing_mihomo_config().await;
+        }
+        let _guard = crate::runtime_config::RUNTIME_CONFIG_IO.lock().await;
+        let path = clash_verge_core::utils::dirs::clash_path()?;
+        let parent = path.parent().context("runtime config has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let candidate = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+        let enable_tun = clash_verge_core::config::IVerge::try_new()
+            .await?
+            .enable_tun_mode
+            .unwrap_or(false);
+        crate::runtime_config::write_mihomo_candidate(enable_tun, &candidate).await?;
+        preflight_tun_capability(binary, enable_tun)?;
+        crate::runtime_config::prevalidate_mihomo_config(binary, config_dir, &candidate).await?;
+        std::fs::rename(&candidate, &path).context("failed to install validated mihomo config")?;
         Ok(path)
     }
 
@@ -1608,19 +1649,8 @@ impl MihomoManager {
                     .map_err(anyhow::Error::msg)?;
             }
             CoreKind::Mihomo => {
-                let yaml = ManagerInner::active_profile_yaml().await?;
-                let mut config = match yaml {
-                    Some(yaml) if crate::subscribe::from_url::is_singbox_json_profile(&yaml) => {
-                        anyhow::bail!("Selected native sing-box JSON has no lossless Clash conversion; select a Clash subscription before switching to mihomo");
-                    }
-                    Some(yaml) => serde_yaml_ng::from_str::<serde_yaml_ng::Mapping>(&yaml)
-                        .context("Selected native sing-box JSON has no lossless Clash conversion; select a Clash subscription before switching to mihomo")?,
-                    None => clash_verge_core::config::IClashTemp::new().await.0,
-                };
-                crate::enhance::apply_verge_ports(&mut config).await;
-                crate::enhance::apply_controller_cors(&mut config).await?;
-                let config = crate::enhance::prepare_runtime_config(config, enable_tun);
-                std::fs::write(&candidate, serde_yaml_ng::to_string(&config)?)?;
+                crate::runtime_config::write_mihomo_candidate(enable_tun, &candidate).await?;
+                crate::runtime_config::prevalidate_mihomo_config(&prepared.path, &self.config_dir, &candidate).await?;
             }
         }
         let target_selections = guided_target_selections(prepared.kind, &candidate, &selections)?;
@@ -1865,6 +1895,7 @@ stop it where it was started",
         // core untouched; only then stop the tracked predecessor (re-pressing
         // `s` must never stack a second child on the same ports/socket).
         let resolved = Self::resolve_and_preflight().await.context("failed to start mihomo")?;
+        let config_path = ManagerInner::runtime_config_for_mihomo_start(&self.config_dir, &resolved.path, mode).await?;
 
         self.stop_tracked_predecessor().await?;
 
@@ -1876,12 +1907,13 @@ stop it where it was started",
             .await
             .map_err(anyhow::Error::msg)?;
 
-        ManagerInner::spawn_and_watch(
+        ManagerInner::spawn_core(
             &resolved.path,
             &resolved.version,
             resolved.source.as_str(),
             &self.config_dir,
             &self.socket_path,
+            Some(config_path),
             Arc::clone(&self.inner),
         )
         .await
@@ -2003,7 +2035,9 @@ stop it where it was started",
                     preflight_tun_capability(&path, tun_enabled).context(
                         "TUN capability preflight failed — run `clash-verge-cli tun setup` for the \
 resolved binary; the running core was left untouched",
-                    )
+                    )?;
+                    ManagerInner::runtime_config_for_mihomo_start(&self.config_dir, &path, mode).await?;
+                    Ok(())
                 }
             },
             || async move { self.stop().await },
@@ -2015,12 +2049,13 @@ resolved binary; the running core was left untouched",
                     Arc::clone(&self.inner),
                 );
                 async move {
-                    ManagerInner::spawn_and_watch(
+                    ManagerInner::spawn_core(
                         &resolved.path,
                         &resolved.version,
                         resolved.source.as_str(),
                         &config_dir,
                         &socket_path,
+                        Some(ManagerInner::existing_mihomo_config().await?),
                         inner,
                     )
                     .await
@@ -2316,6 +2351,7 @@ stop it where it was started",
         }
         self.ensure_external_replacement_allowed()?;
         self.authorize_still_ours(authorization)?;
+        let mode = self.prepare_mihomo_launch(mode).await?;
         // A partially started previous attempt (supervisor alive, core not
         // yet answering) must be cleared first, or the recovery would leave
         // two supervisors fighting over one controller socket.
@@ -2343,6 +2379,30 @@ stop it where it was started",
         // record so the rest of this process sees the running core.
         self.adopt_running_core();
         Ok(())
+    }
+
+    /// CLI replacements call this while the old core is still serving. The
+    /// supervisor then consumes the exact validated file without recomposing.
+    pub(crate) async fn prepare_mihomo_launch(
+        &self,
+        mode: crate::commands::start::SupervisorLaunch,
+    ) -> anyhow::Result<crate::commands::start::SupervisorLaunch> {
+        if self.core_kind() != CoreKind::Mihomo {
+            return Ok(mode);
+        }
+        if mode == crate::commands::start::SupervisorLaunch::UseExistingConfig {
+            ManagerInner::existing_mihomo_config().await?;
+            return Ok(mode);
+        }
+        // Resolve once in this process; the detached supervisor independently
+        // resolves its executable but is bound to this checked artifact.
+        let cached = self.binary_path();
+        let binary = match cached {
+            Some(path) => path,
+            None => Self::resolve_and_preflight().await?.path,
+        };
+        ManagerInner::runtime_config_for_mihomo_start(&self.config_dir, &binary, mode).await?;
+        Ok(crate::commands::start::SupervisorLaunch::UseExistingConfig)
     }
 
     /// Stop everything THIS launch created, and nothing else.
@@ -2777,7 +2837,7 @@ fn check_guided_record(
     Ok(())
 }
 
-fn controller_secret_from_config(path: Option<&Path>) -> anyhow::Result<String> {
+pub(crate) fn controller_secret_from_config(path: Option<&Path>) -> anyhow::Result<String> {
     let Some(path) = path else {
         return Ok(String::new());
     };
@@ -6677,5 +6737,347 @@ mod recovery_config_selection {
         .await
         .expect_err("no restored config must not regenerate");
         assert!(error.to_string().contains("no restored"), "{error}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod mihomo_regeneration {
+    use super::*;
+
+    const BASE: &str =
+        "proxies: []\nrules:\n  - DOMAIN,original.example,DIRECT\n  - DOMAIN,second.example,REJECT\n  - MATCH,DIRECT\n";
+
+    fn seed_profile(home: &Path) -> MihomoManager {
+        std::fs::write(
+            home.join("verge.yaml"),
+            "proxy_core: mihomo\nverge_mixed_port: 35123\nenable_tun_mode: false\nenable_system_proxy: false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("profiles.yaml"),
+            "current: base\nitems:\n  - {uid: base, type: local, name: fixture, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::write(home.join("profiles/base.yaml"), BASE).unwrap();
+        let manager = MihomoManager::new(home.to_path_buf()).with_socket(home.join("controller.sock"));
+        *manager.inner.resolved_binary.lock() = Some("/bin/true".into());
+        manager
+    }
+
+    async fn regenerate(manager: &MihomoManager) -> serde_yaml_ng::Mapping {
+        let mode = manager
+            .prepare_mihomo_launch(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .unwrap();
+        assert_eq!(mode, crate::commands::start::SupervisorLaunch::UseExistingConfig);
+        serde_yaml_ng::from_str(&std::fs::read_to_string(manager.config_dir().join("config.yaml")).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn mihomo_regenerate_picks_up_current_profile_changes() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        std::fs::write(
+            home.path().join("verge.yaml"),
+            "verge_mixed_port: 35123\nenable_tun_mode: false\nenable_system_proxy: false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: base\nitems:\n  - {uid: base, type: local, name: fixture, file: base.yaml}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("profiles/base.yaml"),
+            "proxies: []\nrules:\n  - DOMAIN,marker.example,DIRECT\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let manager = MihomoManager::new(home.path().to_path_buf()).with_socket(home.path().join("controller.sock"));
+        *manager.inner.resolved_binary.lock() = Some("/bin/true".into());
+        let path = manager
+            .inner
+            .runtime_config_for_start(home.path(), crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .unwrap();
+        assert_eq!(
+            path,
+            home.path().join("config.yaml"),
+            "mihomo must regenerate its YAML, not singbox.json"
+        );
+        assert!(std::fs::read_to_string(path).unwrap().contains("marker.example"));
+    }
+
+    #[tokio::test]
+    async fn config_set_then_mihomo_restart_preparation_applies_cors_and_ports() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        let old = std::fs::read(home.path().join("config.yaml")).unwrap();
+        crate::commands::config::set("controller_allowed_origins", "[\"https://dash.example\"]", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(home.path().join("config.yaml")).unwrap(),
+            old,
+            "config set only persists settings"
+        );
+        let mut verge = clash_verge_core::config::IVerge::try_new().await.unwrap();
+        verge.verge_mixed_port = Some(35124);
+        verge.save_file().await.unwrap();
+        let config = regenerate(&manager).await;
+        let cors = config["external-controller-cors"].as_mapping().unwrap();
+        assert!(
+            cors["allow-origins"]
+                .as_sequence()
+                .unwrap()
+                .contains(&"https://dash.example".into())
+        );
+        assert_eq!(cors["allow-private-network"].as_bool(), Some(true));
+        assert_eq!(config["mixed-port"].as_u64(), Some(35124));
+        assert_eq!(
+            config["secret"].as_str(),
+            Some("fixture"),
+            "keep the current strong secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_file_edit_then_restart_preparation_uses_fresh_source() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        regenerate(&manager).await;
+        let refreshed = BASE.replace("original.example", "marker.example");
+        std::fs::write(home.path().join("profiles/base.yaml"), refreshed).unwrap();
+        let config = regenerate(&manager).await;
+        let rules = config["rules"].as_sequence().unwrap();
+        assert!(rules.contains(&"DOMAIN,marker.example,DIRECT".into()));
+        assert!(!rules.contains(&"DOMAIN,original.example,DIRECT".into()));
+    }
+
+    #[tokio::test]
+    async fn overlay_edited_under_singbox_is_used_by_mihomo_switch_preparation() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        regenerate(&manager).await;
+        let mut verge = clash_verge_core::config::IVerge::try_new().await.unwrap();
+        verge.proxy_core = Some("singbox".into());
+        verge.save_file().await.unwrap();
+        let source = crate::routing::load_profile_rules(BASE).unwrap();
+        let edited = vec![source[1].clone(), source[0].clone(), source[2].clone()];
+        let overlay = crate::rule_overlay::RuleOverlay::from_edit(&source, &edited).unwrap();
+        let item = crate::profile_store::store::ProfileStore::snapshot()
+            .await
+            .unwrap()
+            .items()
+            .into_iter()
+            .next()
+            .unwrap();
+        let overlay_path = crate::rule_overlay::path(&home.path().join("profiles"), &item).unwrap();
+        std::fs::write(overlay_path, overlay.serialize().unwrap()).unwrap();
+        let config = regenerate(&manager).await;
+        assert_eq!(
+            config["rules"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|rule| rule.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "DOMAIN,second.example,REJECT",
+                "DOMAIN,original.example,DIRECT",
+                "MATCH,DIRECT"
+            ]
+        );
+        assert_eq!(
+            clash_verge_core::config::IVerge::try_new()
+                .await
+                .unwrap()
+                .proxy_core
+                .as_deref(),
+            Some("singbox"),
+            "preparation does not change core selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn mihomo_candidate_contains_full_merge_script_and_tun_controls() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        seed_profile(home.path());
+        std::fs::write(home.path().join("profiles.yaml"), "current: base\nitems:\n  - {uid: base, type: remote, name: fixture, file: base.yaml, option: {merge: custom, script: hook}}\n  - {uid: custom, type: merge, file: merge.yaml}\n  - {uid: hook, type: script, file: hook.js}\n").unwrap();
+        std::fs::write(
+            home.path().join("profiles/merge.yaml"),
+            "hosts: {merge.example: 127.0.0.2}\n",
+        )
+        .unwrap();
+        std::fs::write(home.path().join("profiles/hook.js"), "function main(config) { config.rules.unshift('DOMAIN,script.example,REJECT'); config['mixed-port'] = 1; config.tun = {stack: 'system', mtu: 1400}; return config; }").unwrap();
+        let candidate = home.path().join("candidate.yaml");
+        // Only assemble TUN=true; no core/capability/TUN operation is run.
+        crate::runtime_config::write_mihomo_candidate(true, &candidate)
+            .await
+            .unwrap();
+        let config: serde_yaml_ng::Mapping =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(candidate).unwrap()).unwrap();
+        assert_eq!(config["hosts"]["merge.example"].as_str(), Some("127.0.0.2"));
+        assert_eq!(config["rules"][0].as_str(), Some("DOMAIN,script.example,REJECT"));
+        assert_eq!(config["mixed-port"].as_u64(), Some(35123));
+        assert_eq!(config["tun"]["enable"].as_bool(), Some(true));
+        assert_eq!(
+            config["tun"]["stack"].as_str(),
+            Some("gvisor"),
+            "app TUN settings survive script changes"
+        );
+        assert_eq!(
+            config["tun"]["mtu"].as_u64(),
+            Some(1400),
+            "script extras survive app enforcement"
+        );
+        assert_eq!(config["dns"]["enable"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn rejected_mihomo_restart_preserves_old_config_and_live_core() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        // A weak old secret must not be rotated until the candidate passes.
+        std::fs::write(
+            home.path().join("config.yaml"),
+            "# keep exact bytes\nsecret: set-your-secret\nmixed-port: 35123\ntun: {enable: false}\n",
+        )
+        .unwrap();
+        let old = std::fs::read(home.path().join("config.yaml")).unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        *manager.inner.pid.lock() = Some(pid);
+        *manager.inner.state.lock() = CoreState::Running;
+        *manager.inner.resolved_binary.lock() = Some("/bin/false".into());
+        let error = crate::commands::restart::run(manager.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("mihomo -t rejected"), "{error:#}");
+        assert_eq!(std::fs::read(home.path().join("config.yaml")).unwrap(), old);
+        assert_eq!(manager.pid(), Some(pid));
+        assert_eq!(manager.state(), CoreState::Running);
+        assert!(child.try_wait().unwrap().is_none(), "the old process is still alive");
+        assert!(
+            !home.path().read_dir().unwrap().any(|entry| entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp")),
+            "private candidate removed on rejection"
+        );
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mihomo_use_existing_keeps_bytes_and_ignores_invalid_new_source() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        let formal = home.path().join("config.yaml");
+        let old = b"# frozen recovery artifact\nsecret: set-your-secret\nport: 0\n";
+        std::fs::write(&formal, old).unwrap();
+        std::fs::write(home.path().join("profiles/base.yaml"), "[bad YAML").unwrap();
+        let path = manager
+            .inner
+            .runtime_config_for_start(home.path(), crate::commands::start::SupervisorLaunch::UseExistingConfig)
+            .await
+            .unwrap();
+        assert_eq!(path, formal);
+        crate::commands::start::prepare_controller_credentials(&manager)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&formal).unwrap(), old);
+        std::fs::remove_file(&formal).unwrap();
+        let error = manager
+            .inner
+            .runtime_config_for_start(home.path(), crate::commands::start::SupervisorLaunch::UseExistingConfig)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no restored"));
+        assert!(!formal.exists());
+    }
+
+    #[tokio::test]
+    async fn prepared_mihomo_spawn_failure_keeps_frozen_weak_secret_bytes() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        let formal = home.path().join("config.yaml");
+        let old = b"# frozen recovery artifact\nsecret: set-your-secret\nport: 0\n";
+        std::fs::write(&formal, old).unwrap();
+        let error = ManagerInner::spawn_core(
+            &home.path().join("missing-core"),
+            "fixture",
+            "fixture",
+            home.path(),
+            manager.socket_path(),
+            Some(formal.clone()),
+            manager.inner(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("does not exist"), "{error:#}");
+        assert_eq!(
+            std::fs::read(&formal).unwrap(),
+            old,
+            "spawn must not rotate a frozen recovery artifact before failing"
+        );
+        assert_eq!(manager.pid(), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_runtime_and_native_singbox_source_fail_without_overwrite() {
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        let formal = home.path().join("config.yaml");
+        std::fs::write(&formal, "[bad YAML").unwrap();
+        let error = manager
+            .prepare_mihomo_launch(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot read"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&formal).unwrap(), "[bad YAML");
+        std::fs::write(&formal, "secret: fixture\n").unwrap();
+        std::fs::write(
+            home.path().join("profiles/base.yaml"),
+            r#"{"outbounds":[{"type":"direct","tag":"direct"}],"route":{}}"#,
+        )
+        .unwrap();
+        let error = manager
+            .prepare_mihomo_launch(crate::commands::start::SupervisorLaunch::Regenerate)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no lossless Clash conversion"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&formal).unwrap(), "secret: fixture\n");
+    }
+
+    #[tokio::test]
+    async fn mihomo_validation_reads_private_candidate_before_atomic_install() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (home, _home_guard) = super::conversion_fixture().await;
+        let manager = seed_profile(home.path());
+        let old = std::fs::read(home.path().join("config.yaml")).unwrap();
+        std::fs::write(home.path().join("old.yaml"), &old).unwrap();
+        let binary = home.path().join("validator");
+        std::fs::write(&binary, "#!/bin/sh\n[ \"$1\" = -t ] && [ \"$2\" = -d ] && [ \"$4\" = -f ] || exit 2\ncmp \"$3/old.yaml\" \"$3/config.yaml\" || exit 3\ncp \"$5\" \"$3/checked.yaml\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        *manager.inner.resolved_binary.lock() = Some(binary);
+        regenerate(&manager).await;
+        let checked = std::fs::read(home.path().join("checked.yaml")).unwrap();
+        assert_eq!(
+            std::fs::read(home.path().join("config.yaml")).unwrap(),
+            checked,
+            "installed artifact is exactly the validated one"
+        );
+        assert_ne!(checked, old);
+        assert_eq!(
+            std::fs::metadata(home.path().join("config.yaml"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }
