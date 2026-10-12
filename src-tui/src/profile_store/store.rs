@@ -5,6 +5,7 @@ use std::sync::LazyLock;
 use anyhow::Context;
 use clash_verge_core::config::{IProfiles, PrfItem, PrfOption};
 use compact_str::CompactString;
+use serde_yaml_ng::{Mapping, Value};
 use tokio::sync::Mutex;
 
 use crate::subscribe::from_url::{self, RemoteProfileBundle};
@@ -17,12 +18,19 @@ pub struct ProfileStore {
     profiles: IProfiles,
 }
 
-/// Exact forced-refresh backup. Both files are compared before restoration so
-/// a late failed apply cannot overwrite another refresh or a user's edits.
+/// Captured inside the same IO transaction as the forced-refresh write.
 pub(crate) struct RefreshSnapshot {
+    uid: String,
     metadata: Vec<u8>,
     body: Vec<u8>,
     file: String,
+    fragments: Vec<RefreshFragment>,
+}
+
+struct RefreshFragment {
+    item: Value,
+    file: String,
+    body: Vec<u8>,
 }
 
 impl ProfileStore {
@@ -139,14 +147,55 @@ impl ProfileStore {
         Ok(())
     }
 
-    pub(crate) async fn refresh_snapshot_locked(uid: &str) -> anyhow::Result<RefreshSnapshot> {
+    /// Identify the refresh's writes before any queued profile edit can run.
+    /// The lock is released before runtime reload/readiness begins.
+    pub(crate) async fn force_refresh_locked(uid: &str) -> anyhow::Result<(RefreshSnapshot, RefreshSnapshot)> {
         let _guard = PROFILE_IO.lock().await;
-        let store = Self::load_unlocked().await?;
-        let item = store.profiles.get_item(CompactString::from(uid))?;
+        let mut store = Self::load_unlocked().await?;
+        let previous_uids: Vec<_> = store
+            .profiles
+            .get_items()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.uid.clone())
+            .collect();
+        let old = store.refresh_snapshot(uid).await?;
+        store.update_remote(uid, None).await?;
+        let mut expected = store.refresh_snapshot(uid).await?;
+        let expected_metadata: Value = serde_yaml_ng::from_slice(&expected.metadata)?;
+        for item in profile_items(&expected_metadata)? {
+            if previous_uids
+                .iter()
+                .any(|uid| item["uid"].as_str() == Some(uid.as_str()))
+            {
+                continue;
+            }
+            let file = item["file"]
+                .as_str()
+                .context("new refresh fragment has no file")?
+                .to_owned();
+            let body = tokio::fs::read(clash_verge_core::utils::dirs::app_profiles_dir()?.join(&file)).await?;
+            expected.fragments.push(RefreshFragment {
+                item: item.clone(),
+                file,
+                body,
+            });
+        }
+        Ok((old, expected))
+    }
+
+    async fn refresh_snapshot(&self, uid: &str) -> anyhow::Result<RefreshSnapshot> {
+        let item = self.profiles.get_item(CompactString::from(uid))?;
         let file = item.file.as_deref().context("profile has no file")?.to_owned();
         let metadata = tokio::fs::read(clash_verge_core::utils::dirs::profiles_path()?).await?;
         let body = tokio::fs::read(clash_verge_core::utils::dirs::app_profiles_dir()?.join(&file)).await?;
-        Ok(RefreshSnapshot { metadata, body, file })
+        Ok(RefreshSnapshot {
+            uid: uid.to_owned(),
+            metadata,
+            body,
+            file,
+            fragments: Vec::new(),
+        })
     }
 
     pub(crate) async fn restore_refresh_if_matches(
@@ -155,15 +204,81 @@ impl ProfileStore {
     ) -> anyhow::Result<()> {
         let _guard = PROFILE_IO.lock().await;
         let metadata = clash_verge_core::utils::dirs::profiles_path()?;
-        let body = clash_verge_core::utils::dirs::app_profiles_dir()?.join(&expected.file);
+        let profiles_dir = clash_verge_core::utils::dirs::app_profiles_dir()?;
+        let source = profiles_dir.join(&expected.file);
+        let current_bytes = tokio::fs::read(&metadata).await?;
+        let mut current: Value = serde_yaml_ng::from_slice(&current_bytes)?;
+        let old_metadata: Value = serde_yaml_ng::from_slice(&old.metadata)?;
+        let expected_metadata: Value = serde_yaml_ng::from_slice(&expected.metadata)?;
+        let old_item = profile_item(&old_metadata, &old.uid)?;
+        let expected_item = profile_item(&expected_metadata, &expected.uid)?;
+        let current_item = profile_items_mut(&mut current)?
+            .iter_mut()
+            .find(|item| item["uid"].as_str() == Some(old.uid.as_str()))
+            .context("refreshed profile was removed; refusing rollback")?;
+        let current_file_matches = current_item["file"].as_str() == Some(expected.file.as_str());
+        let mut conflict = !current_file_matches
+            || old.file != expected.file
+            || current_item["url"] != expected_item["url"]
+            || current_item["type"] != expected_item["type"];
+        // These are the only fields update_item owns. Desc/name/current,
+        // unknown fields and other profiles are never rollback targets.
+        let mapping = current_item.as_mapping_mut().context("profile item is not a mapping")?;
+        for field in ["updated", "extra", "home", "option", "file"] {
+            let key = Value::from(field);
+            conflict |= restore_field_delta(mapping, &key, old_item.get(field), expected_item.get(field));
+        }
+        let body_matches = tokio::fs::read(&source).await? == expected.body;
+        // Keep A's source and metadata as one transaction: a newer owned
+        // field or body rejects the entire rollback, including fragment cleanup.
         anyhow::ensure!(
-            old.file == expected.file
-                && tokio::fs::read(&metadata).await? == expected.metadata
-                && tokio::fs::read(&body).await? == expected.body,
+            !conflict && body_matches,
             "profile changed after forced refresh; refusing to overwrite newer source or metadata"
         );
-        tokio::fs::write(body, &old.body).await?;
-        tokio::fs::write(metadata, &old.metadata).await?;
+
+        // Remove only this refresh's newly generated fragments. A later
+        // reference from any surviving profile makes the fragment shared.
+        let mut protected_fragment = false;
+        let mut removed_files = Vec::new();
+        for fragment in &expected.fragments {
+            let uid = fragment.item["uid"].as_str().context("fragment has no uid")?;
+            if profile_items(&current)?
+                .iter()
+                .any(|item| references_fragment(item, uid))
+            {
+                protected_fragment = true;
+                continue;
+            }
+            let items = profile_items_mut(&mut current)?;
+            let Some(index) = items.iter().position(|item| item["uid"].as_str() == Some(uid)) else {
+                continue;
+            };
+            let path = profiles_dir.join(&fragment.file);
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if items[index] != fragment.item || bytes.as_deref() != Some(fragment.body.as_slice()) {
+                protected_fragment = true;
+                continue;
+            }
+            items.remove(index);
+            removed_files.push(path);
+        }
+
+        tokio::fs::write(source, &old.body).await?;
+        // Preserve exact old bytes when the document has no other changes;
+        // otherwise serialize the merged current document, including unknowns.
+        if current_bytes == expected.metadata && !protected_fragment {
+            tokio::fs::write(metadata, &old.metadata).await?;
+        } else {
+            tokio::fs::write(metadata, serde_yaml_ng::to_string(&current)?).await?;
+        }
+        // Persist removal of chain references before deleting their files.
+        for path in removed_files {
+            tokio::fs::remove_file(path).await?;
+        }
         Ok(())
     }
 
@@ -371,6 +486,92 @@ impl ProfileStore {
         }
         Ok(refreshed_current)
     }
+}
+
+fn profile_items(metadata: &Value) -> anyhow::Result<&Vec<Value>> {
+    metadata["items"]
+        .as_sequence()
+        .context("profile metadata has no item list")
+}
+
+fn profile_items_mut(metadata: &mut Value) -> anyhow::Result<&mut Vec<Value>> {
+    metadata["items"]
+        .as_sequence_mut()
+        .context("profile metadata has no item list")
+}
+
+fn profile_item<'a>(metadata: &'a Value, uid: &str) -> anyhow::Result<&'a Value> {
+    profile_items(metadata)?
+        .iter()
+        .find(|item| item["uid"].as_str() == Some(uid))
+        .context("profile missing from refresh snapshot")
+}
+
+fn references_fragment(item: &Value, uid: &str) -> bool {
+    ["merge", "script", "rules", "proxies", "groups"]
+        .iter()
+        .any(|key| item["option"][key].as_str() == Some(uid))
+}
+
+fn null_or_missing(value: Option<&Value>) -> bool {
+    value.is_none_or(Value::is_null)
+}
+
+/// Apply only the writer's leaf delta to a candidate document. The caller
+/// discards that document if any changed leaf no longer matches expected.
+fn restore_field_delta(current: &mut Mapping, key: &Value, old: Option<&Value>, expected: Option<&Value>) -> bool {
+    if old == expected || (null_or_missing(old) && null_or_missing(expected)) {
+        return false;
+    }
+    let old_map = old.and_then(Value::as_mapping);
+    let expected_map = expected.and_then(Value::as_mapping);
+    if (old_map.is_some() || expected_map.is_some())
+        && (old_map.is_some() || null_or_missing(old))
+        && (expected_map.is_some() || null_or_missing(expected))
+        && let Some(current_map) = current.get_mut(key).and_then(Value::as_mapping_mut)
+    {
+        let mut keys = Vec::new();
+        for map in [old_map, expected_map].into_iter().flatten() {
+            for key in map.keys() {
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
+        let mut conflict = false;
+        for nested in keys {
+            conflict |= restore_field_delta(
+                current_map,
+                &nested,
+                old_map.and_then(|map| map.get(&nested)),
+                expected_map.and_then(|map| map.get(&nested)),
+            );
+        }
+        if current_map.is_empty() && null_or_missing(old) {
+            match old {
+                Some(old) => {
+                    current.insert(key.clone(), old.clone());
+                }
+                None => {
+                    current.remove(key);
+                }
+            }
+        }
+        return conflict;
+    }
+    let actual = current.get(key);
+    if actual != expected && !(null_or_missing(actual) && null_or_missing(expected)) {
+        return true;
+    }
+    match old {
+        Some(old) => {
+            current.insert(key.clone(), old.clone());
+        }
+        None => {
+            current.remove(key);
+        }
+    }
+    false
 }
 
 async fn ensure_profile_storage() -> anyhow::Result<()> {

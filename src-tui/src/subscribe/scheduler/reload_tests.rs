@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+mod ownership_tests;
+
 struct ReloadLifecycle {
     api: MihomoApi,
     reloads: AtomicUsize,

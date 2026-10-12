@@ -350,27 +350,8 @@ impl AutoUpdateScheduler {
         node: &str,
         enable_tun: bool,
     ) -> ProbeOutcome {
-        let old_snapshot = match ProfileStore::refresh_snapshot_locked(uid).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return ProbeOutcome {
-                    error: Some(error.to_string()),
-                    ..Default::default()
-                };
-            }
-        };
-        match ProfileStore::update_remotes_locked(&[uid.to_string()]).await {
-            Ok((updated, _failed)) if !updated.is_empty() => {
-                let refreshed_snapshot = match ProfileStore::refresh_snapshot_locked(uid).await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        return ProbeOutcome {
-                            forced_refresh: true,
-                            error: Some(error.to_string()),
-                            ..Default::default()
-                        };
-                    }
-                };
+        match ProfileStore::force_refresh_locked(uid).await {
+            Ok((old_snapshot, refreshed_snapshot)) => {
                 if refreshed_config_has_node(uid, node).await {
                     match super::lifecycle::reload_selected_with_lifecycle(lifecycle, uid, node, enable_tun).await {
                         Ok(_) => {
@@ -442,11 +423,6 @@ impl AutoUpdateScheduler {
                     }
                 }
             }
-            Ok(_) => ProbeOutcome {
-                forced_refresh: true,
-                error: Some(format!("forced refresh of {uid} produced no update")),
-                ..Default::default()
-            },
             Err(error) => ProbeOutcome {
                 error: Some(format!("forced refresh failed: {error}")),
                 ..Default::default()
