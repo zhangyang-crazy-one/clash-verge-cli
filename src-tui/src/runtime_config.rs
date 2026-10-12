@@ -10,6 +10,10 @@ use tokio::sync::Mutex;
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 pub(crate) mod reload_tests;
 
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod port_tests;
+
 /// Serializes all runtime-config read-modify-write sequences (mode switches,
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -182,7 +186,7 @@ pub(crate) async fn write_mihomo_candidate(enable_tun: bool, destination: &std::
             );
         }
         Some(yaml) => serde_yaml_ng::from_str::<serde_yaml_ng::Mapping>(&yaml)?,
-        None => clash_verge_core::config::IClashTemp::new().await.0,
+        None => load_runtime_app_config().await?,
     };
     crate::enhance::apply_verge_ports(&mut config).await;
     crate::enhance::apply_controller_cors(&mut config).await?;
@@ -738,6 +742,28 @@ pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::
     }
 }
 
+/// Load app-owned runtime values without the UI's port guards. An explicit
+/// zero disables a listener; only absent keys inherit the shared template.
+/// Existing read/parse errors must never replace user intent with defaults.
+async fn load_runtime_app_config() -> anyhow::Result<serde_yaml_ng::Mapping> {
+    use anyhow::Context as _;
+
+    let path = clash_verge_core::utils::dirs::clash_path()?;
+    let template = clash_verge_core::config::IClashTemp::template().0;
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(template),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    }
+    let mut mapping = clash_verge_core::utils::help::read_mapping(&path)
+        .await
+        .with_context(|| format!("cannot read {}; config was left untouched", path.display()))?;
+    for (key, value) in template {
+        mapping.entry(key).or_insert(value);
+    }
+    Ok(mapping)
+}
+
 /// Read a remote profile's YAML from disk and compose its configured rules
 /// fragment (`option.rules`) before returning the parsed mapping.
 ///
@@ -752,7 +778,7 @@ pub async fn load_remote_profile_with_rules(
         .await
         .map_err(|error| error.to_string())?
         .all_items();
-    let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    let mut app_config = load_runtime_app_config().await.map_err(|error| error.to_string())?;
     crate::enhance::apply_verge_ports(&mut app_config).await;
     crate::enhance::apply_controller_cors(&mut app_config)
         .await
@@ -795,7 +821,7 @@ pub async fn compose_profile_rules(
         .await
         .map_err(|error| error.to_string())?
         .all_items();
-    let mut app_config = clash_verge_core::config::IClashTemp::new().await.0;
+    let mut app_config = load_runtime_app_config().await.map_err(|error| error.to_string())?;
     crate::enhance::apply_verge_ports(&mut app_config).await;
     crate::enhance::apply_controller_cors(&mut app_config)
         .await
