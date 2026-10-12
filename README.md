@@ -72,6 +72,21 @@ publishes Linux builds for these targets:
 | `armv7-unknown-linux-musleabihf` | 32-bit ARMv7 boards and routers (static) | `.tar.gz`, `.deb` (armhf), `.rpm` (armv7hl) |
 | `x86_64-unknown-linux-gnu` | x86_64 with glibc | `.tar.gz` |
 
+The CLI does not require Linux 5.3: older kernels and containers that block
+`pidfd_open` or `pidfd_send_signal` with `ENOSYS`/`EPERM` use a verified
+PID + `/proc/PID/stat` starttime fallback. Working pidfds remain preferred.
+Cleanup verifies spawned child ancestry or an authenticated launch receipt;
+external processes still require matching executable and arguments. The CLI
+rechecks the process generation before every fallback signal and logs one
+warning per process. A small PID-reuse window remains between that check and
+the numeric-PID signal. Other syscall errors do not enable the fallback.
+For the GNU x86_64 target, Rust's documented platform baseline is Linux 3.2+
+and glibc 2.17+. Rust's [platform support table](https://doc.rust-lang.org/rustc/platform-support.html)
+does not specify a numeric kernel floor for the shipped musl targets, so
+there is no claimed universal minimum for those artifacts. The build target,
+dependencies and selected mihomo/sing-box core requirements still apply;
+historical-kernel boots have not been verified. `/proc` must be available.
+
 `SHA256SUMS` lists the checksum of every file.
 
 Debian/Ubuntu or Fedora/RHEL (installs the binary, completions, and man pages):

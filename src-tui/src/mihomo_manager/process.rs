@@ -58,16 +58,17 @@ impl ProcessIdentity {
     }
 
     pub(crate) fn bind(&self) -> anyhow::Result<OwnedProcess> {
-        let process = OwnedProcess::capture(self.pid)?;
+        let mut process = OwnedProcess::capture(self.pid)?;
         anyhow::ensure!(
             process.start_ticks == self.start_ticks && self.matches_live(),
             "receipt process identity changed before binding"
         );
+        process.fallback_authorized = true; // Strict executable/argv identity, never a disk-only claim.
         Ok(process)
     }
 
-    /// Open a pidfd before the final identity check. Both TERM and KILL use
-    /// this handle, so PID reuse between checks cannot redirect a signal.
+    /// Prefer a pidfd, otherwise authorize the fallback only after the final
+    /// strict live-identity check. Every numeric signal rechecks generation.
     pub(crate) async fn stop(&self) -> anyhow::Result<()> {
         if !self.matches_live() {
             return Ok(());
@@ -76,13 +77,16 @@ impl ProcessIdentity {
     }
 }
 
-/// Authority over one kernel process, not over a reusable numeric PID or
-/// an executable name. Kept open from ancestry verification through cleanup.
+/// Authority over one verified process generation, not an executable name.
+/// A pidfd is kept open from ancestry verification through cleanup when possible.
 /// An owned child may exec between those steps without becoming foreign.
 pub(crate) struct OwnedProcess {
     pub pid: u32,
     start_ticks: u64,
-    pidfd: OwnedFd,
+    pidfd: Option<OwnedFd>,
+    // Set only after verifying ancestry, a strict live external identity,
+    // or the actual supervisor's authenticated per-launch attestation.
+    fallback_authorized: bool,
 }
 
 impl OwnedProcess {
@@ -98,7 +102,8 @@ impl OwnedProcess {
         Ok(Self {
             pid: self.pid,
             start_ticks: self.start_ticks,
-            pidfd: self.pidfd.try_clone()?,
+            pidfd: self.pidfd.as_ref().map(OwnedFd::try_clone).transpose()?,
+            fallback_authorized: self.fallback_authorized,
         })
     }
 
@@ -107,21 +112,29 @@ impl OwnedProcess {
             .ok_or_else(|| anyhow::anyhow!("cannot read starttime of pid {pid}"))?;
         // SAFETY: pidfd_open has no pointer arguments and returns an owned fd.
         let raw = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) } as i32;
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: raw is a fresh successful pidfd_open result.
+        let pidfd = if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            if !pidfd_unavailable(&error) {
+                return Err(error.into());
+            }
+            warn_pid_fallback();
+            None
+        } else {
+            // SAFETY: raw is a fresh successful pidfd_open result.
+            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
         let process = Self {
             pid,
             start_ticks: ticks,
-            pidfd: unsafe { OwnedFd::from_raw_fd(raw) },
+            pidfd,
+            fallback_authorized: false,
         };
         anyhow::ensure!(process.matches_process(), "pid {pid} changed identity before binding");
         Ok(process)
     }
 
     pub(crate) fn capture_child(pid: u32, parent: &Self) -> anyhow::Result<Self> {
-        let process = Self::capture(pid)?;
+        let mut process = Self::capture(pid)?;
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
         let ppid = stat
             .rsplit_once(')')
@@ -131,6 +144,7 @@ impl OwnedProcess {
             ppid == Some(parent.pid) && parent.matches_process() && process.matches_process(),
             "pid {pid} is no longer a child of the bound parent"
         );
+        process.fallback_authorized = true;
         Ok(process)
     }
 
@@ -143,17 +157,41 @@ impl OwnedProcess {
     }
 
     fn signal(&self, signal: i32) -> anyhow::Result<()> {
-        // SAFETY: the fd remains owned/live, siginfo is null, and flags is 0.
-        let result = unsafe {
-            nix::libc::syscall(
-                nix::libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<nix::libc::siginfo_t>(),
-                0,
-            )
-        };
-        if result < 0 {
+        if let Some(pidfd) = &self.pidfd {
+            // SAFETY: the fd remains owned/live, siginfo is null, and flags is 0.
+            let result = unsafe {
+                nix::libc::syscall(
+                    nix::libc::SYS_pidfd_send_signal,
+                    pidfd.as_raw_fd(),
+                    signal,
+                    std::ptr::null::<nix::libc::siginfo_t>(),
+                    0,
+                )
+            };
+            if result >= 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(nix::libc::ESRCH) {
+                return Ok(());
+            }
+            if !pidfd_unavailable(&error) {
+                return Err(error.into());
+            }
+        }
+        anyhow::ensure!(
+            self.fallback_authorized,
+            "numeric PID signaling requires verified ownership or live identity"
+        );
+        warn_pid_fallback();
+        // Recheck immediately before EACH numeric signal, including CONT
+        // and escalation. The tiny check-to-kill reuse window is unavoidable
+        // without working pidfds and is explicitly documented.
+        if !self.matches_process() {
+            return Ok(());
+        }
+        // SAFETY: kill takes only a positive PID and a signal number.
+        if unsafe { nix::libc::kill(self.pid as nix::libc::pid_t, signal) } < 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(nix::libc::ESRCH) {
                 return Err(error.into());
@@ -218,6 +256,15 @@ impl OwnedProcess {
         );
         Ok(())
     }
+}
+
+fn pidfd_unavailable(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(nix::libc::ENOSYS | nix::libc::EPERM))
+}
+
+fn warn_pid_fallback() {
+    static WARN: std::sync::Once = std::sync::Once::new();
+    WARN.call_once(|| tracing::warn!(target: "mihomo", "pidfd unavailable or blocked; using verified PID/starttime fallback. A small PID-reuse window remains between the identity check and signal."));
 }
 
 fn start_ticks(stat: &str) -> Option<u64> {
@@ -317,33 +364,41 @@ impl ReceiptTarget {
                 || self.supervisor.map(|(_, ticks)| ticks) != sender_ticks
                 // SAFETY: geteuid has no arguments.
                 || credentials.uid != unsafe { nix::libc::geteuid() }
-                || fds.len() != 1
+                || fds.len() > 1
             {
                 continue;
             }
             let Ok(receipt) = serde_json::from_slice::<LaunchReceipt>(&body) else {
                 continue;
             };
-            let pidfd = fds.remove(0);
-            // fdinfo is kernel evidence that SCM_RIGHTS carried the pidfd
-            // for the receipt's PID, rather than an unrelated descriptor.
-            let fdinfo =
-                std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap_or_default();
-            let fd_pid = fdinfo
-                .lines()
-                .find_map(|line| line.strip_prefix("Pid:").and_then(|pid| pid.trim().parse::<u32>().ok()));
-            if fd_pid != Some(receipt.identity.pid)
-                || self.supervisor != Some((credentials.pid as u32, receipt.supervisor_start_ticks))
+            if self.supervisor != Some((credentials.pid as u32, receipt.supervisor_start_ticks))
                 || receipt.launch_id != self.launch_id
                 || receipt.kind != self.kind
                 || receipt.config != self.config
             {
                 continue;
             }
+            let pidfd = fds.pop();
+            // fdinfo is kernel evidence that SCM_RIGHTS carried the pidfd
+            // for the receipt's PID, rather than an unrelated descriptor.
+            if let Some(pidfd) = &pidfd {
+                let fdinfo =
+                    std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap_or_default();
+                let fd_pid = fdinfo
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Pid:").and_then(|pid| pid.trim().parse::<u32>().ok()));
+                if fd_pid != Some(receipt.identity.pid) {
+                    continue;
+                }
+            }
             let process = OwnedProcess {
                 pid: receipt.identity.pid,
                 start_ticks: receipt.identity.start_ticks,
                 pidfd,
+                // Credentials authenticate the actual bound, still-unreaped
+                // supervisor. record_launch verifies its original child
+                // relationship before sending, even if it later reparents.
+                fallback_authorized: true,
             };
             if process.matches_process() {
                 *self.received.lock() = Some((receipt, process));
@@ -448,7 +503,7 @@ pub(crate) fn record_launch(
     file.persist(&path).map_err(|error| error.error)?;
     let socket = UnixDatagram::unbound()?;
     socket.connect_addr(&receipt_address(&receipt.launch_id)?)?;
-    send_receipt(&socket, &body, &process.pidfd)?;
+    send_receipt(&socket, &body, process.pidfd.as_ref())?;
     Ok(())
 }
 
@@ -456,7 +511,7 @@ fn receipt_address(launch_id: &str) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(format!("clash-verge-cli-launch-{launch_id}"))
 }
 
-fn send_receipt(socket: &UnixDatagram, body: &[u8], pidfd: &OwnedFd) -> std::io::Result<()> {
+fn send_receipt(socket: &UnixDatagram, body: &[u8], pidfd: Option<&OwnedFd>) -> std::io::Result<()> {
     let mut control = [0usize; 8];
     let mut iov = nix::libc::iovec {
         iov_base: body.as_ptr().cast_mut().cast(),
@@ -466,15 +521,17 @@ fn send_receipt(socket: &UnixDatagram, body: &[u8], pidfd: &OwnedFd) -> std::io:
     let mut message: nix::libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
     // SAFETY: control is aligned and large enough for one integer fd.
     unsafe {
-        message.msg_controllen = nix::libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) as _;
-        let header = nix::libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = nix::libc::SOL_SOCKET;
-        (*header).cmsg_type = nix::libc::SCM_RIGHTS;
-        (*header).cmsg_len = nix::libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
-        std::ptr::write_unaligned(nix::libc::CMSG_DATA(header).cast::<i32>(), pidfd.as_raw_fd());
+        if let Some(pidfd) = pidfd {
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = nix::libc::CMSG_SPACE(std::mem::size_of::<i32>() as _) as _;
+            let header = nix::libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = nix::libc::SOL_SOCKET;
+            (*header).cmsg_type = nix::libc::SCM_RIGHTS;
+            (*header).cmsg_len = nix::libc::CMSG_LEN(std::mem::size_of::<i32>() as _) as _;
+            std::ptr::write_unaligned(nix::libc::CMSG_DATA(header).cast::<i32>(), pidfd.as_raw_fd());
+        }
         if nix::libc::sendmsg(socket.as_raw_fd(), &message, nix::libc::MSG_DONTWAIT) < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -606,6 +663,285 @@ pub(crate) fn refuse_external_systemd_apply(owns_child: bool, cgroup: &str) -> a
 mod tests {
     use super::*;
 
+    // Real kernel syscall denial, installed only in a freshly forked test
+    // subprocess before exec. Works with static musl too (no LD_PRELOAD).
+    fn deny_syscall(number: i64, errno: i32) -> std::io::Result<()> {
+        let mut filter = [
+            nix::libc::sock_filter {
+                code: 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }, // LD W ABS syscall nr
+            nix::libc::sock_filter {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: number as u32,
+            }, // JEQ
+            nix::libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x00050000 | errno as u32,
+            }, // RET ERRNO
+            nix::libc::sock_filter {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x7fff0000,
+            }, // RET ALLOW
+        ];
+        let program = nix::libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: only the calling test child is restricted; the kernel
+        // copies the stack-owned filter, and no pointer survives this call.
+        if unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0
+            || unsafe { nix::libc::prctl(nix::libc::PR_SET_SECCOMP, 2, &program) } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_pidfd_seccomp_regression() {
+        use std::os::unix::process::CommandExt as _;
+        for syscall in [nix::libc::SYS_pidfd_open, nix::libc::SYS_pidfd_send_signal] {
+            for errno in [nix::libc::ENOSYS, nix::libc::EPERM, nix::libc::EINVAL] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "mihomo_manager::process::tests::disabled_pidfd_fixture",
+                        "--nocapture",
+                    ])
+                    .env("CLI_TEST_PIDFD_FIXTURE", "1")
+                    .env("CLI_TEST_PIDFD_ERROR", errno.to_string())
+                    .env(
+                        "CLI_TEST_PIDFD_OPEN_DENIED",
+                        if syscall == nix::libc::SYS_pidfd_open { "1" } else { "0" },
+                    );
+                // SAFETY: child-only pre_exec uses stack storage and libc calls.
+                unsafe {
+                    command.pre_exec(move || deny_syscall(syscall, errno));
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "syscall={syscall} errno={errno}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_pidfd_fixture() {
+        if std::env::var_os("CLI_TEST_PIDFD_FIXTURE").is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let home = tempfile::tempdir().unwrap();
+            let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+            if std::env::var("CLI_TEST_PIDFD_ERROR").unwrap() == nix::libc::EINVAL.to_string() {
+                let mut child = tokio::process::Command::new("sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                let result = crate::mihomo_manager::manager::bind_spawned_core(
+                    &mut child,
+                    CoreKind::Mihomo,
+                    None,
+                    Path::new("/bin/sleep"),
+                    vec![],
+                )
+                .await;
+                if std::env::var("CLI_TEST_PIDFD_OPEN_DENIED").unwrap() == "1" {
+                    assert!(result.is_err(), "unexpected open errors must abort binding");
+                    assert!(
+                        child.try_wait().unwrap().is_some(),
+                        "failed bind reaps its actual child"
+                    );
+                } else {
+                    assert!(
+                        result.unwrap().freeze().await.is_err(),
+                        "unexpected send errors must not use numeric signaling"
+                    );
+                    assert!(child.try_wait().unwrap().is_none(), "no signal bypass on EINVAL");
+                    child.kill().await.unwrap();
+                    child.wait().await.unwrap();
+                }
+                return;
+            }
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut foreign = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let bound = crate::mihomo_manager::manager::bind_spawned_core(
+                &mut child,
+                CoreKind::Mihomo,
+                None,
+                Path::new("/bin/sleep"),
+                vec![],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                bound.pidfd.is_none(),
+                std::env::var("CLI_TEST_PIDFD_OPEN_DENIED").unwrap() == "1"
+            );
+            assert!(child.try_wait().unwrap().is_none(), "spawn binds when pidfd is denied");
+            let parent = OwnedProcess::capture(std::process::id()).unwrap();
+            assert!(
+                OwnedProcess::capture_child(foreign.id().unwrap(), &bound).is_err(),
+                "false ancestry refused"
+            );
+            let mut wrong = bound.try_clone().unwrap();
+            wrong.start_ticks += 1;
+            wrong.signal(nix::libc::SIGKILL).unwrap();
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "each numeric signal checks generation"
+            );
+            let untrusted = OwnedProcess::capture(foreign.id().unwrap()).unwrap();
+            assert!(
+                untrusted.signal(nix::libc::SIGKILL).is_err(),
+                "bare PID capture cannot authorize fallback"
+            );
+            bound.freeze().await.unwrap();
+            bound.stop().await.unwrap();
+            child.wait().await.unwrap();
+            assert!(
+                foreign.try_wait().unwrap().is_none(),
+                "cleanup affects only the verified child"
+            );
+            OwnedProcess::capture_child(foreign.id().unwrap(), &parent)
+                .unwrap()
+                .stop()
+                .await
+                .unwrap();
+            foreign.wait().await.unwrap();
+
+            let mut target = ReceiptTarget::new(home.path(), CoreKind::SingBox).unwrap();
+            let mut supervisor = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mihomo_manager::process::tests::exiting_supervisor_fixture"])
+                .env(RECEIPT_PATH_ENV, &target.path)
+                .env(LAUNCH_ID_ENV, &target.launch_id)
+                .env("CLI_TEST_RECEIPT_CONFIG", &target.config)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            target.bind_supervisor(supervisor.id());
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while crate::commands::start::supervisor_exit_status(&supervisor)
+                .unwrap()
+                .is_none()
+            {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let identity = target
+                .verified_identity()
+                .expect("actual unreaped supervisor authenticates reparented core");
+            let owned = target.bind().unwrap();
+            let _guard = FixtureCoreGuard(owned.try_clone().unwrap());
+            assert!(supervisor.wait().unwrap().success());
+            assert!(
+                target.verified_identity().is_some(),
+                "authentication persists after reaping"
+            );
+            owned.stop().await.unwrap();
+            assert!(!identity.matches_process());
+
+            let mut target = ReceiptTarget::new(home.path(), CoreKind::Mihomo).unwrap();
+            let mut supervisor = std::process::Command::new("sleep").arg("60").spawn().unwrap();
+            target.bind_supervisor(supervisor.id());
+            let sender = UnixDatagram::unbound().unwrap();
+            sender
+                .connect_addr(&receipt_address(&target.launch_id).unwrap())
+                .unwrap();
+            let forged = LaunchReceipt {
+                launch_id: target.launch_id.clone(),
+                supervisor_start_ticks: target.supervisor.unwrap().1,
+                identity: ProcessIdentity::capture(std::process::id()).unwrap(),
+                kind: target.kind,
+                config: target.config.clone(),
+            };
+            let body = serde_json::to_vec(&forged).unwrap();
+            std::fs::write(&target.path, &body).unwrap();
+            assert!(target.bind().is_err(), "disk alone cannot authorize no-fd receipt");
+            send_receipt(&sender, &body, None).unwrap();
+            assert!(
+                target.bind().is_err(),
+                "same uid and exact token cannot forge supervisor credentials"
+            );
+            supervisor.kill().unwrap();
+            supervisor.wait().unwrap();
+            target.supervisor = Some((std::process::id(), parent.start_ticks + 1));
+            send_receipt(&sender, &body, None).unwrap();
+            assert!(target.bind().is_err(), "changed sender generation refused");
+
+            // Even an authenticated sender cannot pass a non-pidfd or a
+            // pidfd for another process. No-fd mode is not a bypass for an
+            // invalid descriptor when one is present.
+            let mut target = ReceiptTarget::new(home.path(), CoreKind::Mihomo).unwrap();
+            target.bind_supervisor(std::process::id());
+            let mut child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let owned = OwnedProcess::spawned(&child).unwrap();
+            let mut receipt = LaunchReceipt {
+                launch_id: target.launch_id.clone(),
+                supervisor_start_ticks: parent.start_ticks,
+                identity: ProcessIdentity::capture(owned.pid).unwrap(),
+                kind: target.kind,
+                config: target.config.clone(),
+            };
+            let sender = UnixDatagram::unbound().unwrap();
+            sender
+                .connect_addr(&receipt_address(&target.launch_id).unwrap())
+                .unwrap();
+            for invalid in ["fd-kind", "generation", "token", "config", "kind"] {
+                let original = serde_json::to_vec(&receipt).unwrap();
+                let wrong_fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+                match invalid {
+                    "generation" => receipt.identity.start_ticks += 1,
+                    "token" => receipt.launch_id = "foreign-launch".into(),
+                    "config" => receipt.config = home.path().join("foreign.json"),
+                    "kind" => receipt.kind = CoreKind::SingBox,
+                    _ => {}
+                }
+                let body = serde_json::to_vec(&receipt).unwrap();
+                std::fs::write(&target.path, &body).unwrap();
+                send_receipt(
+                    &sender,
+                    &body,
+                    if invalid == "fd-kind" { Some(&wrong_fd) } else { None },
+                )
+                .unwrap();
+                assert!(target.bind().is_err(), "invalid no-fd receipt {invalid} rejected");
+                receipt = serde_json::from_slice(&original).unwrap();
+            }
+            owned.stop().await.unwrap();
+            child.wait().await.unwrap();
+        });
+    }
+
     fn command_cmdline(command: &tokio::process::Command) -> Vec<u8> {
         let mut bytes = Vec::new();
         for arg in std::iter::once(command.as_std().get_program()).chain(command.as_std().get_args()) {
@@ -727,7 +1063,7 @@ mod tests {
         sender
             .connect_addr(&receipt_address(&target.launch_id).unwrap())
             .unwrap();
-        send_receipt(&sender, &body, &owned.pidfd).unwrap();
+        send_receipt(&sender, &body, owned.pidfd.as_ref()).unwrap();
         assert!(
             target.bind().is_err(),
             "matching uid, launch metadata and pidfd cannot impersonate the known supervisor"
@@ -796,7 +1132,11 @@ mod tests {
             send_receipt(
                 &sender,
                 &body,
-                if invalid == "fd-kind" { &wrong_fd } else { &owned.pidfd },
+                if invalid == "fd-kind" {
+                    Some(&wrong_fd)
+                } else {
+                    owned.pidfd.as_ref()
+                },
             )
             .unwrap();
             assert!(target.bind().is_err(), "{invalid} must be rejected");
@@ -869,7 +1209,7 @@ mod tests {
         sender
             .connect_addr(&receipt_address(&target.launch_id).unwrap())
             .unwrap();
-        send_receipt(&sender, &body, &owned.pidfd).unwrap();
+        send_receipt(&sender, &body, owned.pidfd.as_ref()).unwrap();
         assert!(target.verified_identity().is_some());
         let stdin = child.stdin.take().unwrap();
         use tokio::io::AsyncWriteExt as _;
@@ -1068,7 +1408,7 @@ mod tests {
             .connect_addr(&receipt_address(&receipt.launch_id).unwrap())
             .unwrap();
         let foreign_handle = OwnedProcess::capture(std::process::id()).unwrap();
-        send_receipt(&foreign_sender, &vec![0u8; 65537], &foreign_handle.pidfd).unwrap();
+        send_receipt(&foreign_sender, &vec![0u8; 65537], foreign_handle.pidfd.as_ref()).unwrap();
         let mut supervisor = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "mihomo_manager::process::tests::exiting_supervisor_fixture"])
             .env(RECEIPT_PATH_ENV, &receipt.path)

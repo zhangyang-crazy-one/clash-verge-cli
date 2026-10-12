@@ -1114,7 +1114,9 @@ impl LaunchOwnership {
     pub(crate) fn new(supervisor_pid: u32) -> Self {
         Self {
             supervisor_pid,
-            supervisor_identity: super::process::OwnedProcess::capture(supervisor_pid).ok(),
+            supervisor_identity: super::process::OwnedProcess::capture(std::process::id())
+                .and_then(|parent| super::process::OwnedProcess::capture_child(supervisor_pid, &parent))
+                .ok(),
             receipt: None,
         }
     }
@@ -1123,7 +1125,9 @@ impl LaunchOwnership {
         receipt.bind_supervisor(supervisor_pid);
         Self {
             supervisor_pid,
-            supervisor_identity: super::process::OwnedProcess::capture(supervisor_pid).ok(),
+            supervisor_identity: super::process::OwnedProcess::capture(std::process::id())
+                .and_then(|parent| super::process::OwnedProcess::capture_child(supervisor_pid, &parent))
+                .ok(),
             receipt: Some(receipt),
         }
     }
