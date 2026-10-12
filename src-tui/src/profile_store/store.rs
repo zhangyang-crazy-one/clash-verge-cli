@@ -17,6 +17,14 @@ pub struct ProfileStore {
     profiles: IProfiles,
 }
 
+/// Exact forced-refresh backup. Both files are compared before restoration so
+/// a late failed apply cannot overwrite another refresh or a user's edits.
+pub(crate) struct RefreshSnapshot {
+    metadata: Vec<u8>,
+    body: Vec<u8>,
+    file: String,
+}
+
 impl ProfileStore {
     /// Read-only snapshot under the shared IO lock (avoids torn reads during a save).
     pub async fn snapshot() -> anyhow::Result<Self> {
@@ -118,15 +126,31 @@ impl ProfileStore {
         Ok(())
     }
 
-    /// Restore a profile's `updated` timestamp (probe rollback path).
-    pub async fn restore_updated_locked(uid: &str, updated: usize) -> anyhow::Result<()> {
+    pub(crate) async fn refresh_snapshot_locked(uid: &str) -> anyhow::Result<RefreshSnapshot> {
         let _guard = PROFILE_IO.lock().await;
-        let mut store = Self::load_unlocked().await?;
-        let patch = PrfItem {
-            updated: Some(updated),
-            ..Default::default()
-        };
-        store.profiles.patch_item(&uid.into(), &patch).await?;
+        let store = Self::load_unlocked().await?;
+        let item = store.profiles.get_item(CompactString::from(uid))?;
+        let file = item.file.as_deref().context("profile has no file")?.to_owned();
+        let metadata = tokio::fs::read(clash_verge_core::utils::dirs::profiles_path()?).await?;
+        let body = tokio::fs::read(clash_verge_core::utils::dirs::app_profiles_dir()?.join(&file)).await?;
+        Ok(RefreshSnapshot { metadata, body, file })
+    }
+
+    pub(crate) async fn restore_refresh_if_matches(
+        old: &RefreshSnapshot,
+        expected: &RefreshSnapshot,
+    ) -> anyhow::Result<()> {
+        let _guard = PROFILE_IO.lock().await;
+        let metadata = clash_verge_core::utils::dirs::profiles_path()?;
+        let body = clash_verge_core::utils::dirs::app_profiles_dir()?.join(&expected.file);
+        anyhow::ensure!(
+            old.file == expected.file
+                && tokio::fs::read(&metadata).await? == expected.metadata
+                && tokio::fs::read(&body).await? == expected.body,
+            "profile changed after forced refresh; refusing to overwrite newer source or metadata"
+        );
+        tokio::fs::write(body, &old.body).await?;
+        tokio::fs::write(metadata, &old.metadata).await?;
         Ok(())
     }
 

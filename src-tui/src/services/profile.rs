@@ -7,7 +7,7 @@ use serde_yaml_ng::Mapping;
 use crate::mihomo_api::MihomoApi;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
 use crate::profile_store::store::ProfileStore;
-use crate::runtime_config::commit_runtime_config;
+use crate::runtime_config::{ApplyError, commit_runtime_config};
 
 /// Prepare a candidate profile with the shared GUI DNS section applied when
 /// this profile's setting is enabled and its provider DNS source is confirmed.
@@ -124,8 +124,8 @@ pub fn find_profile<'a>(items: &'a [PrfItem], query: &str) -> anyhow::Result<&'a
 
 /// Make `item` the current profile and apply it: remote subscriptions are
 /// reloaded as-is, local profiles get their chain fragments merged into the
-/// runtime config. On failure the previous current profile is restored (if
-/// nothing else changed it meanwhile) and a user-facing error is returned.
+/// runtime config. Only a rejected/pre-send failure restores the previous UID;
+/// an uncertain reload keeps the desired UID and candidate for a real retry.
 pub async fn switch_profile(
     api: &MihomoApi,
     item: &PrfItem,
@@ -143,10 +143,10 @@ pub async fn switch_profile(
 
     let applied = apply_profile(api, item, &yaml, enable_tun, core_running).await;
 
-    if applied.is_err() {
+    if applied.as_ref().is_err_and(ApplyError::allows_rollback) {
         let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
     }
-    applied
+    applied.map_err(|error| format!("profile reload: {error}"))
 }
 
 async fn apply_profile(
@@ -155,7 +155,7 @@ async fn apply_profile(
     yaml: &str,
     enable_tun: bool,
     core_running: bool,
-) -> Result<(), String> {
+) -> Result<(), ApplyError> {
     let profile = serde_yaml_ng::from_str(yaml).map_err(|error| format!("invalid profile YAML: {error}"))?;
     commit_runtime_config(api, enable_tun, core_running, Some(item), |app_config| {
         let control_plane = crate::enhance::snapshot_control_plane(&app_config);
@@ -163,7 +163,6 @@ async fn apply_profile(
     })
     .await
     .map(|_| ())
-    .map_err(|error| format!("profile reload: {error}"))
 }
 
 /// Make `item` the current profile and apply it, dispatching by
@@ -215,16 +214,16 @@ pub async fn switch_profile_for_core(
                 )
                 .await
                 .map(|_report| ())
-                .map_err(|error| format!("profile reload: {error}"))
+                .map_err(ApplyError::from)
             }
         }
     }
     .await;
 
-    if applied.is_err() {
+    if applied.as_ref().is_err_and(ApplyError::allows_rollback) {
         let _ = ProfileStore::restore_current_if_matches(uid, previous_uid.as_deref()).await;
     }
-    applied
+    applied.map_err(|error| format!("profile reload: {error}"))
 }
 
 #[cfg(test)]

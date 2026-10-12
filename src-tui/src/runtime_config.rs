@@ -6,6 +6,10 @@ use std::sync::LazyLock;
 
 use tokio::sync::Mutex;
 
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub(crate) mod reload_tests;
+
 /// Serializes all runtime-config read-modify-write sequences (mode switches,
 /// TUN toggles, profile commits) across TUI/daemon tasks.
 pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -16,6 +20,34 @@ pub static RUNTIME_CONFIG_IO: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(
 pub(crate) enum ApplyOutcome {
     Applied,
     Unchanged,
+}
+
+/// Rejected/pre-send failures can restore previous state. Uncertain means the
+/// core may already have applied the candidate, so all callers must retain it.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ApplyError {
+    #[error("{0}")]
+    Rejected(String),
+    #[error("{0}")]
+    Uncertain(String),
+}
+
+impl ApplyError {
+    pub(crate) fn allows_rollback(&self) -> bool {
+        matches!(self, Self::Rejected(_))
+    }
+}
+
+impl From<String> for ApplyError {
+    fn from(error: String) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+impl From<&str> for ApplyError {
+    fn from(error: &str) -> Self {
+        Self::Rejected(error.into())
+    }
 }
 
 /// Compare parsed configuration, preserving array order and every unknown
@@ -534,6 +566,7 @@ struct RuntimeCandidate {
     candidate: std::path::PathBuf,
     previous: Option<Vec<u8>>,
     installed: bool,
+    rollback_on_drop: bool,
 }
 
 impl RuntimeCandidate {
@@ -543,6 +576,7 @@ impl RuntimeCandidate {
             candidate,
             previous,
             installed: false,
+            rollback_on_drop: true,
         }
     }
     fn install(&mut self) -> Result<(), String> {
@@ -580,7 +614,9 @@ impl RuntimeCandidate {
 
 impl Drop for RuntimeCandidate {
     fn drop(&mut self) {
-        if let Err(error) = self.rollback() {
+        if self.rollback_on_drop
+            && let Err(error) = self.rollback()
+        {
             tracing::error!(target: "config", "cancelled config apply rollback failed: {error}");
         }
         let _ = std::fs::remove_file(&self.candidate);
@@ -612,29 +648,12 @@ pub async fn apply_singbox_active_reload(manager: &crate::mihomo_manager::Mihomo
     apply_singbox_restart(manager, yaml.as_deref(), enable_tun).await
 }
 
-pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), String> {
-    let config_path = path
-        .to_str()
-        .ok_or_else(|| format!("config path is not valid UTF-8: {}", path.display()))?;
-    let mut endpoint = api.path_url(&["configs"]).map_err(|error| error.to_string())?;
-    endpoint.query_pairs_mut().append_pair("force", "true");
-    let response = api
-        .client
-        .put(endpoint)
-        .json(&serde_json::json!({ "path": config_path, "payload": "" }))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if response.status().is_success() {
-        api.version()
-            .await
-            .map_err(|error| format!("config reload accepted but controller readiness failed: {error}"))?;
-        Ok(())
-    } else {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        Err(format!("Mihomo rejected config reload ({status}): {body}"))
+pub async fn reload_config_file(api: &crate::mihomo_api::MihomoApi, path: &std::path::Path) -> Result<(), ApplyError> {
+    use crate::mihomo_api::client::ReloadOutcome;
+    match api.reload_config(path).await {
+        ReloadOutcome::Confirmed => Ok(()),
+        ReloadOutcome::Rejected(error) => Err(ApplyError::Rejected(error)),
+        ReloadOutcome::Uncertain(error) => Err(ApplyError::Uncertain(error)),
     }
 }
 
@@ -928,6 +947,7 @@ pub async fn reload_remote_profile(
     reload_remote_profile_with_outcome(api, item, enable_tun, core_running)
         .await
         .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn reload_remote_profile_with_outcome(
@@ -935,7 +955,7 @@ pub(crate) async fn reload_remote_profile_with_outcome(
     item: &clash_verge_core::config::PrfItem,
     enable_tun: bool,
     core_running: bool,
-) -> Result<ApplyOutcome, String> {
+) -> Result<ApplyOutcome, ApplyError> {
     let profile = load_remote_profile_with_rules(item).await?;
 
     // Control-plane snapshot happens inside commit_runtime_config under the IO lock.
@@ -974,6 +994,81 @@ pub async fn write_runtime_config(
     write_runtime_config_unlocked(config, enable_tun).await
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReloadPending {
+    sha256: String,
+    profile_uid: Option<String>,
+}
+
+fn runtime_hash(bytes: &[u8]) -> Result<String, String> {
+    use sha2::Digest as _;
+    // Match the no-op comparison's semantics: mapping order/formatting are
+    // irrelevant, while array order, scalar type and unknown fields matter.
+    fn canonical(value: serde_yaml_ng::Value) -> serde_json::Value {
+        use serde_json::json;
+        use serde_yaml_ng::Value;
+        match value {
+            Value::Null => json!(["null"]),
+            Value::Bool(value) => json!(["bool", value]),
+            Value::Number(value) => json!(["number", value.to_string()]),
+            Value::String(value) => json!(["string", value]),
+            Value::Sequence(values) => json!(["sequence", values.into_iter().map(canonical).collect::<Vec<_>>()]),
+            Value::Mapping(mapping) => {
+                let mut entries: Vec<_> = mapping
+                    .into_iter()
+                    .map(|(key, value)| (canonical(key).to_string(), canonical(value)))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                json!(["mapping", entries])
+            }
+            Value::Tagged(tagged) => json!(["tagged", tagged.tag.to_string(), canonical(tagged.value)]),
+        }
+    }
+    let value = serde_yaml_ng::from_slice(bytes).map_err(|error| error.to_string())?;
+    let canonical = serde_json::to_vec(&canonical(value)).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", sha2::Sha256::digest(canonical)))
+}
+
+fn reload_pending_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_file_name(".mihomo-reload-pending.json")
+}
+
+fn read_reload_pending(path: &std::path::Path) -> Result<Option<ReloadPending>, String> {
+    match std::fs::read(reload_pending_path(path)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| format!("cannot read reload pending state: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("cannot read reload pending state: {error}")),
+    }
+}
+
+fn write_reload_pending(path: &std::path::Path, pending: &ReloadPending) -> Result<(), String> {
+    let data = serde_json::to_string(pending).map_err(|error| error.to_string())?;
+    write_private_runtime_yaml(&reload_pending_path(path), &data)?;
+    // Make the rename durable before the network request can be sent.
+    std::fs::File::open(path.parent().ok_or("runtime config has no parent")?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())
+}
+
+fn clear_reload_pending(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::remove_file(reload_pending_path(path)) {
+        Ok(()) => std::fs::File::open(path.parent().ok_or("runtime config has no parent")?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn restore_reload_pending(path: &std::path::Path, previous: Option<&ReloadPending>) -> Result<(), String> {
+    match previous {
+        Some(previous) => write_reload_pending(path, previous),
+        None => clear_reload_pending(path),
+    }
+}
+
 /// Backup → build (from a fresh on-disk snapshot) → write → reload/rollback.
 ///
 /// `build` receives the latest `clash.yaml` mapping while `RUNTIME_CONFIG_IO` is held,
@@ -984,7 +1079,7 @@ pub async fn commit_runtime_config<F>(
     core_running: bool,
     restore_item: Option<&clash_verge_core::config::PrfItem>,
     build: F,
-) -> Result<std::path::PathBuf, String>
+) -> Result<std::path::PathBuf, ApplyError>
 where
     F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
 {
@@ -999,11 +1094,24 @@ async fn commit_runtime_config_with_outcome<F>(
     core_running: bool,
     restore_item: Option<&clash_verge_core::config::PrfItem>,
     build: F,
-) -> Result<(std::path::PathBuf, ApplyOutcome), String>
+) -> Result<(std::path::PathBuf, ApplyOutcome), ApplyError>
 where
     F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
 {
     let _guard = RUNTIME_CONFIG_IO.lock().await;
+    commit_runtime_config_unlocked(api, enable_tun, core_running, restore_item, build).await
+}
+
+pub(crate) async fn commit_runtime_config_unlocked<F>(
+    api: &crate::mihomo_api::MihomoApi,
+    enable_tun: bool,
+    core_running: bool,
+    restore_item: Option<&clash_verge_core::config::PrfItem>,
+    build: F,
+) -> Result<(std::path::PathBuf, ApplyOutcome), ApplyError>
+where
+    F: FnOnce(serde_yaml_ng::Mapping) -> Result<serde_yaml_ng::Mapping, String>,
+{
     let app_config = clash_verge_core::config::IClashTemp::new().await.0;
     let config = build(app_config)?;
     let (config, dns_state) = if let Some(uid) = restore_item.and_then(|item| item.uid.as_deref()) {
@@ -1016,16 +1124,21 @@ where
     let previous = match tokio::fs::read(&path).await {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(format!("failed to back up {}: {error}", path.display())),
+        Err(error) => return Err(format!("failed to back up {}: {error}", path.display()).into()),
     };
     let mut transaction = RuntimeCandidate::new(path.clone(), private_candidate_path(&path), previous);
 
     let yaml = prepare_mihomo_runtime_yaml(config, enable_tun).await?;
-    if effective_config_unchanged(
-        crate::mihomo_manager::CoreKind::Mihomo,
-        transaction.previous.as_deref(),
-        yaml.as_bytes(),
-    )? {
+    let previous_pending = read_reload_pending(&path)?;
+    let hash = runtime_hash(yaml.as_bytes())?;
+    let pending_matches = previous_pending.as_ref().is_some_and(|pending| pending.sha256 == hash);
+    if !pending_matches
+        && effective_config_unchanged(
+            crate::mihomo_manager::CoreKind::Mihomo,
+            transaction.previous.as_deref(),
+            yaml.as_bytes(),
+        )?
+    {
         persist_dns_override_state(dns_state.as_ref()).await;
         tracing::info!(target: "config", "mihomo effective configuration unchanged, not reloaded");
         return Ok((path, ApplyOutcome::Unchanged));
@@ -1039,20 +1152,56 @@ where
         persist_dns_override_state(dns_state.as_ref()).await;
         return Ok((path, ApplyOutcome::Applied));
     }
-    if let Err(error) = reload_config_file(api, &path).await {
-        transaction
-            .rollback()
-            .map_err(|rollback_error| format!("{error}; rollback failed: {rollback_error}"))?;
-        if transaction.previous.is_some() {
-            let _ = reload_config_file(api, &path).await;
-            return Err(format!("{error}; restored the previous config"));
-        }
-        return Err(error);
+    // There is no await between durable pending and disarming cancellation
+    // rollback. A killed process/task may have sent PUT and cannot safely undo it.
+    if let Err(error) = write_reload_pending(
+        &path,
+        &ReloadPending {
+            sha256: hash,
+            profile_uid: restore_item.and_then(|item| item.uid.as_deref()).map(str::to_owned),
+        },
+    ) {
+        transaction.rollback().map_err(|rollback| {
+            ApplyError::Uncertain(format!(
+                "reload was not sent: {error}; config rollback failed: {rollback}"
+            ))
+        })?;
+        let pending_error = restore_reload_pending(&path, previous_pending.as_ref())
+            .err()
+            .map(|error| format!("; pending restore failed: {error}"))
+            .unwrap_or_default();
+        return Err(ApplyError::Rejected(format!(
+            "reload was not sent because pending state could not be persisted: {error}{pending_error}; previous config restored"
+        )));
     }
+    transaction.rollback_on_drop = false;
+    if let Err(error) = reload_config_file(api, &path).await {
+        if !error.allows_rollback() {
+            transaction.commit();
+            persist_dns_override_state(dns_state.as_ref()).await;
+            return Err(error);
+        }
+        transaction.rollback().map_err(|rollback_error| {
+            ApplyError::Uncertain(format!(
+                "{error}; rollback failed: {rollback_error}; retain desired profile"
+            ))
+        })?;
+        restore_reload_pending(&path, previous_pending.as_ref()).map_err(|pending_error| {
+            ApplyError::Rejected(format!(
+                "{error}; previous config restored but pending state restore failed: {pending_error}"
+            ))
+        })?;
+        return Err(ApplyError::Rejected(format!("{error}; restored the previous config")));
+    }
+    transaction.commit();
+    clear_reload_pending(&path).map_err(|error| {
+        ApplyError::Uncertain(format!(
+            "config reload confirmed but pending state cleanup failed: {error}; candidate retained"
+        ))
+    })?;
     if let Some(item) = restore_item {
         restore_selected_nodes(api, item).await;
     }
-    transaction.commit();
     persist_dns_override_state(dns_state.as_ref()).await;
     Ok((path, ApplyOutcome::Applied))
 }
@@ -1614,7 +1763,9 @@ entries:
             let result = reload_config_file(&api, &dir.path().join("candidate.yaml")).await;
             assert_eq!(result.is_ok(), ready);
             if !ready {
-                assert!(result.unwrap_err().contains("readiness failed"));
+                let error = result.unwrap_err();
+                assert!(matches!(error, ApplyError::Uncertain(_)));
+                assert!(error.to_string().contains("readiness failed"));
             }
             server.await.unwrap();
         }

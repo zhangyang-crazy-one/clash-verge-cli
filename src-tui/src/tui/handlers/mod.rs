@@ -325,6 +325,15 @@ pub(super) async fn handle_event(app: &mut App, ctx: &Ctx, action: Action) -> Fl
             ctx.cancel_background();
             lifecycle::note_error(app, msg);
         }
+        Action::OperationError(msg) => {
+            // A pending reload can retain the requested UID on disk. Mirror
+            // that desired profile without treating it as a confirmed apply
+            // or discarding the still-running core's runtime snapshots.
+            if let Ok(store) = crate::profile_store::store::ProfileStore::snapshot().await {
+                app.load_profiles(&store);
+            }
+            app.status_msg = Some(format!("{}: {msg}", app.tr("status.error")));
+        }
         Action::ConfirmCoreUpdate => core_update::confirm(app, ctx),
         Action::RequestCoreUpdate { kind, intent } => core_update::begin(app, ctx, kind, intent),
         Action::CancelCoreUpdate => core_update::cancel(app),
@@ -629,6 +638,117 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[tokio::test]
+    async fn operation_errors_preserve_running_core_and_runtime_snapshots() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: desired\nitems:\n  - {uid: desired, type: local, file: desired.yaml}\n",
+        )
+        .unwrap();
+        let (ctx, _rx) = ctx();
+        let generation = ctx.tx.current_generation();
+        let pending = ctx.tx.spawn(std::future::pending::<()>());
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.core_version = Some("fixture-version".into());
+        app.current_profile_uid = Some("previous".into());
+        app.traffic = Some(TrafficData { up: 123, down: 456 });
+        app.traffic_totals = Some((1000, 2000));
+        app.logs.push(LogEntry {
+            level: "info".into(),
+            payload: "healthy core".into(),
+        });
+        app.delay_map.insert("node".into(), Some(30));
+        app.batch_delay = Some((1, 2));
+        app.runtime_loading.proxies = true;
+        app.log_stream = Some(pending.abort_handle());
+
+        for message in [
+            "profile reload rejected: invalid configuration",
+            "profile reload uncertain: response timeout; retry required",
+            "TUN setup failed: permission denied",
+        ] {
+            handle_event(&mut app, &ctx, Action::OperationError(message.into())).await;
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.core_version.as_deref(), Some("fixture-version"));
+            assert_eq!(
+                app.traffic.as_ref().map(|traffic| (traffic.up, traffic.down)),
+                Some((123, 456))
+            );
+            assert_eq!(app.traffic_totals, Some((1000, 2000)));
+            assert_eq!(app.logs.len(), 1);
+            assert_eq!(app.delay_map.get("node"), Some(&Some(30)));
+            assert_eq!(app.batch_delay, Some((1, 2)));
+            assert!(app.runtime_loading.proxies);
+            assert!(app.log_stream.is_some());
+            assert!(!pending.is_finished(), "an operation error must not abort live streams");
+            assert_eq!(ctx.tx.current_generation(), generation);
+            assert!(app.status_msg.as_deref().unwrap().contains(message));
+            assert_eq!(app.current_profile_uid.as_deref(), Some("desired"));
+        }
+        pending.abort();
+        let _ = pending.await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_error_still_clears_failed_core_and_runtime_snapshots() {
+        let (ctx, _rx) = ctx();
+        let generation = ctx.tx.current_generation();
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.traffic = Some(TrafficData { up: 1, down: 2 });
+        app.delay_map.insert("node".into(), Some(30));
+        handle_event(&mut app, &ctx, Action::CoreError("core process exited".into())).await;
+        assert_eq!(
+            app.core_state,
+            crate::app::CoreState::Error("core process exited".into())
+        );
+        assert!(app.core_pid.is_none());
+        assert!(app.traffic.is_none());
+        assert!(app.delay_map.is_empty());
+        assert_ne!(ctx.tx.current_generation(), generation);
+    }
+
+    #[tokio::test]
+    async fn failed_profile_switch_and_import_emit_operation_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
+        std::fs::write(
+            home.path().join("profiles.yaml"),
+            "current: previous\nitems:\n  - {uid: desired, type: local, file: missing-profile.yaml}\n",
+        )
+        .unwrap();
+        let (ctx, mut rx) = ctx();
+        let mut app = App::new();
+        app.core_state = crate::app::CoreState::Running;
+        app.core_pid = Some(42);
+        app.traffic_totals = Some((1000, 2000));
+        let store = crate::profile_store::store::ProfileStore::snapshot().await.unwrap();
+        app.load_profiles(&store);
+
+        for imported in [false, true] {
+            if imported {
+                profile::note_imported(&mut app, &ctx).await;
+            } else {
+                profile::switch_selected(&mut app, &ctx);
+            }
+            let action = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&action, Action::OperationError(message) if message.contains("missing-profile.yaml")));
+            handle_event(&mut app, &ctx, action).await;
+            assert_eq!(app.core_state, crate::app::CoreState::Running);
+            assert_eq!(app.core_pid, Some(42));
+            assert_eq!(app.traffic_totals, Some((1000, 2000)));
+        }
     }
 
     #[tokio::test]

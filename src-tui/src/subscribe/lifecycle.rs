@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use crate::mihomo_api::error::MihomoError;
 use crate::mihomo_api::types::ProxyDelay;
 use crate::mihomo_manager::{CoreKind, MihomoManager};
-use crate::runtime_config::ApplyOutcome;
+use crate::runtime_config::{ApplyError, ApplyOutcome};
 
 #[async_trait]
 pub(crate) trait CoreLifecycle: Send + Sync {
@@ -17,7 +17,7 @@ pub(crate) trait CoreLifecycle: Send + Sync {
     fn owns_core(&self) -> bool;
     async fn current_exit_node(&self, items: &[clash_verge_core::config::PrfItem], uid: &str) -> Option<String>;
     async fn delay_test(&self, node: &str, url: &str, timeout_ms: u64) -> Result<ProxyDelay, MihomoError>;
-    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, String>;
+    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, ApplyError>;
     async fn reapply_selected(&self, node: &str) -> Result<(), String>;
 }
 
@@ -48,7 +48,7 @@ pub(crate) async fn reload_with_lifecycle<C: CoreLifecycle>(
     lifecycle: &C,
     uid: &str,
     enable_tun: bool,
-) -> Result<ApplyOutcome, String> {
+) -> Result<ApplyOutcome, ApplyError> {
     validate_apply_target(lifecycle.core_kind(), lifecycle.is_running(), lifecycle.owns_core())?;
     if !lifecycle.is_running() {
         return Ok(ApplyOutcome::Unchanged);
@@ -62,10 +62,14 @@ pub(crate) async fn reload_selected_with_lifecycle<C: CoreLifecycle>(
     uid: &str,
     node: &str,
     tun: bool,
-) -> Result<ApplyOutcome, String> {
+) -> Result<ApplyOutcome, ApplyError> {
     let outcome = reload_with_lifecycle(lifecycle, uid, tun).await?;
     if outcome == ApplyOutcome::Applied && lifecycle.is_running() {
-        lifecycle.reapply_selected(node).await?;
+        lifecycle.reapply_selected(node).await.map_err(|error| {
+            ApplyError::Uncertain(format!(
+                "candidate applied but selection restore failed: {error}; candidate retained"
+            ))
+        })?;
     }
     Ok(outcome)
 }
@@ -165,7 +169,7 @@ impl CoreLifecycle for ManagerLifecycle<'_> {
         Some(node)
     }
 
-    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, String> {
+    async fn reload_profile(&self, uid: &str, enable_tun: bool) -> Result<ApplyOutcome, ApplyError> {
         super::scheduler::reload_current_profile_for_manager(self.manager, uid, enable_tun, true).await
     }
 
@@ -244,7 +248,7 @@ mod tests {
         async fn delay_test(&self, _node: &str, _url: &str, _timeout_ms: u64) -> Result<ProxyDelay, MihomoError> {
             Ok(ProxyDelay { delay: 1 })
         }
-        async fn reload_profile(&self, uid: &str, _enable_tun: bool) -> Result<ApplyOutcome, String> {
+        async fn reload_profile(&self, uid: &str, _enable_tun: bool) -> Result<ApplyOutcome, ApplyError> {
             self.events.lock().unwrap().push("reload");
             if self.fail_reload {
                 return Err("readiness failed".into());
@@ -337,7 +341,7 @@ mod tests {
         let error = reload_with_lifecycle(&fake, "profile-a", false)
             .await
             .expect_err("external guard");
-        assert!(error.contains("externally managed"));
+        assert!(error.to_string().contains("externally managed"));
         assert!(reloads.lock().unwrap().is_empty());
     }
 

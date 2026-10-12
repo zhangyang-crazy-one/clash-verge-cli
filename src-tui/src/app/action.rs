@@ -32,7 +32,10 @@ pub enum Action {
         binary_source: Option<String>,
     },
     CoreExited(i32),
+    /// A lifecycle or watcher failure: the core is no longer usable.
     CoreError(String),
+    /// A failed configuration/setup operation does not establish core failure.
+    OperationError(String),
     ConfirmCoreUpdate,
     RequestCoreUpdate {
         kind: crate::mihomo_manager::CoreKind,
@@ -353,6 +356,7 @@ mod tests {
         let _ = Action::CoreExited(0);
         let _ = Action::CoreExited(137);
         let _ = Action::CoreError("boom".to_string());
+        let _ = Action::OperationError("reload uncertain".to_string());
         let _ = Action::Quit;
         let _ = Action::TunSetupSucceeded {
             resume_start: Some(true),

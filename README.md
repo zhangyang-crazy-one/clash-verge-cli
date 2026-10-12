@@ -142,6 +142,15 @@ clash-verge-cli profile use my-sub           # uid or name
 eval "$(clash-verge-cli sysproxy env)"   # proxy the current shell
 ```
 
+Mihomo profile reloads allow up to 120 seconds for GeoIP/GeoSite downloads and
+rule-provider initialization. If the response is lost or readiness cannot be
+confirmed, the command reports an uncertain outcome and retains the candidate
+configuration and selected profile. Controller health alone does not prove the
+profile was applied. Retry `profile use` with the same profile: a private,
+hash-bound pending record makes that retry send a fresh reload, even in a new
+CLI process. A confirmed reload clears the record; an explicit rejection or a
+connection failure before sending restores the previous configuration.
+
 Commands that talk to the running core (they fail with a hint when it is
 not running):
 
