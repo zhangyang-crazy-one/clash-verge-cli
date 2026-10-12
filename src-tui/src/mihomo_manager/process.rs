@@ -981,8 +981,23 @@ mod tests {
         command
     }
 
+    /// These three tests exercise EACCES on a non-dumpable same-uid child.
+    /// Privileged root may still read /proc/pid/exe, so that fixture cannot
+    /// demonstrate this security boundary. Keep production checks strict.
+    fn skip_unreadable_exe_fixture_as_root() -> bool {
+        // SAFETY: geteuid takes no arguments and does not mutate state.
+        let root = unsafe { nix::libc::geteuid() } == 0;
+        if root {
+            eprintln!("SKIP: unreadable /proc/exe fixture requires an unprivileged user; root can bypass EACCES");
+        }
+        root
+    }
+
     #[tokio::test]
     async fn nondumpable_direct_spawn_binds_and_failure_cleanup_stops_only_that_child() {
+        if skip_unreadable_exe_fixture_as_root() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let config = home.path().join("owned.json");
         let other_config = home.path().join("foreign.json");
@@ -1032,6 +1047,9 @@ mod tests {
 
     #[tokio::test]
     async fn forged_receipt_and_foreign_sender_cannot_authorize_nondumpable_process() {
+        if skip_unreadable_exe_fixture_as_root() {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;
         let mut target = ReceiptTarget::new(home.path(), CoreKind::SingBox).unwrap();
@@ -1396,6 +1414,9 @@ mod tests {
 
     #[tokio::test]
     async fn reparented_launch_core_is_cleaned_without_touching_another_instances_record() {
+        if skip_unreadable_exe_fixture_as_root() {
+            return;
+        }
         use crate::mihomo_manager::manager::{LaunchOwnership, MihomoManager};
         let home = tempfile::tempdir().unwrap();
         let _home = crate::profile_store::store::tests::claim_test_app_home(home.path().to_path_buf()).await;

@@ -32,10 +32,41 @@ Managed binaries live under `$XDG_DATA_HOME/clash-verge-cli/` (or
 digest or exact checksum-manifest entry, a matching executable version,
 and atomic installation under a shared lock.
 
+For offline installation, obtain the official pinned release archive for
+your Linux architecture, then run:
+
+```sh
+clash-verge-cli core install --core mihomo --from mihomo-linux-amd64-v2-v1.19.32.gz
+clash-verge-cli core install --core singbox --from sing-box-1.14.2-linux-amd64.tar.gz
+```
+
+`--core` defaults to the selected core. This command authenticates the whole
+archive against an embedded official release SHA256, checks the extracted
+ELF and exact pinned version, and writes the same trusted-install receipt as
+an online download. It supports amd64, arm64 and armv7 archives; a raw binary,
+another architecture or version, or modified archive is rejected. Installation
+does not switch the selected core or restart it. Existing executables and
+receipts remain unchanged; replacements use a separate version-qualified path.
+
+Alternatively, place a compatible executable named `verge-mihomo` or
+`verge-sing-box` in a directory on `PATH` (for example `~/.local/bin`);
+plain `sing-box` on `PATH` is also recognized. System executables use the same
+offline version policy: stable versions at least as new as the pin in the same
+major line are accepted. Manually copying a raw binary into the managed data
+directory does not create a trusted-install receipt and is not an installation.
+
+CLI `profile import` stores the subscription without changing the current
+profile. Run the printed `profile use <uid>` command to activate it.
+
 Native sing-box profiles keep their routing, DNS and unknown provider fields,
 with reference validation before launch. Nonempty `services` are rejected:
 the CLI manages its mixed/TUN inbounds and controller, and cannot manage
 additional provider service listeners.
+
+The launcher and config checks pass sing-box's `--disable-color` flag;
+captured logs also strip ANSI and retain their level under `singbox_core`.
+The pinned core does not accept a JSON `log.disable_color` field ([official
+v1.14.2 options](https://github.com/SagerNet/sing-box/blob/v1.14.2/option/options.go)).
 
 Clash profiles converted to sing-box can lose rules, node fields or group
 semantics. After a validated runtime config is committed, its loss digest is

@@ -109,6 +109,7 @@ pub async fn prevalidate_singbox_config(binary: &std::path::Path, config: &std::
         .arg("check")
         .arg("-c")
         .arg(config)
+        .arg("--disable-color")
         .output()
         .await
         .map_err(|error| format!("failed to run {} check: {error}", binary.display()))?;

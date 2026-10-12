@@ -45,6 +45,24 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets --locked
 
+      - name: Verify explicit root skip for unreadable-exe fixtures
+        run: |
+          cargo test --locked -p clash-verge-cli --no-run --message-format=json > "$RUNNER_TEMP/issue83-test-artifacts.jsonl"
+          python3 - <<'PY'
+          import json, os, subprocess
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "issue83-test-artifacts.jsonl")) as stream:
+              binaries = [row["executable"] for line in stream if (row := json.loads(line)).get("reason") == "compiler-artifact" and row.get("profile", {}).get("test") and row.get("executable") and row["target"]["name"] == "clash-verge-cli"]
+          assert len(binaries) == 1, binaries
+          for test in (
+              "nondumpable_direct_spawn_binds_and_failure_cleanup_stops_only_that_child",
+              "forged_receipt_and_foreign_sender_cannot_authorize_nondumpable_process",
+              "reparented_launch_core_is_cleaned_without_touching_another_instances_record",
+          ):
+              result = subprocess.run(["sudo", "-n", "--", binaries[0], "--exact", f"mihomo_manager::process::tests::{test}", "--nocapture"], text=True, capture_output=True, timeout=60)
+              print(result.stdout, result.stderr, flush=True)
+              assert result.returncode == 0 and "SKIP: unreadable /proc/exe fixture" in result.stderr and "1 passed" in result.stdout, test
+          PY
+
       - name: Verify disabled-pidfd fallback (ENOSYS and EPERM)
         run: cargo test --locked -p clash-verge-cli disabled_pidfd_seccomp_regression -- --nocapture
 

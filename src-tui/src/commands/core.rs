@@ -16,6 +16,18 @@ use std::path::PathBuf;
 
 use crate::mihomo_manager::CoreKind;
 
+/// Explicit offline preparation does not change selection or a running core.
+pub async fn install(kind: CoreKind, archive: &std::path::Path) -> anyhow::Result<()> {
+    let prepared = crate::mihomo_manager::binary::install_from_archive(kind, archive).await?;
+    println!(
+        "installed {} {} at {}",
+        kind.as_str(),
+        prepared.version,
+        prepared.path.display()
+    );
+    Ok(())
+}
+
 /// The core this CLI would actually adopt right now, with its pid.
 ///
 /// Uses the same validated read as the lifecycle commands

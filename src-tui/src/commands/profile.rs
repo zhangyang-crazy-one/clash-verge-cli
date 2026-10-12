@@ -123,10 +123,11 @@ pub async fn import(
         trusted_hosts: (!trusted_hosts.is_empty()).then_some(trusted_hosts),
         ..Default::default()
     };
-    let item = ProfileStore::import_url_locked(url, name, Some(&option)).await?;
+    let item = ProfileStore::import_url_unselected_locked(url, name, Some(&option)).await?;
     let uid = item.uid.as_deref().unwrap_or("?");
     let name = item.name.as_deref().unwrap_or("(unnamed)");
     println!("imported {uid} ({name})");
+    println!("activate with: clash-verge-cli profile use {uid}");
     Ok(())
 }
 

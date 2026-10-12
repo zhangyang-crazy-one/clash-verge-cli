@@ -31,16 +31,17 @@ pub fn spawn_watcher(
     // The auto-restart path outlives this function, so own the paths.
     let config_dir = config_dir.to_path_buf();
     let socket_path = socket_path.to_path_buf();
+    let kind = inner.core_kind();
     tokio::spawn(async move {
         let mut child = child;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
         if let Some(out) = stdout {
-            pipe_to_tracing(out, tracing::Level::INFO, "stdout");
+            pipe_to_tracing(out, kind, tracing::Level::INFO, "stdout");
         }
         if let Some(err) = stderr {
-            pipe_to_tracing(err, tracing::Level::WARN, "stderr");
+            pipe_to_tracing(err, kind, tracing::Level::WARN, "stderr");
         }
 
         let exit_code = match child.wait().await {
@@ -140,7 +141,7 @@ fn auto_restart_failure_message(exit_code: i32, error: &anyhow::Error) -> String
     format!("exited {exit_code} (auto-restart failed: {error})")
 }
 
-fn pipe_to_tracing<R>(reader: R, level: tracing::Level, label: &'static str)
+fn pipe_to_tracing<R>(reader: R, kind: super::CoreKind, level: tracing::Level, label: &'static str)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -148,15 +149,7 @@ where
         let mut lines = BufReader::new(reader).lines();
         loop {
             match lines.next_line().await {
-                Ok(Some(line)) => match level {
-                    tracing::Level::INFO => {
-                        tracing::info!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}")
-                    }
-                    tracing::Level::WARN => {
-                        tracing::warn!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}")
-                    }
-                    _ => tracing::debug!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}"),
-                },
+                Ok(Some(line)) => emit_core_line(kind, level, label, &line),
                 Ok(None) => break,
                 Err(_) => break,
             }
@@ -164,9 +157,126 @@ where
     });
 }
 
+fn singbox_log_line(line: &str, fallback: tracing::Level) -> (String, tracing::Level) {
+    use std::sync::LazyLock;
+    static ANSI: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))").expect("ANSI regex")
+    });
+    static LEVEL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"^(?:[+-]\d{4}\s+)?(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\s+)?(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|PANIC)\b")
+            .expect("sing-box level regex")
+    });
+    let clean = ANSI.replace_all(line, "").into_owned();
+    let level = match LEVEL
+        .captures(clean.trim_start())
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str())
+    {
+        Some("TRACE") => tracing::Level::TRACE,
+        Some("DEBUG") => tracing::Level::DEBUG,
+        Some("INFO") => tracing::Level::INFO,
+        Some("WARN" | "WARNING") => tracing::Level::WARN,
+        Some("ERROR" | "FATAL" | "PANIC") => tracing::Level::ERROR,
+        _ => fallback,
+    };
+    (clean, level)
+}
+
+fn emit_core_line(kind: super::CoreKind, level: tracing::Level, label: &'static str, line: &str) {
+    if kind == super::CoreKind::SingBox {
+        let (line, level) = singbox_log_line(line, level);
+        match level {
+            tracing::Level::ERROR => tracing::error!(target: crate::logging::SINGBOX_OUTPUT_TARGET, "[{label}] {line}"),
+            tracing::Level::WARN => tracing::warn!(target: crate::logging::SINGBOX_OUTPUT_TARGET, "[{label}] {line}"),
+            tracing::Level::INFO => tracing::info!(target: crate::logging::SINGBOX_OUTPUT_TARGET, "[{label}] {line}"),
+            tracing::Level::DEBUG => tracing::debug!(target: crate::logging::SINGBOX_OUTPUT_TARGET, "[{label}] {line}"),
+            _ => tracing::trace!(target: crate::logging::SINGBOX_OUTPUT_TARGET, "[{label}] {line}"),
+        }
+    } else {
+        match level {
+            tracing::Level::INFO => tracing::info!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}"),
+            tracing::Level::WARN => tracing::warn!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}"),
+            _ => tracing::debug!(target: crate::logging::MIHOMO_OUTPUT_TARGET, "[{label}] {line}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue83_singbox_stream_levels_ansi_and_target_are_preserved() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self {
+                self.clone()
+            }
+        }
+        let buffer = Buffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for label in ["stdout", "stderr"] {
+                for (token, expected) in [
+                    ("INFO", tracing::Level::INFO),
+                    ("WARN", tracing::Level::WARN),
+                    ("ERROR", tracing::Level::ERROR),
+                    ("DEBUG", tracing::Level::DEBUG),
+                ] {
+                    let line = format!("+0000 2026-10-12 10:30:01 \x1b[36m{token}\x1b[0m fixture-{token}");
+                    let (clean, level) = singbox_log_line(&line, tracing::Level::WARN);
+                    assert_eq!(level, expected);
+                    assert!(!clean.contains('\x1b'));
+                    emit_core_line(super::super::CoreKind::SingBox, tracing::Level::WARN, label, &line);
+                }
+            }
+            emit_core_line(
+                super::super::CoreKind::Mihomo,
+                tracing::Level::WARN,
+                "stderr",
+                "mihomo-fixture",
+            );
+        });
+        let logs = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        for label in ["stdout", "stderr"] {
+            for token in ["INFO", "WARN", "ERROR", "DEBUG"] {
+                assert!(
+                    logs.lines().any(|line| line.contains(token)
+                        && line.contains("singbox_core:")
+                        && line.contains(&format!("[{label}]"))
+                        && line.contains(&format!("fixture-{token}"))),
+                    "{logs}"
+                );
+            }
+        }
+        assert!(!logs.contains('\x1b'));
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("WARN") && line.contains("mihomo_core:") && line.contains("mihomo-fixture")),
+            "{logs}"
+        );
+        assert_eq!(
+            singbox_log_line("unstructured message mentioning ERROR", tracing::Level::INFO).1,
+            tracing::Level::INFO
+        );
+    }
 
     #[tokio::test]
     async fn superseded_watcher_does_not_clear_the_new_generation_state() {

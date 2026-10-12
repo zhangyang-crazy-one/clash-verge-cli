@@ -84,6 +84,7 @@ pub fn validate_singbox(path: &Path) -> anyhow::Result<()> {
             .arg("check")
             .arg("-c")
             .arg(path)
+            .arg("--disable-color")
             .output()
             .map_err(|e| anyhow::anyhow!("failed to run sing-box check: {e}"))?;
         if !output.status.success() {

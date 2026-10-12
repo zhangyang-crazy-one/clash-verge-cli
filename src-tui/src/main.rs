@@ -206,6 +206,13 @@ async fn run() -> anyhow::Result<i32> {
         Some(cli::Command::Core { action }) => match action.unwrap_or(cli::CoreCommand::Show) {
             cli::CoreCommand::Show => commands::core::show(config_dir, json).await?,
             cli::CoreCommand::Use { core } => commands::core::use_core(config_dir, core).await?,
+            cli::CoreCommand::Install { from, core } => {
+                let core = match core {
+                    Some(core) => core,
+                    None => commands::configured_core_kind().await,
+                };
+                commands::core::install(core, &from).await?;
+            }
         },
         Some(cli::Command::Config { action }) => match action {
             cli::ConfigCommand::Get { key } => commands::config::get(&key, json).await?,

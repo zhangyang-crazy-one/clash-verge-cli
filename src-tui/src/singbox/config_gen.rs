@@ -940,7 +940,12 @@ pub fn apply_control_plane(
     tun: &TunSettings,
     clash_api: &ClashApiSettings,
 ) {
-    config["log"] = json!({ "level": "info", "timestamp": true });
+    if !config.get("log").is_some_and(Value::is_object) {
+        config["log"] = json!({ "level": "info", "timestamp": true });
+    }
+    // Native log options (including future fields) remain provider-owned.
+    // sing-box's DisableColor is internal (json:"-"); the launcher uses
+    // the supported --disable-color flag rather than adding an invalid key.
     config["inbounds"] = Value::Array(control_plane_inbounds(mixed_port, enable_tun, tun));
     if !config.get("experimental").is_some_and(Value::is_object) {
         config["experimental"] = json!({});
@@ -1266,6 +1271,7 @@ mod tests {
     #[test]
     fn apply_control_plane_preserves_native_singbox_document() {
         let mut native = json!({
+            "log": { "level": "debug", "timestamp": false, "output": "custom.log", "future": {"keep": true} },
             "outbounds": [{ "type": "vless", "tag": "custom-node" }],
             "route": { "rules": [{ "outbound": "custom-node" }] },
             "dns": { "servers": [{ "tag": "remote", "type": "https" }] },
@@ -1280,6 +1286,11 @@ mod tests {
             secret: "my-secret".into(),
         };
         apply_control_plane(&mut native, 7897, true, &tun, &clash_api);
+        assert!(native["log"].get("disable_color").is_none());
+        assert_eq!(native["log"]["level"], "debug");
+        assert_eq!(native["log"]["timestamp"], false);
+        assert_eq!(native["log"]["output"], "custom.log");
+        assert_eq!(native["log"]["future"]["keep"], true);
 
         // Preserved original content
         assert_eq!(native["outbounds"][0]["tag"], "custom-node");
@@ -1459,6 +1470,7 @@ mod tests {
     #[test]
     fn generated_clash_api_has_no_placeholder_secret_and_no_wildcard_cors() {
         let config = generate_config(&sample_input()).expect("config");
+        assert!(config["log"].get("disable_color").is_none());
         let text = serde_json::to_string(&config).expect("json");
 
         assert!(

@@ -152,6 +152,15 @@ pub enum CoreCommand {
         /// Core to select: mihomo or singbox
         core: crate::mihomo_manager::CoreKind,
     },
+    /// Install a pinned official release archive without network access
+    Install {
+        /// Official .gz (mihomo) or .tar.gz (sing-box) release archive
+        #[arg(long, value_name = "FILE")]
+        from: PathBuf,
+        /// Core to install (default: the selected core)
+        #[arg(long)]
+        core: Option<crate::mihomo_manager::CoreKind>,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]

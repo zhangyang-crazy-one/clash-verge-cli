@@ -73,6 +73,19 @@ impl ProfileStore {
         store.import_url(url, name, option).await
     }
 
+    /// CLI import stores a profile without claiming it was applied. TUI
+    /// import retains its explicit first-profile application transaction.
+    pub async fn import_url_unselected_locked(
+        url: &str,
+        name: Option<&str>,
+        option: Option<&PrfOption>,
+    ) -> anyhow::Result<PrfItem> {
+        let _guard = PROFILE_IO.lock().await;
+        let mut store = Self::load_unlocked().await?;
+        let bundle = from_url::import_with_fallback(url, name, option).await?;
+        store.append_bundle_with_selection(bundle, false).await
+    }
+
     /// Update one remote profile under the shared IO lock.
     pub async fn update_remote_locked(uid: &str, option_override: Option<&PrfOption>) -> anyhow::Result<bool> {
         let _guard = PROFILE_IO.lock().await;
@@ -263,17 +276,25 @@ impl ProfileStore {
 
     /// Append enhance fragments then the remote item, and persist.
     pub async fn append_bundle(&mut self, bundle: RemoteProfileBundle) -> anyhow::Result<PrfItem> {
+        self.append_bundle_with_selection(bundle, true).await
+    }
+
+    async fn append_bundle_with_selection(
+        &mut self,
+        bundle: RemoteProfileBundle,
+        select_first: bool,
+    ) -> anyhow::Result<PrfItem> {
         ensure_profile_storage().await?;
         for mut fragment in bundle.fragments {
             self.profiles
-                .append_item(&mut fragment)
+                .append_item_with_selection(&mut fragment, select_first)
                 .await
                 .context("failed to append profile fragment")?;
         }
         let mut item = bundle.item;
         let saved = item.clone();
         self.profiles
-            .append_item(&mut item)
+            .append_item_with_selection(&mut item, select_first)
             .await
             .context("failed to append remote profile")?;
         self.profiles
@@ -482,6 +503,57 @@ pub(crate) mod tests {
         };
         assert!(body.contains("proxies:"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn issue83_unselected_import_preserves_selection_and_unknown_fields_even_on_save_failure() {
+        let home = tempfile::tempdir().unwrap();
+        let _home = claim_test_app_home(home.path().to_path_buf()).await;
+        let bundle = |uid: &str| RemoteProfileBundle {
+            item: PrfItem {
+                uid: Some(uid.into()),
+                itype: Some("remote".into()),
+                file: Some(format!("{uid}.yaml").into()),
+                file_data: Some("proxies: []\n".into()),
+                ..Default::default()
+            },
+            fragments: vec![PrfItem::from_merge(None).unwrap()],
+        };
+        let mut store = ProfileStore {
+            profiles: serde_yaml_ng::from_str("future: {keep: true}\n").unwrap(),
+        };
+        store
+            .append_bundle_with_selection(bundle("first"), false)
+            .await
+            .unwrap();
+        assert!(store.current_uid().is_none());
+        assert!(ProfileStore::snapshot().await.unwrap().current_uid().is_none());
+        let saved: serde_yaml_ng::Value =
+            serde_yaml_ng::from_slice(&std::fs::read(home.path().join("profiles.yaml")).unwrap()).unwrap();
+        assert_eq!(saved["future"]["keep"], serde_yaml_ng::Value::Bool(true));
+        store.set_current("first").await.unwrap();
+        store
+            .append_bundle_with_selection(bundle("second"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            ProfileStore::snapshot().await.unwrap().current_uid().as_deref(),
+            Some("first")
+        );
+        std::fs::remove_file(home.path().join("profiles.yaml")).unwrap();
+        std::fs::create_dir(home.path().join("profiles.yaml")).unwrap();
+        for previous in [None, Some("first".into())] {
+            let mut profiles = IProfiles {
+                current: previous.clone(),
+                ..Default::default()
+            };
+            let mut item = bundle("failed").item;
+            assert!(profiles.append_item_with_selection(&mut item, false).await.is_err());
+            assert_eq!(
+                profiles.current, previous,
+                "no transient current mutation before failed metadata write"
+            );
+        }
     }
 
     #[tokio::test]

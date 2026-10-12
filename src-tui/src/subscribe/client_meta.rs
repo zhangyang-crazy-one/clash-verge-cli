@@ -252,9 +252,7 @@ fn trusted_digest_metadata(
         })
         .collect();
     if manifests.len() != 1 {
-        anyhow::bail!(
-            "null asset digest and missing or ambiguous official checksum manifest for {asset_name}; existing binary preserved"
-        );
+        anyhow::bail!("null asset digest and missing or ambiguous official checksum manifest for {asset_name}");
     }
     let name = manifests[0]
         .get("name")
@@ -310,7 +308,7 @@ pub(crate) async fn fetch_trusted_release_digest(repo: &str, tag: &str, asset_na
     let status = response.status();
     if !status.is_success() {
         anyhow::bail!(
-            "release metadata request to {url} failed ({}): status {} — {}; existing binary preserved",
+            "release metadata request to {url} failed ({}): status {} — {}",
             network.describe(),
             status.as_u16(),
             metadata_status_hint(status.as_u16())
@@ -364,7 +362,7 @@ pub async fn clash_verge_compat_version() -> &'static str {
                 tracing::info!(target: "subscribe", "subscription UA version from local package: {version}");
                 return version;
             }
-            tracing::warn!(
+            tracing::debug!(
                 target: "subscribe",
                 "subscription UA falling back to {FALLBACK_CLASH_VERGE_VERSION}"
             );

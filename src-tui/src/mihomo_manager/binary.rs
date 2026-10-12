@@ -374,9 +374,12 @@ pub async fn acquire(
     }
     let dest = acquisition_destination(&managed_path(kind), kind);
     report_progress(progress.as_ref(), authorization, CoreProgressPhase::Downloading, None);
-    let version = match kind {
+    let had_existing = managed_candidates(&managed_path(kind), kind)
+        .iter()
+        .any(|path| path.is_file());
+    let installed = match kind {
         CoreKind::Mihomo => {
-            download_managed_mihomo(&dest, target_version(kind), Some((authorization, progress.as_ref()))).await?
+            download_managed_mihomo(&dest, target_version(kind), Some((authorization, progress.as_ref()))).await
         }
         CoreKind::SingBox => {
             super::singbox_binary::download_managed_singbox(
@@ -384,9 +387,10 @@ pub async fn acquire(
                 target_version(kind),
                 Some((authorization, progress.as_ref())),
             )
-            .await?
+            .await
         }
     };
+    let version = installed.with_context(|| installation_failure_context(had_existing))?;
     report_progress(
         progress.as_ref(),
         authorization,
@@ -397,6 +401,86 @@ pub async fn acquire(
         kind,
         path: dest,
         source: "downloaded".into(),
+        version,
+    })
+}
+
+fn installation_failure_context(had_existing: bool) -> &'static str {
+    if had_existing {
+        "core installation failed; existing managed binary preserved"
+    } else {
+        "core installation failed; no existing managed binary is available"
+    }
+}
+
+/// Official release archive digests from MetaCubeX/mihomo v1.19.32 and
+/// SagerNet/sing-box v1.14.2 asset metadata. These authenticate compressed
+/// release bytes, never a caller-provided binary or locally computed hash.
+fn pinned_archive(kind: CoreKind, arch: &str) -> anyhow::Result<(&'static str, &'static str)> {
+    let asset = match (kind, arch) {
+        (CoreKind::Mihomo, "x86_64") => (
+            "mihomo-linux-amd64-v2-v1.19.32.gz",
+            "sha256:8892bc6373c3bea0ba43de8020acc70ba62aca60b632edf6dbd33835df27f81f",
+        ),
+        (CoreKind::Mihomo, "aarch64") => (
+            "mihomo-linux-arm64-v1.19.32.gz",
+            "sha256:9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
+        ),
+        (CoreKind::Mihomo, "arm") => (
+            "mihomo-linux-armv7-v1.19.32.gz",
+            "sha256:f622cbe903ba1a11d30e9071d1c5373929c675b854856ff3e7f977255a25bb66",
+        ),
+        (CoreKind::SingBox, "x86_64") => (
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            "sha256:a684484d7477d1437282ee411f4d131d0340aaad60a7868841ebd5d87dd8a0c6",
+        ),
+        (CoreKind::SingBox, "aarch64") => (
+            "sing-box-1.14.2-linux-arm64.tar.gz",
+            "sha256:b43a1fb1bda131c6653576741ce527eb2bdeab7c9308ca90ee8b972abb7e4a7f",
+        ),
+        (CoreKind::SingBox, "arm") => (
+            "sing-box-1.14.2-linux-armv7.tar.gz",
+            "sha256:1e2700de1cca1b58d410abc0ead40b595aa26ebe4812e0475311228d3e688db4",
+        ),
+        _ => anyhow::bail!(
+            "no embedded official archive digest for {} on {arch}; offline installation is unsupported",
+            kind.as_str()
+        ),
+    };
+    Ok(asset)
+}
+
+pub async fn install_from_archive(kind: CoreKind, source: &Path) -> anyhow::Result<PreparedCore> {
+    install_from_archive_at(kind, source, &managed_path(kind)).await
+}
+
+async fn install_from_archive_at(kind: CoreKind, source: &Path, managed: &Path) -> anyhow::Result<PreparedCore> {
+    use tokio::io::AsyncReadExt as _;
+    let (asset, digest) = pinned_archive(kind, std::env::consts::ARCH)?;
+    let source = tokio::fs::File::open(source)
+        .await
+        .with_context(|| format!("failed to open archive {}", source.display()))?;
+    let mut compressed = Vec::new();
+    source.take(256 * 1024 * 1024 + 1).read_to_end(&mut compressed).await?;
+    if compressed.len() > 256 * 1024 * 1024 {
+        anyhow::bail!("core archive exceeds size limit");
+    }
+    verify_sha256(&compressed, digest).with_context(|| format!("offline installation requires official {asset}"))?;
+    let _in_process = INSTALL_LOCK.lock().await;
+    let _cross_process = lock_install(&versioned_path(managed, kind)).await?;
+    let had_existing = managed_candidates(managed, kind).iter().any(|path| path.is_file());
+    let dest = acquisition_destination(managed, kind);
+    let installed = match kind {
+        CoreKind::Mihomo => extract_mihomo_archive(&compressed, &dest, target_version(kind)).await,
+        CoreKind::SingBox => {
+            super::singbox_binary::extract_tar_gz_binary(&compressed, &dest, target_version(kind)).await
+        }
+    };
+    let version = installed.with_context(|| installation_failure_context(had_existing))?;
+    Ok(PreparedCore {
+        kind,
+        path: dest,
+        source: "offline".into(),
         version,
     })
 }
@@ -480,6 +564,17 @@ fn system_mihomo_candidates() -> Vec<PathBuf> {
             && std::fs::metadata(&path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
         {
             found.push(path);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let path = dir.join("verge-mihomo");
+            if seen.insert(path.clone())
+                && path.is_file()
+                && std::fs::metadata(&path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            {
+                found.push(path);
+            }
         }
     }
     found
@@ -728,7 +823,11 @@ async fn download_managed_mihomo(
     verify_sha256_digest(&actual, &expected).with_context(|| format!("integrity check failed for {url}"))?;
     tracing::info!(target: "mihomo", "verified sha256 of {asset_file}");
 
-    let decoder = flate2::read::GzDecoder::new(compressed.as_slice());
+    extract_mihomo_archive(&compressed, dest, version).await
+}
+
+async fn extract_mihomo_archive(compressed: &[u8], dest: &Path, version: &str) -> anyhow::Result<String> {
+    let decoder = flate2::read::GzDecoder::new(compressed);
     let mut binary = Vec::new();
     decoder
         .take(512 * 1024 * 1024 + 1)
@@ -897,6 +996,48 @@ fn version_matches_target(version: &str, target: &str) -> bool {
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn issue83_embedded_archive_policy_is_exact_and_failure_message_is_truthful() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            for arch in ["x86_64", "aarch64", "arm"] {
+                let (name, digest) = pinned_archive(kind, arch).unwrap();
+                assert!(name.contains(target_version(kind).trim_start_matches('v')));
+                verify_sha256_digest(digest, digest).unwrap();
+            }
+            assert!(pinned_archive(kind, "unknown").is_err());
+            assert!(pinned_archive(kind, "riscv64").is_err());
+        }
+        assert!(!installation_failure_context(false).contains("preserved"));
+        assert!(installation_failure_context(true).contains("existing managed binary preserved"));
+    }
+
+    #[tokio::test]
+    async fn issue83_offline_untrusted_archives_and_raw_binary_preserve_existing_payload_and_receipt() {
+        for kind in [CoreKind::Mihomo, CoreKind::SingBox] {
+            let home = tempfile::tempdir().unwrap();
+            let managed = home.path().join(kind.as_str());
+            let qualified = versioned_path(&managed, kind);
+            let original = b"\x7fELFexisting";
+            std::fs::write(&qualified, original).unwrap();
+            write_digest_receipt(&qualified, original, ".fixture-").await.unwrap();
+            let receipt = digest_receipt_path(&qualified, &sha256_hex(original));
+            let receipt_bytes = std::fs::read(&receipt).unwrap();
+            for data in [
+                b"wrong version or wrong architecture archive".as_slice(),
+                b"\x7fELFraw binary",
+                b"tampered archive",
+            ] {
+                let archive = home.path().join("input.gz");
+                std::fs::write(&archive, data).unwrap();
+                let error = install_from_archive_at(kind, &archive, &managed).await.unwrap_err();
+                assert!(format!("{error:#}").contains("sha256 mismatch"));
+                assert_eq!(std::fs::read(&qualified).unwrap(), original);
+                assert_eq!(std::fs::read(&receipt).unwrap(), receipt_bytes);
+                assert!(verify_cached_digest(&qualified).await.unwrap());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn guided_tun_exact_inspection_requires_receipt_before_probe_and_keeps_selected_version() {

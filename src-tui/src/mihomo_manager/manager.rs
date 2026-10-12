@@ -487,7 +487,7 @@ impl ManagerInner {
                         path.display()
                     );
                 }
-                command.arg("run").arg("-c").arg(path);
+                command.arg("run").arg("-c").arg(path).arg("--disable-color");
             }
         }
         // Output is piped into this process's tracing, so the spawner must
